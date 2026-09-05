@@ -12,13 +12,25 @@ import (
 
 func TestServerRootExposesConfigurationCommands(t *testing.T) {
 	root := cli.NewServerRoot()
-	for _, name := range []string{"run", "check-config", "init-db", "print-config"} {
+	for _, name := range []string{"run", "check-config", "init-db", "print-config", "admin"} {
 		if root.CommandPath() == "" {
 			t.Fatal("root command has no path")
 		}
 		if findCommand(root, name) == nil {
 			t.Fatalf("server root missing %q command", name)
 		}
+	}
+}
+
+func TestServerAdminExposesCredentialRegeneration(t *testing.T) {
+	root := cli.NewServerRoot()
+	admin := findCommand(root, "admin")
+	if admin == nil || findCommand(admin, "regenerate-credentials") == nil {
+		t.Fatal("admin credential regeneration command missing")
+	}
+	regen := findCommand(admin, "regenerate-credentials")
+	if regen.Flag("confirm") == nil {
+		t.Fatal("regeneration command missing --confirm")
 	}
 }
 

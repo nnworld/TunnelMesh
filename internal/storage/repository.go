@@ -202,7 +202,13 @@ func pageLimit(limit int) int {
 	return limit
 }
 
-type userRepo struct{ db *sql.DB }
+type dbExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type userRepo struct{ db dbExecutor }
 
 func (r *userRepo) Create(ctx context.Context, v User) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "user")
@@ -297,7 +303,7 @@ func checkAffected(res sql.Result, err error) error {
 	return nil
 }
 
-type tokenRepo struct{ db *sql.DB }
+type tokenRepo struct{ db dbExecutor }
 
 func (r *tokenRepo) Create(ctx context.Context, v APIToken) error {
 	v.ID, v.CreatedAt = stampCreate(v.ID, v.CreatedAt, "tok")
@@ -810,7 +816,7 @@ func (r *leaseRepo) Get(ctx context.Context, agentID string) (AgentLease, error)
 	return v, err
 }
 
-type auditRepo struct{ db *sql.DB }
+type auditRepo struct{ db dbExecutor }
 
 func (r *auditRepo) Create(ctx context.Context, v AuditLog) error {
 	v.ID, v.CreatedAt = stampCreate(v.ID, v.CreatedAt, "audit")

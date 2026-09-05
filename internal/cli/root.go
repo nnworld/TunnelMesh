@@ -9,7 +9,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 // NewServerRoot constructs the server command tree.
@@ -89,7 +91,42 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(data))
 			return nil
 		}),
+		adminCommand(opts),
 	}
+}
+
+func adminCommand(opts *rootOptions) *cobra.Command {
+	admin := &cobra.Command{Use: "admin", Short: "administrator operations"}
+	regenerate := &cobra.Command{
+		Use:   "regenerate-credentials",
+		Short: "rotate administrator credentials and revoke old sessions",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			confirm, err := cmd.Flags().GetBool("confirm")
+			if err != nil {
+				return err
+			}
+			cfg, err := config.Load(cmd.Context(), config.ConfigOptions{ConfigFile: opts.configFile, CLI: changedFlags(cmd, opts)})
+			if err != nil {
+				return err
+			}
+			db, err := storage.OpenConfig(cmd.Context(), cfg.Storage)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			creds, err := auth.NewBootstrapService(db).RegenerateCredentials(cmd.Context(), confirm)
+			if err != nil {
+				return err
+			}
+			// Credentials are deliberately emitted only to the command's output
+			// stream, never logs or HTTP responses.
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "admin username: %s\nadmin password: %s\n", creds.Username, creds.Password)
+			return nil
+		},
+	}
+	regenerate.Flags().Bool("confirm", false, "confirm credential rotation")
+	admin.AddCommand(regenerate)
+	return admin
 }
 
 func agentCommands(opts *rootOptions) []*cobra.Command {

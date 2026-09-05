@@ -36,6 +36,28 @@ type DB struct {
 	idempotency IdempotencyRepository
 }
 
+// AuthTransaction executes user/token/audit changes in one database
+// transaction. The schema_meta no-op update acquires a portable writer lock,
+// fencing concurrent bootstrap or recovery operations across processes.
+func (d *DB) AuthTransaction(ctx context.Context, fn func(UserRepository, TokenRepository, AuditRepository) error) error {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE schema_meta SET version=version WHERE id=1`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	users := &userRepo{db: tx}
+	tokens := &tokenRepo{db: tx}
+	audits := &auditRepo{db: tx}
+	if err := fn(users, tokens, audits); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func Open(ctx context.Context, driver, dsn string, autoInit bool) (*DB, error) {
 	if ctx == nil {
 		ctx = context.Background()
