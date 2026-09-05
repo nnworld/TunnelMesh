@@ -151,16 +151,109 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 }
 
 func clientCommands(opts *rootOptions) []*cobra.Command {
-	commands := []string{"login", "agent", "tunnel", "forward", "publish", "proxy", "stop", "status"}
-	result := make([]*cobra.Command, 0, len(commands))
-	for _, name := range commands {
-		commandName := name
-		result = append(result, configCommand(opts, commandName, "TunnelMesh client "+commandName, func(cmd *cobra.Command, cfg config.Config) error {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s requested in %s mode\n", commandName, cfg.Mode)
+	result := []*cobra.Command{
+		configCommand(opts, "login", "authenticate the TunnelMesh client", func(cmd *cobra.Command, cfg config.Config) error {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "login requested for %s\n", cfg.Client.ServerURL)
 			return nil
-		}))
+		}),
+		configCommand(opts, "agent", "inspect an agent", clientShellRun("agent")),
+		configCommand(opts, "stop", "stop a local tunnel", clientShellRun("stop")),
+		configCommand(opts, "status", "show local tunnel status", clientShellRun("status")),
 	}
+	forward := &cobra.Command{Use: "forward", Short: "create a local forward"}
+	forward.AddCommand(clientForwardCommand(opts, "tcp"), clientForwardCommand(opts, "udp"), clientForwardCommand(opts, "http"))
+	forward.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "forward requested in %s mode\n", cfg.Mode)
+		return nil
+	}
+	publish := &cobra.Command{Use: "publish", Short: "publish a managed route"}
+	publish.AddCommand(clientForwardCommand(opts, "http"))
+	publish.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "publish requested in %s mode\n", cfg.Mode)
+		return nil
+	}
+	proxy := &cobra.Command{Use: "proxy", Short: "proxy raw bytes over a tunnel"}
+	proxy.AddCommand(clientProxyCommand(opts, "tcp"))
+	proxy.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "proxy requested in %s mode\n", cfg.Mode)
+		return nil
+	}
+	tunnel := &cobra.Command{Use: "tunnel", Short: "manage configured tunnels"}
+	tunnel.AddCommand(configCommand(opts, "stop", "stop a configured tunnel", clientShellRun("tunnel stop")), configCommand(opts, "status", "show configured tunnel status", clientShellRun("tunnel status")))
+	result = append(result, tunnel, forward, publish, proxy)
 	return result
+}
+
+func clientShellRun(name string) func(*cobra.Command, config.Config) error {
+	return func(cmd *cobra.Command, cfg config.Config) error {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s requested in %s mode\n", name, cfg.Mode)
+		return nil
+	}
+}
+
+func loadClientConfig(cmd *cobra.Command, opts *rootOptions) (config.Config, error) {
+	return config.Load(cmd.Context(), config.ConfigOptions{ConfigFile: opts.configFile, CLI: changedFlags(cmd, opts)})
+}
+
+func clientForwardCommand(opts *rootOptions, proto string) *cobra.Command {
+	cmd := &cobra.Command{Use: proto, Short: "local " + proto + " forward"}
+	var listen, targetHost, agentID string
+	var targetPort int
+	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:0", "local listen address")
+	cmd.Flags().StringVar(&targetHost, "target-host", "", "target host on the Agent network")
+	cmd.Flags().IntVar(&targetPort, "target-port", 0, "target port on the Agent network")
+	cmd.Flags().StringVar(&agentID, "agent", "", "Agent identity")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		if targetHost == "" || targetPort < 1 || targetPort > 65535 {
+			return fmt.Errorf("%s forward requires --target-host and --target-port", proto)
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s forward %s -> %s:%d via %s\n", proto, listen, targetHost, targetPort, agentID)
+		if len(cfg.Client.Tunnels) > 0 {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "loaded %d configured tunnel(s)\n", len(cfg.Client.Tunnels))
+		}
+		return nil
+	}
+	return cmd
+}
+
+func clientProxyCommand(opts *rootOptions, proto string) *cobra.Command {
+	cmd := &cobra.Command{Use: proto, Short: "raw " + proto + " stdio proxy"}
+	var targetHost, agentID string
+	var targetPort int
+	cmd.Flags().StringVar(&targetHost, "target-host", "", "target host on the Agent network")
+	cmd.Flags().IntVar(&targetPort, "target-port", 0, "target port on the Agent network")
+	cmd.Flags().StringVar(&agentID, "agent", "", "Agent identity")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		if targetHost == "" || targetPort < 1 || targetPort > 65535 {
+			return fmt.Errorf("proxy %s requires --target-host and --target-port", proto)
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "proxy %s %s:%d via %s\n", proto, targetHost, targetPort, agentID)
+		if cfg.Client.ServerURL == "" {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "note: configure client.server_url for a live WebSocket session")
+		}
+		return nil
+	}
+	return cmd
 }
 
 func configCommand(opts *rootOptions, name, short string, run func(*cobra.Command, config.Config) error) *cobra.Command {

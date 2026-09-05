@@ -106,7 +106,19 @@ type AgentConfig struct {
 }
 
 type ClientConfig struct {
-	ServerURL string `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	ServerURL string         `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	Tunnels   []TunnelConfig `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
+}
+
+// TunnelConfig describes a client tunnel loaded from a configuration file.
+// CLI flags can override these fields for one-off forwards.
+type TunnelConfig struct {
+	Name       string `mapstructure:"name" json:"name" yaml:"name"`
+	Protocol   string `mapstructure:"protocol" json:"protocol" yaml:"protocol"`
+	ListenAddr string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	AgentID    string `mapstructure:"agent_id" json:"agent_id" yaml:"agent_id"`
+	TargetHost string `mapstructure:"target_host" json:"target_host" yaml:"target_host"`
+	TargetPort int    `mapstructure:"target_port" json:"target_port" yaml:"target_port"`
 }
 
 // Load applies the documented precedence: CLI > environment > file >
