@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ func TestEtcdRegistryContract(t *testing.T) {
 	if len(endpoints) == 0 || endpoints[0] == "" {
 		t.Skip("TUNNELMESH_TEST_ETCD_ENDPOINTS is not set")
 	}
-	r, err := NewEtcdRegistryFromEndpoints(context.Background(), endpoints, "")
+	r, err := NewEtcdRegistryFromEndpoints(context.Background(), endpoints, fmt.Sprintf("/tunnelmesh-test-%d", time.Now().UnixNano()))
 	if err != nil {
 		t.Fatal(err)
 	}
