@@ -1,0 +1,2 @@
+<template><h2>Tunnels</h2><el-table :data="items"><el-table-column prop="protocol" label="Protocol"/><el-table-column prop="targetHost" label="Target"/><el-table-column prop="status" label="Status"/></el-table></template>
+<script setup lang="ts">import {ref,onMounted} from 'vue'; import {api} from '../api/client'; const items=ref<any[]>([]); onMounted(async()=>{items.value=(await api<any>('/tunnels')).items})</script>

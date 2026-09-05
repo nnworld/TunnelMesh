@@ -1,0 +1,2 @@
+<template><h2>Managed routes</h2><p>Explicit subdomain and dynamic wildcard routes are managed through the server API.</p><el-table :data="items"><el-table-column prop="domain" label="Domain"/><el-table-column prop="pathPrefix" label="Path"/><el-table-column prop="agentId" label="Agent"/></el-table></template>
+<script setup lang="ts">import {ref,onMounted} from 'vue'; import {api} from '../api/client'; const items=ref<any[]>([]); onMounted(async()=>{items.value=(await api<any>('/routes')).items})</script>

@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     status VARCHAR(32) NOT NULL DEFAULT 'active',
     config TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(domain, path_prefix)
 );
 CREATE INDEX idx_tunnels_agent ON tunnels(agent_id);
 CREATE INDEX idx_tunnels_domain_path ON tunnels(domain, path_prefix);

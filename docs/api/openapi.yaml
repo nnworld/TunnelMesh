@@ -1,0 +1,80 @@
+openapi: 3.0.3
+info:
+  title: TunnelMesh Server API
+  version: 1.0.0
+  description: Versioned management API for agents, policies, routes, tunnels and audit logs.
+servers:
+  - url: /
+paths:
+  /api/v1/auth/login:
+    post:
+      summary: Login and issue an opaque bearer token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { description: Authenticated, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } } }
+  /api/v1/auth/me:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses: { '200': { description: Current principal } }
+  /api/v1/agents:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
+      responses: {'200': {description: Cursor page}}
+    post:
+      security: [{ bearerAuth: [] }]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}
+      responses: {'201': {description: Created}, '403': {description: Forbidden}, '409': {description: Conflict}}
+  /api/v1/agents/{agentId}:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Agent}, '404': {description: Not found}}}
+    put: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
+    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
+    delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/agents/{agentId}/policies:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    get: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}], responses: {'200': {description: Policies}}}
+    post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'201': {description: Created}}}
+  /api/v1/agents/{agentId}/policies/{policyId}:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}, {name: policyId, in: path, required: true, schema: {type: string}}]
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Policy}}}
+    put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
+    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
+    delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/routes:
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Managed routes}}}
+    post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}, '409': {description: Duplicate route}}}
+  /api/v1/routes/{routeId}:
+    parameters: [{name: routeId, in: path, required: true, schema: {type: string}}]
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Route}}}
+    put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
+    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
+    delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/tunnels:
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnels}}}
+    post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}}}
+  /api/v1/tunnels/{tunnelId}:
+    parameters: [{name: tunnelId, in: path, required: true, schema: {type: string}}]
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnel}}}
+    put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
+    delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/audit-logs:
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Audit records}}}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  parameters:
+    Cursor: {name: cursor, in: query, schema: {type: string}}
+    Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 255}}
+  schemas:
+    Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
+    LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
+    AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
+    PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
+    TunnelRequest: {type: object, required: [agentId, targetHost, targetPort], properties: {agentId: {type: string}, protocol: {type: string}, domain: {type: string}, pathPrefix: {type: string}, targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, publicPort: {type: integer}, status: {type: string}, config: {type: object}}}

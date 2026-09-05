@@ -1,0 +1,2 @@
+<template><h2>Audit logs</h2><el-table :data="items"><el-table-column prop="createdAt" label="Time"/><el-table-column prop="action" label="Action"/><el-table-column prop="resourceType" label="Resource"/></el-table></template>
+<script setup lang="ts">import {ref,onMounted} from 'vue'; import {api} from '../api/client'; const items=ref<any[]>([]); onMounted(async()=>{items.value=(await api<any>('/audit-logs')).items})</script>

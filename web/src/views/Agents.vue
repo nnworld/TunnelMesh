@@ -1,0 +1,2 @@
+<template><h2>Agents</h2><el-table :data="items"><el-table-column prop="name" label="Name"/><el-table-column prop="id" label="ID"/><el-table-column prop="enabled" label="Enabled"/></el-table></template>
+<script setup lang="ts">import {ref,onMounted} from 'vue'; import {api} from '../api/client'; const items=ref<any[]>([]); onMounted(async()=>{items.value=(await api<any>('/agents')).items})</script>

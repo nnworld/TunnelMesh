@@ -78,6 +78,14 @@ type IdempotencyRepository interface {
 	Delete(context.Context, string) error
 }
 
+// AtomicIdempotencyRepository is an optional stronger contract used by the
+// HTTP API when the backing store supports compare-and-set key claiming.
+type AtomicIdempotencyRepository interface {
+	IdempotencyRepository
+	Claim(context.Context, IdempotencyRecord) (existing IdempotencyRecord, claimed bool, err error)
+	Update(context.Context, IdempotencyRecord) error
+}
+
 // Constructor helpers are useful for services that own a database/sql handle
 // directly (for example tests or read-only reporting jobs).
 func NewUserRepository(db *sql.DB) UserRepository     { return &userRepo{db} }
@@ -873,6 +881,39 @@ func (r *auditRepo) List(ctx context.Context, cursor string, limit int) (Page[Au
 }
 
 type idempotencyRepo struct{ db *sql.DB }
+
+func (r *idempotencyRepo) Claim(ctx context.Context, v IdempotencyRecord) (IdempotencyRecord, bool, error) {
+	if v.Key == "" {
+		return IdempotencyRecord{}, false, errors.New("idempotency key is required")
+	}
+	v.CreatedAt = timeOrNow(v.CreatedAt)
+	if v.ExpiresAt == nil {
+		exp := v.CreatedAt.Add(24 * time.Hour)
+		v.ExpiresAt = &exp
+	}
+	_, err := r.db.ExecContext(ctx, `INSERT INTO idempotency_keys(idempotency_key,user_id,response,status_code,created_at,expires_at) VALUES(?,?,?,?,?,?)`, v.Key, nullableString(v.UserID), "", 102, tm(v.CreatedAt), nullableTime(v.ExpiresAt))
+	if err == nil {
+		return IdempotencyRecord{}, true, nil
+	}
+	if !isDuplicateError(err) {
+		return IdempotencyRecord{}, false, err
+	}
+	existing, getErr := r.Get(ctx, v.Key)
+	if errors.Is(getErr, sql.ErrNoRows) {
+		_, _ = r.db.ExecContext(ctx, `DELETE FROM idempotency_keys WHERE idempotency_key=? AND expires_at<?`, v.Key, tm(time.Now().UTC()))
+		return r.Claim(ctx, v)
+	}
+	return existing, false, getErr
+}
+
+func (r *idempotencyRepo) Update(ctx context.Context, v IdempotencyRecord) error {
+	v.CreatedAt = timeOrNow(v.CreatedAt)
+	if v.StatusCode == 0 {
+		v.StatusCode = 200
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE idempotency_keys SET response=?,status_code=?,created_at=?,expires_at=? WHERE idempotency_key=?`, v.Response, v.StatusCode, tm(v.CreatedAt), nullableTime(v.ExpiresAt), v.Key)
+	return checkAffected(res, err)
+}
 
 func (r *idempotencyRepo) Put(ctx context.Context, v IdempotencyRecord) error {
 	v.CreatedAt = timeOrNow(v.CreatedAt)
