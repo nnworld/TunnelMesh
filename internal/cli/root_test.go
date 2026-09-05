@@ -51,6 +51,23 @@ func TestCheckConfigCommandLoadsCLIOverrides(t *testing.T) {
 	}
 }
 
+func TestPrintConfigFlatTCPBridgeFlagCanDisableBridge(t *testing.T) {
+	root := cli.NewServerRoot()
+	root.SetArgs([]string{"print-config", "--server.tcp_bridge_enabled=false"})
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if strings.Contains(out.String(), `"enabled": true`) {
+		t.Fatalf("output = %q, flat bridge flag was ignored", out.String())
+	}
+	if !strings.Contains(out.String(), `"enabled": false`) {
+		t.Fatalf("output = %q, want disabled nested bridge value", out.String())
+	}
+}
+
 func findCommand(root *cobra.Command, name string) *cobra.Command {
 	for _, command := range root.Commands() {
 		if command.Name() == name {

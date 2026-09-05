@@ -146,11 +146,13 @@ func Load(ctx context.Context, opts ConfigOptions) (Config, error) {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 	// Support both the nested spelling used in files and the flat flag spelling
-	// used by Cobra.  Nested is canonical for service code.
-	// The nested key is canonical and participates in Viper's normal source
-	// precedence.  The flat field is an output alias for older callers; using
-	// it as an input here would let its default mask an explicit nested value.
+	// used by Cobra. The nested key is canonical, while the flat key is an
+	// explicit input alias only. It intentionally has no default: otherwise its
+	// default would mask an explicit nested value during precedence resolution.
 	cfg.Server.TCPBridge.Enabled = v.GetBool("server.tcp_bridge.enabled")
+	if shouldUseFlatBridgeAlias(opts, v) {
+		cfg.Server.TCPBridge.Enabled = v.GetBool("server.tcp_bridge_enabled")
+	}
 	cfg.Server.TCPBridgeEnabled = cfg.Server.TCPBridge.Enabled
 	cfg.Storage.SQLitePath = cfg.Storage.SQLite.Path
 	cfg.Storage.MySQLDSN = cfg.Storage.MySQL.DSN
@@ -167,14 +169,61 @@ func setValues(v *viper.Viper, source any) {
 	switch values := source.(type) {
 	case map[string]any:
 		for key, value := range values {
-			v.Set(key, value)
+			v.Set(normalizeKey(key), value)
 		}
 	case map[string]string:
 		for key, value := range values {
-			v.Set(key, value)
+			v.Set(normalizeKey(key), value)
 		}
 	case nil:
 		return
+	}
+}
+
+func normalizeKey(key string) string {
+	if key == "server.tcp_bridge_enabled" {
+		return "server.tcp_bridge.enabled"
+	}
+	return key
+}
+
+func shouldUseFlatBridgeAlias(opts ConfigOptions, v *viper.Viper) bool {
+	// Values supplied by callers have an unambiguous precedence order. Since
+	// setValues normalizes aliases, a caller-provided flat key is already
+	// represented by the canonical key and does not need alias resolution.
+	for _, source := range []any{opts.CLI, opts.Set, opts.Overrides, opts.Env} {
+		if hasKey(source, "server.tcp_bridge.enabled") || hasKey(source, "server.tcp_bridge_enabled") {
+			return false
+		}
+	}
+	// The nested and flat environment spellings map to the same environment
+	// variable under TUNNELMESH_*; canonical Viper resolution already handled
+	// it, so do not apply the flat alias a second time.
+	if _, ok := os.LookupEnv("TUNNELMESH_SERVER_TCP_BRIDGE_ENABLED"); ok {
+		return false
+	}
+	// A flat key in a config file remains useful for backwards compatibility.
+	return v.InConfig("server.tcp_bridge_enabled") && !v.InConfig("server.tcp_bridge.enabled")
+}
+
+func hasKey(source any, want string) bool {
+	switch values := source.(type) {
+	case map[string]any:
+		_, ok := values[want]
+		if ok {
+			return true
+		}
+		_, ok = values["server.tcp_bridge_enabled"]
+		return want == "server.tcp_bridge.enabled" && ok
+	case map[string]string:
+		_, ok := values[want]
+		if ok {
+			return true
+		}
+		_, ok = values["server.tcp_bridge_enabled"]
+		return want == "server.tcp_bridge.enabled" && ok
+	default:
+		return false
 	}
 }
 
@@ -192,7 +241,6 @@ func setDefaults(v *viper.Viper) {
 		"server.agent_ws_addr":        ":443",
 		"server.client_ws_addr":       ":443",
 		"server.tcp_bridge.enabled":   true,
-		"server.tcp_bridge_enabled":   true,
 		"server.tcp_bridge.path":      "/ws/tcp",
 		"server.tcp_bridge.max_bytes": int64(64 << 10),
 	}

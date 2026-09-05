@@ -33,3 +33,9 @@ All commands passed.
 
 - Command shells intentionally stop at configuration/orchestration boundaries. Database initialization, server loops, agent registration, and client forwarding are service work for later tasks.
 - `ConfigOptions` accepts map aliases (`CLI`, `Overrides`, `Set`, and test/embedder `Env`) to keep later integrations decoupled from Cobra internals.
+
+## Reviewer fix
+
+- Fixed the `--server.tcp_bridge_enabled=false` alias path: explicit flat values are normalized to the canonical nested key for caller/CLI sources, while flat config-file keys remain supported without allowing defaults to mask them.
+- Added `TestPrintConfigFlatTCPBridgeFlagCanDisableBridge`, which failed before the fix and now verifies the rendered nested bridge value is `false`.
+- Re-ran `go test ./internal/config ./internal/cli -v`, `go test ./...`, `go test -race ./internal/config ./internal/cli`, `go vet ./...`, `go build ./cmd/...`, and `git diff --check`; all pass after the fix.
