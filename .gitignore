@@ -1,0 +1,9 @@
+.worktrees/
+.superpowers/
+.env
+.env.*
+data/
+dist/
+node_modules/
+coverage/
+*.log
