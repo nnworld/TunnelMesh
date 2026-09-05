@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -85,7 +86,7 @@ func NewAgentRepository(db *sql.DB) AgentRepository   { return &agentRepo{db} }
 func NewPolicyRepository(db *sql.DB) PolicyRepository { return &policyRepo{db} }
 func NewTunnelRepository(db *sql.DB) TunnelRepository { return &tunnelRepo{db} }
 func NewNodeRepository(db *sql.DB) NodeRepository     { return &nodeRepo{db} }
-func NewLeaseRepository(db *sql.DB) LeaseRepository   { return &leaseRepo{db} }
+func NewLeaseRepository(db *sql.DB) LeaseRepository   { return &leaseRepo{db: db} }
 func NewAuditRepository(db *sql.DB) AuditRepository   { return &auditRepo{db} }
 func NewIdempotencyRepository(db *sql.DB) IdempotencyRepository {
 	return &idempotencyRepo{db}
@@ -102,7 +103,7 @@ func (r *sqlRepositories) agents() *agentRepo            { return &agentRepo{r.d
 func (r *sqlRepositories) policies() *policyRepo         { return &policyRepo{r.db} }
 func (r *sqlRepositories) tunnels() *tunnelRepo          { return &tunnelRepo{r.db} }
 func (r *sqlRepositories) nodes() *nodeRepo              { return &nodeRepo{r.db} }
-func (r *sqlRepositories) leases() *leaseRepo            { return &leaseRepo{r.db} }
+func (r *sqlRepositories) leases() *leaseRepo            { return &leaseRepo{db: r.db} }
 func (r *sqlRepositories) audits() *auditRepo            { return &auditRepo{r.db} }
 func (r *sqlRepositories) idempotency() *idempotencyRepo { return &idempotencyRepo{r.db} }
 
@@ -678,48 +679,90 @@ func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[Ser
 	return p, nil
 }
 
-type leaseRepo struct{ db *sql.DB }
+type leaseRepo struct {
+	db     *sql.DB
+	driver string
+}
 
 func (r *leaseRepo) Acquire(ctx context.Context, v AgentLease) (AgentLease, error) {
-	now := time.Now().UTC()
 	if v.TTL <= 0 {
 		v.TTL = time.Minute
 	}
-	exp := now.Add(v.TTL)
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return AgentLease{}, err
-	}
-	defer tx.Rollback()
-	var epoch int64
-	var oldNode string
-	var oldExp sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT epoch,node_id,expires_at FROM agent_runtime_leases WHERE agent_id=?`, v.AgentID).Scan(&epoch, &oldNode, &oldExp)
-	if err == nil && oldExp.Valid {
-		if t := parseTime(oldExp.String); t.After(now) && oldNode != v.NodeID {
-			return AgentLease{}, fmt.Errorf("agent %s lease is held by %s", v.AgentID, oldNode)
+	// MySQL locks the current lease row while deciding takeover. Other drivers
+	// use an epoch compare-and-swap below; this keeps SQLite portable while
+	// preventing two concurrent expired-lease owners from publishing one epoch.
+	for attempt := 0; attempt < 8; attempt++ {
+		now := time.Now().UTC()
+		exp := now.Add(v.TTL)
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return AgentLease{}, err
 		}
+		var epoch int64
+		var oldNode string
+		var oldExp sql.NullString
+		selectSQL := `SELECT epoch,node_id,expires_at FROM agent_runtime_leases WHERE agent_id=?`
+		if r.driver == DriverMySQL {
+			selectSQL += ` FOR UPDATE`
+		}
+		queryErr := tx.QueryRowContext(ctx, selectSQL, v.AgentID).Scan(&epoch, &oldNode, &oldExp)
+		if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
+			_ = tx.Rollback()
+			return AgentLease{}, queryErr
+		}
+		if queryErr == nil {
+			active := oldExp.Valid && parseTime(oldExp.String).After(now)
+			if active && oldNode != v.NodeID {
+				_ = tx.Rollback()
+				return AgentLease{}, fmt.Errorf("agent %s lease is held by %s", v.AgentID, oldNode)
+			}
+			newEpoch := epoch + 1
+			res, updateErr := tx.ExecContext(ctx, `UPDATE agent_runtime_leases SET node_id=?,epoch=?,acquired_at=?,expires_at=?,updated_at=? WHERE agent_id=? AND epoch=?`, v.NodeID, newEpoch, tm(now), tm(exp), tm(now), v.AgentID, epoch)
+			if updateErr != nil {
+				_ = tx.Rollback()
+				return AgentLease{}, updateErr
+			}
+			affected, affectedErr := res.RowsAffected()
+			if affectedErr != nil {
+				_ = tx.Rollback()
+				return AgentLease{}, affectedErr
+			}
+			if affected != 1 {
+				_ = tx.Rollback()
+				time.Sleep(time.Duration(attempt+1) * time.Millisecond)
+				continue
+			}
+			if err = tx.Commit(); err != nil {
+				return AgentLease{}, err
+			}
+			v.Epoch, v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = newEpoch, now, exp, now
+			return v, nil
+		}
+
+		_, insertErr := tx.ExecContext(ctx, `INSERT INTO agent_runtime_leases(agent_id,node_id,epoch,acquired_at,expires_at,updated_at) VALUES(?,?,?,?,?,?)`, v.AgentID, v.NodeID, 1, tm(now), tm(exp), tm(now))
+		if insertErr != nil {
+			_ = tx.Rollback()
+			if isDuplicateError(insertErr) {
+				time.Sleep(time.Duration(attempt+1) * time.Millisecond)
+				continue
+			}
+			return AgentLease{}, insertErr
+		}
+		if err = tx.Commit(); err != nil {
+			return AgentLease{}, err
+		}
+		v.Epoch, v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = 1, now, exp, now
+		return v, nil
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return AgentLease{}, err
+	return AgentLease{}, errors.New("lease acquisition contention exceeded retry budget")
+}
+
+func isDuplicateError(err error) bool {
+	if err == nil {
+		return false
 	}
-	epoch++
-	if errors.Is(err, sql.ErrNoRows) {
-		_, err = tx.ExecContext(ctx, `INSERT INTO agent_runtime_leases(agent_id,node_id,epoch,acquired_at,expires_at,updated_at) VALUES(?,?,?,?,?,?)`, v.AgentID, v.NodeID, epoch, tm(now), tm(exp), tm(now))
-	} else {
-		_, err = tx.ExecContext(ctx, `UPDATE agent_runtime_leases SET node_id=?,epoch=?,acquired_at=?,expires_at=?,updated_at=? WHERE agent_id=?`, v.NodeID, epoch, tm(now), tm(exp), tm(now), v.AgentID)
-	}
-	if err != nil {
-		return AgentLease{}, err
-	}
-	if err = tx.Commit(); err != nil {
-		return AgentLease{}, err
-	}
-	v.Epoch = epoch
-	v.AcquiredAt = now
-	v.ExpiresAt = exp
-	v.UpdatedAt = now
-	return v, nil
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "unique constraint") || strings.Contains(s, "duplicate") || strings.Contains(s, "already exists")
 }
 func (r *leaseRepo) Renew(ctx context.Context, agentID string, epoch int64, ttl time.Duration) error {
 	if ttl <= 0 {
@@ -821,6 +864,9 @@ func (r *idempotencyRepo) Get(ctx context.Context, key string) (IdempotencyRecor
 	}
 	v.CreatedAt = parseTime(created.String)
 	v.ExpiresAt = parseTM(exp)
+	if v.ExpiresAt != nil && !v.ExpiresAt.After(time.Now().UTC()) {
+		return IdempotencyRecord{}, sql.ErrNoRows
+	}
 	return v, err
 }
 func (r *idempotencyRepo) Delete(ctx context.Context, key string) error {

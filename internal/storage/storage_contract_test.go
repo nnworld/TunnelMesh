@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 	"time"
 )
@@ -107,6 +109,17 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	idem, err := db.Idempotency().Get(ctx, "request-1")
 	if err != nil || idem.Response != `{"ok":true}` {
 		t.Fatalf("idempotency = %+v err=%v", idem, err)
+	}
+}
+
+func TestIdempotencyExpiredRecordsAreNotReplayed(t *testing.T) {
+	db := newTestDB(t)
+	expired := time.Now().UTC().Add(-time.Minute)
+	if err := db.Idempotency().Put(context.Background(), IdempotencyRecord{Key: "expired", Response: `{"ok":true}`, ExpiresAt: &expired}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Idempotency().Get(context.Background(), "expired"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Get expired record error = %v, want sql.ErrNoRows", err)
 	}
 }
 

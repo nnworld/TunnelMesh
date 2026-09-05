@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     revoked_at TEXT,
     created_at TEXT NOT NULL
 );
+CREATE INDEX idx_api_tokens_user_id ON api_tokens(user_id);
 
 CREATE TABLE IF NOT EXISTS agents (
     id VARCHAR(255) PRIMARY KEY,
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE INDEX idx_agents_owner ON agents(owner_user_id);
 
 CREATE TABLE IF NOT EXISTS agent_policies (
     id VARCHAR(255) PRIMARY KEY,
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS agent_policies (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE INDEX idx_agent_policies_agent ON agent_policies(agent_id);
 
 CREATE TABLE IF NOT EXISTS tunnel_groups (
     id VARCHAR(255) PRIMARY KEY,
@@ -68,6 +71,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE INDEX idx_tunnels_agent ON tunnels(agent_id);
+CREATE INDEX idx_tunnels_domain_path ON tunnels(domain, path_prefix);
 
 CREATE TABLE IF NOT EXISTS server_nodes (
     id VARCHAR(255) PRIMARY KEY,
@@ -88,6 +93,7 @@ CREATE TABLE IF NOT EXISTS agent_runtime_leases (
     expires_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE INDEX idx_agent_leases_node ON agent_runtime_leases(node_id);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id VARCHAR(255) PRIMARY KEY,
@@ -98,6 +104,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     details TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX idx_audit_created ON audit_logs(created_at, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     idempotency_key VARCHAR(255) PRIMARY KEY,

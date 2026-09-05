@@ -24,3 +24,15 @@ Implemented and locally verified in the task worktree. The storage package now e
 
 - A live MySQL integration run was not possible in this environment because no `TUNNELMESH_TEST_MYSQL_DSN` was provided. The DDL avoids SQLite-only syntax and uses VARCHAR for indexed string identifiers so it can be exercised in CI against MySQL.
 - Repository APIs intentionally keep clear-text secrets out of storage models; callers provide password/token hashes.
+
+## Review fixes
+
+- Lease acquisition now uses `SELECT ... FOR UPDATE` for MySQL and epoch compare-and-swap updates with bounded retries for SQLite/other drivers. Concurrent expired-lease takeover has a regression test proving exactly one winner and strictly increasing epochs.
+- Schema initialization and validation now require `schema_meta.version == SchemaVersion`; version 0 or any other mismatch returns an actionable `schema version mismatch` error.
+- Idempotency reads reject expired records with `sql.ErrNoRows` instead of replaying them.
+- Restored the `agent_policies(agent_id)` index and related portable indexes in the shared DDL; duplicate-index errors are safely ignored during repeat initialization.
+
+### Review-fix verification
+
+- `go test ./internal/storage -run 'Test(SQLiteAutoInitRejects|SQLiteConcurrentExpired|SQLiteDDLAdds|IdempotencyExpired)' -count=1` — pass.
+- Full package, race, repository, vet, build, and diff checks are run before the fix commit; live MySQL remains environment-gated by `TUNNELMESH_TEST_MYSQL_DSN`.

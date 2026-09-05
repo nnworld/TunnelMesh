@@ -20,6 +20,8 @@ const (
 	SchemaVersion = 1
 )
 
+var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
+
 type DB struct {
 	sql         *sql.DB
 	driver      string
@@ -90,7 +92,7 @@ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
 }
 
 func newDB(db *sql.DB, driver string) *DB {
-	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: &leaseRepo{db}, audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
+	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: &leaseRepo{db: db, driver: driver}, audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
 }
 
 func initializeSchema(ctx context.Context, db *sql.DB) error {
@@ -100,12 +102,25 @@ func initializeSchema(ctx context.Context, db *sql.DB) error {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if isDuplicateError(err) {
+				continue
+			}
 			return fmt.Errorf("apply schema: %w", err)
 		}
 	}
-	_, err := db.ExecContext(ctx, `INSERT INTO schema_meta(id,version) VALUES(1,?)`, SchemaVersion)
-	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") && !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
-		return fmt.Errorf("write schema version: %w", err)
+	var version int
+	err := db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err = db.ExecContext(ctx, `INSERT INTO schema_meta(id,version) VALUES(1,?)`, SchemaVersion); err != nil {
+			return fmt.Errorf("write schema version: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if version != SchemaVersion {
+		return fmt.Errorf("%w: database has version %d, application requires version %d; run the migration tool", ErrSchemaVersionMismatch, version, SchemaVersion)
 	}
 	return nil
 }
@@ -115,8 +130,8 @@ func checkSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("schema is not initialized: %w", err)
 	}
-	if v < SchemaVersion {
-		return fmt.Errorf("schema version %d is older than required %d", v, SchemaVersion)
+	if v != SchemaVersion {
+		return fmt.Errorf("%w: database has version %d, application requires version %d; run the migration tool", ErrSchemaVersionMismatch, v, SchemaVersion)
 	}
 	return nil
 }
