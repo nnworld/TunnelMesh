@@ -34,3 +34,11 @@ git diff --check                                         PASS
 ## Scope note
 
 The handlers depend on the existing `relay.NodeTransport` and `server.WSConn` interfaces. A concrete WebSocket upgrader remains an application integration concern, keeping the routing and bridge packages independent of a specific WebSocket library.
+
+## Follow-up hardening
+
+- Agent default stream dispatch now supports `http` through an injectable raw HTTP stream dialer (with TCP fallback).
+- Bridge cancellation actively closes both ends to unblock library reads; half-close remains available through `CloseWrite`.
+- WebSocket Upgrade validates `101 Switching Protocols`, preserves buffered client bytes after `Hijack`, and preserves buffered upstream bytes after response parsing.
+- Mixed-case exact domains are normalized before ranking.
+- HTTP fallback dialing evaluates the Agent policy under the `http` protocol namespace before opening its raw TCP transport.

@@ -46,6 +46,17 @@ func TestResolverPrecedence(t *testing.T) {
 	}
 }
 
+func TestResolverExactDomainMatchingIsCaseInsensitive(t *testing.T) {
+	r := NewRouteResolver([]Route{
+		{ID: "wild", Domain: "*.example.com", AgentID: "wild", TargetHost: "10.0.0.2", TargetPort: 80},
+		{ID: "exact", Domain: "FOO.example.com", AgentID: "exact", TargetHost: "10.0.0.1", TargetPort: 80},
+	})
+	got, err := r.ResolveHTTP("foo.EXAMPLE.com", "/")
+	if err != nil || got.ID != "exact" {
+		t.Fatalf("got=%#v err=%v", got, err)
+	}
+}
+
 func TestPolicyCIDRAndPorts(t *testing.T) {
 	p, err := NewPolicy([]string{"10.0.0.0/8"}, []int{80, 443})
 	if err != nil {

@@ -15,6 +15,10 @@ type Dialer struct {
 	Timeout    time.Duration
 	Policy     PolicyHook
 	HTTPClient *http.Client
+	// HTTPStream allows the agent to inject a raw logical stream dialer for
+	// managed HTTP and WebSocket routes. When nil, HTTP falls back to TCP so
+	// request bytes remain transparent to the server-side proxy.
+	HTTPStream func(context.Context, string, int) (io.ReadWriteCloser, error)
 }
 
 func (d Dialer) check(ctx context.Context, proto, host string, port int) error {
@@ -31,6 +35,16 @@ func (d Dialer) timeout() time.Duration {
 }
 func (d Dialer) DialTCP(ctx context.Context, host string, port int) (net.Conn, error) {
 	if err := d.check(ctx, "tcp", host, port); err != nil {
+		return nil, err
+	}
+	return (&net.Dialer{Timeout: d.timeout()}).DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprint(port)))
+}
+
+// DialHTTPStream opens the raw byte stream used by managed HTTP and WebSocket
+// routes while evaluating the policy as protocol "http" (rather than silently
+// reusing the TCP policy namespace).
+func (d Dialer) DialHTTPStream(ctx context.Context, host string, port int) (net.Conn, error) {
+	if err := d.check(ctx, "http", host, port); err != nil {
 		return nil, err
 	}
 	return (&net.Dialer{Timeout: d.timeout()}).DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprint(port)))

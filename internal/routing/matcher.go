@@ -221,6 +221,8 @@ func domainMatch(pattern, host string) bool {
 }
 
 func domainRank(pattern, host string) int {
+	pattern = normalizeHost(pattern)
+	host = normalizeHost(host)
 	if pattern == host {
 		return 3
 	}

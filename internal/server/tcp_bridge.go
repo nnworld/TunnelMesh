@@ -102,19 +102,51 @@ func (h *TCPBridgeHandler) bridge(ctx context.Context, ws WSConn, stream io.Read
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Closing both ends is required because ReadMessage and Read may be
+			// blocked in library code that does not observe context directly.
+			_ = stream.Close()
+			_ = ws.Close()
+		case <-watchDone:
+		}
+	}()
 	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	type bridgeResult struct {
+		direction int // 0 = websocket->stream, 1 = stream->websocket
+		err       error
+	}
+	errCh := make(chan bridgeResult, 2)
 	wg.Add(2)
-	go func() { defer wg.Done(); errCh <- h.copyWS(ctx, ws, stream) }()
-	go func() { defer wg.Done(); errCh <- h.copyTCP(ctx, ws, stream) }()
+	go func() { defer wg.Done(); errCh <- bridgeResult{direction: 0, err: h.copyWS(ctx, ws, stream)} }()
+	go func() { defer wg.Done(); errCh <- bridgeResult{direction: 1, err: h.copyTCP(ctx, ws, stream)} }()
 	var first error
 	for i := 0; i < 2; i++ {
-		err := <-errCh
+		result := <-errCh
+		err := result.err
 		if first == nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 			first = err
 			cancel()
 			_ = stream.Close()
 			_ = ws.Close()
+		} else if errors.Is(err, io.EOF) {
+			if result.direction == 0 {
+				// Preserve TCP half-close when available; otherwise a generic
+				// logical stream cannot guarantee that the peer will observe EOF.
+				if _, ok := stream.(interface{ CloseWrite() error }); !ok {
+					cancel()
+					_ = stream.Close()
+					_ = ws.Close()
+				}
+			} else {
+				// Target EOF terminates the public WebSocket.
+				cancel()
+				_ = stream.Close()
+				_ = ws.Close()
+			}
 		}
 	}
 	_ = stream.Close()

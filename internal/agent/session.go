@@ -44,6 +44,11 @@ func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
 				return d.DialTCP(ctx, host, port)
 			case "udp":
 				return d.DialUDP(ctx, host, port)
+			case "http":
+				if d.HTTPStream != nil {
+					return d.HTTPStream(ctx, host, port)
+				}
+				return d.DialHTTPStream(ctx, host, port)
 			default:
 				return nil, errors.New("agent: unsupported stream protocol")
 			}
@@ -59,6 +64,11 @@ func NewStreamDispatcherWithCallback(d Dialer, override StreamDialFunc, cb func(
 				return d.DialTCP(ctx, host, port)
 			case "udp":
 				return d.DialUDP(ctx, host, port)
+			case "http":
+				if d.HTTPStream != nil {
+					return d.HTTPStream(ctx, host, port)
+				}
+				return d.DialHTTPStream(ctx, host, port)
 			default:
 				return nil, errors.New("agent: unsupported stream protocol")
 			}

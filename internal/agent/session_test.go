@@ -76,6 +76,30 @@ func TestStreamDispatcherOpensAndWritesTarget(t *testing.T) {
 	}
 }
 
+func TestDefaultStreamDispatcherSupportsHTTPLogicalStreams(t *testing.T) {
+	conn := &streamConn{}
+	called := false
+	d := NewStreamDispatcher(Dialer{HTTPStream: func(context.Context, string, int) (io.ReadWriteCloser, error) {
+		called = true
+		return conn, nil
+	}}, nil)
+	p, _ := json.Marshal(StreamOpenPayload{Protocol: "http", TargetHost: "service", TargetPort: 8080})
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 12, Payload: p}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("HTTP logical stream did not use the injected HTTP dialer")
+	}
+}
+
+func TestDialHTTPStreamUsesHTTPPolicyNamespace(t *testing.T) {
+	var got string
+	d := Dialer{Policy: func(_ context.Context, proto, _ string, _ int) error { got = proto; return errors.New("blocked") }}
+	if _, err := d.DialHTTPStream(context.Background(), "service", 8080); err == nil || got != "http" {
+		t.Fatalf("err=%v policy protocol=%q", err, got)
+	}
+}
+
 func TestStreamDispatcherReadsTargetBackToFrameCallback(t *testing.T) {
 	conn := &streamConn{read: []byte("reply")}
 	gotc := make(chan protocol.Frame, 1)

@@ -106,7 +106,8 @@ func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request,
 	if err := r.Write(stream); err != nil {
 		return
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(stream), r)
+	streamReader := bufio.NewReader(stream)
+	resp, err := http.ReadResponse(streamReader, r)
 	if err != nil {
 		return
 	}
@@ -114,9 +115,20 @@ func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	_ = rw.Flush()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return
+	}
+	// net/http may have read bytes belonging to the upgraded stream into the
+	// buffered reader returned by Hijack. Forward those bytes before switching
+	// to the raw client connection or SSH/WebSocket data is lost.
+	if buffered := rw.Reader.Buffered(); buffered > 0 {
+		if _, err := io.CopyN(stream, rw.Reader, int64(buffered)); err != nil {
+			return
+		}
+	}
 	// Once the 101 response has been sent the stream is an opaque byte pipe.
 	go io.Copy(stream, clientConn)
-	_, _ = io.Copy(clientConn, stream)
+	_, _ = io.Copy(clientConn, streamReader)
 }
 
 func isWebSocketUpgrade(r *http.Request) bool {
