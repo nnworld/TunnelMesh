@@ -48,6 +48,7 @@ type AgentSession struct {
 	queue           chan protocol.Frame
 	slots           chan struct{}
 	stop            chan struct{}
+	stopOnce        sync.Once
 	drain           chan chan struct{}
 	closing         bool
 }
@@ -103,6 +104,11 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 	go s.writer()
 	m.mu.Lock()
 	old := m.sessions[req.AgentID]
+	if old != nil && old.Epoch >= req.Epoch {
+		m.mu.Unlock()
+		_ = s.Close()
+		return nil, ErrEpoch
+	}
 	m.sessions[req.AgentID] = s
 	m.mu.Unlock()
 	if old != nil {
@@ -139,7 +145,7 @@ func (m *AgentSessionManager) Send(id string, f protocol.Frame) error {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	if s.closed || s.closing {
 		return ErrSessionClosed
 	}
 	select {
@@ -170,11 +176,15 @@ func (m *AgentSessionManager) GoAway(id string) error {
 	s.closing = true
 	s.mu.Unlock()
 	ack := make(chan struct{})
-	s.drain <- ack
-	<-ack
+	select {
+	case s.drain <- ack:
+		<-ack
+	case <-s.stop:
+		return ErrSessionClosed
+	}
 	s.mu.Lock()
 	s.closed = true
-	close(s.stop)
+	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
 	err := s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameGoAway})
 	_ = s.transport.Close()
@@ -184,13 +194,22 @@ func (s *AgentSession) writer() {
 	for {
 		select {
 		case f := <-s.queue:
-			_ = s.transport.Send(f)
+			if err := s.transport.Send(f); err != nil {
+				s.fail(err)
+				<-s.slots
+				return
+			}
 			<-s.slots
 		case ack := <-s.drain:
 			for {
 				select {
 				case f := <-s.queue:
-					_ = s.transport.Send(f)
+					if err := s.transport.Send(f); err != nil {
+						s.fail(err)
+						<-s.slots
+						close(ack)
+						return
+					}
 					<-s.slots
 				default:
 					close(ack)
@@ -202,6 +221,16 @@ func (s *AgentSession) writer() {
 		}
 	}
 }
+func (s *AgentSession) fail(_ error) {
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		s.closing = true
+	}
+	s.mu.Unlock()
+	s.stopOnce.Do(func() { close(s.stop) })
+	_ = s.transport.Close()
+}
 func (s *AgentSession) Close() error {
 	s.mu.Lock()
 	if s.closed || s.closing {
@@ -209,7 +238,7 @@ func (s *AgentSession) Close() error {
 		return nil
 	}
 	s.closed = true
-	close(s.stop)
+	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
 	return s.transport.Close()
 }

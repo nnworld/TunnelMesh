@@ -37,3 +37,11 @@ target port, and optional metadata. GOAWAY drains queued frames before writing
 the terminal frame. Node registration is monotonic by epoch and relay opens
 hold the registry read lock through transport acquisition to fence concurrent
 unregister operations.
+
+The Agent now includes a per-stream dispatcher that decodes OPEN_STREAM,
+dials TCP/UDP targets through the policy-aware Dialer, routes DATA frames to
+the target, and closes streams on HALF_CLOSE/RESET. The relay package also
+contains a concrete `GRPCNodeTransport`: it dials a real `grpc.ClientConn`
+with mTLS credentials and opens the `/tunnelmesh.relay.v1.Relay/OpenStream`
+HTTP/2 bidi stream. The generated server stub remains an integration concern;
+the client adapter and mTLS validation are covered by package tests.

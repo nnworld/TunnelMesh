@@ -2,11 +2,89 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"io"
 	"math/rand"
 	"sync/atomic"
 	"time"
 )
+
+var ErrStreamNotFound = errors.New("agent: stream not found")
+
+type StreamOpenPayload struct {
+	Protocol   string `json:"protocol"`
+	TargetHost string `json:"target_host"`
+	TargetPort int    `json:"target_port"`
+	Metadata   []byte `json:"metadata,omitempty"`
+}
+type StreamDialFunc func(context.Context, string, string, int) (io.ReadWriteCloser, error)
+type StreamDispatcher struct {
+	ctx     context.Context
+	dial    StreamDialFunc
+	streams map[uint32]io.ReadWriteCloser
+}
+
+func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
+	if override == nil {
+		override = func(ctx context.Context, proto, host string, port int) (io.ReadWriteCloser, error) {
+			switch proto {
+			case "tcp":
+				return d.DialTCP(ctx, host, port)
+			case "udp":
+				return d.DialUDP(ctx, host, port)
+			default:
+				return nil, errors.New("agent: unsupported stream protocol")
+			}
+		}
+	}
+	return &StreamDispatcher{ctx: context.Background(), dial: override, streams: make(map[uint32]io.ReadWriteCloser)}
+}
+func (d *StreamDispatcher) Handle(f protocol.Frame) error {
+	if d == nil {
+		return ErrStreamNotFound
+	}
+	switch f.Type {
+	case protocol.FrameOpenStream:
+		var p StreamOpenPayload
+		if err := json.Unmarshal(f.Payload, &p); err != nil {
+			return err
+		}
+		if f.StreamID == 0 || p.TargetHost == "" || p.TargetPort < 1 || p.TargetPort > 65535 {
+			return errors.New("agent: invalid stream target")
+		}
+		c, err := d.dial(d.ctx, p.Protocol, p.TargetHost, p.TargetPort)
+		if err != nil {
+			return err
+		}
+		d.streams[f.StreamID] = c
+		return nil
+	case protocol.FrameData:
+		c, ok := d.streams[f.StreamID]
+		if !ok {
+			return ErrStreamNotFound
+		}
+		_, err := c.Write(f.Payload)
+		return err
+	case protocol.FrameHalfClose, protocol.FrameReset:
+		c, ok := d.streams[f.StreamID]
+		if !ok {
+			return ErrStreamNotFound
+		}
+		delete(d.streams, f.StreamID)
+		return c.Close()
+	default:
+		return nil
+	}
+}
+func (d *StreamDispatcher) Close() error {
+	for id, c := range d.streams {
+		_ = c.Close()
+		delete(d.streams, id)
+	}
+	return nil
+}
 
 type FrameTransport interface {
 	Send(protocol.Frame) error

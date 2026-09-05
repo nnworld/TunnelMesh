@@ -2,11 +2,24 @@ package relay
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"testing"
 	"time"
 )
+
+func TestGRPCRelayRequiresMTLSAndBuildsConcreteAdapter(t *testing.T) {
+	if _, err := NewGRPCRelayTransport(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) { return nil, nil }, &tls.Config{}); err == nil {
+		t.Fatal("expected mTLS validation")
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{{}}, RootCAs: x509.NewCertPool()}
+	tr, err := NewGRPCRelayTransport(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) { return nopConn{}, nil }, cfg)
+	if err != nil || tr == nil {
+		t.Fatalf("adapter=%v", err)
+	}
+}
 
 type fakeNode struct {
 	open int

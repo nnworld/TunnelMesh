@@ -148,3 +148,26 @@ func TestWSFrameTransportRejectsTextMessages(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestRegisterRejectsStaleEpoch(t *testing.T) {
+	m := NewAgentSessionManager(AgentSessionConfig{})
+	_, _ = m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 4}, newFakeTransport())
+	if _, err := m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n2", Epoch: 3}, newFakeTransport()); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+type failingTransport struct{ fakeTransport }
+
+func (f *failingTransport) Send(protocol.Frame) error { return errors.New("write failed") }
+func TestWriterErrorClosesSession(t *testing.T) {
+	m := NewAgentSessionManager(AgentSessionConfig{QueueSize: 1})
+	_, _ = m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, &failingTransport{fakeTransport: *newFakeTransport()})
+	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("err=%v", err)
+	}
+}

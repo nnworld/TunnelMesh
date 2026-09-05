@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"io"
 	"testing"
 	"time"
 )
@@ -37,5 +39,31 @@ func TestSessionRunContextCancelClosesReceive(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not unblock")
+	}
+}
+
+type streamConn struct {
+	writes [][]byte
+	closed bool
+}
+
+func (c *streamConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *streamConn) Write(p []byte) (int, error) {
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+func (c *streamConn) Close() error { c.closed = true; return nil }
+func TestStreamDispatcherOpensAndWritesTarget(t *testing.T) {
+	conn := &streamConn{}
+	d := NewStreamDispatcher(Dialer{Policy: func(context.Context, string, string, int) error { return nil }}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil })
+	p, _ := json.Marshal(StreamOpenPayload{Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 7, Payload: p}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 7, Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if string(conn.writes[0]) != "x" {
+		t.Fatalf("writes=%q", conn.writes)
 	}
 }
