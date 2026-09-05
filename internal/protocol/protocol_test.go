@@ -43,6 +43,18 @@ func TestFrameRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestDecoderRejectsUnknownVersionAndType(t *testing.T) {
+	var raw [16]byte
+	raw[0], raw[1] = 9, byte(FrameData)
+	if _, err := NewDecoder(bytes.NewReader(raw[:])).ReadFrame(); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("version: %v", err)
+	}
+	raw[0], raw[1] = CurrentVersion, 99
+	if _, err := NewDecoder(bytes.NewReader(raw[:])).ReadFrame(); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("type: %v", err)
+	}
+}
+
 func TestStreamStateTransitionsAndWindow(t *testing.T) {
 	s, err := NewStreamState(7, 1024)
 	if err != nil {
