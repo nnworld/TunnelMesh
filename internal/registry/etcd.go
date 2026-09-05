@@ -73,9 +73,23 @@ func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (Node
 	if err != nil {
 		return NodeOwner{}, err
 	}
+	var existingKV *mvccpb.KeyValue
+	if resp, e := r.client.Get(ctx, r.agentKey(req.AgentID)); e == nil && len(resp.Kvs) > 0 {
+		existingKV = resp.Kvs[0]
+		var current etcdOwnerValue
+		if json.Unmarshal(existingKV.Value, &current) == nil && !current.ExpiresAt.After(time.Now().UTC()) {
+			// The lease server may take a short while to deliver its delete
+			// event. Treat an expired value as reclaimable, guarded by modrev.
+		} else {
+			_, _ = r.client.Revoke(ctx, leaseResp.ID)
+			return NodeOwner{}, ErrLeaseHeld
+		}
+	}
 	var oldEpoch int64
+	var epochKV *mvccpb.KeyValue
 	if resp, e := r.client.Get(ctx, r.agentEpochKey(req.AgentID)); e == nil && len(resp.Kvs) > 0 {
-		_, _ = fmt.Sscanf(string(resp.Kvs[0].Value), "%d", &oldEpoch)
+		epochKV = resp.Kvs[0]
+		_, _ = fmt.Sscanf(string(epochKV.Value), "%d", &oldEpoch)
 	}
 	if oldEpoch == 0 {
 		if resp, e := r.client.Get(ctx, r.nodeKey(req.NodeID)); e == nil && len(resp.Kvs) > 0 {
@@ -86,11 +100,28 @@ func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (Node
 	}
 	epoch := oldEpoch + 1
 	now := time.Now().UTC()
-	owner := NodeOwner{NodeID: req.NodeID, Address: req.Address, Metadata: req.Metadata, AgentID: req.AgentID, Epoch: epoch, ExpiresAt: now.Add(time.Duration(ttlSec) * time.Second), LeaseID: int64(leaseResp.ID)}
+	owner := NodeOwner{NodeID: req.NodeID, Address: req.Address, Metadata: req.Metadata, AgentID: req.AgentID, Epoch: epoch, ExpiresAt: now.Add(ttl), LeaseID: int64(leaseResp.ID)}
 	b, _ := json.Marshal(etcdOwnerValue{NodeID: owner.NodeID, Address: owner.Address, Metadata: owner.Metadata, AgentID: owner.AgentID, Epoch: owner.Epoch, ExpiresAt: owner.ExpiresAt, LeaseID: owner.LeaseID})
 	// Keep the node record persistent so its epoch survives an expired agent
 	// lease; the agent key itself is the ephemeral ownership marker.
-	txn := r.client.Txn(ctx).If(clientv3.Compare(clientv3.Version(r.agentKey(req.AgentID)), "=", 0)).Then(clientv3.OpPut(r.agentEpochKey(req.AgentID), fmt.Sprintf("%d", epoch)), clientv3.OpPut(r.nodeKey(req.NodeID), string(b)), clientv3.OpPut(r.agentKey(req.AgentID), string(b), clientv3.WithLease(leaseResp.ID)))
+	// The marker comparison closes the read/CAS gap: a contender that read an
+	// older epoch cannot overwrite a newer marker after the previous lease
+	// expires and is replaced.
+	compares := []clientv3.Cmp{}
+	thenOps := []clientv3.Op{}
+	if existingKV == nil {
+		compares = append(compares, clientv3.Compare(clientv3.Version(r.agentKey(req.AgentID)), "=", 0))
+	} else {
+		compares = append(compares, clientv3.Compare(clientv3.ModRevision(r.agentKey(req.AgentID)), "=", existingKV.ModRevision))
+		thenOps = append(thenOps, clientv3.OpDelete(r.agentKey(req.AgentID)))
+	}
+	if epochKV == nil {
+		compares = append(compares, clientv3.Compare(clientv3.Version(r.agentEpochKey(req.AgentID)), "=", 0))
+	} else {
+		compares = append(compares, clientv3.Compare(clientv3.ModRevision(r.agentEpochKey(req.AgentID)), "=", epochKV.ModRevision))
+	}
+	thenOps = append(thenOps, clientv3.OpPut(r.agentEpochKey(req.AgentID), fmt.Sprintf("%d", epoch)), clientv3.OpPut(r.nodeKey(req.NodeID), string(b)), clientv3.OpPut(r.agentKey(req.AgentID), string(b), clientv3.WithLease(leaseResp.ID)))
+	txn := r.client.Txn(ctx).If(compares...).Then(thenOps...)
 	resp, err := txn.Commit()
 	if err != nil {
 		_, _ = r.client.Revoke(ctx, leaseResp.ID)
