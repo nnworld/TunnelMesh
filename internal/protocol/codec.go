@@ -86,11 +86,16 @@ func (d *Decoder) ReadFrame() (Frame, error) {
 	}
 	f := Frame{Version: h[0], Type: FrameType(h[1]), Flags: binary.BigEndian.Uint16(h[2:4]), StreamID: binary.BigEndian.Uint32(h[4:8]), Window: binary.BigEndian.Uint32(h[12:16])}
 	n := binary.BigEndian.Uint32(h[8:12])
-	if n > uint32(d.MaxPayload) {
-		return Frame{}, ErrPayloadTooLarge
+	// Reject the protocol namespace before inspecting the untrusted payload
+	// length, so a frame from a future version cannot be misclassified.
+	if f.Version != CurrentVersion {
+		return Frame{}, fmt.Errorf("%w: %d", ErrUnsupportedVersion, f.Version)
 	}
 	if !knownFrameType(f.Type) {
 		return Frame{}, fmt.Errorf("%w: %d", ErrUnknownFrameType, f.Type)
+	}
+	if n > uint32(d.MaxPayload) {
+		return Frame{}, ErrPayloadTooLarge
 	}
 	if n > 0 {
 		f.Payload = make([]byte, n)
