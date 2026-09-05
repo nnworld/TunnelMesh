@@ -1,0 +1,146 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "modernc.org/sqlite"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/migrations"
+)
+
+const (
+	DriverSQLite  = "sqlite"
+	DriverMySQL   = "mysql"
+	SchemaVersion = 1
+)
+
+type DB struct {
+	sql         *sql.DB
+	driver      string
+	users       UserRepository
+	tokens      TokenRepository
+	agents      AgentRepository
+	policies    PolicyRepository
+	tunnels     TunnelRepository
+	nodes       NodeRepository
+	leases      LeaseRepository
+	audits      AuditRepository
+	idempotency IdempotencyRepository
+}
+
+func Open(ctx context.Context, driver, dsn string, autoInit bool) (*DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if driver == "sqlite3" {
+		driver = DriverSQLite
+	}
+	sqlDriver := driver
+	if driver == DriverSQLite {
+		sqlDriver = "sqlite"
+	}
+	if driver != DriverSQLite && driver != DriverMySQL {
+		return nil, fmt.Errorf("unsupported storage driver %q", driver)
+	}
+	if dsn == "" {
+		if driver == DriverSQLite {
+			dsn = "tunnelmesh.db"
+		} else {
+			return nil, errors.New("mysql DSN is required")
+		}
+	}
+	db, err := sql.Open(sqlDriver, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", driver, err)
+	}
+	if driver == DriverSQLite {
+		db.SetMaxOpenConns(1)
+	}
+	if err = db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping %s: %w", driver, err)
+	}
+	if autoInit {
+		if err = initializeSchema(ctx, db); err != nil {
+			db.Close()
+			return nil, err
+		}
+	} else if err = checkSchema(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return newDB(db, driver), nil
+}
+
+// OpenConfig consumes the already-validated storage settings produced by
+// internal/config and keeps driver-specific DSN selection inside storage.
+func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
+	dsn := cfg.SQLite.Path
+	if cfg.Driver == DriverMySQL {
+		dsn = cfg.MySQL.DSN
+	}
+	return Open(ctx, cfg.Driver, dsn, cfg.AutoInit)
+}
+
+func newDB(db *sql.DB, driver string) *DB {
+	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: &leaseRepo{db}, audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
+}
+
+func initializeSchema(ctx context.Context, db *sql.DB) error {
+	for _, stmt := range strings.Split(migrations.DDL, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO schema_meta(id,version) VALUES(1,?)`, SchemaVersion)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "unique") && !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		return fmt.Errorf("write schema version: %w", err)
+	}
+	return nil
+}
+func checkSchema(ctx context.Context, db *sql.DB) error {
+	var v int
+	err := db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
+	if err != nil {
+		return fmt.Errorf("schema is not initialized: %w", err)
+	}
+	if v < SchemaVersion {
+		return fmt.Errorf("schema version %d is older than required %d", v, SchemaVersion)
+	}
+	return nil
+}
+
+func (d *DB) Close() error {
+	if d == nil || d.sql == nil {
+		return nil
+	}
+	return d.sql.Close()
+}
+func (d *DB) Ping(ctx context.Context) error { return d.sql.PingContext(ctx) }
+func (d *DB) SQL() *sql.DB                   { return d.sql }
+func (d *DB) Driver() string                 { return d.driver }
+func (d *DB) SchemaVersion(ctx context.Context) (int, error) {
+	var v int
+	err := d.sql.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
+	return v, err
+}
+func (d *DB) Users() UserRepository              { return d.users }
+func (d *DB) Tokens() TokenRepository            { return d.tokens }
+func (d *DB) Agents() AgentRepository            { return d.agents }
+func (d *DB) Policies() PolicyRepository         { return d.policies }
+func (d *DB) Tunnels() TunnelRepository          { return d.tunnels }
+func (d *DB) Nodes() NodeRepository              { return d.nodes }
+func (d *DB) Leases() LeaseRepository            { return d.leases }
+func (d *DB) Audits() AuditRepository            { return d.audits }
+func (d *DB) Idempotency() IdempotencyRepository { return d.idempotency }
