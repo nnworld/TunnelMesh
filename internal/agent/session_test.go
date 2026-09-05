@@ -45,9 +45,17 @@ func TestSessionRunContextCancelClosesReceive(t *testing.T) {
 type streamConn struct {
 	writes [][]byte
 	closed bool
+	read   []byte
 }
 
-func (c *streamConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *streamConn) Read(p []byte) (int, error) {
+	if len(c.read) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.read)
+	c.read = c.read[n:]
+	return n, nil
+}
 func (c *streamConn) Write(p []byte) (int, error) {
 	c.writes = append(c.writes, append([]byte(nil), p...))
 	return len(p), nil
@@ -65,5 +73,70 @@ func TestStreamDispatcherOpensAndWritesTarget(t *testing.T) {
 	}
 	if string(conn.writes[0]) != "x" {
 		t.Fatalf("writes=%q", conn.writes)
+	}
+}
+
+func TestStreamDispatcherReadsTargetBackToFrameCallback(t *testing.T) {
+	conn := &streamConn{read: []byte("reply")}
+	gotc := make(chan protocol.Frame, 1)
+	d := NewStreamDispatcherWithCallback(Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil }, func(f protocol.Frame) {
+		if f.Type == protocol.FrameData {
+			gotc <- f
+		}
+	})
+	p, _ := json.Marshal(StreamOpenPayload{Protocol: "tcp", TargetHost: "h", TargetPort: 1})
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 8, Payload: p}); err != nil {
+		t.Fatal(err)
+	}
+	var got protocol.Frame
+	select {
+	case got = <-gotc:
+	case <-time.After(time.Second):
+		t.Fatal("callback timeout")
+	}
+	if string(got.Payload) != "reply" || got.Type != protocol.FrameData {
+		t.Fatalf("frame=%+v", got)
+	}
+}
+
+func TestStreamDispatcherRejectsDuplicateStreamID(t *testing.T) {
+	first, second := &streamConn{}, &streamConn{}
+	count := 0
+	d := NewStreamDispatcher(Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) {
+		count++
+		if count == 1 {
+			return first, nil
+		}
+		return second, nil
+	})
+	p, _ := json.Marshal(StreamOpenPayload{Protocol: "tcp", TargetHost: "h", TargetPort: 1})
+	f := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 10, Payload: p}
+	if err := d.Handle(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(f); !errors.Is(err, ErrDuplicateStream) {
+		t.Fatalf("err=%v", err)
+	}
+	if first.closed || !second.closed {
+		t.Fatalf("duplicate stream lifecycle first=%v second=%v", first.closed, second.closed)
+	}
+}
+
+func TestStaleReadBackCannotDeleteReusedStreamID(t *testing.T) {
+	d := NewStreamDispatcher(Dialer{}, nil)
+	old, newer := &streamConn{}, &streamConn{}
+	d.mu.Lock()
+	d.generation++
+	oldEntry := &streamEntry{conn: old, generation: d.generation}
+	d.streams[11] = oldEntry
+	d.generation++
+	d.streams[11] = &streamEntry{conn: newer, generation: d.generation}
+	d.mu.Unlock()
+	d.readBack(11, oldEntry)
+	d.mu.Lock()
+	_, ok := d.streams[11]
+	d.mu.Unlock()
+	if !ok {
+		t.Fatal("stale reader deleted replacement stream")
 	}
 }

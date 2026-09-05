@@ -7,11 +7,13 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"io"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var ErrStreamNotFound = errors.New("agent: stream not found")
+var ErrDuplicateStream = errors.New("agent: duplicate stream")
 
 type StreamOpenPayload struct {
 	Protocol   string `json:"protocol"`
@@ -20,10 +22,18 @@ type StreamOpenPayload struct {
 	Metadata   []byte `json:"metadata,omitempty"`
 }
 type StreamDialFunc func(context.Context, string, string, int) (io.ReadWriteCloser, error)
+type streamEntry struct {
+	conn       io.ReadWriteCloser
+	generation uint64
+}
 type StreamDispatcher struct {
-	ctx     context.Context
-	dial    StreamDialFunc
-	streams map[uint32]io.ReadWriteCloser
+	ctx        context.Context
+	cancel     context.CancelFunc
+	dial       StreamDialFunc
+	streams    map[uint32]*streamEntry
+	generation uint64
+	mu         sync.Mutex
+	onFrame    func(protocol.Frame)
 }
 
 func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
@@ -39,7 +49,23 @@ func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
 			}
 		}
 	}
-	return &StreamDispatcher{ctx: context.Background(), dial: override, streams: make(map[uint32]io.ReadWriteCloser)}
+	return NewStreamDispatcherWithCallback(d, override, nil)
+}
+func NewStreamDispatcherWithCallback(d Dialer, override StreamDialFunc, cb func(protocol.Frame)) *StreamDispatcher {
+	if override == nil {
+		override = func(ctx context.Context, proto, host string, port int) (io.ReadWriteCloser, error) {
+			switch proto {
+			case "tcp":
+				return d.DialTCP(ctx, host, port)
+			case "udp":
+				return d.DialUDP(ctx, host, port)
+			default:
+				return nil, errors.New("agent: unsupported stream protocol")
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &StreamDispatcher{ctx: ctx, cancel: cancel, dial: override, streams: make(map[uint32]*streamEntry), onFrame: cb}
 }
 func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 	if d == nil {
@@ -58,29 +84,74 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if err != nil {
 			return err
 		}
-		d.streams[f.StreamID] = c
+		d.mu.Lock()
+		if _, exists := d.streams[f.StreamID]; exists {
+			d.mu.Unlock()
+			_ = c.Close()
+			return ErrDuplicateStream
+		}
+		d.generation++
+		entry := &streamEntry{conn: c, generation: d.generation}
+		d.streams[f.StreamID] = entry
+		d.mu.Unlock()
+		go d.readBack(f.StreamID, entry)
 		return nil
 	case protocol.FrameData:
-		c, ok := d.streams[f.StreamID]
+		d.mu.Lock()
+		entry, ok := d.streams[f.StreamID]
+		d.mu.Unlock()
 		if !ok {
 			return ErrStreamNotFound
 		}
-		_, err := c.Write(f.Payload)
+		_, err := entry.conn.Write(f.Payload)
 		return err
 	case protocol.FrameHalfClose, protocol.FrameReset:
-		c, ok := d.streams[f.StreamID]
+		d.mu.Lock()
+		entry, ok := d.streams[f.StreamID]
+		d.mu.Unlock()
 		if !ok {
 			return ErrStreamNotFound
 		}
-		delete(d.streams, f.StreamID)
-		return c.Close()
+		d.mu.Lock()
+		if current, exists := d.streams[f.StreamID]; exists && current == entry {
+			delete(d.streams, f.StreamID)
+		}
+		d.mu.Unlock()
+		return entry.conn.Close()
 	default:
 		return nil
 	}
 }
+
+func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := entry.conn.Read(buf)
+		if n > 0 && d.onFrame != nil {
+			d.onFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buf[:n]...)})
+		}
+		if err != nil {
+			d.mu.Lock()
+			current, ok := d.streams[id]
+			stale := !ok || current != entry
+			if !stale {
+				delete(d.streams, id)
+			}
+			cb := d.onFrame
+			d.mu.Unlock()
+			if !stale && cb != nil {
+				cb(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: id})
+			}
+			return
+		}
+	}
+}
 func (d *StreamDispatcher) Close() error {
-	for id, c := range d.streams {
-		_ = c.Close()
+	d.cancel()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, entry := range d.streams {
+		_ = entry.conn.Close()
 		delete(d.streams, id)
 	}
 	return nil

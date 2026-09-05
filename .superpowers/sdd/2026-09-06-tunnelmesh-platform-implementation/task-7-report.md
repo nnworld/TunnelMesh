@@ -43,5 +43,10 @@ dials TCP/UDP targets through the policy-aware Dialer, routes DATA frames to
 the target, and closes streams on HALF_CLOSE/RESET. The relay package also
 contains a concrete `GRPCNodeTransport`: it dials a real `grpc.ClientConn`
 with mTLS credentials and opens the `/tunnelmesh.relay.v1.Relay/OpenStream`
-HTTP/2 bidi stream. The generated server stub remains an integration concern;
-the client adapter and mTLS validation are covered by package tests.
+HTTP/2 bidi stream. The package includes a matching service descriptor and
+server-side registration/bridge handler; mTLS validation is covered by tests.
+
+The final hardening now also provides a server-side `grpc.ServiceDesc`
+registration and bidirectional bridge handler, preserves unread `BytesValue`
+tails in client reads, serializes transport close with writes, and dispatches
+target read-back as DATA/HALF_CLOSE frames through a callback.

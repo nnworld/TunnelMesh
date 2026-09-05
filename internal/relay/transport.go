@@ -111,6 +111,8 @@ func (t *BoundedTransport) Close() error {
 	default:
 		close(t.done)
 	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	return t.conn.Close()
 }
 
@@ -135,6 +137,74 @@ func NewGRPCRelayTransport(open func(context.Context, StreamRequest) (io.ReadWri
 type GRPCNodeTransport struct {
 	conn      *grpc.ClientConn
 	tlsConfig *tls.Config
+}
+
+type RelayServer interface {
+	OpenStream(RelayOpenStreamServer) error
+}
+type RelayOpenStreamServer interface {
+	Send(*wrapperspb.BytesValue) error
+	Recv() (*wrapperspb.BytesValue, error)
+	grpc.ServerStream
+}
+type relayServer struct {
+	handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+}
+
+func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)) RelayServer {
+	return &relayServer{handler: handler}
+}
+func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
+	s.RegisterService(&grpc.ServiceDesc{ServiceName: "tunnelmesh.relay.v1.Relay", HandlerType: (*RelayServer)(nil), Streams: []grpc.StreamDesc{{StreamName: "OpenStream", Handler: relayOpenStreamHandler, ServerStreams: true, ClientStreams: true}}}, srv)
+}
+func relayOpenStreamHandler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RelayServer).OpenStream(&relayOpenStreamServer{ServerStream: stream})
+}
+
+type relayOpenStreamServer struct{ grpc.ServerStream }
+
+func (s *relayOpenStreamServer) Send(v *wrapperspb.BytesValue) error {
+	return s.ServerStream.SendMsg(v)
+}
+func (s *relayOpenStreamServer) Recv() (*wrapperspb.BytesValue, error) {
+	v := new(wrapperspb.BytesValue)
+	if err := s.ServerStream.RecvMsg(v); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+func (r *relayServer) OpenStream(stream RelayOpenStreamServer) error {
+	var first structpb.Struct
+	if err := stream.RecvMsg(&first); err != nil {
+		return err
+	}
+	req := StreamRequest{Protocol: first.GetFields()["protocol"].GetStringValue(), TargetHost: first.GetFields()["target_host"].GetStringValue(), TargetPort: int(first.GetFields()["target_port"].GetNumberValue()), StreamID: uint32(first.GetFields()["stream_id"].GetNumberValue()), AgentID: first.GetFields()["agent_id"].GetStringValue(), NodeID: first.GetFields()["node_id"].GetStringValue(), Epoch: int64(first.GetFields()["epoch"].GetNumberValue())}
+	conn, err := r.handler(stream.Context(), req)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	go func() {
+		buf := make([]byte, 32<<10)
+		for {
+			n, e := conn.Read(buf)
+			if n > 0 {
+				_ = stream.Send(&wrapperspb.BytesValue{Value: append([]byte(nil), buf[:n]...)})
+			}
+			if e != nil {
+				return
+			}
+		}
+	}()
+	for {
+		msg, e := stream.Recv()
+		if e != nil {
+			return e
+		}
+		if _, e = conn.Write(msg.Value); e != nil {
+			return e
+		}
+	}
 }
 
 var relayStreamDesc = &grpc.StreamDesc{StreamName: "OpenStream", ServerStreams: true, ClientStreams: true}
@@ -176,14 +246,29 @@ func (n *GRPCNodeTransport) Close() error {
 	return n.conn.Close()
 }
 
-type grpcStreamConn struct{ stream grpc.ClientStream }
+type grpcStreamConn struct {
+	stream  grpc.ClientStream
+	mu      sync.Mutex
+	pending []byte
+}
 
 func (c *grpcStreamConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
 	var msg wrapperspb.BytesValue
 	if err := c.stream.RecvMsg(&msg); err != nil {
 		return 0, err
 	}
-	return copy(p, msg.Value), nil
+	n := copy(p, msg.Value)
+	if n < len(msg.Value) {
+		c.pending = append(c.pending, msg.Value[n:]...)
+	}
+	return n, nil
 }
 func (c *grpcStreamConn) Write(p []byte) (int, error) {
 	b := append([]byte(nil), p...)
