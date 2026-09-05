@@ -22,7 +22,7 @@
 
 ## Commit
 
-`1a3f5999b4070d7023743fea6ec5cabec7f351e4`
+`6c6e98921bcd1fd43e3627e957a9bf0a8b4ad5e7`
 
 ### Review follow-ups
 
@@ -32,3 +32,5 @@
   uniqueness constraint, and propagated conflict/list errors.
 - Added API application-service helpers for agent/tunnel creation and expanded
   OpenAPI item CRUD/PATCH/request schemas.
+- Routed all handler repository access through the API service façade to keep
+  the Handler → Service → Repository layering explicit.
