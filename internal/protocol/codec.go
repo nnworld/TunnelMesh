@@ -77,8 +77,9 @@ func (d *Decoder) ReadFrame() (Frame, error) {
 	if d == nil || d.r == nil {
 		return Frame{}, fmt.Errorf("protocol: nil decoder")
 	}
-	if d.MaxPayload <= 0 {
-		d.MaxPayload = MaxPayload
+	effectiveMaxPayload := d.MaxPayload
+	if effectiveMaxPayload <= 0 || effectiveMaxPayload > MaxPayload {
+		effectiveMaxPayload = MaxPayload
 	}
 	var h [headerSize]byte
 	if _, err := io.ReadFull(d.r, h[:]); err != nil {
@@ -94,7 +95,7 @@ func (d *Decoder) ReadFrame() (Frame, error) {
 	if !knownFrameType(f.Type) {
 		return Frame{}, fmt.Errorf("%w: %d", ErrUnknownFrameType, f.Type)
 	}
-	if n > uint32(d.MaxPayload) {
+	if n > uint32(effectiveMaxPayload) {
 		return Frame{}, ErrPayloadTooLarge
 	}
 	if n > 0 {

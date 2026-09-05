@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -52,6 +53,18 @@ func TestDecoderRejectsUnknownVersionAndType(t *testing.T) {
 	raw[0], raw[1] = CurrentVersion, 99
 	if _, err := NewDecoder(bytes.NewReader(raw[:])).ReadFrame(); !errors.Is(err, ErrUnknownFrameType) {
 		t.Fatalf("type: %v", err)
+	}
+}
+
+func TestDecoderCustomLimitCannotExceedProtocolLimit(t *testing.T) {
+	var raw [16]byte
+	raw[0], raw[1] = CurrentVersion, byte(FrameData)
+	binary.BigEndian.PutUint32(raw[4:8], 1)
+	binary.BigEndian.PutUint32(raw[8:12], MaxPayload+1)
+	dec := NewDecoder(bytes.NewReader(raw[:]))
+	dec.MaxPayload = MaxPayload * 4
+	if _, err := dec.ReadFrame(); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("payload limit: %v", err)
 	}
 }
 
@@ -106,6 +119,31 @@ func TestStreamReset(t *testing.T) {
 	}
 	if err := s.Reset(); !errors.Is(err, ErrStreamReset) {
 		t.Fatalf("reset twice: %v", err)
+	}
+}
+
+func TestStreamWindowUpdateRejectedAfterTerminalState(t *testing.T) {
+	closed, _ := NewStreamState(2, 10)
+	_ = closed.Handle(Frame{Version: CurrentVersion, Type: FrameOpenStream, StreamID: 2})
+	_ = closed.Handle(Frame{Version: CurrentVersion, Type: FrameHalfClose, StreamID: 2})
+	_ = closed.HalfCloseLocal()
+	before := closed.SendWindow()
+	if err := closed.Handle(Frame{Version: CurrentVersion, Type: FrameWindowUpdate, StreamID: 2, Window: 5}); !errors.Is(err, ErrStreamClosed) {
+		t.Fatalf("closed update: %v", err)
+	}
+	if closed.SendWindow() != before {
+		t.Fatalf("closed window changed: %d -> %d", before, closed.SendWindow())
+	}
+
+	reset, _ := NewStreamState(3, 10)
+	_ = reset.Handle(Frame{Version: CurrentVersion, Type: FrameOpenStream, StreamID: 3})
+	_ = reset.Handle(Frame{Version: CurrentVersion, Type: FrameReset, StreamID: 3})
+	before = reset.SendWindow()
+	if err := reset.Handle(Frame{Version: CurrentVersion, Type: FrameWindowUpdate, StreamID: 3, Window: 5}); !errors.Is(err, ErrStreamReset) {
+		t.Fatalf("reset update: %v", err)
+	}
+	if reset.SendWindow() != before {
+		t.Fatalf("reset window changed: %d -> %d", before, reset.SendWindow())
 	}
 }
 

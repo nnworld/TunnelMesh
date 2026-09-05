@@ -235,6 +235,12 @@ func (s *StreamState) Handle(f Frame) error {
 		}
 		s.status = StreamReset
 	case FrameWindowUpdate:
+		if s.status == StreamReset {
+			return ErrStreamReset
+		}
+		if s.status == StreamClosed {
+			return ErrStreamClosed
+		}
 		if f.Window == 0 || uint64(s.sendWindow)+uint64(f.Window) > math.MaxUint32 {
 			return ErrInvalidFrame
 		}

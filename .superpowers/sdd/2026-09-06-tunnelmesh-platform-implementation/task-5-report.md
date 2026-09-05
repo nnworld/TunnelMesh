@@ -8,6 +8,7 @@
 - Added stream lifecycle and flow control in `StreamState`: open, data receive accounting, local/remote half-close, full close, reset, window update, send-window consumption, and overflow checks. State access and transitions are mutex protected.
 - Added `UDPAssociation`, preserving one datagram per binary message and enforcing a configurable maximum (capped at 64 KiB).
 - Added unit and fuzz tests for valid/invalid frames, payload limits, unknown versions/types, truncation, stream transitions, half-close/reset, flow-control windows, UDP boundaries, and malformed-input panic safety.
+- Follow-up review fixes clamp decoder overrides to the protocol-wide 1 MiB ceiling and reject window updates after closed/reset terminal states without mutating flow-control state.
 
 ## TDD evidence
 
@@ -26,4 +27,4 @@ git diff --check                              PASS
 
 ## Commit
 
-Pending local commit after parent review handoff.
+Implementation commit: `1642e6c`; follow-up validation fixes: `818f220`, `947f45f`, and the review-fix commit containing the changes above.
