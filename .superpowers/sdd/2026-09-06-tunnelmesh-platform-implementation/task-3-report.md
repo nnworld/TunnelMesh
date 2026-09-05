@@ -36,3 +36,9 @@ Implemented and locally verified in the task worktree. The storage package now e
 
 - `go test ./internal/storage -run 'Test(SQLiteAutoInitRejects|SQLiteConcurrentExpired|SQLiteDDLAdds|IdempotencyExpired)' -count=1` — pass.
 - Full package, race, repository, vet, build, and diff checks are run before the fix commit; live MySQL remains environment-gated by `TUNNELMESH_TEST_MYSQL_DSN`.
+
+## Constructor fix
+
+- Added `NewLeaseRepositoryWithDriver`; `DB.Leases()` now uses it with the opened driver, ensuring MySQL repositories retain `SELECT ... FOR UPDATE` fencing.
+- Kept `NewLeaseRepository` as a deprecated SQLite-compatible convenience; non-SQLite callers must choose the explicit driver-aware constructor.
+- Added a public-constructor regression test that verifies the MySQL implementation path is selected.

@@ -92,7 +92,7 @@ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
 }
 
 func newDB(db *sql.DB, driver string) *DB {
-	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: &leaseRepo{db: db, driver: driver}, audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
+	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: NewLeaseRepositoryWithDriver(db, driver), audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
 }
 
 func initializeSchema(ctx context.Context, db *sql.DB) error {

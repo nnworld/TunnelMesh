@@ -109,3 +109,14 @@ func TestSQLiteDDLAddsAgentPolicyIndex(t *testing.T) {
 		t.Fatal("agent policy agent_id index is missing")
 	}
 }
+
+func TestLeaseRepositoryPublicConstructorPropagatesMySQLDriver(t *testing.T) {
+	repo := NewLeaseRepositoryWithDriver(nil, DriverMySQL)
+	impl, ok := repo.(*leaseRepo)
+	if !ok {
+		t.Fatalf("repository type = %T, want *leaseRepo", repo)
+	}
+	if impl.driver != DriverMySQL {
+		t.Fatalf("lease driver = %q, want %q", impl.driver, DriverMySQL)
+	}
+}

@@ -86,8 +86,27 @@ func NewAgentRepository(db *sql.DB) AgentRepository   { return &agentRepo{db} }
 func NewPolicyRepository(db *sql.DB) PolicyRepository { return &policyRepo{db} }
 func NewTunnelRepository(db *sql.DB) TunnelRepository { return &tunnelRepo{db} }
 func NewNodeRepository(db *sql.DB) NodeRepository     { return &nodeRepo{db} }
-func NewLeaseRepository(db *sql.DB) LeaseRepository   { return &leaseRepo{db: db} }
-func NewAuditRepository(db *sql.DB) AuditRepository   { return &auditRepo{db} }
+
+// NewLeaseRepository is retained for SQLite callers. MySQL callers must use
+// NewLeaseRepositoryWithDriver so row-lock fencing is enabled explicitly.
+// Deprecated: use NewLeaseRepositoryWithDriver for non-SQLite databases.
+func NewLeaseRepository(db *sql.DB) LeaseRepository {
+	return NewLeaseRepositoryWithDriver(db, DriverSQLite)
+}
+
+// NewLeaseRepositoryWithDriver constructs a lease repository with the driver
+// capability needed to select the correct concurrency strategy.
+func NewLeaseRepositoryWithDriver(db *sql.DB, driver string) LeaseRepository {
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if driver == "sqlite3" {
+		driver = DriverSQLite
+	}
+	if driver != DriverMySQL && driver != DriverSQLite {
+		panic(fmt.Sprintf("unsupported lease repository driver %q", driver))
+	}
+	return &leaseRepo{db: db, driver: driver}
+}
+func NewAuditRepository(db *sql.DB) AuditRepository { return &auditRepo{db} }
 func NewIdempotencyRepository(db *sql.DB) IdempotencyRepository {
 	return &idempotencyRepo{db}
 }
@@ -97,13 +116,15 @@ type sqlRepositories struct{ db *sql.DB }
 func (r *sqlRepositories) CreateUser(ctx context.Context, v User) error {
 	return r.users().Create(ctx, v)
 }
-func (r *sqlRepositories) users() *userRepo              { return &userRepo{r.db} }
-func (r *sqlRepositories) tokens() *tokenRepo            { return &tokenRepo{r.db} }
-func (r *sqlRepositories) agents() *agentRepo            { return &agentRepo{r.db} }
-func (r *sqlRepositories) policies() *policyRepo         { return &policyRepo{r.db} }
-func (r *sqlRepositories) tunnels() *tunnelRepo          { return &tunnelRepo{r.db} }
-func (r *sqlRepositories) nodes() *nodeRepo              { return &nodeRepo{r.db} }
-func (r *sqlRepositories) leases() *leaseRepo            { return &leaseRepo{db: r.db} }
+func (r *sqlRepositories) users() *userRepo      { return &userRepo{r.db} }
+func (r *sqlRepositories) tokens() *tokenRepo    { return &tokenRepo{r.db} }
+func (r *sqlRepositories) agents() *agentRepo    { return &agentRepo{r.db} }
+func (r *sqlRepositories) policies() *policyRepo { return &policyRepo{r.db} }
+func (r *sqlRepositories) tunnels() *tunnelRepo  { return &tunnelRepo{r.db} }
+func (r *sqlRepositories) nodes() *nodeRepo      { return &nodeRepo{r.db} }
+func (r *sqlRepositories) leases() *leaseRepo {
+	return NewLeaseRepositoryWithDriver(r.db, DriverSQLite).(*leaseRepo)
+}
 func (r *sqlRepositories) audits() *auditRepo            { return &auditRepo{r.db} }
 func (r *sqlRepositories) idempotency() *idempotencyRepo { return &idempotencyRepo{r.db} }
 
