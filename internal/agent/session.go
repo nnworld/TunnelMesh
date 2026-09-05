@@ -27,6 +27,16 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 	if s == nil || s.transport == nil {
 		return context.Canceled
 	}
+	defer s.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.transport.Close()
+		case <-done:
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -36,6 +46,9 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 		}
 		f, err := s.transport.Receive()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		if f.Type == protocol.FrameGoAway {

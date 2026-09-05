@@ -19,11 +19,21 @@ All commands passed in the implementation worktree.
 
 ## Commit
 
-`2e410d0 feat(session): add agent client sessions and relay service`
+Initial implementation: `f9f3170 feat(session): add agent client sessions and relay service`
+
+Hardening follow-up: `6227904 fix(session): harden relay lifecycle and frame ordering`
 
 ## Notes
 
-Transport interfaces intentionally avoid coupling to a concrete WebSocket or
-gRPC package. Production listeners can provide Gorilla/WebSocket and gRPC
-adapters while preserving the Handler → Service boundaries. Relay TLS config
-is caller-supplied and does not disable peer verification.
+Transport interfaces intentionally avoid coupling to a concrete WebSocket
+package. `GRPCRelayTransport` is the explicit HTTP/2/mTLS adapter boundary:
+callers inject a generated gRPC stream opener and a `tls.Config` containing
+client certificates and trusted roots; construction rejects incomplete mTLS
+configuration. Relay TLS config is caller-supplied and never disables peer
+verification.
+
+The OPEN_STREAM payload is a stable JSON schema carrying protocol, target host,
+target port, and optional metadata. GOAWAY drains queued frames before writing
+the terminal frame. Node registration is monotonic by epoch and relay opens
+hold the registry read lock through transport acquisition to fence concurrent
+unregister operations.

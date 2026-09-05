@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 )
 
 type fakeNode struct {
@@ -39,5 +40,36 @@ func TestRelayEpochValidationAndNodeDisconnect(t *testing.T) {
 	r.UnregisterNode("n1")
 	if _, err := r.OpenStream(context.Background(), StreamRequest{NodeID: "n1", Epoch: 3}); !errors.Is(err, ErrNodeDisconnected) {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestRelayRegisterNodeRejectsStaleEpoch(t *testing.T) {
+	r := NewRelayService()
+	old, newer := &fakeNode{}, &fakeNode{}
+	r.RegisterNode("n", 3, newer)
+	r.RegisterNode("n", 2, old)
+	if _, err := r.OpenStream(context.Background(), StreamRequest{NodeID: "n", Epoch: 3}); err != nil {
+		t.Fatalf("stale registration replaced owner: %v", err)
+	}
+	if newer.open != 1 || old.open != 0 {
+		t.Fatalf("old=%d newer=%d", old.open, newer.open)
+	}
+}
+
+type errorConn struct{ closed bool }
+
+func (c *errorConn) Read([]byte) (int, error)  { return 0, io.EOF }
+func (c *errorConn) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func (c *errorConn) Close() error              { c.closed = true; return nil }
+func TestBoundedTransportPropagatesWriteErrorAndRejectsAfterClose(t *testing.T) {
+	c := &errorConn{}
+	tr := NewBoundedTransport(c, 1)
+	if _, err := tr.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	_ = tr.Close()
+	if _, err := tr.Write([]byte("y")); err == nil {
+		t.Fatalf("err=%v", err)
 	}
 }

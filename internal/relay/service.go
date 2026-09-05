@@ -49,6 +49,10 @@ func (r *RelayService) RegisterNode(id string, epoch int64, tr NodeTransport) {
 		return
 	}
 	r.mu.Lock()
+	if current, ok := r.nodes[id]; ok && current.epoch >= epoch {
+		r.mu.Unlock()
+		return
+	}
 	r.nodes[id] = nodeEntry{epoch: epoch, transport: tr}
 	r.mu.Unlock()
 }
@@ -72,12 +76,17 @@ func (r *RelayService) OpenStream(ctx context.Context, req StreamRequest) (io.Re
 		return tr.OpenStream(ctx, req)
 	}
 	e, ok := r.nodes[req.NodeID]
-	r.mu.RUnlock()
 	if !ok {
+		r.mu.RUnlock()
 		return nil, ErrNodeDisconnected
 	}
 	if req.Epoch != e.epoch {
+		r.mu.RUnlock()
 		return nil, ErrEpoch
 	}
-	return e.transport.OpenStream(ctx, req)
+	// Keep the read lock while opening so UnregisterNode cannot close the
+	// transport between lookup and use.
+	conn, err := e.transport.OpenStream(ctx, req)
+	r.mu.RUnlock()
+	return conn, err
 }

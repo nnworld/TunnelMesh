@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"sync"
@@ -18,6 +19,12 @@ type StreamRequest struct {
 	Protocol, TargetHost string
 	TargetPort           int
 	Metadata             []byte
+}
+type StreamOpenPayload struct {
+	Protocol   string `json:"protocol"`
+	TargetHost string `json:"target_host"`
+	TargetPort int    `json:"target_port"`
+	Metadata   []byte `json:"metadata,omitempty"`
 }
 type Session struct {
 	mu        sync.RWMutex
@@ -40,7 +47,11 @@ func (s *Session) OpenStream(ctx context.Context, req StreamRequest) error {
 		return ctx.Err()
 	default:
 	}
-	return s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: req.Metadata})
+	payload, err := json.Marshal(StreamOpenPayload{Protocol: req.Protocol, TargetHost: req.TargetHost, TargetPort: req.TargetPort, Metadata: req.Metadata})
+	if err != nil {
+		return err
+	}
+	return s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
 }
 func (s *Session) Close() error {
 	s.mu.Lock()

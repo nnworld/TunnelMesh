@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -47,6 +48,8 @@ type AgentSession struct {
 	queue           chan protocol.Frame
 	slots           chan struct{}
 	stop            chan struct{}
+	drain           chan chan struct{}
+	closing         bool
 }
 
 func (s *AgentSession) Supports(capability string) bool {
@@ -96,7 +99,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 			}
 		}
 	}
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{})}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
 	go s.writer()
 	m.mu.Lock()
 	old := m.sessions[req.AgentID]
@@ -120,7 +123,7 @@ func (m *AgentSessionManager) Heartbeat(id string, epoch int64) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.closing {
 		return ErrSessionClosed
 	}
 	if s.Epoch != epoch {
@@ -164,10 +167,16 @@ func (m *AgentSessionManager) GoAway(id string) error {
 	}
 	// GOAWAY is written synchronously so the peer receives the terminal frame
 	// before the transport is closed and no new frames can be queued.
-	err := s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameGoAway})
+	s.closing = true
+	s.mu.Unlock()
+	ack := make(chan struct{})
+	s.drain <- ack
+	<-ack
+	s.mu.Lock()
 	s.closed = true
 	close(s.stop)
 	s.mu.Unlock()
+	err := s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameGoAway})
 	_ = s.transport.Close()
 	return err
 }
@@ -177,6 +186,17 @@ func (s *AgentSession) writer() {
 		case f := <-s.queue:
 			_ = s.transport.Send(f)
 			<-s.slots
+		case ack := <-s.drain:
+			for {
+				select {
+				case f := <-s.queue:
+					_ = s.transport.Send(f)
+					<-s.slots
+				default:
+					close(ack)
+					return
+				}
+			}
 		case <-s.stop:
 			return
 		}
@@ -184,7 +204,7 @@ func (s *AgentSession) writer() {
 }
 func (s *AgentSession) Close() error {
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.closing {
 		s.mu.Unlock()
 		return nil
 	}
@@ -208,6 +228,12 @@ type StreamOpenRequest struct {
 	Protocol, TargetHost string
 	TargetPort           int
 	Metadata             []byte
+}
+type StreamOpenPayload struct {
+	Protocol   string `json:"protocol"`
+	TargetHost string `json:"target_host"`
+	TargetPort int    `json:"target_port"`
+	Metadata   []byte `json:"metadata,omitempty"`
 }
 type ClientSessionManager struct {
 	mu       sync.RWMutex
@@ -253,5 +279,9 @@ func (m *ClientSessionManager) OpenStream(ctx context.Context, id string, req St
 		return ctx.Err()
 	default:
 	}
-	return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: req.Metadata})
+	payload, err := json.Marshal(StreamOpenPayload{req.Protocol, req.TargetHost, req.TargetPort, req.Metadata})
+	if err != nil {
+		return err
+	}
+	return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
 }

@@ -65,6 +65,10 @@ func (d Dialer) DoHTTP(ctx context.Context, method, url string, body io.Reader) 
 	c := d.HTTPClient
 	if c == nil {
 		c = &http.Client{Timeout: d.timeout()}
+	} else if c.Timeout <= 0 {
+		clone := *c
+		clone.Timeout = d.timeout()
+		c = &clone
 	}
 	return c.Do(u)
 }

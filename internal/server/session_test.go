@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"testing"
@@ -81,5 +82,69 @@ func TestClientSessionOpenLocalRouting(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+func TestClientSessionOpenStreamEncodesRouteFields(t *testing.T) {
+	c := NewClientSessionManager()
+	tr := newFakeTransport()
+	c.Register("u", tr)
+	if err := c.OpenStream(context.Background(), "u", StreamOpenRequest{StreamID: 9, Protocol: "udp", TargetHost: "10.0.0.2", TargetPort: 5353, Metadata: []byte("m")}); err != nil {
+		t.Fatal(err)
+	}
+	f := <-tr.sent
+	var got map[string]any
+	if err := json.Unmarshal(f.Payload, &got); err != nil {
+		t.Fatalf("payload is not JSON: %v", err)
+	}
+	if got["protocol"] != "udp" || got["target_host"] != "10.0.0.2" || got["target_port"] != float64(5353) {
+		t.Fatalf("route payload=%v", got)
+	}
+}
+
+func TestGoAwayDrainsQueuedFramesBeforeTerminal(t *testing.T) {
+	tr := newFakeTransport()
+	m := NewAgentSessionManager(AgentSessionConfig{QueueSize: 8})
+	_, _ = m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, tr)
+	for i := 0; i < 3; i++ {
+		if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, StreamID: uint32(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.GoAway("a"); err != nil {
+		t.Fatal(err)
+	}
+	seen := make([]protocol.Frame, 0, 4)
+	for len(seen) < 4 {
+		select {
+		case f := <-tr.sent:
+			seen = append(seen, f)
+		case <-time.After(time.Second):
+			t.Fatalf("frames=%d", len(seen))
+		}
+	}
+	for i, f := range seen {
+		if i < 3 && f.Type == protocol.FrameGoAway {
+			t.Fatalf("GOAWAY before queued frame at %d", i)
+		}
+	}
+	if seen[3].Type != protocol.FrameGoAway {
+		t.Fatalf("terminal=%+v", seen[3])
+	}
+}
+
+type fakeWSConn struct {
+	typ     int
+	payload []byte
+}
+
+func (c *fakeWSConn) ReadMessage() (int, []byte, error) { return c.typ, c.payload, nil }
+func (c *fakeWSConn) WriteMessage(int, []byte) error    { return nil }
+func (c *fakeWSConn) Close() error                      { return nil }
+func TestWSFrameTransportRejectsTextMessages(t *testing.T) {
+	c := &fakeWSConn{typ: 1}
+	tr := NewWSFrameTransport(c)
+	if _, err := tr.Receive(); !errors.Is(err, ErrNonBinaryMessage) {
+		t.Fatalf("err=%v", err)
 	}
 }

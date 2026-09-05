@@ -2,10 +2,13 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"io"
 	"sync"
 )
+
+var ErrNonBinaryMessage = errors.New("websocket: binary message required")
 
 // WSConn keeps the server independent from a particular WebSocket library.
 type WSConn interface {
@@ -29,9 +32,12 @@ func (t *WSFrameTransport) Send(f protocol.Frame) error {
 	return t.conn.WriteMessage(2, b.Bytes())
 }
 func (t *WSFrameTransport) Receive() (protocol.Frame, error) {
-	_, b, err := t.conn.ReadMessage()
+	typ, b, err := t.conn.ReadMessage()
 	if err != nil {
 		return protocol.Frame{}, err
+	}
+	if typ != 2 {
+		return protocol.Frame{}, ErrNonBinaryMessage
 	}
 	return protocol.NewDecoder(bytes.NewReader(b)).ReadFrame()
 }
