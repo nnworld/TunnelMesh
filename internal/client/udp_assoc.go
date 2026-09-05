@@ -1,9 +1,7 @@
 package client
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -16,6 +14,14 @@ type DatagramStream interface {
 	io.Closer
 	WriteDatagram([]byte) error
 	ReadDatagram() ([]byte, error)
+}
+
+// DatagramOpener is the message-oriented counterpart to StreamOpener. A
+// WebSocket/FrameData implementation must use this interface for UDP so one
+// binary message remains exactly one datagram; it must not add a byte-stream
+// length prefix.
+type DatagramOpener interface {
+	OpenDatagram(context.Context, StreamRequest) (DatagramStream, error)
 }
 
 type UDPAssociationConfig struct {
@@ -45,6 +51,7 @@ type UDPAssociationManager struct {
 	mu      sync.Mutex
 	items   map[string]*udpAssociation
 	deliver func(*net.UDPAddr, []byte)
+	closed  bool
 }
 
 func NewUDPAssociationManager(opener StreamOpener, cfg UDPAssociationConfig) (*UDPAssociationManager, error) {
@@ -67,28 +74,58 @@ func (m *UDPAssociationManager) HandleDatagram(ctx context.Context, source *net.
 	if source == nil {
 		return errors.New("client: nil UDP source")
 	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrListenerClosed
+	}
+	m.mu.Unlock()
 	if len(payload) > m.cfg.MaxDatagram {
 		return errors.New("client: UDP datagram too large")
 	}
 	key := source.String()
 	m.mu.Lock()
 	a := m.items[key]
+	m.mu.Unlock()
 	if a == nil {
-		stream, err := m.opener.OpenStream(ctx, StreamRequest{AgentID: m.cfg.AgentID, Protocol: "udp", TargetHost: m.cfg.TargetHost, TargetPort: m.cfg.TargetPort})
+		req := StreamRequest{AgentID: m.cfg.AgentID, Protocol: "udp", TargetHost: m.cfg.TargetHost, TargetPort: m.cfg.TargetPort}
+		var ds DatagramStream
+		var err error
+		if opener, ok := m.opener.(DatagramOpener); ok {
+			ds, err = opener.OpenDatagram(ctx, req)
+		} else {
+			var stream io.ReadWriteCloser
+			stream, err = m.opener.OpenStream(ctx, req)
+			if err == nil {
+				ds, _ = stream.(DatagramStream)
+				if ds == nil {
+					_ = stream.Close()
+					err = errors.New("client: UDP opener does not preserve datagram boundaries")
+				}
+			}
+		}
 		if err != nil {
-			m.mu.Unlock()
 			return err
 		}
-		ds, ok := stream.(DatagramStream)
-		if !ok {
-			ds = newFramedDatagramStream(stream, m.cfg.MaxDatagram)
+		candidate := &udpAssociation{key: key, addr: cloneUDPAddr(source), stream: ds, lastUsed: time.Now()}
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			candidate.Close()
+			return ErrListenerClosed
 		}
-		a = &udpAssociation{key: key, addr: cloneUDPAddr(source), stream: ds, lastUsed: time.Now()}
-		m.items[key] = a
-		go m.readBack(a)
+		if current := m.items[key]; current != nil {
+			m.mu.Unlock()
+			candidate.Close()
+			a = current
+		} else {
+			m.items[key] = candidate
+			m.mu.Unlock()
+			a = candidate
+			go m.readBack(a)
+		}
 	}
 	a.touch(time.Now())
-	m.mu.Unlock()
 	return a.stream.WriteDatagram(append([]byte(nil), payload...))
 }
 func (m *UDPAssociationManager) readBack(a *udpAssociation) {
@@ -107,8 +144,11 @@ func (m *UDPAssociationManager) readBack(a *udpAssociation) {
 			continue
 		}
 		a.touch(time.Now())
-		if m.deliver != nil {
-			m.deliver(a.addr, payload)
+		m.mu.Lock()
+		deliver := m.deliver
+		m.mu.Unlock()
+		if deliver != nil {
+			deliver(a.addr, payload)
 		}
 	}
 }
@@ -132,6 +172,7 @@ func (m *UDPAssociationManager) Expire(now time.Time) int {
 }
 func (m *UDPAssociationManager) Close() error {
 	m.mu.Lock()
+	m.closed = true
 	items := make([]*udpAssociation, 0, len(m.items))
 	for key, a := range m.items {
 		delete(m.items, key)
@@ -152,44 +193,3 @@ func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 	c.IP = append(net.IP(nil), a.IP...)
 	return &c
 }
-
-type framedDatagramStream struct {
-	conn            io.ReadWriteCloser
-	max             int
-	readMu, writeMu sync.Mutex
-	reader          *bufio.Reader
-}
-
-func newFramedDatagramStream(conn io.ReadWriteCloser, max int) *framedDatagramStream {
-	return &framedDatagramStream{conn: conn, max: max, reader: bufio.NewReader(conn)}
-}
-func (s *framedDatagramStream) WriteDatagram(p []byte) error {
-	if len(p) > s.max {
-		return errors.New("client: UDP datagram too large")
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	var h [4]byte
-	binary.BigEndian.PutUint32(h[:], uint32(len(p)))
-	if _, err := s.conn.Write(h[:]); err != nil {
-		return err
-	}
-	_, err := s.conn.Write(p)
-	return err
-}
-func (s *framedDatagramStream) ReadDatagram() ([]byte, error) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-	var h [4]byte
-	if _, err := io.ReadFull(s.reader, h[:]); err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint32(h[:])
-	if n > uint32(s.max) {
-		return nil, errors.New("client: UDP datagram too large")
-	}
-	p := make([]byte, n)
-	_, err := io.ReadFull(s.reader, p)
-	return p, err
-}
-func (s *framedDatagramStream) Close() error { return s.conn.Close() }

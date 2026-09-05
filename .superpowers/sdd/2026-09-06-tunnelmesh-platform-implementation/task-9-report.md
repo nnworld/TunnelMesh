@@ -23,7 +23,20 @@
 - `go vet ./...` — pass
 - `git diff --check` — pass
 
-The repository-wide race suite has a known intermittent Task 8 agent-session
-duplicate-stream test failure; the client package race suite is stable and
-passes independently.
+The repository-wide tests and race suite pass on the reviewed revision.
 
+## Review fixes
+
+- UDP associations now use message-oriented datagram openers and never add a
+  byte-stream length prefix; concurrent source creation uses open-outside-lock
+  plus compare-and-swap insertion.
+- HTTP 101 upgrades hijack the local connection and bridge raw bytes in both
+  directions, including bytes buffered while parsing the upstream headers.
+- TCP forwarders close tracked active connections during shutdown; raw bridges
+  handle half-close, errors, bounded join, and cancellation without hanging.
+- Session frame streams preserve DATA queued before HALF_CLOSE, expose AgentID
+  in OPEN payloads, and provide a native DatagramStream implementation.
+- stdio proxy handles nil contexts and joins both directions while closing on
+  hard errors.
+- Raw stream endpoints expose directional `CloseWrite` half-close semantics;
+  queued DATA is drained before terminal EOF and proxy joins are bounded.

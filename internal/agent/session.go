@@ -16,6 +16,7 @@ var ErrStreamNotFound = errors.New("agent: stream not found")
 var ErrDuplicateStream = errors.New("agent: duplicate stream")
 
 type StreamOpenPayload struct {
+	AgentID    string `json:"agent_id,omitempty"`
 	Protocol   string `json:"protocol"`
 	TargetHost string `json:"target_host"`
 	TargetPort int    `json:"target_port"`

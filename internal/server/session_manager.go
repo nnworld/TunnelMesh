@@ -259,6 +259,7 @@ type StreamOpenRequest struct {
 	Metadata             []byte
 }
 type StreamOpenPayload struct {
+	AgentID    string `json:"agent_id,omitempty"`
 	Protocol   string `json:"protocol"`
 	TargetHost string `json:"target_host"`
 	TargetPort int    `json:"target_port"`
@@ -308,7 +309,7 @@ func (m *ClientSessionManager) OpenStream(ctx context.Context, id string, req St
 		return ctx.Err()
 	default:
 	}
-	payload, err := json.Marshal(StreamOpenPayload{req.Protocol, req.TargetHost, req.TargetPort, req.Metadata})
+	payload, err := json.Marshal(StreamOpenPayload{Protocol: req.Protocol, TargetHost: req.TargetHost, TargetPort: req.TargetPort, Metadata: req.Metadata})
 	if err != nil {
 		return err
 	}

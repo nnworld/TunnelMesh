@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -11,13 +12,52 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
+
+type receiveTransport struct {
+	sent chan protocol.Frame
+	recv chan protocol.Frame
+	done chan struct{}
+}
+
+func (t *receiveTransport) Send(f protocol.Frame) error { t.sent <- f; return nil }
+func (t *receiveTransport) Receive() (protocol.Frame, error) {
+	select {
+	case f := <-t.recv:
+		return f, nil
+	case <-t.done:
+		return protocol.Frame{}, io.EOF
+	}
+}
+func (t *receiveTransport) Close() error {
+	select {
+	case <-t.done:
+	default:
+		close(t.done)
+	}
+	return nil
+}
 
 type testStream struct {
 	mu     sync.Mutex
 	read   *bytes.Buffer
 	writes bytes.Buffer
 	closed chan struct{}
+}
+
+type closeWriteStream struct {
+	*testStream
+	muClosedWrite sync.Mutex
+	closedWrite   bool
+}
+
+func (s *closeWriteStream) CloseWrite() error {
+	s.muClosedWrite.Lock()
+	s.closedWrite = true
+	s.muClosedWrite.Unlock()
+	return nil
 }
 
 func newTestStream(read []byte) *testStream {
@@ -53,6 +93,15 @@ func (s *testStream) Written() []byte {
 type openerFunc func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
 
 func (f openerFunc) OpenStream(ctx context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
+	return f(ctx, req)
+}
+
+type datagramOpenerFunc func(context.Context, StreamRequest) (DatagramStream, error)
+
+func (f datagramOpenerFunc) OpenStream(ctx context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
+	return nil, errors.New("datagram opener")
+}
+func (f datagramOpenerFunc) OpenDatagram(ctx context.Context, req StreamRequest) (DatagramStream, error) {
 	return f(ctx, req)
 }
 
@@ -171,6 +220,65 @@ func TestUDPAssociationMapsSourceAndExpiresIdleEntries(t *testing.T) {
 	}
 }
 
+func TestUDPAssociationUsesDatagramMessagesWithoutByteFraming(t *testing.T) {
+	d := newTestDatagram()
+	m, err := NewUDPAssociationManager(datagramOpenerFunc(func(_ context.Context, req StreamRequest) (DatagramStream, error) {
+		if req.Protocol != "udp" {
+			t.Fatalf("protocol=%q", req.Protocol)
+		}
+		return d, nil
+	}), UDPAssociationConfig{TargetHost: "service", TargetPort: 5353})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.HandleDatagram(context.Background(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.writes) != 1 || string(d.writes[0]) != "one" {
+		t.Fatalf("writes=%q", d.writes)
+	}
+}
+
+func TestUDPAssociationDoesNotHoldManagerLockWhileOpening(t *testing.T) {
+	started := make(chan StreamRequest, 2)
+	release := make(chan struct{})
+	d := newTestDatagram()
+	m, err := NewUDPAssociationManager(datagramOpenerFunc(func(_ context.Context, req StreamRequest) (DatagramStream, error) {
+		started <- req
+		<-release
+		return d, nil
+	}), UDPAssociationConfig{TargetHost: "service", TargetPort: 5353})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 2)
+	go func() {
+		done <- m.HandleDatagram(context.Background(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, []byte("one"))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first open did not start")
+	}
+	go func() {
+		done <- m.HandleDatagram(context.Background(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2}, []byte("two"))
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("second source was serialized behind first opener")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHTTPForwardUsesLogicalStream(t *testing.T) {
 	remote := newTestStream([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"))
 	fwd, err := NewHTTPForward(openerFunc(func(_ context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
@@ -202,6 +310,44 @@ func TestHTTPForwardUsesLogicalStream(t *testing.T) {
 	}
 }
 
+func TestHTTPForwardUpgradeBridgesRawBytes(t *testing.T) {
+	remote := newTestStream([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nremote-data"))
+	fwd, err := NewHTTPForward(openerFunc(func(_ context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
+		if req.Protocol != "http" {
+			t.Fatalf("protocol=%q", req.Protocol)
+		}
+		return remote, nil
+	}), HTTPForwardConfig{ListenAddr: "127.0.0.1:0", AgentID: "a", TargetHost: "service", TargetPort: 8080})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fwd.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer fwd.Close()
+	c, err := net.Dial("tcp", fwd.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, _ = io.WriteString(c, "GET /chat HTTP/1.1\r\nHost: service\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	var got strings.Builder
+	buf := make([]byte, 256)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			got.Write(buf[:n])
+			if strings.Contains(got.String(), "101 Switching Protocols") && strings.Contains(got.String(), "remote-data") {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestProxyStdioCopiesBytesBothDirections(t *testing.T) {
 	remote := newTestStream([]byte("from-remote"))
 	var out bytes.Buffer
@@ -211,6 +357,103 @@ func TestProxyStdioCopiesBytesBothDirections(t *testing.T) {
 	}
 	if string(remote.Written()) != "from-stdin" || out.String() != "from-remote" {
 		t.Fatalf("remote=%q out=%q", remote.Written(), out.String())
+	}
+}
+
+func TestProxyStdioNilContextAndEOFDoNotBlock(t *testing.T) {
+	remote := newTestStream(nil)
+	var out bytes.Buffer
+	if err := ProxyStdio(nil, strings.NewReader(""), &out, remote); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyStdioHalfClosesStreamAfterStdinEOF(t *testing.T) {
+	remote := &closeWriteStream{testStream: newTestStream([]byte("reply"))}
+	var out bytes.Buffer
+	if err := ProxyStdio(context.Background(), strings.NewReader("request"), &out, remote); err != nil {
+		t.Fatal(err)
+	}
+	remote.muClosedWrite.Lock()
+	closedWrite := remote.closedWrite
+	remote.muClosedWrite.Unlock()
+	if !closedWrite || out.String() != "reply" || string(remote.Written()) != "request" {
+		t.Fatalf("closeWrite=%v out=%q written=%q", closedWrite, out.String(), remote.Written())
+	}
+}
+
+func TestSessionStreamDrainsDataQueuedBeforeHalfCloseAndIncludesAgentID(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	s := NewSession(tr)
+	stream, err := s.OpenStreamConn(context.Background(), StreamRequest{AgentID: "agent-7", Protocol: "tcp", TargetHost: "h", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := <-tr.sent
+	var payload StreamOpenPayload
+	if err := json.Unmarshal(open.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.AgentID != "agent-7" {
+		t.Fatalf("agent id=%q", payload.AgentID)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: []byte("tail")}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: open.StreamID}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(stream, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tail" {
+		t.Fatalf("got=%q", got)
+	}
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal err=%v", err)
+	}
+}
+
+func TestSessionDatagramDrainsQueuedDataBeforeHalfClose(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	s := NewSession(tr)
+	ds, err := s.OpenDatagram(context.Background(), StreamRequest{Protocol: "udp", TargetHost: "h", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := <-tr.sent
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: []byte("datagram")}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: open.StreamID}
+	got, err := ds.ReadDatagram()
+	if err != nil || string(got) != "datagram" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	if _, err := ds.ReadDatagram(); !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal err=%v", err)
+	}
+}
+
+func TestSessionHalfCloseWriteKeepsRemoteResponseReadable(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 3), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	s := NewSession(tr)
+	stream, err := s.OpenStreamConn(context.Background(), StreamRequest{Protocol: "tcp", TargetHost: "h", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := <-tr.sent
+	if c, ok := stream.(interface{ CloseWrite() error }); !ok {
+		t.Fatal("stream does not expose directional half-close")
+	} else if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	closeFrame := <-tr.sent
+	if closeFrame.Type != protocol.FrameHalfClose {
+		t.Fatalf("frame=%+v", closeFrame)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: []byte("delayed-reply")}
+	got := make([]byte, len("delayed-reply"))
+	if _, err := io.ReadFull(stream, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "delayed-reply" {
+		t.Fatalf("got=%q", got)
 	}
 }
 

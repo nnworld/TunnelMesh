@@ -34,6 +34,7 @@ type TCPForward struct {
 	ln     *TCPListener
 	mu     sync.Mutex
 	closed bool
+	active map[net.Conn]struct{}
 }
 
 func NewTCPForward(opener StreamOpener, cfg TCPForwardConfig) (*TCPForward, error) {
@@ -46,7 +47,7 @@ func NewTCPForward(opener StreamOpener, cfg TCPForwardConfig) (*TCPForward, erro
 	if strings.TrimSpace(cfg.TargetHost) == "" || cfg.TargetPort < 1 || cfg.TargetPort > 65535 {
 		return nil, errors.New("client: target host and port required")
 	}
-	return &TCPForward{opener: opener, cfg: cfg}, nil
+	return &TCPForward{opener: opener, cfg: cfg, active: make(map[net.Conn]struct{})}, nil
 }
 
 func (f *TCPForward) Start(ctx context.Context) error {
@@ -84,11 +85,34 @@ func (f *TCPForward) Close() error {
 	ln := f.ln
 	f.mu.Unlock()
 	if ln != nil {
-		return ln.Close()
+		err := ln.Close()
+		f.mu.Lock()
+		active := make([]net.Conn, 0, len(f.active))
+		for conn := range f.active {
+			active = append(active, conn)
+		}
+		f.mu.Unlock()
+		for _, conn := range active {
+			_ = conn.Close()
+		}
+		return err
 	}
 	return nil
 }
 func (f *TCPForward) handleConn(local net.Conn) {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		_ = local.Close()
+		return
+	}
+	f.active[local] = struct{}{}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		delete(f.active, local)
+		f.mu.Unlock()
+	}()
 	defer local.Close()
 	ctx := context.Background()
 	var cancel context.CancelFunc
@@ -165,10 +189,11 @@ func (f *UDPForward) Start(ctx context.Context) error {
 }
 func (f *UDPForward) readLoop(ctx context.Context) {
 	buf := make([]byte, f.manager.cfg.MaxDatagram)
-	ticker := time.NewTicker(f.manager.cfg.IdleTimeout / 2)
-	if f.manager.cfg.IdleTimeout <= 0 {
-		ticker.Stop()
+	interval := f.manager.cfg.IdleTimeout / 2
+	if interval <= 0 {
+		interval = time.Nanosecond
 	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -303,9 +328,40 @@ func (f *HTTPForward) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tunnel write failed", http.StatusBadGateway)
 		return
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(stream), r)
+	br := bufio.NewReader(stream)
+	resp, err := http.ReadResponse(br, r)
 	if err != nil {
 		http.Error(w, "tunnel read failed", http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "upgrade unsupported", http.StatusHTTPVersionNotSupported)
+			return
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		if err := resp.Write(rw); err != nil {
+			_ = conn.Close()
+			return
+		}
+		_ = rw.Flush()
+		if n := br.Buffered(); n > 0 {
+			buffered, readErr := br.Peek(n)
+			if readErr == nil {
+				if _, writeErr := rw.Write(buffered); writeErr != nil {
+					_ = conn.Close()
+					return
+				}
+				_, _ = br.Discard(n)
+				_ = rw.Flush()
+			}
+		}
+		remote := &bufferedStream{Reader: br, Writer: stream, closer: stream}
+		_ = bridge(conn, remote)
 		return
 	}
 	defer resp.Body.Close()
@@ -322,26 +378,65 @@ func (f *HTTPForward) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // the remote response from being drained. Closing both endpoints after one
 // side reaches EOF provides deterministic cleanup for SSH/raw TCP clients.
 func bridge(a, b io.ReadWriteCloser) error {
-	results := make(chan error, 2)
+	results := make(chan copyResult, 2)
 	copyOne := func(dst io.Writer, src io.Reader, halfClose io.Writer) {
 		buf := make([]byte, 32<<10)
 		_, err := io.CopyBuffer(dst, src, buf)
+		halfClosed := false
 		if c, ok := halfClose.(interface{ CloseWrite() error }); ok {
-			_ = c.CloseWrite()
+			halfClosed = c.CloseWrite() == nil
 		}
-		results <- err
+		results <- copyResult{err: err, halfClosed: halfClosed}
 	}
 	go copyOne(a, b, a)
 	go copyOne(b, a, b)
 	first := <-results
-	second := <-results
+	if first.err != nil && !errors.Is(first.err, io.EOF) {
+		_ = a.Close()
+		_ = b.Close()
+		select {
+		case <-results:
+		case <-time.After(time.Second):
+		}
+		return first.err
+	}
+	if !first.halfClosed {
+		_ = a.Close()
+		_ = b.Close()
+		select {
+		case <-results:
+		case <-time.After(time.Second):
+		}
+		return first.err
+	}
+	var second copyResult
+	select {
+	case second = <-results:
+	case <-time.After(time.Second):
+		_ = a.Close()
+		_ = b.Close()
+		return first.err
+	}
 	_ = a.Close()
 	_ = b.Close()
-	if errors.Is(first, io.EOF) {
-		return second
+	if errors.Is(first.err, io.EOF) {
+		return second.err
 	}
-	return first
+	return first.err
 }
+
+type copyResult struct {
+	err        error
+	halfClosed bool
+}
+
+type bufferedStream struct {
+	io.Reader
+	io.Writer
+	closer io.Closer
+}
+
+func (s *bufferedStream) Close() error { return s.closer.Close() }
 
 type RetryConfig struct {
 	MaxAttempts int
