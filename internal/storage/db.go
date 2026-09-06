@@ -31,6 +31,7 @@ type DB struct {
 	policies    PolicyRepository
 	tunnels     TunnelRepository
 	nodes       NodeRepository
+	metadata    AgentMetadataRepository
 	leases      LeaseRepository
 	audits      AuditRepository
 	idempotency IdempotencyRepository
@@ -114,7 +115,7 @@ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
 }
 
 func newDB(db *sql.DB, driver string) *DB {
-	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, leases: NewLeaseRepositoryWithDriver(db, driver), audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
+	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, metadata: NewAgentMetadataRepositoryWithDriver(db, driver), leases: NewLeaseRepositoryWithDriver(db, driver), audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
 }
 
 func initializeSchema(ctx context.Context, db *sql.DB) error {
@@ -172,12 +173,14 @@ func (d *DB) SchemaVersion(ctx context.Context) (int, error) {
 	err := d.sql.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
 	return v, err
 }
-func (d *DB) Users() UserRepository              { return d.users }
-func (d *DB) Tokens() TokenRepository            { return d.tokens }
-func (d *DB) Agents() AgentRepository            { return d.agents }
-func (d *DB) Policies() PolicyRepository         { return d.policies }
-func (d *DB) Tunnels() TunnelRepository          { return d.tunnels }
-func (d *DB) Nodes() NodeRepository              { return d.nodes }
-func (d *DB) Leases() LeaseRepository            { return d.leases }
-func (d *DB) Audits() AuditRepository            { return d.audits }
-func (d *DB) Idempotency() IdempotencyRepository { return d.idempotency }
+func (d *DB) Users() UserRepository                  { return d.users }
+func (d *DB) Tokens() TokenRepository                { return d.tokens }
+func (d *DB) Agents() AgentRepository                { return d.agents }
+func (d *DB) Policies() PolicyRepository             { return d.policies }
+func (d *DB) Tunnels() TunnelRepository              { return d.tunnels }
+func (d *DB) Nodes() NodeRepository                  { return d.nodes }
+func (d *DB) Metadata() AgentMetadataRepository      { return d.metadata }
+func (d *DB) AgentMetadata() AgentMetadataRepository { return d.metadata }
+func (d *DB) Leases() LeaseRepository                { return d.leases }
+func (d *DB) Audits() AuditRepository                { return d.audits }
+func (d *DB) Idempotency() IdempotencyRepository     { return d.idempotency }

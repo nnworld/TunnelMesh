@@ -84,6 +84,19 @@ type ServerNode struct {
 	UpdatedAt  time.Time
 }
 
+type AgentRuntimeMetadata struct {
+	AgentID    string
+	NodeID     string
+	Epoch      int64
+	Revision   int64
+	Metadata   string
+	ReportedAt time.Time
+	LastSeenAt time.Time
+	ExpiresAt  *time.Time
+	Stale      bool
+	UpdatedAt  time.Time
+}
+
 type AgentLease struct {
 	AgentID    string
 	NodeID     string

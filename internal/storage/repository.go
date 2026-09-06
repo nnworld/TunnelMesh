@@ -60,6 +60,15 @@ type NodeRepository interface {
 	List(context.Context, string, int) (Page[ServerNode], error)
 }
 
+var ErrMetadataStale = errors.New("runtime metadata is stale")
+
+type AgentMetadataRepository interface {
+	Upsert(context.Context, AgentRuntimeMetadata) error
+	Get(context.Context, string) (AgentRuntimeMetadata, error)
+	List(context.Context, string, int) (Page[AgentRuntimeMetadata], error)
+	MarkStale(context.Context, string, int64) error
+}
+
 type LeaseRepository interface {
 	Acquire(context.Context, AgentLease) (AgentLease, error)
 	Renew(context.Context, string, int64, time.Duration) error
@@ -94,6 +103,15 @@ func NewAgentRepository(db *sql.DB) AgentRepository   { return &agentRepo{db} }
 func NewPolicyRepository(db *sql.DB) PolicyRepository { return &policyRepo{db} }
 func NewTunnelRepository(db *sql.DB) TunnelRepository { return &tunnelRepo{db} }
 func NewNodeRepository(db *sql.DB) NodeRepository     { return &nodeRepo{db} }
+func NewAgentMetadataRepository(db *sql.DB) AgentMetadataRepository {
+	return &agentMetadataRepo{db: db, driver: DriverSQLite}
+}
+func NewAgentMetadataRepositoryWithDriver(db *sql.DB, driver string) AgentMetadataRepository {
+	if strings.EqualFold(driver, "mysql") {
+		return &agentMetadataRepo{db: db, driver: DriverMySQL}
+	}
+	return &agentMetadataRepo{db: db, driver: DriverSQLite}
+}
 
 // NewLeaseRepository is retained for SQLite callers. MySQL callers must use
 // NewLeaseRepositoryWithDriver so row-lock fencing is enabled explicitly.
@@ -712,6 +730,114 @@ func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[Ser
 		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
 	}
 	return p, nil
+}
+
+type agentMetadataRepo struct {
+	db     *sql.DB
+	driver string
+}
+
+func (r *agentMetadataRepo) Upsert(ctx context.Context, v AgentRuntimeMetadata) error {
+	if v.AgentID == "" || v.NodeID == "" || v.Epoch <= 0 || v.Revision < 0 {
+		return errors.New("invalid runtime metadata identity")
+	}
+	if v.Metadata == "" {
+		v.Metadata = "{}"
+	}
+	now := time.Now().UTC()
+	if v.ReportedAt.IsZero() {
+		v.ReportedAt = now
+	}
+	if v.LastSeenAt.IsZero() {
+		v.LastSeenAt = now
+	}
+	if v.UpdatedAt.IsZero() {
+		v.UpdatedAt = now
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	selectSQL := `SELECT epoch,revision FROM agent_runtime_metadata WHERE agent_id=?`
+	if r.driver == DriverMySQL {
+		selectSQL += ` FOR UPDATE`
+	}
+	var epoch, revision int64
+	err = tx.QueryRowContext(ctx, selectSQL, v.AgentID).Scan(&epoch, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, v.AgentID, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt))
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if v.Epoch < epoch || (v.Epoch == epoch && v.Revision < revision) {
+		return ErrMetadataStale
+	}
+	if v.Epoch == epoch && v.Revision == revision {
+		return tx.Commit()
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE agent_runtime_metadata SET node_id=?,epoch=?,revision=?,metadata=?,reported_at=?,last_seen_at=?,expires_at=?,stale=?,updated_at=? WHERE agent_id=?`, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt), v.AgentID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (r *agentMetadataRepo) Get(ctx context.Context, id string) (AgentRuntimeMetadata, error) {
+	var v AgentRuntimeMetadata
+	var reported, seen, exp, updated sql.NullString
+	var stale int
+	err := r.db.QueryRowContext(ctx, `SELECT agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_runtime_metadata WHERE agent_id=?`, id).Scan(&v.AgentID, &v.NodeID, &v.Epoch, &v.Revision, &v.Metadata, &reported, &seen, &exp, &stale, &updated)
+	v.ReportedAt = parseTime(reported.String)
+	v.LastSeenAt = parseTime(seen.String)
+	v.ExpiresAt = parseTM(exp)
+	v.Stale = stale != 0
+	v.UpdatedAt = parseTime(updated.String)
+	return v, err
+}
+func (r *agentMetadataRepo) List(ctx context.Context, cursor string, limit int) (Page[AgentRuntimeMetadata], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	q := `SELECT agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_runtime_metadata`
+	args := []any{}
+	if c := decodeCursor(cursor); c != "" {
+		q += ` WHERE agent_id>?`
+		args = append(args, c)
+	}
+	q += ` ORDER BY agent_id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return Page[AgentRuntimeMetadata]{}, err
+	}
+	defer rows.Close()
+	page := Page[AgentRuntimeMetadata]{}
+	for rows.Next() {
+		var v AgentRuntimeMetadata
+		var reported, seen, exp, updated sql.NullString
+		var stale int
+		if err := rows.Scan(&v.AgentID, &v.NodeID, &v.Epoch, &v.Revision, &v.Metadata, &reported, &seen, &exp, &stale, &updated); err != nil {
+			return Page[AgentRuntimeMetadata]{}, err
+		}
+		v.ReportedAt, v.LastSeenAt, v.ExpiresAt, v.Stale, v.UpdatedAt = parseTime(reported.String), parseTime(seen.String), parseTM(exp), stale != 0, parseTime(updated.String)
+		page.Items = append(page.Items, v)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[AgentRuntimeMetadata]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].AgentID)
+	}
+	return page, nil
+}
+func (r *agentMetadataRepo) MarkStale(ctx context.Context, id string, epoch int64) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_metadata SET stale=1,updated_at=? WHERE agent_id=? AND epoch<=?`, tm(time.Now().UTC()), id, epoch)
+	return checkAffected(res, err)
 }
 
 type leaseRepo struct {

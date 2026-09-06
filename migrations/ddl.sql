@@ -96,6 +96,21 @@ CREATE TABLE IF NOT EXISTS agent_runtime_leases (
 );
 CREATE INDEX idx_agent_leases_node ON agent_runtime_leases(node_id);
 
+CREATE TABLE IF NOT EXISTS agent_runtime_metadata (
+    agent_id VARCHAR(255) PRIMARY KEY,
+    node_id VARCHAR(255) NOT NULL,
+    epoch INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    metadata TEXT NOT NULL,
+    reported_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    expires_at TEXT,
+    stale INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_agent_metadata_node ON agent_runtime_metadata(node_id);
+CREATE INDEX idx_agent_metadata_stale ON agent_runtime_metadata(stale, updated_at);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id VARCHAR(255) PRIMARY KEY,
     actor_user_id VARCHAR(255),
