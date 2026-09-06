@@ -1,7 +1,7 @@
 export type APIResponse<T> = { code: number; msg: string; data: T }
 
-export type Agent = { id: string; name: string; enabled: boolean; ownerUserId?: string; capabilities?: string }
-export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted?: boolean }
+export type Agent = { id: string; name: string; enabled: boolean; ownerUserId?: string; capabilities?: string[] }
+export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted: boolean }
 export type AgentMetadata = {
   agentId: string; nodeId: string; epoch: number; revision: number; stale: boolean
   reportedAt: string; updatedAt: string; items: AgentMetadataItem[]
