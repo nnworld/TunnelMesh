@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
@@ -151,8 +152,15 @@ func adminCommand(opts *rootOptions) *cobra.Command {
 func agentCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh agent", func(cmd *cobra.Command, cfg config.Config) error {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent ready in %s mode\n", cfg.Mode)
-			return nil
+			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" || strings.TrimSpace(cfg.Agent.ID) == "" {
+				return fmt.Errorf("agent run requires agent.server_url, agent.token, and agent.id")
+			}
+			nodeID := cfg.Node.ID
+			if strings.TrimSpace(nodeID) == "" {
+				nodeID = cfg.Agent.ID
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
+			return agent.RunWebSocket(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token, cfg.Agent.ID, nodeID, 1, agent.NewMetadataCollector(cfg.Agent.Metadata), nil)
 		}),
 		configCommand(opts, "register", "register this agent", func(cmd *cobra.Command, cfg config.Config) error {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent registration requested for %s\n", effectiveAgentID(cfg))

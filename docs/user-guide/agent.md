@@ -9,6 +9,7 @@ mode: local
 agent:
   server_url: wss://tunnel.example.com/ws/agent/v1
   id: agent-devbox
+# token is injected through the environment/Secret manager, not committed here
 ```
 
 也可以使用环境变量：
@@ -17,6 +18,7 @@ agent:
 export TUNNELMESH_MODE=local
 export TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1
 export TUNNELMESH_AGENT_ID=agent-devbox
+export TUNNELMESH_AGENT_TOKEN='api-token-from-secret-manager'
 ```
 
 配置优先级为：命令行参数 > 环境变量 > 配置文件 > 默认值。
@@ -114,7 +116,7 @@ Agent 容器通常不需要暴露端口。它只需要出站访问 Server 和目
 
 ### `check-config` 失败
 
-检查 `mode`、`agent.server_url` 和 `agent.id`，并确认配置文件格式正确。使用 `--config` 指向实际挂载路径。
+检查 `mode`、`agent.server_url`、`agent.id` 和 `agent.token`，并确认配置文件格式正确。使用 `--config` 指向实际挂载路径；token 只通过环境变量或 Secret manager 注入。
 
 ### Agent 一直离线
 

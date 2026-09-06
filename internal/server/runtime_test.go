@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,7 +13,9 @@ import (
 
 	"golang.org/x/net/websocket"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -164,6 +167,77 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
 	}
 	if envelope["data"] == nil {
 		t.Fatalf("metadata API response missing data: %v", envelope)
+	}
+}
+
+func TestServerRuntimeAcceptsRealAgentWebSocketClient(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-agent-client?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	user, err := authService.CreateUser(context.Background(), "agent-client-owner", "agent-client-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := authService.Login(context.Background(), user.Username, "agent-client-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(ctx context.Context, registration AgentRegistration) error {
+		_, err := authService.ValidateToken(ctx, registration.Token)
+		return err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(ctx, listener) }()
+
+	t.Setenv("TUNNELMESH_AGENT_REGION", "east")
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	agentErr := make(chan error, 1)
+	go func() {
+		agentErr <- agent.RunWebSocket(agentCtx, "ws://"+listener.Addr().String()+"/ws/agent", login.Token, "agent-client", "node-client", 1, agent.NewMetadataCollector([]config.MetadataSource{{Name: "region", Source: "env", Key: "TUNNELMESH_AGENT_REGION"}}), nil)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		metadata, getErr := db.Metadata().Get(context.Background(), "agent-client")
+		if getErr == nil && metadata.AgentID == "agent-client" {
+			if !bytes.Contains([]byte(metadata.Metadata), []byte(`"region"`)) {
+				t.Fatalf("metadata=%s", metadata.Metadata)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent metadata not persisted: metadata=%+v err=%v", metadata, getErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	agentCancel()
+	select {
+	case err := <-agentErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("agent error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent did not stop")
+	}
+	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("server error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
 	}
 }
 

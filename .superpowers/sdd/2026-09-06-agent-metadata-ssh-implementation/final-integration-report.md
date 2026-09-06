@@ -10,6 +10,7 @@
 - `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it wires the management API, embedded Web UI, and authenticated `/ws/agent` endpoint. The CLI now binds the configured HTTP address and shuts down gracefully with command context cancellation.
 - Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token. The CLI runtime validates that bearer through `AuthService.ValidateToken`; embedders can inject an equivalent `AgentSessionConfig.Authenticate` policy. Accepted hello frames persist metadata with a five-minute expiry by default.
 - The built-in HTTP listener does not terminate TLS; production deployments must use a reverse proxy or load balancer for HTTPS/WSS termination.
+- `tunnelmesh-agent run` now uses the configured `agent.server_url`, `agent.id`, `agent.token`, and allowlisted metadata collector to establish the authenticated binary WebSocket session. Missing URL, token, or identity fails fast; no unauthenticated fallback is provided.
 
 ## Schema compatibility
 

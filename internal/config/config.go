@@ -105,6 +105,7 @@ type TCPBridgeConfig struct {
 type AgentConfig struct {
 	ServerURL string           `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
 	ID        string           `mapstructure:"id" json:"id" yaml:"id"`
+	Token     string           `mapstructure:"token" json:"-" yaml:"-"`
 	Metadata  []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
 }
 
@@ -288,7 +289,7 @@ func bindEnvironment(v *viper.Viper) {
 		"storage.mysql.dsn", "storage.mysql.tls", "storage.mysql.ca", "storage.mysql.cert", "storage.mysql.key",
 		"registry.type", "registry.endpoints", "node.id", "server.http_addr", "server.https_addr",
 		"server.agent_ws_addr", "server.client_ws_addr", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
-		"agent.server_url", "agent.id", "client.server_url",
+		"agent.server_url", "agent.id", "agent.token", "client.server_url",
 	}
 	for _, key := range keys {
 		_ = v.BindEnv(key)

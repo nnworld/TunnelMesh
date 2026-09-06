@@ -138,3 +138,23 @@ func TestLoadDecodesAgentMetadataSources(t *testing.T) {
 		t.Fatalf("metadata = %+v", cfg.Agent.Metadata)
 	}
 }
+
+func TestLoadReadsAgentBearerTokenFromEnvironmentWithoutRedactionLeak(t *testing.T) {
+	t.Setenv("TUNNELMESH_AGENT_SERVER_URL", "wss://server.example/ws/agent")
+	t.Setenv("TUNNELMESH_AGENT_ID", "agent-1")
+	t.Setenv("TUNNELMESH_AGENT_TOKEN", "secret-token")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent.Token != "secret-token" {
+		t.Fatalf("agent token=%q", cfg.Agent.Token)
+	}
+	data, err := cfg.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "secret-token") {
+		t.Fatalf("redacted config leaked agent token: %s", data)
+	}
+}
