@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/server"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
@@ -72,6 +73,14 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 func serverCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh server", func(cmd *cobra.Command, cfg config.Config) error {
+			db, err := storage.OpenConfig(cmd.Context(), cfg.Storage)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			if _, err := server.NewServerRuntime(db, server.AgentSessionConfig{}); err != nil {
+				return err
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server ready in %s mode\n", cfg.Mode)
 			return nil
 		}),

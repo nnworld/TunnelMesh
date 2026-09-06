@@ -4,10 +4,57 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
+
+type blockingStaleRepo struct {
+	mu      sync.Mutex
+	value   storage.AgentRuntimeMetadata
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingStaleRepo) Upsert(_ context.Context, v storage.AgentRuntimeMetadata) error {
+	r.mu.Lock()
+	r.value = v
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *blockingStaleRepo) Get(context.Context, string) (storage.AgentRuntimeMetadata, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.value, nil
+}
+
+func (r *blockingStaleRepo) List(context.Context, string, int) (storage.Page[storage.AgentRuntimeMetadata], error) {
+	v, _ := r.Get(context.Background(), "")
+	return storage.Page[storage.AgentRuntimeMetadata]{Items: []storage.AgentRuntimeMetadata{v}}, nil
+}
+
+func (r *blockingStaleRepo) MarkStale(_ context.Context, _ string, _ int64) error {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-r.release
+	r.mu.Lock()
+	r.value.Stale = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *blockingStaleRepo) stale() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.value.Stale
+}
 
 type fakeTransport struct {
 	sent   chan protocol.Frame
@@ -154,6 +201,86 @@ func TestRegisterRejectsStaleEpoch(t *testing.T) {
 	_, _ = m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 4}, newFakeTransport())
 	if _, err := m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n2", Epoch: 3}, newFakeTransport()); !errors.Is(err, ErrEpoch) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRemoveSessionDoesNotStaleSameEpochReplacement(t *testing.T) {
+	repo := &blockingStaleRepo{started: make(chan struct{}), release: make(chan struct{})}
+	service := NewAgentMetadataService(repo)
+	if _, err := service.Upsert(context.Background(), AgentMetadataInput{
+		AgentID: "a", NodeID: "n", Epoch: 1, Revision: 1,
+		Items: []MetadataItem{{Name: "region", Source: "env", Value: "east"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewAgentSessionManager(AgentSessionConfig{MetadataService: service})
+	old, err := m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeDone := make(chan struct{})
+	go func() {
+		m.RemoveSession("a", old)
+		close(removeDone)
+	}()
+	select {
+	case <-repo.started:
+	case <-time.After(time.Second):
+		t.Fatal("stale marking did not start")
+	}
+	type registerResult struct {
+		session *AgentSession
+		err     error
+	}
+	replacementCh := make(chan registerResult, 1)
+	go func() {
+		s, err := m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, newFakeTransport())
+		replacementCh <- registerResult{session: s, err: err}
+	}()
+	select {
+	case <-replacementCh:
+		t.Fatal("replacement registered before stale fencing completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(repo.release)
+	select {
+	case <-removeDone:
+	case <-time.After(time.Second):
+		t.Fatal("session removal did not finish")
+	}
+	result := <-replacementCh
+	if result.err != nil {
+		t.Fatalf("replacement registration failed: %v", result.err)
+	}
+	replacement := result.session
+	ack, err := replacement.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{
+		AgentID: "a", NodeID: "n", Epoch: 1, Revision: 2,
+		Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "west"}},
+	})
+	if err != nil || !ack.Accepted {
+		t.Fatalf("replacement metadata ack=%+v err=%v", ack, err)
+	}
+	if repo.stale() {
+		t.Fatal("old session cleanup marked same-epoch replacement stale")
+	}
+}
+
+func TestNewAgentSessionManagerWithMetadataWiresPersistence(t *testing.T) {
+	repo := &fakeMetadataRepo{}
+	m := NewAgentSessionManagerWithMetadata(repo, AgentSessionConfig{})
+	s, err := m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := s.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{
+		AgentID: "a", NodeID: "n", Epoch: 1, Revision: 1,
+		Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}},
+	})
+	if err != nil || !ack.Accepted {
+		t.Fatalf("metadata ack=%+v err=%v", ack, err)
+	}
+	if repo.value.AgentID != "a" || repo.value.NodeID != "n" || repo.value.Epoch != 1 {
+		t.Fatalf("metadata was not persisted: %+v", repo.value)
 	}
 }
 

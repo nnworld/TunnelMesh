@@ -423,12 +423,15 @@ func (s *AgentSession) Close() error {
 func (m *AgentSessionManager) Remove(id string) {
 	m.mu.Lock()
 	s := m.sessions[id]
-	delete(m.sessions, id)
-	m.mu.Unlock()
 	if s != nil {
+		// Keep the manager lock while fencing metadata. Otherwise a same-epoch
+		// reconnect can register between map removal and MarkStale, allowing
+		// the old session's cleanup to stale the replacement snapshot.
 		_ = s.Close()
 		m.markMetadataStale(context.Background(), s)
+		delete(m.sessions, id)
 	}
+	m.mu.Unlock()
 }
 
 // RemoveSession removes only the expected current session. This prevents an
@@ -437,13 +440,15 @@ func (m *AgentSessionManager) RemoveSession(id string, expected *AgentSession) {
 	m.mu.Lock()
 	current := m.sessions[id]
 	if current == expected {
+		// Keep the manager lock through stale marking so a replacement cannot
+		// become visible until cleanup of the expected session is fenced.
+		if expected != nil {
+			_ = expected.Close()
+			m.markMetadataStale(context.Background(), expected)
+		}
 		delete(m.sessions, id)
 	}
 	m.mu.Unlock()
-	if current == expected && expected != nil {
-		_ = expected.Close()
-		m.markMetadataStale(context.Background(), expected)
-	}
 }
 
 func (m *AgentSessionManager) markMetadataStale(ctx context.Context, s *AgentSession) {

@@ -5,7 +5,9 @@
 - `AgentSessionConfig.MetadataService` now persists authenticated Agent metadata frames through `AgentMetadataService.Upsert`.
 - Agent and node identity are fenced against the authenticated session; revision overflow and service validation failures return structured ACK errors without closing the data session.
 - `ServeAgentSession` now uses the configured service path, so accepted frames are visible through the SQLite repository and `/api/v1/agents/{agentId}/metadata`.
-- Session replacement uses identity-aware cleanup: closing an old epoch cannot stale a newer replacement. Removing the current session marks its metadata stale.
+- Session replacement uses identity-aware cleanup: closing an old epoch cannot stale a newer replacement. Removing the current session marks its metadata stale while holding the manager lock, preventing a same-epoch reconnect from racing with stale marking.
+- `NewAgentSessionManagerWithMetadata` provides the production wiring point: server startup can pass `storage.DB.Metadata()` (or another repository) once, then reuse the manager for every `ServeAgentSession` call.
+- `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it opens the configured DB, constructs the metadata-backed Agent session manager, and leaves WebSocket serving to the existing transport integration.
 
 ## Schema compatibility
 
