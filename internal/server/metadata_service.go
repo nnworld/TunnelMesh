@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	maxMetadataFields = 32
-	maxMetadataBytes  = 32 << 10
+	maxMetadataFields    = 32
+	maxMetadataBytes     = 32 << 10
+	maxMetadataItemBytes = 4 << 10
 )
 
 type MetadataItem struct {
@@ -59,6 +60,9 @@ func (s *AgentMetadataService) Upsert(ctx context.Context, in AgentMetadataInput
 		}
 		if item.Source != "file" && item.Source != "env" {
 			return storage.AgentRuntimeMetadata{}, fmt.Errorf("invalid metadata source %q", item.Source)
+		}
+		if len([]byte(item.Value)) > maxMetadataItemBytes {
+			return storage.AgentRuntimeMetadata{}, fmt.Errorf("metadata field %q exceeds %d bytes", item.Name, maxMetadataItemBytes)
 		}
 		if sensitiveMetadataRE.MatchString(item.Name) {
 			item.Value = ""
@@ -108,7 +112,17 @@ func (s *AgentMetadataService) GetView(ctx context.Context, agentID string) (Age
 	return AgentMetadataView{AgentRuntimeMetadata: v, Items: envelope.Items}, nil
 }
 func (s *AgentMetadataService) List(ctx context.Context, cursor string, limit int) (storage.Page[storage.AgentRuntimeMetadata], error) {
-	return s.repo.List(ctx, cursor, limit)
+	page, err := s.repo.List(ctx, cursor, limit)
+	if err != nil {
+		return page, err
+	}
+	now := time.Now().UTC()
+	for i := range page.Items {
+		if page.Items[i].ExpiresAt != nil && now.After(*page.Items[i].ExpiresAt) {
+			page.Items[i].Stale = true
+		}
+	}
+	return page, nil
 }
 func (s *AgentMetadataService) MarkStale(ctx context.Context, agentID string, epoch int64) error {
 	return s.repo.MarkStale(ctx, agentID, epoch)

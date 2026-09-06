@@ -32,9 +32,27 @@ func TestAgentMetadataServiceRejectsInvalidSourceAndOversizedPayload(t *testing.
 	if _, err := svc.Upsert(context.Background(), AgentMetadataInput{AgentID: "a", NodeID: "n", Epoch: 1, Revision: 1, Items: []MetadataItem{{Name: "x", Source: "env", Value: strings.Repeat("x", 40<<10)}}}); err == nil {
 		t.Fatal("oversized metadata accepted")
 	}
+	if _, err := svc.Upsert(context.Background(), AgentMetadataInput{AgentID: "a", NodeID: "n", Epoch: 1, Revision: 1, Items: []MetadataItem{{Name: "x", Source: "env", Value: strings.Repeat("x", 4<<10+1)}}}); err == nil {
+		t.Fatal("oversized metadata field accepted")
+	}
 }
 
-type fakeMetadataRepo struct{ value storage.AgentRuntimeMetadata }
+func TestAgentMetadataServiceListComputesExpiryStale(t *testing.T) {
+	expired := time.Now().UTC().Add(-time.Minute)
+	repo := &fakeMetadataRepo{list: storage.Page[storage.AgentRuntimeMetadata]{Items: []storage.AgentRuntimeMetadata{{AgentID: "a", Metadata: `{"items":[]}`, ExpiresAt: &expired}}}}
+	page, err := NewAgentMetadataService(repo).List(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || !page.Items[0].Stale {
+		t.Fatalf("page=%+v", page)
+	}
+}
+
+type fakeMetadataRepo struct {
+	value storage.AgentRuntimeMetadata
+	list  storage.Page[storage.AgentRuntimeMetadata]
+}
 
 func (r *fakeMetadataRepo) Upsert(_ context.Context, v storage.AgentRuntimeMetadata) error {
 	r.value = v
@@ -43,7 +61,11 @@ func (r *fakeMetadataRepo) Upsert(_ context.Context, v storage.AgentRuntimeMetad
 func (r *fakeMetadataRepo) Get(context.Context, string) (storage.AgentRuntimeMetadata, error) {
 	return r.value, nil
 }
+
 func (r *fakeMetadataRepo) List(context.Context, string, int) (storage.Page[storage.AgentRuntimeMetadata], error) {
+	if r.list.Items != nil {
+		return r.list, nil
+	}
 	return storage.Page[storage.AgentRuntimeMetadata]{Items: []storage.AgentRuntimeMetadata{r.value}}, nil
 }
 func (r *fakeMetadataRepo) MarkStale(context.Context, string, int64) error {
