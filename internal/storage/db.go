@@ -17,7 +17,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 1
+	SchemaVersion = 2
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -93,11 +93,11 @@ func Open(ctx context.Context, driver, dsn string, autoInit bool) (*DB, error) {
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
 	if autoInit {
-		if err = initializeSchema(ctx, db); err != nil {
+		if err = initializeSchema(ctx, db, driver); err != nil {
 			db.Close()
 			return nil, err
 		}
-	} else if err = checkSchema(ctx, db); err != nil {
+	} else if err = checkSchema(ctx, db, driver); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func newDB(db *sql.DB, driver string) *DB {
 	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, metadata: NewAgentMetadataRepositoryWithDriver(db, driver), leases: NewLeaseRepositoryWithDriver(db, driver), audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
 }
 
-func initializeSchema(ctx context.Context, db *sql.DB) error {
+func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 	for _, stmt := range strings.Split(migrations.DDL, ";") {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
@@ -142,12 +142,20 @@ func initializeSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	if version != SchemaVersion {
+	if version > SchemaVersion || version < 1 {
 		return fmt.Errorf("%w: database has version %d, application requires version %d; run the migration tool", ErrSchemaVersionMismatch, version, SchemaVersion)
+	}
+	if version < SchemaVersion {
+		if _, err := db.ExecContext(ctx, `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+			return fmt.Errorf("migrate schema version: %w", err)
+		}
+	}
+	if err := requireSchemaTables(ctx, db, driver); err != nil {
+		return err
 	}
 	return nil
 }
-func checkSchema(ctx context.Context, db *sql.DB) error {
+func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 	var v int
 	err := db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
 	if err != nil {
@@ -155,6 +163,25 @@ func checkSchema(ctx context.Context, db *sql.DB) error {
 	}
 	if v != SchemaVersion {
 		return fmt.Errorf("%w: database has version %d, application requires version %d; run the migration tool", ErrSchemaVersionMismatch, v, SchemaVersion)
+	}
+	return requireSchemaTables(ctx, db, driver)
+}
+
+func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
+	for _, table := range []string{"schema_meta", "users", "agents", "agent_runtime_metadata"} {
+		var found string
+		var err error
+		if driver == DriverMySQL {
+			err = db.QueryRowContext(ctx, `SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?`, table).Scan(&found)
+		} else {
+			err = db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("schema is missing required table %s", table)
+		}
+		if err != nil {
+			return fmt.Errorf("check required table %s: %w", table, err)
+		}
 	}
 	return nil
 }

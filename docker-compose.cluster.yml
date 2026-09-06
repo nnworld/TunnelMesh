@@ -1,0 +1,61 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: tunnelmesh
+      MYSQL_USER: tunnelmesh
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+    volumes:
+      - tunnelmesh-mysql-data:/var/lib/mysql
+    restart: unless-stopped
+
+  server-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP: server
+    image: tunnelmesh:server-cluster
+    command: ["run"]
+    environment: &server-environment
+      TUNNELMESH_MODE: cluster
+      TUNNELMESH_STORAGE_DRIVER: mysql
+      TUNNELMESH_STORAGE_AUTO_INIT: ${TUNNELMESH_STORAGE_AUTO_INIT:-true}
+      TUNNELMESH_STORAGE_MYSQL_DSN: ${TUNNELMESH_STORAGE_MYSQL_DSN:?set a TLS MySQL DSN}
+      TUNNELMESH_STORAGE_MYSQL_TLS: "true"
+      TUNNELMESH_STORAGE_MYSQL_CA: /run/secrets/mysql-ca.pem
+      TUNNELMESH_NODE_ID: server-1
+      TUNNELMESH_REGISTRY_TYPE: ${TUNNELMESH_REGISTRY_TYPE:-database}
+      TUNNELMESH_REGISTRY_ENDPOINTS: ${TUNNELMESH_REGISTRY_ENDPOINTS:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/certs/mysql-ca.pem:/run/secrets/mysql-ca.pem:ro
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
+  server-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP: server
+    image: tunnelmesh:server-cluster
+    command: ["run"]
+    environment:
+      <<: *server-environment
+      TUNNELMESH_NODE_ID: server-2
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./deploy/certs/mysql-ca.pem:/run/secrets/mysql-ca.pem:ro
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
+volumes:
+  tunnelmesh-mysql-data:

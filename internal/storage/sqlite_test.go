@@ -39,6 +39,47 @@ func TestSQLiteAutoInitRejectsIncompatibleSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestSQLiteAutoInitMigratesSchemaV1ToCurrent(t *testing.T) {
+	dsn := "file:schema-v1-migrate?mode=memory&cache=shared"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,1)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	version, err := db.SchemaVersion(context.Background())
+	if err != nil || version != SchemaVersion {
+		t.Fatalf("version=%d err=%v, want %d", version, err, SchemaVersion)
+	}
+	if _, err := db.SQL().Exec(`INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,stale,updated_at) VALUES ('a','n',1,1,'{}','now','now',0,'now')`); err != nil {
+		t.Fatalf("metadata table unavailable after migration: %v", err)
+	}
+}
+
+func TestSQLiteAutoInitDisabledRejectsMissingRuntimeMetadataTable(t *testing.T) {
+	dsn := "file:schema-missing-metadata?mode=memory&cache=shared"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,2); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := OpenSQLite(context.Background(), dsn, false); err == nil || !strings.Contains(err.Error(), "agent_runtime_metadata") {
+		t.Fatalf("error=%v, want missing runtime metadata table", err)
+	}
+}
+
 func TestSQLiteConcurrentExpiredLeaseTakeoverHasSingleOwner(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

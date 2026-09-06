@@ -1,13 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"sync"
 	"testing"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 func TestMetadataManagerFencesIdentityEpochAndRevision(t *testing.T) {
@@ -32,6 +35,10 @@ func TestMetadataManagerFencesIdentityEpochAndRevision(t *testing.T) {
 	ack, err = session.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "other", Epoch: 4, Revision: 2})
 	if err != nil || ack.Accepted || len(ack.Errors) == 0 {
 		t.Fatalf("identity mismatch ack=%+v err=%v", ack, err)
+	}
+	ack, err = session.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "agent-1", NodeID: "other-node", Epoch: 4, Revision: 2})
+	if err != nil || ack.Accepted || len(ack.Errors) == 0 || ack.Errors[0].Name != "node_id" {
+		t.Fatalf("node identity mismatch ack=%+v err=%v", ack, err)
 	}
 	ack, err = session.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "agent-1", Epoch: 3, Revision: 2})
 	if err != nil || ack.Accepted || len(ack.Errors) == 0 {
@@ -78,6 +85,18 @@ func TestMetadataManagerRejectsZeroRevisionAndConflictingReplay(t *testing.T) {
 	}
 }
 
+func TestMetadataManagerRejectsStorageOverflowWithAckError(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{MetadataService: NewAgentMetadataService(&fakeMetadataRepo{})})
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-overflow", NodeID: "node-1", Epoch: 1}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := session.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "agent-overflow", Epoch: 1, Revision: ^uint64(0)})
+	if err != nil || ack.Accepted || len(ack.Errors) != 1 || ack.Errors[0].Code != "invalid_revision" {
+		t.Fatalf("ack=%+v err=%v", ack, err)
+	}
+}
+
 type metadataSessionWSConn struct {
 	mu     sync.Mutex
 	reads  [][]byte
@@ -121,5 +140,75 @@ func TestServeAgentSessionRemovesSessionAfterTransportEOF(t *testing.T) {
 	}
 	if len(conn.writes) != 0 {
 		t.Fatalf("unexpected writes: %d", len(conn.writes))
+	}
+}
+
+func TestServeAgentSessionPersistsMetadataAndFencesStaleLifecycle(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:metadata-session-integration?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewAgentMetadataService(db.Metadata())
+	manager := NewAgentSessionManager(AgentSessionConfig{MetadataService: service})
+	payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{
+		AgentID: "agent-integrated", NodeID: "node-a", Epoch: 1, Revision: 1,
+		Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame bytes.Buffer
+	if err := protocol.NewEncoder(&frame).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentMetadataUpdate, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &metadataSessionWSConn{reads: [][]byte{frame.Bytes()}}
+	if err := ServeAgentSession(context.Background(), manager, AgentRegistration{AgentID: "agent-integrated", NodeID: "node-a", Epoch: 1}, NewWSFrameTransport(conn), nil); err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.GetView(context.Background(), "agent-integrated")
+	if err != nil || len(view.Items) != 1 || view.Items[0].Value != "east" {
+		t.Fatalf("persisted metadata=%+v err=%v", view, err)
+	}
+	authService := auth.NewAuthService(db)
+	user, err := authService.CreateUser(context.Background(), "metadata-owner", "metadata-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "agent-integrated", Name: "integrated", OwnerUserID: user.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	login, err := authService.Login(context.Background(), user.Username, "metadata-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := apiJSON(t, NewAPI(db, authService).Handler(), "GET", "/api/v1/agents/agent-integrated/metadata?includeStale=true", login.Token, "", nil)
+	if response.Code != 200 || !bytes.Contains(response.Body.Bytes(), []byte(`"region"`)) {
+		t.Fatalf("API metadata response status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	oldTransport := newFakeTransport()
+	old, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-integrated", NodeID: "node-a", Epoch: 1}, oldTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack, err := old.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "agent-integrated", NodeID: "node-a", Epoch: 1, Revision: 2, Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}}}); err != nil || !ack.Accepted {
+		t.Fatalf("refresh ack=%+v err=%v", ack, err)
+	}
+	// A newer registration replaces the previous owner. Its cleanup must not
+	// mark the replacement's metadata stale.
+	newSession, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-integrated", NodeID: "node-b", Epoch: 2}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = old
+	current, err := service.Get(context.Background(), "agent-integrated")
+	if err != nil || current.Stale {
+		t.Fatalf("replacement unexpectedly stale: %+v err=%v", current, err)
+	}
+	manager.RemoveSession("agent-integrated", newSession)
+	current, err = service.Get(context.Background(), "agent-integrated")
+	if err != nil || !current.Stale {
+		t.Fatalf("disconnect did not mark stale: %+v err=%v", current, err)
 	}
 }

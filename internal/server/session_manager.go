@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +42,7 @@ type AgentSessionConfig struct {
 	QueueSize             int
 	Authenticate          func(context.Context, AgentRegistration) error
 	MetadataCallback      MetadataCallback
+	MetadataService       *AgentMetadataService
 }
 
 type AgentSession struct {
@@ -55,6 +58,7 @@ type AgentSession struct {
 	metadataRevision uint64
 	metadataDigest   string
 	metadataCallback MetadataCallback
+	metadataService  *AgentMetadataService
 	queue            chan protocol.Frame
 	slots            chan struct{}
 	stop             chan struct{}
@@ -110,7 +114,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 			}
 		}
 	}
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, registration: req, metadataCallback: m.cfg.MetadataCallback, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
 	go s.writer()
 	m.mu.Lock()
 	old := m.sessions[req.AgentID]
@@ -150,6 +154,11 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "agent_id", Code: "identity_mismatch", Message: "agent identity does not match authenticated session"})
 		return ack, nil
 	}
+	if payload.NodeID != "" && payload.NodeID != s.NodeID {
+		s.metadataMu.Unlock()
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "node_id", Code: "identity_mismatch", Message: "node identity does not match authenticated session"})
+		return ack, nil
+	}
 	if payload.Epoch != s.Epoch {
 		s.metadataMu.Unlock()
 		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "epoch", Code: "stale_epoch", Message: "metadata epoch does not match authenticated session"})
@@ -176,6 +185,9 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 	if callback := s.managerMetadataCallback(); callback != nil {
 		callbackErrors = callback(ctx, s.registration, payload)
 	}
+	if len(callbackErrors) == 0 {
+		callbackErrors = s.persistMetadata(ctx, payload)
+	}
 	s.metadataMu.Lock()
 	defer s.metadataMu.Unlock()
 	if s.isTerminal() {
@@ -198,6 +210,35 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 	s.metadataDigest = digest
 	ack.Accepted = true
 	return ack, nil
+}
+
+func (s *AgentSession) persistMetadata(ctx context.Context, payload protocol.AgentMetadataPayload) []protocol.AgentMetadataError {
+	if s == nil || s.metadataService == nil {
+		return nil
+	}
+	if payload.Revision > math.MaxInt64 {
+		return []protocol.AgentMetadataError{{Name: "revision", Code: "invalid_revision", Message: "metadata revision exceeds storage range"}}
+	}
+	nodeID := payload.NodeID
+	if nodeID == "" {
+		nodeID = s.NodeID
+	}
+	items := make([]MetadataItem, len(payload.Items))
+	for i, item := range payload.Items {
+		items[i] = MetadataItem{Name: item.Name, Source: item.Source, Value: item.Value}
+	}
+	_, err := s.metadataService.Upsert(ctx, AgentMetadataInput{AgentID: s.AgentID, NodeID: nodeID, Epoch: s.Epoch, Revision: int64(payload.Revision), ReportedAt: payload.ReportedAt, Items: items})
+	if err == nil {
+		return nil
+	}
+	return []protocol.AgentMetadataError{{Name: "metadata", Code: "invalid_metadata", Message: safeMetadataError(err)}}
+}
+
+func safeMetadataError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("metadata rejected: %v", err)
 }
 
 func metadataDigest(payload protocol.AgentMetadataPayload) string {
@@ -386,6 +427,7 @@ func (m *AgentSessionManager) Remove(id string) {
 	m.mu.Unlock()
 	if s != nil {
 		_ = s.Close()
+		m.markMetadataStale(context.Background(), s)
 	}
 }
 
@@ -400,7 +442,15 @@ func (m *AgentSessionManager) RemoveSession(id string, expected *AgentSession) {
 	m.mu.Unlock()
 	if current == expected && expected != nil {
 		_ = expected.Close()
+		m.markMetadataStale(context.Background(), expected)
 	}
+}
+
+func (m *AgentSessionManager) markMetadataStale(ctx context.Context, s *AgentSession) {
+	if m == nil || s == nil || m.cfg.MetadataService == nil {
+		return
+	}
+	_ = m.cfg.MetadataService.MarkStale(ctx, s.AgentID, s.Epoch)
 }
 
 type StreamOpenRequest struct {
