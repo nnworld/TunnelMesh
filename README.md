@@ -1,7 +1,9 @@
 # TunnelMesh
 
-TunnelMesh is a Go platform for authenticated Agent tunnels, local client
-forwarding, managed HTTP routes, and TCP-over-WebSocket access.
+TunnelMesh is a Go platform for authenticated Agent tunnels, controlled Agent
+metadata, local TCP/UDP/HTTP forwarding, managed HTTP/HTTPS/WebSocket routes,
+and TCP-over-WebSocket SSH access. Public Server exposure remains HTTP/HTTPS;
+public UDP is not supported.
 
 The repository ships three commands:
 
@@ -48,3 +50,9 @@ docker build --build-arg APP=server -t tunnelmesh:server .
 docker build --build-arg APP=agent -t tunnelmesh:agent .
 docker build --build-arg APP=client -t tunnelmesh:client .
 ```
+
+The client supports `forward tcp`, `forward udp`, `forward http`, `publish
+http`, and `proxy tcp`. Agents only read metadata from explicit `file` or `env`
+allowlist entries; they do not execute arbitrary commands. SSH public-key or
+`ssh-agent` authentication remains on the target host, and remote command exit
+codes are returned by SSH itself.
