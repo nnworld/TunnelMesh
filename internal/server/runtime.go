@@ -35,7 +35,27 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig) (*ServerRuntime, e
 		return nil, ErrRuntimeDatabaseRequired
 	}
 	authService := auth.NewAuthService(db)
+	if cfg.Authenticate == nil {
+		cfg.Authenticate = func(ctx context.Context, registration AgentRegistration) error {
+			return authenticateAgent(ctx, db, authService, registration)
+		}
+	}
 	return &ServerRuntime{DB: db, AgentSessions: NewAgentSessionManagerWithMetadata(db.Metadata(), cfg), API: NewAPI(db, authService), Auth: authService, sessionConfig: cfg}, nil
+}
+
+func authenticateAgent(ctx context.Context, db *storage.DB, authService *auth.AuthService, registration AgentRegistration) error {
+	principal, err := authService.ValidateToken(ctx, registration.Token)
+	if err != nil {
+		return err
+	}
+	configured, err := db.Agents().Get(ctx, registration.AgentID)
+	if err != nil || !configured.Enabled {
+		return auth.ErrForbidden
+	}
+	if principal.Role != "admin" && configured.OwnerUserID != principal.UserID {
+		return auth.ErrForbidden
+	}
+	return nil
 }
 
 // Handler exposes management API, embedded web assets, and the Agent WebSocket

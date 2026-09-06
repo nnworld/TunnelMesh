@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/websocket"
 
@@ -20,10 +22,22 @@ var (
 	ErrAgentSessionClosed     = errors.New("agent: session closed")
 )
 
+// WebSocketRunOptions controls reconnect pacing. Zero values use bounded
+// production defaults with jitter.
+type WebSocketRunOptions struct {
+	BaseBackoff time.Duration
+	MaxBackoff  time.Duration
+	Rand        *rand.Rand
+}
+
 // RunWebSocket dials the configured Server, authenticates with a bearer token,
-// reports metadata through the existing Session, and processes server frames
-// until the context is cancelled or the connection closes.
+// reports metadata through the existing Session, and reconnects with bounded
+// exponential backoff until the context is cancelled.
 func RunWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string, epoch int64, collector *MetadataCollector, onFrame func(protocol.Frame) error) error {
+	return RunWebSocketWithOptions(ctx, serverURL, token, agentID, nodeID, epoch, collector, onFrame, WebSocketRunOptions{})
+}
+
+func RunWebSocketWithOptions(ctx context.Context, serverURL, token, agentID, nodeID string, epoch int64, collector *MetadataCollector, onFrame func(protocol.Frame) error, options WebSocketRunOptions) error {
 	if strings.TrimSpace(serverURL) == "" {
 		return ErrAgentServerURLRequired
 	}
@@ -33,13 +47,52 @@ func RunWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string,
 	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(nodeID) == "" || epoch <= 0 {
 		return ErrAgentIdentityRequired
 	}
-	transport, err := DialWebSocket(ctx, serverURL, token)
-	if err != nil {
+	if _, err := parseWebSocketURL(serverURL); err != nil {
 		return err
 	}
-	session := NewSessionWithMetadata(transport, collector)
-	session.SetMetadataIdentity(agentID, nodeID, epoch)
-	return session.Run(ctx, onFrame)
+	base := options.BaseBackoff
+	if base <= 0 {
+		base = time.Second
+	}
+	max := options.MaxBackoff
+	if max <= 0 {
+		max = 30 * time.Second
+	}
+	rng := options.Rand
+	if rng == nil {
+		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	attempt, currentEpoch := 0, epoch
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		transport, err := DialWebSocket(ctx, serverURL, token)
+		if err == nil {
+			session := NewSessionWithMetadata(transport, collector)
+			session.BaseBackoff, session.MaxBackoff, session.Rand = base, max, rng
+			session.SetMetadataIdentity(agentID, nodeID, currentEpoch)
+			err = session.Run(ctx, onFrame)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			currentEpoch++
+		}
+		attempt++
+		delay := base
+		for i := 0; i < attempt-1 && delay < max; i++ {
+			delay *= 2
+		}
+		if delay > max {
+			delay = max
+		}
+		delay = time.Duration(float64(delay) * (0.8 + rng.Float64()*0.4))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 }
 
 // DialWebSocket creates the binary protocol transport used by Agent sessions.
@@ -48,10 +101,7 @@ func DialWebSocket(ctx context.Context, serverURL, token string) (FrameTransport
 	if strings.TrimSpace(token) == "" {
 		return nil, ErrAgentTokenRequired
 	}
-	u, err := url.Parse(serverURL)
-	if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
-		return nil, fmt.Errorf("agent: invalid websocket URL %q", serverURL)
-	}
+	u, err := parseWebSocketURL(serverURL)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -66,6 +116,14 @@ func DialWebSocket(ctx context.Context, serverURL, token string) (FrameTransport
 	}
 	conn.MaxPayloadBytes = protocol.MaxPayload
 	return &websocketFrameTransport{conn: conn}, nil
+}
+
+func parseWebSocketURL(serverURL string) (*url.URL, error) {
+	u, err := url.Parse(serverURL)
+	if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
+		return nil, fmt.Errorf("agent: invalid websocket URL %q", serverURL)
+	}
+	return u, nil
 }
 
 func originFor(u *url.URL) string {

@@ -99,6 +99,8 @@ Agent 主机必须满足：
 
 Agent WebSocket 握手还必须携带 `Authorization: Bearer <token>`。Server 使用同一套 API token 校验该凭据；无效或缺失 token 的连接会在 metadata hello 前被拒绝。请通过 Secret 管理系统注入 token，不要写入仓库或命令行历史。
 
+Token 还必须属于该 Agent 的 owner；管理员 token 可用于运维接管。被禁用或不存在的 Agent ID 会被拒绝。Agent 断线后会以带抖动的指数退避自动重连，并在每次连接发送新的完整 metadata hello。
+
 ## 7. Docker 运行
 
 ```bash

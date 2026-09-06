@@ -40,3 +40,4 @@
 - Task 6: complete (commits 91c9d17..6aa8cab, fix bd6e289; review clean)
 - Runtime integration residuals: complete (commits 512bf2e, dc49e0f, bearer-token validation and TLS deployment documentation)
 - Agent runtime client residual: complete (commit 26b239c; bearer-configured ws/wss dial, binary protocol transport, CLI run wiring, and end-to-end persistence coverage)
+- Reconnect and Agent ownership residual: complete (bounded backoff/jitter, epoch fencing, owner/admin token binding, and rejection coverage)

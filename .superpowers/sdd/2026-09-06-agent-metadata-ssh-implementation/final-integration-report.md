@@ -11,6 +11,8 @@
 - Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token. The CLI runtime validates that bearer through `AuthService.ValidateToken`; embedders can inject an equivalent `AgentSessionConfig.Authenticate` policy. Accepted hello frames persist metadata with a five-minute expiry by default.
 - The built-in HTTP listener does not terminate TLS; production deployments must use a reverse proxy or load balancer for HTTPS/WSS termination.
 - `tunnelmesh-agent run` now uses the configured `agent.server_url`, `agent.id`, `agent.token`, and allowlisted metadata collector to establish the authenticated binary WebSocket session. Missing URL, token, or identity fails fast; no unauthenticated fallback is provided.
+- Agent connections reconnect with bounded exponential backoff and jitter; each successful connection advances the metadata epoch and emits a fresh hello, so stale sessions cannot overwrite replacements.
+- Server bearer authentication is bound to the requested Agent ID: enabled Agents accept their owner's token or an admin token; unrelated users, disabled Agents, and unknown IDs are rejected.
 
 ## Schema compatibility
 

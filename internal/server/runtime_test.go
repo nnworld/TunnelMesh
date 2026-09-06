@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"testing"
@@ -26,7 +27,7 @@ func TestNewServerRuntimeWiresAgentMetadataPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(context.Context, AgentRegistration) error { return nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,13 +66,7 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(ctx context.Context, registration AgentRegistration) error {
-		if registration.Token == "" {
-			return ErrAuthentication
-		}
-		_, err := authService.ValidateToken(ctx, registration.Token)
-		return err
-	}})
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,10 +180,10 @@ func TestServerRuntimeAcceptsRealAgentWebSocketClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(ctx context.Context, registration AgentRegistration) error {
-		_, err := authService.ValidateToken(ctx, registration.Token)
-		return err
-	}})
+	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "agent-client", Name: "agent-client", OwnerUserID: user.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,6 +226,166 @@ func TestServerRuntimeAcceptsRealAgentWebSocketClient(t *testing.T) {
 		t.Fatal("agent did not stop")
 	}
 	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("server error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+func TestServerRuntimeBindsAgentTokenToEnabledOwner(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-agent-ownership?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(context.Background(), "ownership-owner", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := authService.CreateUser(context.Background(), "ownership-other", "other-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerLogin, err := authService.Login(context.Background(), owner.Username, "owner-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherLogin, err := authService.Login(context.Background(), other.Username, "other-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "owned-agent", Name: "owned-agent", OwnerUserID: owner.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "disabled-agent", Name: "disabled-agent", OwnerUserID: owner.ID, Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(ctx, listener) }()
+	defer func() {
+		cancel()
+		<-serveErr
+	}()
+
+	for _, tc := range []struct {
+		name, token, agentID string
+	}{
+		{name: "unrelated owner", token: otherLogin.Token, agentID: "owned-agent"},
+		{name: "disabled agent", token: ownerLogin.Token, agentID: "disabled-agent"},
+		{name: "missing agent", token: ownerLogin.Token, agentID: "missing-agent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wsURL := "ws://" + listener.Addr().String() + "/ws/agent"
+			config, err := websocket.NewConfig(wsURL, "http://"+listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.Header.Set("Authorization", "Bearer "+tc.token)
+			ws, err := websocket.DialConfig(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ws.Close()
+			payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{AgentID: tc.agentID, NodeID: "node", Epoch: 1, Revision: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := websocket.Message.Send(ws, frameBytes(t, protocol.FrameAgentHello, payload)); err != nil {
+				t.Fatal(err)
+			}
+			_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+			var rejected []byte
+			if err := websocket.Message.Receive(ws, &rejected); err == nil {
+				t.Fatal("unauthorized Agent unexpectedly received an acknowledgement")
+			}
+		})
+	}
+}
+
+func TestRealAgentReconnectsWithNewEpochAfterServerClosesSession(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-agent-reconnect?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	user, err := authService.CreateUser(context.Background(), "reconnect-owner", "reconnect-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "reconnect-agent", Name: "reconnect-agent", OwnerUserID: user.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	login, err := authService.Login(context.Background(), user.Username, "reconnect-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(serverCtx, listener) }()
+
+	t.Setenv("TUNNELMESH_RECONNECT_REGION", "east")
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	agentErr := make(chan error, 1)
+	go func() {
+		agentErr <- agent.RunWebSocketWithOptions(agentCtx, "ws://"+listener.Addr().String()+"/ws/agent", login.Token, "reconnect-agent", "node-reconnect", 1, agent.NewMetadataCollector([]config.MetadataSource{{Name: "region", Source: "env", Key: "TUNNELMESH_RECONNECT_REGION"}}), nil, agent.WebSocketRunOptions{BaseBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond, Rand: rand.New(rand.NewSource(1))})
+	}()
+	waitForEpoch := func(want int64) storage.AgentRuntimeMetadata {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			metadata, getErr := db.Metadata().Get(context.Background(), "reconnect-agent")
+			if getErr == nil && metadata.Epoch >= want {
+				return metadata
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("metadata epoch=%d err=%v, want >=%d", metadata.Epoch, getErr, want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	first := waitForEpoch(1)
+	if first.Epoch != 1 {
+		t.Fatalf("first epoch=%d", first.Epoch)
+	}
+	runtime.AgentSessions.Remove("reconnect-agent")
+	second := waitForEpoch(2)
+	if second.Epoch != 2 || second.Stale {
+		t.Fatalf("reconnect metadata=%+v", second)
+	}
+	agentCancel()
+	select {
+	case err := <-agentErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("agent error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent did not stop")
+	}
+	serverCancel()
 	select {
 	case err := <-serveErr:
 		if err != nil {
