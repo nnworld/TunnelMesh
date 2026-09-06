@@ -12,9 +12,15 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
-type metadataTestTransport struct{ closed bool }
+type metadataTestTransport struct {
+	closed bool
+	sent   []protocol.Frame
+}
 
-func (t *metadataTestTransport) Send(protocol.Frame) error { return nil }
+func (t *metadataTestTransport) Send(frame protocol.Frame) error {
+	t.sent = append(t.sent, frame)
+	return nil
+}
 func (t *metadataTestTransport) Receive() (protocol.Frame, error) {
 	return protocol.Frame{}, errors.New("not used")
 }
@@ -69,6 +75,47 @@ func TestSessionMetadataErrorsDoNotCloseTransport(t *testing.T) {
 	}
 	if transport.closed {
 		t.Fatal("metadata collection closed the active session transport")
+	}
+}
+
+func TestSessionReportsHelloUpdatesAndReconnectSnapshot(t *testing.T) {
+	t.Setenv("TUNNELMESH_REGION", "cn-east")
+	transport := &metadataTestTransport{}
+	session := NewSessionWithMetadata(transport, NewMetadataCollector([]config.MetadataSource{{Name: "region", Source: "env", Key: "TUNNELMESH_REGION"}}))
+	session.SetMetadataIdentity("agent-1", "node-1", 8)
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(transport.sent) != 1 || transport.sent[0].Type != protocol.FrameAgentHello {
+		t.Fatalf("initial frames=%+v", transport.sent)
+	}
+	payload, err := protocol.DecodeAgentMetadataPayload(transport.sent[0].Payload)
+	if err != nil || payload.Revision != 1 || payload.AgentID != "agent-1" {
+		t.Fatalf("hello payload=%+v err=%v", payload, err)
+	}
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(transport.sent) != 1 {
+		t.Fatalf("unchanged snapshot emitted an update: %+v", transport.sent)
+	}
+	t.Setenv("TUNNELMESH_REGION", "cn-north")
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(transport.sent) != 2 || transport.sent[1].Type != protocol.FrameAgentMetadataUpdate {
+		t.Fatalf("changed frames=%+v", transport.sent)
+	}
+	updated, err := protocol.DecodeAgentMetadataPayload(transport.sent[1].Payload)
+	if err != nil || updated.Revision != 2 || updated.Items[0].Value != "cn-north" {
+		t.Fatalf("update payload=%+v err=%v", updated, err)
+	}
+	session.ResetMetadataReport()
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(transport.sent) != 3 || transport.sent[2].Type != protocol.FrameAgentHello {
+		t.Fatalf("reconnect frames=%+v", transport.sent)
 	}
 }
 

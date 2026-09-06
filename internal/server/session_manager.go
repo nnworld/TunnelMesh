@@ -19,6 +19,10 @@ var (
 	ErrCapability     = errors.New("session: unsupported capability")
 )
 
+// MetadataCallback applies server-side allowlist/policy checks. Returning
+// field errors keeps metadata failures isolated from normal data streams.
+type MetadataCallback func(context.Context, AgentRegistration, protocol.AgentMetadataPayload) []protocol.AgentMetadataError
+
 // FrameTransport is the small transport contract shared by WebSocket and
 // relay adapters. Implementations must serialize Send calls.
 type FrameTransport interface {
@@ -35,22 +39,27 @@ type AgentSessionConfig struct {
 	SupportedCapabilities []string
 	QueueSize             int
 	Authenticate          func(context.Context, AgentRegistration) error
+	MetadataCallback      MetadataCallback
 }
 
 type AgentSession struct {
-	AgentID, NodeID string
-	Epoch           int64
-	Capabilities    []string
-	transport       FrameTransport
-	mu              sync.RWMutex
-	closed          bool
-	lastHeartbeat   time.Time
-	queue           chan protocol.Frame
-	slots           chan struct{}
-	stop            chan struct{}
-	stopOnce        sync.Once
-	drain           chan chan struct{}
-	closing         bool
+	AgentID, NodeID  string
+	Epoch            int64
+	Capabilities     []string
+	transport        FrameTransport
+	mu               sync.RWMutex
+	closed           bool
+	lastHeartbeat    time.Time
+	registration     AgentRegistration
+	metadataMu       sync.Mutex
+	metadataRevision uint64
+	metadataCallback MetadataCallback
+	queue            chan protocol.Frame
+	slots            chan struct{}
+	stop             chan struct{}
+	stopOnce         sync.Once
+	drain            chan chan struct{}
+	closing          bool
 }
 
 func (s *AgentSession) Supports(capability string) bool {
@@ -100,7 +109,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 			}
 		}
 	}
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, registration: req, metadataCallback: m.cfg.MetadataCallback, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
 	go s.writer()
 	m.mu.Lock()
 	old := m.sessions[req.AgentID]
@@ -115,6 +124,83 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 		_ = old.Close()
 	}
 	return s, nil
+}
+
+// HandleMetadata fences an authenticated Agent's metadata by identity, epoch,
+// and monotonically increasing revision. Equal revisions are idempotent.
+func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.AgentMetadataPayload) (protocol.AgentMetadataAckPayload, error) {
+	if s == nil {
+		return protocol.AgentMetadataAckPayload{}, ErrSessionClosed
+	}
+	ack := protocol.AgentMetadataAckPayload{AgentID: s.AgentID, Epoch: s.Epoch, Revision: payload.Revision}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	if s.closed || s.closing {
+		return ack, ErrSessionClosed
+	}
+	if payload.AgentID != s.AgentID {
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "agent_id", Code: "identity_mismatch", Message: "agent identity does not match authenticated session"})
+		return ack, nil
+	}
+	if payload.Epoch != s.Epoch {
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "epoch", Code: "stale_epoch", Message: "metadata epoch does not match authenticated session"})
+		return ack, nil
+	}
+	if payload.Revision < s.metadataRevision {
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "revision", Code: "stale_revision", Message: "metadata revision is older than the accepted revision"})
+		return ack, nil
+	}
+	if payload.Revision == s.metadataRevision {
+		ack.Accepted = true
+		ack.Idempotent = true
+		return ack, nil
+	}
+	if callback := s.managerMetadataCallback(); callback != nil {
+		errors := callback(ctx, s.registration, payload)
+		if len(errors) > 0 {
+			ack.Errors = append(ack.Errors, errors...)
+			return ack, nil
+		}
+	}
+	s.metadataRevision = payload.Revision
+	ack.Accepted = true
+	return ack, nil
+}
+
+func (s *AgentSession) managerMetadataCallback() MetadataCallback {
+	// The callback is copied onto the session at registration time so handling
+	// remains independent from manager map lifetime.
+	return s.metadataCallback
+}
+
+// HandleMetadataFrame decodes a bounded metadata control payload and returns
+// an ACK frame. Decode/policy errors become structured ACK errors where the
+// authenticated session is available; no stream is closed.
+func (s *AgentSession) HandleMetadataFrame(ctx context.Context, frame protocol.Frame) (protocol.Frame, error) {
+	if frame.Type != protocol.FrameAgentHello && frame.Type != protocol.FrameAgentMetadataUpdate {
+		return protocol.Frame{}, protocol.ErrInvalidFrame
+	}
+	payload, err := protocol.DecodeAgentMetadataPayload(frame.Payload)
+	if err != nil {
+		return protocol.Frame{}, err
+	}
+	ack, err := s.HandleMetadata(ctx, payload)
+	if err != nil {
+		return protocol.Frame{}, err
+	}
+	encoded, err := protocol.EncodeAgentMetadataAckPayload(ack)
+	if err != nil {
+		return protocol.Frame{}, err
+	}
+	return protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentMetadataAck, Payload: encoded}, nil
+}
+
+func (m *AgentSessionManager) HandleMetadata(ctx context.Context, id string, frame protocol.Frame) (protocol.Frame, error) {
+	s, ok := m.Get(id)
+	if !ok {
+		return protocol.Frame{}, ErrSessionClosed
+	}
+	return s.HandleMetadataFrame(ctx, frame)
 }
 func (m *AgentSessionManager) Get(id string) (*AgentSession, bool) {
 	m.mu.RLock()

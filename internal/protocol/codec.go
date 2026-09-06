@@ -98,6 +98,9 @@ func (d *Decoder) ReadFrame() (Frame, error) {
 	if n > uint32(effectiveMaxPayload) {
 		return Frame{}, ErrPayloadTooLarge
 	}
+	if isMetadataFrame(f.Type) && n > MaxMetadataPayload {
+		return Frame{}, ErrPayloadTooLarge
+	}
 	if n > 0 {
 		f.Payload = make([]byte, n)
 		if _, err := io.ReadFull(d.r, f.Payload); err != nil {

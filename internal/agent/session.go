@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,6 +178,12 @@ type FrameTransport interface {
 type Session struct {
 	transport               FrameTransport
 	metadataCollector       *MetadataCollector
+	metadataAgentID         string
+	metadataNodeID          string
+	metadataEpoch           int64
+	metadataRevision        uint64
+	metadataReported        bool
+	metadataSnapshot        MetadataSnapshot
 	closed                  atomic.Bool
 	BaseBackoff, MaxBackoff time.Duration
 	Rand                    *rand.Rand
@@ -194,6 +201,26 @@ func NewSessionWithMetadata(tr FrameTransport, collector *MetadataCollector) *Se
 	return session
 }
 
+// SetMetadataIdentity sets the authenticated identity attached to future
+// hello/update reports. It is safe to call before Run or ReportMetadata.
+func (s *Session) SetMetadataIdentity(agentID, nodeID string, epoch int64) {
+	if s == nil {
+		return
+	}
+	s.metadataAgentID = agentID
+	s.metadataNodeID = nodeID
+	s.metadataEpoch = epoch
+}
+
+// ResetMetadataReport forces the next report to be a complete hello, as is
+// required after a reconnect.
+func (s *Session) ResetMetadataReport() {
+	if s == nil {
+		return
+	}
+	s.metadataReported = false
+}
+
 // CollectMetadata reads the configured snapshot without changing session
 // state, allowing metadata errors to remain separate from data forwarding.
 func (s *Session) CollectMetadata(ctx context.Context) (MetadataSnapshot, error) {
@@ -202,10 +229,61 @@ func (s *Session) CollectMetadata(ctx context.Context) (MetadataSnapshot, error)
 	}
 	return s.metadataCollector.Collect(ctx)
 }
+
+// ReportMetadata collects and sends a full hello or changed snapshot. Field
+// errors are included in the control payload; they never close the session.
+func (s *Session) ReportMetadata(ctx context.Context) error {
+	if s == nil || s.metadataCollector == nil {
+		return nil
+	}
+	snapshot, err := s.metadataCollector.Collect(ctx)
+	if err != nil {
+		return err
+	}
+	if s.metadataReported && reflect.DeepEqual(s.metadataSnapshot.Fields, snapshot.Fields) && reflect.DeepEqual(s.metadataSnapshot.Errors, snapshot.Errors) {
+		return nil
+	}
+	s.metadataRevision++
+	payload := protocol.AgentMetadataPayload{
+		AgentID: s.metadataAgentID, NodeID: s.metadataNodeID, Epoch: s.metadataEpoch,
+		Revision: s.metadataRevision, ReportedAt: time.Now().UTC(),
+		Items:  make([]protocol.AgentMetadataItem, 0, len(snapshot.Fields)),
+		Errors: make([]protocol.AgentMetadataError, 0, len(snapshot.Errors)),
+	}
+	for _, field := range snapshot.Fields {
+		payload.Items = append(payload.Items, protocol.AgentMetadataItem{Name: field.Name, Source: field.Source, Value: field.Value})
+	}
+	for _, fieldErr := range snapshot.Errors {
+		payload.Errors = append(payload.Errors, protocol.AgentMetadataError{Name: fieldErr.Name, Code: "collection_error", Message: fieldErr.Error})
+	}
+	encoded, err := protocol.EncodeAgentMetadataPayload(payload)
+	if err != nil {
+		return err
+	}
+	frameType := protocol.FrameAgentMetadataUpdate
+	if !s.metadataReported {
+		frameType = protocol.FrameAgentHello
+	}
+	if err := s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: frameType, Payload: encoded}); err != nil {
+		return err
+	}
+	s.metadataSnapshot = snapshot
+	s.metadataReported = true
+	return nil
+}
+
+// SendMetadata is retained as an explicit transport-oriented alias for
+// callers that use the session as a reporting loop.
+func (s *Session) SendMetadata(ctx context.Context) error { return s.ReportMetadata(ctx) }
+
 func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) error {
 	if s == nil || s.transport == nil {
 		return context.Canceled
 	}
+	// Metadata is best-effort and isolated from the data stream. A collection
+	// or policy error must not prevent the authenticated session from serving
+	// TCP/UDP/HTTP frames.
+	_ = s.ReportMetadata(ctx)
 	defer s.Close()
 	done := make(chan struct{})
 	defer close(done)

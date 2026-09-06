@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"io"
 	"sync"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var ErrNonBinaryMessage = errors.New("websocket: binary message required")
@@ -61,4 +63,42 @@ func ServeAgentFrames(tr *WSFrameTransport, onFrame func(protocol.Frame) error) 
 			}
 		}
 	}
+}
+
+// ServeAgentSession registers an authenticated Agent and routes metadata
+// control frames through the fenced session manager while preserving the
+// existing callback path for stream frames.
+func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error) error {
+	if manager == nil || tr == nil {
+		return ErrSessionClosed
+	}
+	session, err := manager.Register(ctx, registration, tr)
+	if err != nil {
+		return err
+	}
+	return ServeAgentFrames(tr, func(frame protocol.Frame) error {
+		if frame.Type != protocol.FrameAgentHello && frame.Type != protocol.FrameAgentMetadataUpdate {
+			if onFrame != nil {
+				return onFrame(frame)
+			}
+			return nil
+		}
+		ack, err := session.HandleMetadataFrame(ctx, frame)
+		if err != nil {
+			// Decode/size failures cannot be safely attributed to a payload
+			// identity, but still receive a field-scoped ACK so the data session
+			// remains alive.
+			ackPayload := protocol.AgentMetadataAckPayload{
+				AgentID: registration.AgentID,
+				Epoch:   registration.Epoch,
+				Errors:  []protocol.AgentMetadataError{{Name: "payload", Code: "invalid_payload", Message: "metadata payload rejected"}},
+			}
+			encoded, encodeErr := protocol.EncodeAgentMetadataAckPayload(ackPayload)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentMetadataAck, Payload: encoded})
+		}
+		return tr.Send(ack)
+	})
 }

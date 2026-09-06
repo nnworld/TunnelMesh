@@ -5,8 +5,59 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestMetadataControlFramesRoundTripWithoutChangingStreamTypes(t *testing.T) {
+	if FrameAgentHello != 9 || FrameAgentMetadataUpdate != 10 || FrameAgentMetadataAck != 11 {
+		t.Fatalf("metadata frame values changed: hello=%d update=%d ack=%d", FrameAgentHello, FrameAgentMetadataUpdate, FrameAgentMetadataAck)
+	}
+	payload := AgentMetadataPayload{
+		AgentID: "agent-1", NodeID: "node-1", Epoch: 4, Revision: 7,
+		ReportedAt: time.Unix(1700000000, 0).UTC(),
+		Items:      []AgentMetadataItem{{Name: "region", Source: "env", Value: "cn-east"}},
+	}
+	encoded, err := EncodeAgentMetadataPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := Frame{Version: CurrentVersion, Type: FrameAgentHello, Payload: encoded}
+	var wire bytes.Buffer
+	if err := NewEncoder(&wire).WriteFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	gotFrame, err := NewDecoder(&wire).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeAgentMetadataPayload(gotFrame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentID != payload.AgentID || got.Epoch != payload.Epoch || got.Revision != payload.Revision || got.Items[0].Value != "cn-east" {
+		t.Fatalf("payload=%+v", got)
+	}
+}
+
+func TestMetadataPayloadRejectsUnknownControlAndOversizedBeforeJSON(t *testing.T) {
+	if err := (Frame{Version: CurrentVersion, Type: FrameType(250)}).Validate(); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("unknown type error = %v", err)
+	}
+	if _, err := DecodeAgentMetadataPayload([]byte(strings.Repeat("x", MaxMetadataPayload+1))); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("oversized metadata error = %v", err)
+	}
+	if _, err := DecodeAgentMetadataAckPayload([]byte(strings.Repeat("x", MaxMetadataPayload+1))); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("oversized ack error = %v", err)
+	}
+	var raw [16]byte
+	raw[0], raw[1] = CurrentVersion, byte(FrameAgentMetadataUpdate)
+	binary.BigEndian.PutUint32(raw[8:12], MaxMetadataPayload+1)
+	if _, err := NewDecoder(bytes.NewReader(raw[:])).ReadFrame(); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("oversized metadata frame error = %v", err)
+	}
+}
 
 func TestFrameRoundTrip(t *testing.T) {
 	in := Frame{Version: CurrentVersion, Type: FrameData, Flags: FlagFin, StreamID: 42, Window: 8192, Payload: []byte("hello")}
