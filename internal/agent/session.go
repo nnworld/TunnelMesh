@@ -177,6 +177,7 @@ type FrameTransport interface {
 }
 type Session struct {
 	transport               FrameTransport
+	metadataMu              sync.Mutex
 	metadataCollector       *MetadataCollector
 	metadataAgentID         string
 	metadataNodeID          string
@@ -207,6 +208,8 @@ func (s *Session) SetMetadataIdentity(agentID, nodeID string, epoch int64) {
 	if s == nil {
 		return
 	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
 	s.metadataAgentID = agentID
 	s.metadataNodeID = nodeID
 	s.metadataEpoch = epoch
@@ -218,6 +221,8 @@ func (s *Session) ResetMetadataReport() {
 	if s == nil {
 		return
 	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
 	s.metadataReported = false
 }
 
@@ -236,6 +241,8 @@ func (s *Session) ReportMetadata(ctx context.Context) error {
 	if s == nil || s.metadataCollector == nil {
 		return nil
 	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
 	snapshot, err := s.metadataCollector.Collect(ctx)
 	if err != nil {
 		return err

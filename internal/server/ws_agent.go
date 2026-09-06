@@ -76,6 +76,7 @@ func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, regist
 	if err != nil {
 		return err
 	}
+	defer manager.RemoveSession(registration.AgentID, session)
 	return ServeAgentFrames(tr, func(frame protocol.Frame) error {
 		if frame.Type != protocol.FrameAgentHello && frame.Type != protocol.FrameAgentMetadataUpdate {
 			if onFrame != nil {

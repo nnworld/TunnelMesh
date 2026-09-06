@@ -53,6 +53,7 @@ type AgentSession struct {
 	registration     AgentRegistration
 	metadataMu       sync.Mutex
 	metadataRevision uint64
+	metadataDigest   string
 	metadataCallback MetadataCallback
 	queue            chan protocol.Frame
 	slots            chan struct{}
@@ -133,38 +134,83 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 		return protocol.AgentMetadataAckPayload{}, ErrSessionClosed
 	}
 	ack := protocol.AgentMetadataAckPayload{AgentID: s.AgentID, Epoch: s.Epoch, Revision: payload.Revision}
+	digest := metadataDigest(payload)
 	s.metadataMu.Lock()
-	defer s.metadataMu.Unlock()
-	if s.closed || s.closing {
+	if s.isTerminal() {
+		s.metadataMu.Unlock()
 		return ack, ErrSessionClosed
 	}
+	if payload.Revision == 0 {
+		s.metadataMu.Unlock()
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "revision", Code: "invalid_revision", Message: "metadata revision must be positive"})
+		return ack, nil
+	}
 	if payload.AgentID != s.AgentID {
+		s.metadataMu.Unlock()
 		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "agent_id", Code: "identity_mismatch", Message: "agent identity does not match authenticated session"})
 		return ack, nil
 	}
 	if payload.Epoch != s.Epoch {
+		s.metadataMu.Unlock()
 		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "epoch", Code: "stale_epoch", Message: "metadata epoch does not match authenticated session"})
 		return ack, nil
 	}
 	if payload.Revision < s.metadataRevision {
+		s.metadataMu.Unlock()
 		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "revision", Code: "stale_revision", Message: "metadata revision is older than the accepted revision"})
 		return ack, nil
 	}
 	if payload.Revision == s.metadataRevision {
+		same := digest == s.metadataDigest
+		s.metadataMu.Unlock()
+		if !same {
+			ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "revision", Code: "revision_conflict", Message: "metadata revision already contains a different snapshot"})
+			return ack, nil
+		}
 		ack.Accepted = true
 		ack.Idempotent = true
 		return ack, nil
 	}
+	s.metadataMu.Unlock()
+	var callbackErrors []protocol.AgentMetadataError
 	if callback := s.managerMetadataCallback(); callback != nil {
-		errors := callback(ctx, s.registration, payload)
-		if len(errors) > 0 {
-			ack.Errors = append(ack.Errors, errors...)
+		callbackErrors = callback(ctx, s.registration, payload)
+	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	if s.isTerminal() {
+		return ack, ErrSessionClosed
+	}
+	if payload.Revision <= s.metadataRevision {
+		if payload.Revision == s.metadataRevision && digest == s.metadataDigest {
+			ack.Accepted = true
+			ack.Idempotent = true
 			return ack, nil
 		}
+		ack.Errors = append(ack.Errors, protocol.AgentMetadataError{Name: "revision", Code: "stale_revision", Message: "metadata revision was superseded"})
+		return ack, nil
+	}
+	if len(callbackErrors) > 0 {
+		ack.Errors = append(ack.Errors, callbackErrors...)
+		return ack, nil
 	}
 	s.metadataRevision = payload.Revision
+	s.metadataDigest = digest
 	ack.Accepted = true
 	return ack, nil
+}
+
+func metadataDigest(payload protocol.AgentMetadataPayload) string {
+	payload.ReportedAt = time.Time{}
+	encoded, _ := json.Marshal(payload)
+	return string(encoded)
+}
+
+func (s *AgentSession) isTerminal() bool {
+	s.mu.RLock()
+	terminal := s.closed || s.closing
+	s.mu.RUnlock()
+	return terminal
 }
 
 func (s *AgentSession) managerMetadataCallback() MetadataCallback {
@@ -308,24 +354,29 @@ func (s *AgentSession) writer() {
 	}
 }
 func (s *AgentSession) fail(_ error) {
+	s.metadataMu.Lock()
 	s.mu.Lock()
 	if !s.closed {
 		s.closed = true
 		s.closing = true
 	}
 	s.mu.Unlock()
+	s.metadataMu.Unlock()
 	s.stopOnce.Do(func() { close(s.stop) })
 	_ = s.transport.Close()
 }
 func (s *AgentSession) Close() error {
+	s.metadataMu.Lock()
 	s.mu.Lock()
 	if s.closed || s.closing {
 		s.mu.Unlock()
+		s.metadataMu.Unlock()
 		return nil
 	}
 	s.closed = true
 	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
+	s.metadataMu.Unlock()
 	return s.transport.Close()
 }
 func (m *AgentSessionManager) Remove(id string) {
@@ -335,6 +386,20 @@ func (m *AgentSessionManager) Remove(id string) {
 	m.mu.Unlock()
 	if s != nil {
 		_ = s.Close()
+	}
+}
+
+// RemoveSession removes only the expected current session. This prevents an
+// old WebSocket's EOF cleanup from deleting a newer reconnect for the same ID.
+func (m *AgentSessionManager) RemoveSession(id string, expected *AgentSession) {
+	m.mu.Lock()
+	current := m.sessions[id]
+	if current == expected {
+		delete(m.sessions, id)
+	}
+	m.mu.Unlock()
+	if current == expected && expected != nil {
+		_ = expected.Close()
 	}
 }
 

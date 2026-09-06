@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
@@ -117,6 +118,29 @@ func TestSessionReportsHelloUpdatesAndReconnectSnapshot(t *testing.T) {
 	if len(transport.sent) != 3 || transport.sent[2].Type != protocol.FrameAgentHello {
 		t.Fatalf("reconnect frames=%+v", transport.sent)
 	}
+}
+
+func TestSessionMetadataStateIsSafeDuringConcurrentReportingAndReset(t *testing.T) {
+	t.Setenv("TUNNELMESH_REGION", "cn-east")
+	session := NewSessionWithMetadata(&metadataTestTransport{}, NewMetadataCollector([]config.MetadataSource{{Name: "region", Source: "env", Key: "TUNNELMESH_REGION"}}))
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				switch worker {
+				case 0:
+					session.SetMetadataIdentity("agent", "node", int64(j+1))
+				case 1:
+					session.ResetMetadataReport()
+				case 2:
+					_ = session.ReportMetadata(context.Background())
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestMetadataCollectorRejectsFieldAndAggregateLimits(t *testing.T) {
