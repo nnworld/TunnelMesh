@@ -78,11 +78,12 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			if _, err := server.NewServerRuntime(db, server.AgentSessionConfig{}); err != nil {
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{})
+			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server ready in %s mode\n", cfg.Mode)
-			return nil
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server listening on %s in %s mode\n", cfg.Server.HTTPAddr, cfg.Mode)
+			return runtime.Serve(cmd.Context(), cfg.Server.HTTPAddr)
 		}),
 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")

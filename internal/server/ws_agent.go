@@ -69,6 +69,18 @@ func ServeAgentFrames(tr *WSFrameTransport, onFrame func(protocol.Frame) error) 
 // control frames through the fenced session manager while preserving the
 // existing callback path for stream frames.
 func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error) error {
+	return serveAgentSession(ctx, manager, registration, tr, nil, onFrame)
+}
+
+// ServeAgentSessionWithInitialFrame is used by WebSocket adapters that must
+// inspect the first hello frame to authenticate and derive the registration.
+// The frame is processed through the same metadata fencing path as all later
+// frames, then the session remains attached to the transport until EOF.
+func ServeAgentSessionWithInitialFrame(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial protocol.Frame, onFrame func(protocol.Frame) error) error {
+	return serveAgentSession(ctx, manager, registration, tr, &initial, onFrame)
+}
+
+func serveAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(protocol.Frame) error) error {
 	if manager == nil || tr == nil {
 		return ErrSessionClosed
 	}
@@ -77,7 +89,7 @@ func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, regist
 		return err
 	}
 	defer manager.RemoveSession(registration.AgentID, session)
-	return ServeAgentFrames(tr, func(frame protocol.Frame) error {
+	handle := func(frame protocol.Frame) error {
 		if frame.Type != protocol.FrameAgentHello && frame.Type != protocol.FrameAgentMetadataUpdate {
 			if onFrame != nil {
 				return onFrame(frame)
@@ -101,5 +113,11 @@ func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, regist
 			return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentMetadataAck, Payload: encoded})
 		}
 		return tr.Send(ack)
-	})
+	}
+	if initial != nil {
+		if err := handle(*initial); err != nil {
+			return err
+		}
+	}
+	return ServeAgentFrames(tr, handle)
 }

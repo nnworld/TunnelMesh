@@ -7,7 +7,8 @@
 - `ServeAgentSession` now uses the configured service path, so accepted frames are visible through the SQLite repository and `/api/v1/agents/{agentId}/metadata`.
 - Session replacement uses identity-aware cleanup: closing an old epoch cannot stale a newer replacement. Removing the current session marks its metadata stale while holding the manager lock, preventing a same-epoch reconnect from racing with stale marking.
 - `NewAgentSessionManagerWithMetadata` provides the production wiring point: server startup can pass `storage.DB.Metadata()` (or another repository) once, then reuse the manager for every `ServeAgentSession` call.
-- `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it opens the configured DB, constructs the metadata-backed Agent session manager, and leaves WebSocket serving to the existing transport integration.
+- `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it wires the management API, embedded Web UI, and authenticated `/ws/agent` endpoint. The CLI now binds the configured HTTP address and shuts down gracefully with command context cancellation.
+- Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token; deployments inject `AgentSessionConfig.Authenticate` to validate agent credentials. Accepted hello frames persist metadata with a five-minute expiry by default.
 
 ## Schema compatibility
 

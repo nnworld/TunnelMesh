@@ -40,6 +40,7 @@ type AgentRegistration struct {
 type AgentSessionConfig struct {
 	SupportedCapabilities []string
 	QueueSize             int
+	MetadataTTL           time.Duration
 	Authenticate          func(context.Context, AgentRegistration) error
 	MetadataCallback      MetadataCallback
 	MetadataService       *AgentMetadataService
@@ -59,6 +60,7 @@ type AgentSession struct {
 	metadataDigest   string
 	metadataCallback MetadataCallback
 	metadataService  *AgentMetadataService
+	metadataTTL      time.Duration
 	queue            chan protocol.Frame
 	slots            chan struct{}
 	stop             chan struct{}
@@ -91,6 +93,9 @@ func NewAgentSessionManager(cfg AgentSessionConfig) *AgentSessionManager {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 64
 	}
+	if cfg.MetadataTTL <= 0 {
+		cfg.MetadataTTL = 5 * time.Minute
+	}
 	return &AgentSessionManager{sessions: make(map[string]*AgentSession), cfg: cfg}
 }
 func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistration, tr FrameTransport) (*AgentSession, error) {
@@ -114,7 +119,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 			}
 		}
 	}
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
 	go s.writer()
 	m.mu.Lock()
 	old := m.sessions[req.AgentID]
@@ -227,12 +232,14 @@ func (s *AgentSession) persistMetadata(ctx context.Context, payload protocol.Age
 	for i, item := range payload.Items {
 		items[i] = MetadataItem{Name: item.Name, Source: item.Source, Value: item.Value}
 	}
-	_, err := s.metadataService.Upsert(ctx, AgentMetadataInput{AgentID: s.AgentID, NodeID: nodeID, Epoch: s.Epoch, Revision: int64(payload.Revision), ReportedAt: payload.ReportedAt, Items: items})
+	_, err := s.metadataService.Upsert(ctx, AgentMetadataInput{AgentID: s.AgentID, NodeID: nodeID, Epoch: s.Epoch, Revision: int64(payload.Revision), ReportedAt: payload.ReportedAt, ExpiresAt: timePtr(time.Now().UTC().Add(s.metadataTTL)), Items: items})
 	if err == nil {
 		return nil
 	}
 	return []protocol.AgentMetadataError{{Name: "metadata", Code: "invalid_metadata", Message: safeMetadataError(err)}}
 }
+
+func timePtr(v time.Time) *time.Time { return &v }
 
 func safeMetadataError(err error) string {
 	if err == nil {
