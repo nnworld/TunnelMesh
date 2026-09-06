@@ -127,6 +127,7 @@ func (c *MetadataCollector) limits() (int, int, int) {
 
 var collectorNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var collectorSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
+var errMetadataFieldTooLarge = errors.New("metadata field exceeds configured limit")
 
 func validateCollectorSource(source config.MetadataSource, seen map[string]struct{}) error {
 	if source.Name == "" || len(source.Name) > 64 || !collectorNamePattern.MatchString(source.Name) {
@@ -171,21 +172,22 @@ func readMetadataSource(ctx context.Context, source config.MetadataSource, maxBy
 		defer file.Close()
 		data, err = io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
 	case "env":
-		var ok bool
 		value, exists := os.LookupEnv(source.Key)
 		if !exists {
 			return "", errors.New("environment value is missing")
 		}
-		ok = true
-		if ok {
-			data = []byte(value)
+		// Check the string's byte length before converting it to a byte slice;
+		// oversized environment values must not trigger an avoidable copy.
+		if len(value) > maxBytes {
+			return "", errMetadataFieldTooLarge
 		}
+		data = []byte(value)
 	}
 	if err != nil {
 		return "", errors.New("source read failed")
 	}
 	if len(data) > maxBytes {
-		return "", fmt.Errorf("metadata field exceeds %d bytes", maxBytes)
+		return "", errMetadataFieldTooLarge
 	}
 	if !utf8.Valid(data) {
 		return "", errors.New("metadata value is not valid UTF-8")

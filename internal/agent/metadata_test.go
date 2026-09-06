@@ -93,6 +93,18 @@ func TestMetadataCollectorRejectsFieldAndAggregateLimits(t *testing.T) {
 	}
 }
 
+func TestOversizedEnvironmentValueIsRejectedBeforeCopy(t *testing.T) {
+	t.Setenv("TUNNELMESH_HUGE", strings.Repeat("x", DefaultMetadataFieldBytes+1))
+	source := config.MetadataSource{Name: "huge", Source: "env", Key: "TUNNELMESH_HUGE"}
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = readMetadataSource(context.Background(), source, DefaultMetadataFieldBytes)
+	})
+	t.Logf("oversized environment read allocations = %.2f", allocs)
+	if allocs > 1 {
+		t.Fatalf("oversized environment read allocated %.2f times; expected the value copy to be avoided", allocs)
+	}
+}
+
 func TestMetadataCollectorHonorsCancellationAndInvalidUTF8(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
