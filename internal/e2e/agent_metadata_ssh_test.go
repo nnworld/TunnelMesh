@@ -69,7 +69,7 @@ func (s *sshDuplex) CloseWriteCalled() bool {
 func TestAgentMetadataSSHByteIntegrityAndExitStatus(t *testing.T) {
 	sshHandshake := []byte("SSH-2.0-TunnelMeshTest\r\n")
 	remoteCommand := []byte{0, 0, 0, 20, 0, 0, 0, 4, 'e', 'x', 'e', 'c', 0, 0, 0, 0}
-	exitStatus := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	exitStatus := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42}
 	stream := newSSHDuplex(append([]byte("SSH-2.0-target\r\n"), exitStatus...))
 	var output bytes.Buffer
 	input := bytes.NewReader(append(append([]byte{}, sshHandshake...), remoteCommand...))
@@ -81,6 +81,9 @@ func TestAgentMetadataSSHByteIntegrityAndExitStatus(t *testing.T) {
 	}
 	if !bytes.Equal(output.Bytes(), append([]byte("SSH-2.0-target\r\n"), exitStatus...)) {
 		t.Fatalf("remote bytes changed in proxy: got %x", output.Bytes())
+	}
+	if output.Bytes()[len(output.Bytes())-1] != 42 {
+		t.Fatalf("nonzero SSH exit status was not preserved: %x", output.Bytes())
 	}
 	if !stream.CloseWriteCalled() {
 		t.Fatal("proxy did not propagate stdin EOF as a half-close")

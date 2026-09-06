@@ -37,10 +37,10 @@ ssh -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agen
 
 ```bash
 websocat --binary -B 65536 - \
-  'wss://8081-agent-id.apps.example.com'
+  'wss://agent-devbox-10-0-0-8-22.apps.example.com'
 ```
 
-`--binary` 保证 WebSocket 使用 binary message，`-B 65536` 控制缓冲区大小。实际 URL 需替换为你的显式路由或动态 wildcard 路由。
+`--binary` 保证 WebSocket 使用 binary message，`-B 65536` 控制缓冲区大小。动态 wildcard 的格式是 `<agent-id>-<ip-octet>-<ip-octet>-<ip-octet>-<ip-octet>-<port>.apps.example.com`，因此上例会访问 Agent `agent-devbox` 的 `10.0.0.8:22`。如果使用显式托管路由，请把 URL 替换为该路由配置的域名和路径（例如由 Server 管理 API 创建的 `ssh.example.com` route）。
 
 ## SSH ProxyCommand
 
@@ -48,13 +48,13 @@ websocat --binary -B 65536 - \
 Host tunnelmesh-agent
     HostName ignored-by-proxy
     User nami
-    ProxyCommand websocat --binary -B 65536 - "wss://8081-agent-id.apps.example.com"
+    ProxyCommand websocat --binary -B 65536 - "wss://agent-devbox-10-0-0-8-22.apps.example.com"
 ```
 
 也可以临时执行：
 
 ```bash
-ssh -o 'ProxyCommand=websocat --binary -B 65536 - wss://8081-agent-id.apps.example.com' \
+ssh -o 'ProxyCommand=websocat --binary -B 65536 - wss://agent-devbox-10-0-0-8-22.apps.example.com' \
   nami@ignored-by-proxy
 ```
 

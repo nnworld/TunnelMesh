@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 )
@@ -115,5 +116,33 @@ func TestTCPBridgeHandleBinaryAndLimit(t *testing.T) {
 	}
 	if conn.String() != "ssh" {
 		t.Fatalf("got %q", conn.String())
+	}
+}
+
+func TestTCPBridgeAuditIncludesUserAndTargetContext(t *testing.T) {
+	conn := &echoConn{closed: make(chan struct{})}
+	ws := &fakeWS{msgs: [][]byte{[]byte("ssh")}}
+	var events []TCPBridgeAuditEvent
+	h := &TCPBridgeHandler{
+		Resolver: routing.NewRouteResolver([]routing.Route{{Domain: "example.com", AgentID: "agent-ssh", TargetHost: "10.0.0.8", TargetPort: 22}}),
+		Opener:   bridgeOpener{conn: conn},
+		Audit: func(_ context.Context, event TCPBridgeAuditEvent) {
+			events = append(events, event)
+		},
+	}
+	ctx := withPrincipal(context.Background(), auth.Principal{UserID: "user-1", Username: "alice", Role: "user"})
+	if err := h.Handle(ctx, ws, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("audit events=%+v", events)
+	}
+	for _, event := range events {
+		if event.AgentID != "agent-ssh" || event.TargetHost != "10.0.0.8" || event.TargetPort != 22 || event.UserID != "user-1" || event.Username != "alice" {
+			t.Fatalf("audit context=%+v", event)
+		}
+	}
+	if events[0].Action != "tcp_proxy.open" || events[1].Action != "tcp_proxy.close" {
+		t.Fatalf("audit actions=%+v", events)
 	}
 }

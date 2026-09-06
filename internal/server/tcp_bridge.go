@@ -25,6 +25,19 @@ type WSUpgrader interface {
 	Upgrade(http.ResponseWriter, *http.Request) (WSConn, error)
 }
 
+// TCPBridgeAuditEvent carries connection metadata only. It deliberately has
+// no payload field so SSH bytes, credentials, and command contents cannot
+// enter audit records through the bridge hook.
+type TCPBridgeAuditEvent struct {
+	Action     string
+	UserID     string
+	Username   string
+	AgentID    string
+	TargetHost string
+	TargetPort int
+	Error      string
+}
+
 // TCPBridgeHandler maps exactly one WebSocket connection to one agent stream.
 // It is intended for raw SSH/websocat bytes and therefore never base64 encodes
 // or coalesces application messages.
@@ -34,6 +47,7 @@ type TCPBridgeHandler struct {
 	Upgrade  WSUpgrader
 	MaxBytes int64
 	Timeout  time.Duration
+	Audit    func(context.Context, TCPBridgeAuditEvent)
 }
 
 func (h *TCPBridgeHandler) maxBytes() int64 {
@@ -61,16 +75,20 @@ func (h *TCPBridgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
 	if err != nil {
+		h.emitAudit(ctx, "tcp_proxy.open", route, err)
 		http.Error(w, "target refused", http.StatusBadGateway)
 		return
 	}
+	h.emitAudit(ctx, "tcp_proxy.open", route, nil)
 	defer stream.Close()
 	ws, err := h.Upgrade.Upgrade(w, r)
 	if err != nil {
+		h.emitAudit(ctx, "tcp_proxy.close", route, err)
 		return
 	}
 	defer ws.Close()
-	_ = h.bridge(ctx, ws, stream)
+	err = h.bridge(ctx, ws, stream)
+	h.emitAudit(ctx, "tcp_proxy.close", route, err)
 }
 
 // Handle is useful to tests and adapters which already completed a WebSocket
@@ -90,10 +108,28 @@ func (h *TCPBridgeHandler) Handle(ctx context.Context, ws WSConn, host string) e
 	}
 	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
 	if err != nil {
+		h.emitAudit(ctx, "tcp_proxy.open", route, err)
 		return ErrBridgeRefused
 	}
+	h.emitAudit(ctx, "tcp_proxy.open", route, nil)
 	defer stream.Close()
-	return h.bridge(ctx, ws, stream)
+	err = h.bridge(ctx, ws, stream)
+	h.emitAudit(ctx, "tcp_proxy.close", route, err)
+	return err
+}
+
+func (h *TCPBridgeHandler) emitAudit(ctx context.Context, action string, route routing.Route, bridgeErr error) {
+	if h == nil || h.Audit == nil {
+		return
+	}
+	event := TCPBridgeAuditEvent{Action: action, AgentID: route.AgentID, TargetHost: route.TargetHost, TargetPort: route.TargetPort}
+	if p, ok := principalFromContext(ctx); ok {
+		event.UserID, event.Username = p.UserID, p.Username
+	}
+	if bridgeErr != nil {
+		event.Error = bridgeErr.Error()
+	}
+	h.Audit(ctx, event)
 }
 
 func (h *TCPBridgeHandler) bridge(ctx context.Context, ws WSConn, stream io.ReadWriteCloser) error {
