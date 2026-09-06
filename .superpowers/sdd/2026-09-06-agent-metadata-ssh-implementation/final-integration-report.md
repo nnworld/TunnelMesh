@@ -8,7 +8,8 @@
 - Session replacement uses identity-aware cleanup: closing an old epoch cannot stale a newer replacement. Removing the current session marks its metadata stale while holding the manager lock, preventing a same-epoch reconnect from racing with stale marking.
 - `NewAgentSessionManagerWithMetadata` provides the production wiring point: server startup can pass `storage.DB.Metadata()` (or another repository) once, then reuse the manager for every `ServeAgentSession` call.
 - `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it wires the management API, embedded Web UI, and authenticated `/ws/agent` endpoint. The CLI now binds the configured HTTP address and shuts down gracefully with command context cancellation.
-- Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token; deployments inject `AgentSessionConfig.Authenticate` to validate agent credentials. Accepted hello frames persist metadata with a five-minute expiry by default.
+- Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token. The CLI runtime validates that bearer through `AuthService.ValidateToken`; embedders can inject an equivalent `AgentSessionConfig.Authenticate` policy. Accepted hello frames persist metadata with a five-minute expiry by default.
+- The built-in HTTP listener does not terminate TLS; production deployments must use a reverse proxy or load balancer for HTTPS/WSS termination.
 
 ## Schema compatibility
 

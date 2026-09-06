@@ -55,6 +55,8 @@ docker run --rm \
 
 配置优先级仍为：命令行参数 > 环境变量 > 配置文件 > 默认值。容器内推荐使用环境变量或挂载只读配置文件。
 
+Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent WebSocket，但当前监听器本身不终止 TLS。生产部署必须在反向代理或负载均衡器处终止 HTTPS/WSS，再将受保护的内部 HTTP 连接转发到 Server；同时为 Agent 注入有效的 API bearer token。
+
 ## 安全与升级
 
 - 镜像以非 root 用户运行。

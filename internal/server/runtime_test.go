@@ -62,11 +62,12 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(_ context.Context, registration AgentRegistration) error {
-		if registration.Token != "agent-secret" {
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(ctx context.Context, registration AgentRegistration) error {
+		if registration.Token == "" {
 			return ErrAuthentication
 		}
-		return nil
+		_, err := authService.ValidateToken(ctx, registration.Token)
+		return err
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -95,21 +96,32 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.Header.Set("Authorization", "Bearer agent-secret")
+	payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{AgentID: "agent-ws", NodeID: "node-ws", Epoch: 1, Revision: 1, Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Header.Set("Authorization", "Bearer invalid-token")
+	invalidWS, err := websocket.DialConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := websocket.Message.Send(invalidWS, frameBytes(t, protocol.FrameAgentHello, payload)); err != nil {
+		t.Fatal(err)
+	}
+	_ = invalidWS.SetReadDeadline(time.Now().Add(time.Second))
+	var rejected []byte
+	if err := websocket.Message.Receive(invalidWS, &rejected); err == nil {
+		t.Fatal("invalid API token unexpectedly received an acknowledgement")
+	}
+	_ = invalidWS.Close()
+
+	config.Header.Set("Authorization", "Bearer "+login.Token)
 	ws, err := websocket.DialConfig(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{AgentID: "agent-ws", NodeID: "node-ws", Epoch: 1, Revision: 1, Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var frame bytes.Buffer
-	if err := protocol.NewEncoder(&frame).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentHello, Payload: payload}); err != nil {
-		t.Fatal(err)
-	}
-	if err := websocket.Message.Send(ws, frame.Bytes()); err != nil {
+	if err := websocket.Message.Send(ws, frameBytes(t, protocol.FrameAgentHello, payload)); err != nil {
 		t.Fatal(err)
 	}
 	var ackBytes []byte
@@ -153,4 +165,13 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
 	if envelope["data"] == nil {
 		t.Fatalf("metadata API response missing data: %v", envelope)
 	}
+}
+
+func frameBytes(t *testing.T, typ protocol.FrameType, payload []byte) []byte {
+	t.Helper()
+	var frame bytes.Buffer
+	if err := protocol.NewEncoder(&frame).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: typ, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	return frame.Bytes()
 }

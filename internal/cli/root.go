@@ -78,7 +78,16 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{})
+			authService := auth.NewAuthService(db)
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{
+				Authenticate: func(ctx context.Context, registration server.AgentRegistration) error {
+					if strings.TrimSpace(registration.Token) == "" {
+						return server.ErrAuthentication
+					}
+					_, err := authService.ValidateToken(ctx, registration.Token)
+					return err
+				},
+			})
 			if err != nil {
 				return err
 			}

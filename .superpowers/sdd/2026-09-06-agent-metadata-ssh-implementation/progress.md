@@ -38,3 +38,4 @@
 - Task 4: complete (commits 71b5d6c..7e34c1f, fix 9ea2368; review clean)
 - Task 5: complete (commits 9ea2368..db575b4, fix 91c9d17; review clean)
 - Task 6: complete (commits 91c9d17..6aa8cab, fix bd6e289; review clean)
+- Runtime integration residuals: complete (commits 512bf2e, dc49e0f, bearer-token validation and TLS deployment documentation)

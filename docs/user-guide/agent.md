@@ -95,6 +95,8 @@ Agent 主机必须满足：
 
 生产环境使用 `wss://`，不要关闭证书校验或把 Server 证书私钥放在 Agent 主机上。
 
+Agent WebSocket 握手还必须携带 `Authorization: Bearer <token>`。Server 使用同一套 API token 校验该凭据；无效或缺失 token 的连接会在 metadata hello 前被拒绝。请通过 Secret 管理系统注入 token，不要写入仓库或命令行历史。
+
 ## 7. Docker 运行
 
 ```bash
