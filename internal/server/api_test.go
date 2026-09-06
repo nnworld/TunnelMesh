@@ -52,6 +52,15 @@ func apiJSON(t *testing.T, h http.Handler, method, path, token, idem string, bod
 	return w
 }
 
+func apiToken(t *testing.T, api *API, username, password string) string {
+	t.Helper()
+	result, err := auth.NewAuthService(api.DB).Login(context.Background(), username, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result.Token
+}
+
 func TestAPIAuthAndRBAC(t *testing.T) {
 	api, _, user := apiTestServer(t)
 	h := api.Handler()

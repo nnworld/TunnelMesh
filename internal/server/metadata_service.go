@@ -22,7 +22,7 @@ type MetadataItem struct {
 	Name     string `json:"name"`
 	Source   string `json:"source"`
 	Value    string `json:"value,omitempty"`
-	Redacted bool   `json:"redacted,omitempty"`
+	Redacted bool   `json:"redacted"`
 }
 type AgentMetadataInput struct {
 	AgentID    string

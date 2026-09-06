@@ -36,6 +36,24 @@ paths:
     put: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
     patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/agents/{agentId}/metadata:
+    parameters:
+      - {name: agentId, in: path, required: true, schema: {type: string}}
+      - {$ref: '#/components/parameters/IncludeStale'}
+    get:
+      summary: Read the latest runtime metadata reported by an agent
+      description: Stale snapshots are omitted by default. Set includeStale=true to read the last stale snapshot marked with stale=true. Runtime metadata is read-only through this API.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Runtime metadata snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentMetadataEnvelope'
+        '401': {description: Unauthenticated}
+        '403': {description: Agent is not owned by the caller}
+        '404': {description: Agent or metadata snapshot not found, or snapshot is stale without includeStale=true}
   /api/v1/agents/{agentId}/policies:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     get: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}], responses: {'200': {description: Policies}}}
@@ -71,10 +89,37 @@ components:
   parameters:
     Cursor: {name: cursor, in: query, schema: {type: string}}
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+    IncludeStale: {name: includeStale, in: query, description: Include an expired or explicitly stale snapshot, schema: {type: boolean, default: false}}
     IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 255}}
   schemas:
     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
     LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
     AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
+    AgentMetadataEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/AgentMetadata'}
+    AgentMetadata:
+      type: object
+      required: [agentId, nodeId, epoch, revision, stale, reportedAt, updatedAt, items]
+      properties:
+        agentId: {type: string}
+        nodeId: {type: string}
+        epoch: {type: integer, format: int64}
+        revision: {type: integer, format: int64}
+        stale: {type: boolean}
+        reportedAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        items: {type: array, items: {$ref: '#/components/schemas/AgentMetadataItem'}}
+    AgentMetadataItem:
+      type: object
+      required: [name, source, redacted]
+      properties:
+        name: {type: string}
+        source: {type: string, enum: [file, env]}
+        value: {type: string, description: Omitted for redacted sensitive fields}
+        redacted: {type: boolean}
     PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
     TunnelRequest: {type: object, required: [agentId, targetHost, targetPort], properties: {agentId: {type: string}, protocol: {type: string}, domain: {type: string}, pathPrefix: {type: string}, targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, publicPort: {type: integer}, status: {type: string}, config: {type: object}}}

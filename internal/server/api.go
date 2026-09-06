@@ -39,6 +39,7 @@ type API struct {
 // for transport decoding, authorization, and response rendering.
 type apiService struct {
 	agents   storage.AgentRepository
+	metadata *AgentMetadataService
 	policies storage.PolicyRepository
 	tunnels  storage.TunnelRepository
 	audits   storage.AuditRepository
@@ -55,7 +56,7 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 	a := &API{DB: db, Auth: authService}
 	if db != nil {
 		a.users, a.agents, a.policies, a.tunnels, a.audits, a.idem = db.Users(), db.Agents(), db.Policies(), db.Tunnels(), db.Audits(), db.Idempotency()
-		a.service = &apiService{agents: a.agents, policies: a.policies, tunnels: a.tunnels, audits: a.audits}
+		a.service = &apiService{agents: a.agents, metadata: NewAgentMetadataService(db.Metadata()), policies: a.policies, tunnels: a.tunnels, audits: a.audits}
 	}
 	return a
 }
@@ -111,6 +112,12 @@ func (s *apiService) CreateTunnel(ctx context.Context, v storage.Tunnel) (storag
 }
 func (s *apiService) GetAgent(ctx context.Context, id string) (storage.Agent, error) {
 	return s.agents.Get(ctx, id)
+}
+func (s *apiService) GetAgentMetadataView(ctx context.Context, id string) (AgentMetadataView, error) {
+	if s == nil || s.metadata == nil {
+		return AgentMetadataView{}, errors.New("metadata service unavailable")
+	}
+	return s.metadata.GetView(ctx, id)
 }
 func (s *apiService) ListAgents(ctx context.Context, cursor string, limit int) (storage.Page[storage.Agent], error) {
 	return s.agents.List(ctx, cursor, limit)
@@ -283,6 +290,10 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 		return
 	}
 	id := parts[0]
+	if len(parts) >= 2 && parts[1] == "metadata" {
+		a.handleAgentMetadata(w, r, p, id)
+		return
+	}
 	if len(parts) >= 2 && parts[1] == "policies" {
 		a.handlePolicies(w, r, p, id, parts[2:])
 		return
@@ -339,6 +350,50 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+type agentMetadataResponse struct {
+	AgentID    string         `json:"agentId"`
+	NodeID     string         `json:"nodeId"`
+	Epoch      int64          `json:"epoch"`
+	Revision   int64          `json:"revision"`
+	Stale      bool           `json:"stale"`
+	ReportedAt time.Time      `json:"reportedAt"`
+	UpdatedAt  time.Time      `json:"updatedAt"`
+	Items      []MetadataItem `json:"items"`
+}
+
+func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth.Principal, agentID string) {
+	// Resolve and authorize the parent agent before looking up metadata so a
+	// caller cannot use metadata existence to probe another user's resources.
+	agent, err := a.service.GetAgent(r.Context(), agentID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if !isAdmin(p) && agent.OwnerUserID != p.UserID {
+		writeAPIError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	view, err := a.service.GetAgentMetadataView(r.Context(), agentID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if view.Stale && !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("includeStale")), "true") {
+		writeAPIError(w, http.StatusNotFound, "metadata not found")
+		return
+	}
+	data := agentMetadataResponse{
+		AgentID: view.AgentID, NodeID: view.NodeID, Epoch: view.Epoch, Revision: view.Revision,
+		Stale: view.Stale, ReportedAt: view.ReportedAt, UpdatedAt: view.UpdatedAt, Items: view.Items,
+	}
+	a.audit(r.Context(), p, "agent.metadata.read", "agent_runtime_metadata", agentID)
+	writeJSON(w, http.StatusOK, data)
 }
 
 type agentRequest struct {
