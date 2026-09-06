@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -101,9 +103,25 @@ type TCPBridgeConfig struct {
 }
 
 type AgentConfig struct {
-	ServerURL string `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
-	ID        string `mapstructure:"id" json:"id" yaml:"id"`
+	ServerURL string           `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	ID        string           `mapstructure:"id" json:"id" yaml:"id"`
+	Metadata  []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
 }
+
+// MetadataSource is an explicit allowlisted host value source. File sources
+// read one configured absolute path; env sources read one configured key.
+type MetadataSource struct {
+	Name   string `mapstructure:"name" json:"name" yaml:"name"`
+	Source string `mapstructure:"source" json:"source" yaml:"source"`
+	Path   string `mapstructure:"path" json:"path" yaml:"path"`
+	Key    string `mapstructure:"key" json:"key" yaml:"key"`
+}
+
+const (
+	MetadataMaxFields       = 32
+	MetadataFieldMaxBytes   = 4 << 10
+	MetadataPayloadMaxBytes = 32 << 10
+)
 
 type ClientConfig struct {
 	ServerURL string         `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
@@ -279,6 +297,7 @@ func bindEnvironment(v *viper.Viper) {
 
 func Validate(cfg Config) error {
 	var problems []string
+	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
 	switch cfg.Mode {
 	case ModeLocal:
 		if cfg.Storage.Driver != StorageSQLite {
@@ -318,6 +337,51 @@ func Validate(cfg Config) error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+var metadataNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var metadataSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
+
+func validateMetadataSources(sources []MetadataSource) []string {
+	var problems []string
+	if len(sources) > MetadataMaxFields {
+		problems = append(problems, fmt.Sprintf("metadata field count exceeds %d", MetadataMaxFields))
+	}
+	seen := make(map[string]struct{}, len(sources))
+	for i, source := range sources {
+		prefix := fmt.Sprintf("metadata[%d]", i)
+		if source.Name == "" || len(source.Name) > 64 || !metadataNamePattern.MatchString(source.Name) {
+			problems = append(problems, prefix+" name must match [a-zA-Z0-9_.-] and be at most 64 characters")
+		}
+		if metadataSensitivePattern.MatchString(source.Name) {
+			problems = append(problems, prefix+" name is sensitive and cannot be reported")
+		}
+		if _, ok := seen[source.Name]; ok {
+			problems = append(problems, prefix+" name is duplicated")
+		}
+		seen[source.Name] = struct{}{}
+		switch source.Source {
+		case "file":
+			if !filepath.IsAbs(source.Path) {
+				problems = append(problems, prefix+" file path must be absolute")
+			}
+			if source.Key != "" {
+				problems = append(problems, prefix+" file source cannot set env key")
+			}
+		case "env":
+			if source.Key == "" {
+				problems = append(problems, prefix+" env source requires a key")
+			} else if strings.ContainsAny(source.Key, "*?[]") {
+				problems = append(problems, prefix+" env key cannot contain wildcard")
+			}
+			if source.Path != "" {
+				problems = append(problems, prefix+" env source cannot set file path")
+			}
+		default:
+			problems = append(problems, prefix+" source must be file or env")
+		}
+	}
+	return problems
 }
 
 // RedactedJSON returns a stable, machine-readable representation safe for

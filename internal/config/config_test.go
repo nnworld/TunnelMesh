@@ -99,3 +99,42 @@ func TestLoadHonorsContextCancellation(t *testing.T) {
 		t.Fatal("Load() error = nil for cancelled context")
 	}
 }
+
+func TestValidateMetadataSourcesRejectsUnsafeEntries(t *testing.T) {
+	cases := []struct {
+		name   string
+		source config.MetadataSource
+		want   string
+	}{
+		{name: "invalid name", source: config.MetadataSource{Name: "bad/name", Source: "env", Key: "REGION"}, want: "name"},
+		{name: "relative file", source: config.MetadataSource{Name: "device", Source: "file", Path: "etc/machine-id"}, want: "absolute"},
+		{name: "sensitive name", source: config.MetadataSource{Name: "api_token", Source: "env", Key: "TOKEN"}, want: "sensitive"},
+		{name: "wildcard env", source: config.MetadataSource{Name: "region", Source: "env", Key: "REGION_*"}, want: "wildcard"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
+			cfg.Agent.Metadata = []config.MetadataSource{tc.source}
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadDecodesAgentMetadataSources(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "metadata.yaml")
+	contents := "mode: local\nstorage:\n  driver: sqlite\nagent:\n  metadata:\n    - name: region\n      source: env\n      key: TUNNELMESH_REGION\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Agent.Metadata) != 1 || cfg.Agent.Metadata[0].Name != "region" {
+		t.Fatalf("metadata = %+v", cfg.Agent.Metadata)
+	}
+}

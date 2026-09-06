@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"io"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var ErrStreamNotFound = errors.New("agent: stream not found")
@@ -175,6 +176,7 @@ type FrameTransport interface {
 }
 type Session struct {
 	transport               FrameTransport
+	metadataCollector       *MetadataCollector
 	closed                  atomic.Bool
 	BaseBackoff, MaxBackoff time.Duration
 	Rand                    *rand.Rand
@@ -182,6 +184,23 @@ type Session struct {
 
 func NewSession(tr FrameTransport) *Session {
 	return &Session{transport: tr, BaseBackoff: time.Second, MaxBackoff: 30 * time.Second, Rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+}
+
+// NewSessionWithMetadata attaches an independent metadata collector. Metadata
+// failures are returned to the caller and never close the frame transport.
+func NewSessionWithMetadata(tr FrameTransport, collector *MetadataCollector) *Session {
+	session := NewSession(tr)
+	session.metadataCollector = collector
+	return session
+}
+
+// CollectMetadata reads the configured snapshot without changing session
+// state, allowing metadata errors to remain separate from data forwarding.
+func (s *Session) CollectMetadata(ctx context.Context) (MetadataSnapshot, error) {
+	if s == nil || s.metadataCollector == nil {
+		return MetadataSnapshot{Values: map[string]string{}}, nil
+	}
+	return s.metadataCollector.Collect(ctx)
 }
 func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) error {
 	if s == nil || s.transport == nil {
