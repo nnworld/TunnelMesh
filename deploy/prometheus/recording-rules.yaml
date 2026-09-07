@@ -1,0 +1,16 @@
+groups:
+  - name: tunnelmesh-recording
+    interval: 30s
+    rules:
+      - record: tunnelmesh:connections:active
+        expr: sum(tunnelmesh_connections_active)
+      - record: tunnelmesh:connections:error_rate5m
+        expr: sum(rate(tunnelmesh_connections_total{result=~"failed|error"}[5m])) / clamp_min(sum(rate(tunnelmesh_connections_total[5m])), 1)
+      - record: tunnelmesh:bytes:rate5m
+        expr: sum(rate(tunnelmesh_bytes_total[5m]))
+      - record: tunnelmesh:heartbeat:rtt_p95_5m
+        expr: histogram_quantile(0.95, sum by (le, component) (rate(tunnelmesh_heartbeat_rtt_seconds_bucket[5m])))
+      - record: tunnelmesh:probe:success_ratio5m
+        expr: sum(rate(tunnelmesh_probe_total{result=~"ok|success|accepted"}[5m])) / clamp_min(sum(rate(tunnelmesh_probe_total[5m])), 1)
+      - record: tunnelmesh:streams:error_rate5m
+        expr: sum(rate(tunnelmesh_stream_errors_total[5m])) / clamp_min(sum(rate(tunnelmesh_streams_total[5m])), 1)

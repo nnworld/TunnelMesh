@@ -2,12 +2,13 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"io"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var ErrSessionClosed = errors.New("client session closed")
@@ -27,25 +28,23 @@ type StreamRequest struct {
 	TargetPort           int
 	Metadata             []byte
 }
-type StreamOpenPayload struct {
-	AgentID    string `json:"agent_id,omitempty"`
-	Protocol   string `json:"protocol"`
-	TargetHost string `json:"target_host"`
-	TargetPort int    `json:"target_port"`
-	Metadata   []byte `json:"metadata,omitempty"`
-}
+type StreamOpenPayload = protocol.StreamOpenPayload
 type Session struct {
 	mu        sync.RWMutex
 	transport FrameTransport
 	closed    bool
 	nextID    atomic.Uint32
 	recvOnce  sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
+	runErr    error
+	Metrics   *observability.Metrics
 	streams   map[uint32]*frameStream
 	datagrams map[uint32]*frameDatagramStream
 }
 
 func NewSession(tr FrameTransport) *Session {
-	s := &Session{transport: tr, streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream)}
+	s := &Session{transport: tr, done: make(chan struct{}), streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream)}
 	s.nextID.Store(1)
 	return s
 }
@@ -63,11 +62,52 @@ func (s *Session) OpenStream(ctx context.Context, req StreamRequest) error {
 		return ctx.Err()
 	default:
 	}
-	payload, err := json.Marshal(StreamOpenPayload{AgentID: req.AgentID, Protocol: req.Protocol, TargetHost: req.TargetHost, TargetPort: req.TargetPort, Metadata: req.Metadata})
+	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{AgentID: req.AgentID, Protocol: req.Protocol, TargetHost: req.TargetHost, TargetPort: req.TargetPort, Metadata: req.Metadata})
 	if err != nil {
 		return err
 	}
-	return s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
+	err = s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
+	if s.Metrics != nil {
+		if err != nil {
+			s.Metrics.ObserveStream(req.Protocol, "failed", observability.NormalizeErrorClass(err))
+		} else {
+			s.Metrics.ObserveStream(req.Protocol, "accepted", "")
+		}
+	}
+	return err
+}
+
+// Start begins the single receive dispatcher even before a logical stream is
+// opened so connection-level PING frames are answered while the session is idle.
+func (s *Session) Start() {
+	if s == nil {
+		return
+	}
+	tr, ok := s.transport.(ReceiveTransport)
+	if !ok || tr == nil {
+		s.finishReceive(errors.New("client session transport does not receive frames"))
+		return
+	}
+	s.recvOnce.Do(func() { go s.receiveLoop(tr) })
+}
+
+func (s *Session) Wait(ctx context.Context) error {
+	if s == nil {
+		return ErrSessionClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		_ = s.Close()
+		return ctx.Err()
+	case <-s.done:
+		s.mu.RLock()
+		err := s.runErr
+		s.mu.RUnlock()
+		return err
+	}
 }
 
 // OpenDatagram opens a message-oriented UDP association. Each WriteDatagram
@@ -96,7 +136,7 @@ func (s *Session) OpenDatagram(ctx context.Context, req StreamRequest) (Datagram
 	}
 	s.datagrams[req.StreamID] = stream
 	s.mu.Unlock()
-	s.recvOnce.Do(func() { go s.receiveLoop(tr) })
+	s.Start()
 	if err := s.OpenStream(ctx, req); err != nil {
 		s.removeDatagram(req.StreamID)
 		return nil, err
@@ -134,7 +174,7 @@ func (s *Session) OpenStreamConn(ctx context.Context, req StreamRequest) (io.Rea
 	}
 	s.streams[req.StreamID] = stream
 	s.mu.Unlock()
-	s.recvOnce.Do(func() { go s.receiveLoop(tr) })
+	s.Start()
 	if err := s.OpenStream(ctx, req); err != nil {
 		s.removeStream(req.StreamID)
 		return nil, err
@@ -180,7 +220,21 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 				delete(s.datagrams, id)
 			}
 			s.mu.Unlock()
+			s.finishReceive(err)
 			return
+		}
+		if f.Type == protocol.FramePing {
+			if err := tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: append([]byte(nil), f.Payload...)}); err != nil {
+				s.finishReceive(err)
+				return
+			}
+			continue
+		}
+		if f.Type == protocol.FramePong {
+			if s.Metrics != nil {
+				s.Metrics.ObserveHeartbeat("client", "pong", 0)
+			}
+			continue
 		}
 		s.mu.RLock()
 		stream := s.streams[f.StreamID]
@@ -191,6 +245,9 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 		}
 		switch f.Type {
 		case protocol.FrameData:
+			if s.Metrics != nil && len(f.Payload) > 0 {
+				s.Metrics.ObserveBytes("client", "inbound", "frame", int64(len(f.Payload)))
+			}
 			if stream != nil {
 				stream.push(f.Payload)
 			} else {
@@ -199,7 +256,6 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 		case protocol.FrameHalfClose:
 			if stream != nil {
 				stream.finish(io.EOF)
-				s.removeStream(f.StreamID)
 			} else {
 				datagram.finish(io.EOF)
 				s.removeDatagram(f.StreamID)
@@ -214,6 +270,18 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			}
 		}
 	}
+}
+
+func (s *Session) finishReceive(err error) {
+	if s == nil {
+		return
+	}
+	s.doneOnce.Do(func() {
+		s.mu.Lock()
+		s.runErr = err
+		s.mu.Unlock()
+		close(s.done)
+	})
 }
 
 func (s *Session) removeDatagram(id uint32) {
@@ -302,7 +370,7 @@ func (s *frameStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	err := s.err
 	s.mu.Unlock()
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, err
 	}
 	s.session.mu.RLock()
@@ -461,6 +529,9 @@ func (s *Session) Close() error {
 		delete(s.datagrams, id)
 	}
 	s.mu.Unlock()
+	if s.Metrics != nil {
+		s.Metrics.ObserveConnection("client", "websocket", "closed", "")
+	}
 	for _, stream := range streams {
 		stream.fail(ErrSessionClosed)
 	}

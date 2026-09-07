@@ -55,7 +55,11 @@ docker run --rm \
 
 配置优先级仍为：命令行参数 > 环境变量 > 配置文件 > 默认值。容器内推荐使用环境变量或挂载只读配置文件。
 
-Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent WebSocket，但当前监听器本身不终止 TLS。生产部署必须在反向代理或负载均衡器处终止 HTTPS/WSS，再将受保护的内部 HTTP 连接转发到 Server；同时为 Agent 注入有效的 API bearer token。
+Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent WebSocket，但当前监听器本身不终止 TLS。生产部署必须在反向代理或负载均衡器处终止 HTTPS/WSS，再将受保护的内部 HTTP 连接转发到 Server；同时为 Agent 注入绑定该 Agent 的 `agent` service token。
+
+Nginx 的完整 HTTPS/WSS、Authorization 透传、Upgrade、超时、限流和 `/metrics` 保护示例见 [Nginx 推荐配置](nginx.md)。
+
+容器日志默认输出到 stdout/stderr，由 Docker logging driver 管理；查看方式和其它平台日志位置见 [日志位置与查看方式](../operations/logging.md)。
 
 ## 安全与升级
 
@@ -64,3 +68,11 @@ Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent W
 - 升级前备份 MySQL/SQLite，并先在一台节点灰度验证。
 - schema 自动初始化关闭时，必须先执行受控的数据库迁移，再启动应用。
 - 回滚使用上一版本镜像，并保留兼容的数据库 schema。
+
+服务凭据建议使用 Compose/Kubernetes Secret 注入，而不是写入镜像或 YAML：
+
+```bash
+docker run --rm --env-file ./secrets/tunnelmesh-client.env tunnelmesh:client run
+```
+
+首次创建 Agent/Client token 后，把 secret 写入权限为 `0600` 的 Secret 文件；轮换时先下发新 secret、验证新连接，再撤销旧 secret。集群 relay 还需要独立的 `server_node` token、mTLS 证书和显式 `server.relay.listen`。

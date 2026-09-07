@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
@@ -98,26 +99,40 @@ func TestMetadataManagerRejectsStorageOverflowWithAckError(t *testing.T) {
 }
 
 type metadataSessionWSConn struct {
-	mu     sync.Mutex
-	reads  [][]byte
-	writes [][]byte
-	closed bool
+	mu         sync.Mutex
+	reads      [][]byte
+	writes     [][]byte
+	closed     bool
+	written    chan struct{}
+	afterReads <-chan struct{}
 }
 
 func (c *metadataSessionWSConn) ReadMessage() (int, []byte, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if len(c.reads) == 0 {
+		wait := c.afterReads
+		c.mu.Unlock()
+		if wait != nil {
+			<-wait
+		}
 		return 0, nil, io.EOF
 	}
 	payload := c.reads[0]
 	c.reads = c.reads[1:]
+	c.mu.Unlock()
 	return 2, payload, nil
 }
 func (c *metadataSessionWSConn) WriteMessage(_ int, payload []byte) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.writes = append(c.writes, append([]byte(nil), payload...))
+	written := c.written
+	c.mu.Unlock()
+	if written != nil {
+		select {
+		case written <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 func (c *metadataSessionWSConn) Close() error {
@@ -210,5 +225,51 @@ func TestServeAgentSessionPersistsMetadataAndFencesStaleLifecycle(t *testing.T) 
 	current, err = service.Get(context.Background(), "agent-integrated")
 	if err != nil || !current.Stale {
 		t.Fatalf("disconnect did not mark stale: %+v err=%v", current, err)
+	}
+}
+
+func TestServeAgentSessionHeartbeatRefreshesMetadataLease(t *testing.T) {
+	repo := &fakeMetadataRepo{}
+	service := NewAgentMetadataService(repo)
+	expired := time.Now().UTC().Add(-time.Minute)
+	repo.value = storage.AgentRuntimeMetadata{
+		AgentID: "agent-heartbeat", NodeID: "node-a", Epoch: 1, Revision: 1,
+		Metadata: `{"items":[]}`, ExpiresAt: &expired, Stale: true,
+	}
+	manager := NewAgentSessionManager(AgentSessionConfig{MetadataService: service, MetadataTTL: time.Minute})
+	var ping bytes.Buffer
+	if err := protocol.NewEncoder(&ping).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	written := make(chan struct{}, 1)
+	conn := &metadataSessionWSConn{reads: [][]byte{ping.Bytes()}, written: written, afterReads: release}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- ServeAgentSession(context.Background(), manager, AgentRegistration{AgentID: "agent-heartbeat", NodeID: "node-a", Epoch: 1}, NewWSFrameTransport(conn), nil)
+	}()
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat pong was not sent")
+	}
+	conn.mu.Lock()
+	writes := append([][]byte(nil), conn.writes...)
+	conn.mu.Unlock()
+	if len(writes) != 1 {
+		t.Fatalf("writes=%d, want pong", len(writes))
+	}
+	frame, err := protocol.NewDecoder(bytes.NewReader(writes[0])).ReadFrame()
+	if err != nil || frame.Type != protocol.FramePong {
+		t.Fatalf("pong frame=%+v err=%v", frame, err)
+	}
+	if repo.value.Stale || repo.value.ExpiresAt == nil || !repo.value.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("metadata lease was not refreshed: %+v", repo.value)
+	}
+	close(release)
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("server session did not stop")
 	}
 }

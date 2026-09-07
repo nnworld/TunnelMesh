@@ -8,12 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -50,6 +54,8 @@ type Config struct {
 	Registry RegistryConfig `mapstructure:"registry" json:"registry" yaml:"registry"`
 	Node     NodeConfig     `mapstructure:"node" json:"node" yaml:"node"`
 	Server   ServerConfig   `mapstructure:"server" json:"server" yaml:"server"`
+	Security SecurityConfig `mapstructure:"security" json:"security" yaml:"security"`
+	TLS      TLSConfig      `mapstructure:"tls" json:"tls" yaml:"tls"`
 	Agent    AgentConfig    `mapstructure:"agent" json:"agent" yaml:"agent"`
 	Client   ClientConfig   `mapstructure:"client" json:"client" yaml:"client"`
 }
@@ -94,12 +100,40 @@ type ServerConfig struct {
 	ClientWSAddr     string          `mapstructure:"client_ws_addr" json:"client_ws_addr" yaml:"client_ws_addr"`
 	TCPBridge        TCPBridgeConfig `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
 	TCPBridgeEnabled bool            `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
+	Relay            RelayConfig     `mapstructure:"relay" json:"relay" yaml:"relay"`
 }
 
 type TCPBridgeConfig struct {
 	Enabled  bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	Path     string `mapstructure:"path" json:"path" yaml:"path"`
 	MaxBytes int64  `mapstructure:"max_bytes" json:"max_bytes" yaml:"max_bytes"`
+}
+
+// RelayConfig is deliberately separate from public HTTP/native TLS settings.
+// NodeToken is never serialized in config output.
+type RelayConfig struct {
+	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	Listen     string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	Endpoint   string `mapstructure:"endpoint" json:"endpoint" yaml:"endpoint"`
+	CA         string `mapstructure:"ca" json:"ca" yaml:"ca"`
+	Cert       string `mapstructure:"cert" json:"cert" yaml:"cert"`
+	Key        string `mapstructure:"key" json:"key" yaml:"key"`
+	ServerName string `mapstructure:"server_name" json:"server_name" yaml:"server_name"`
+	NodeToken  string `mapstructure:"node_token" json:"-" yaml:"-"`
+}
+
+type SecurityConfig struct {
+	AllowedHosts   []string `mapstructure:"allowed_hosts" json:"allowed_hosts" yaml:"allowed_hosts"`
+	AllowedOrigins []string `mapstructure:"allowed_origins" json:"allowed_origins" yaml:"allowed_origins"`
+	// Deprecated: legacy management connection tokens are removed in v0.3.0.
+	AllowLegacyConnectionTokens bool `mapstructure:"allow_legacy_connection_tokens" json:"allow_legacy_connection_tokens" yaml:"allow_legacy_connection_tokens"`
+}
+
+type TLSConfig struct {
+	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	CertFile   string `mapstructure:"cert_file" json:"cert_file" yaml:"cert_file"`
+	KeyFile    string `mapstructure:"key_file" json:"key_file" yaml:"key_file"`
+	MinVersion string `mapstructure:"min_version" json:"min_version" yaml:"min_version"`
 }
 
 type AgentConfig struct {
@@ -126,6 +160,7 @@ const (
 
 type ClientConfig struct {
 	ServerURL string         `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	Token     string         `mapstructure:"token" json:"-" yaml:"-"`
 	Tunnels   []TunnelConfig `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
 }
 
@@ -260,20 +295,32 @@ func hasKey(source any, want string) bool {
 
 func setDefaults(v *viper.Viper) {
 	defaults := map[string]any{
-		"mode":                        ModeLocal,
-		"storage.driver":              StorageSQLite,
-		"storage.sqlite.path":         "tunnelmesh.db",
-		"storage.auto_init":           true,
-		"storage.mysql.tls":           false,
-		"registry.type":               RegistryDatabase,
-		"registry.endpoints":          []string{},
-		"server.http_addr":            ":80",
-		"server.https_addr":           ":443",
-		"server.agent_ws_addr":        ":443",
-		"server.client_ws_addr":       ":443",
-		"server.tcp_bridge.enabled":   true,
-		"server.tcp_bridge.path":      "/ws/tcp",
-		"server.tcp_bridge.max_bytes": int64(64 << 10),
+		"mode":                                    ModeLocal,
+		"storage.driver":                          StorageSQLite,
+		"storage.sqlite.path":                     "tunnelmesh.db",
+		"storage.auto_init":                       true,
+		"storage.mysql.tls":                       false,
+		"registry.type":                           RegistryDatabase,
+		"registry.endpoints":                      []string{},
+		"server.http_addr":                        ":80",
+		"server.https_addr":                       ":443",
+		"server.agent_ws_addr":                    ":443",
+		"server.client_ws_addr":                   ":443",
+		"server.tcp_bridge.enabled":               true,
+		"server.tcp_bridge.path":                  "/ws/tcp",
+		"server.tcp_bridge.max_bytes":             int64(64 << 10),
+		"server.relay.enabled":                    false,
+		"server.relay.listen":                     "",
+		"server.relay.endpoint":                   "",
+		"server.relay.ca":                         "",
+		"server.relay.cert":                       "",
+		"server.relay.key":                        "",
+		"server.relay.server_name":                "",
+		"security.allowed_hosts":                  []string{},
+		"security.allowed_origins":                []string{},
+		"security.allow_legacy_connection_tokens": false,
+		"tls.enabled":                             false,
+		"tls.min_version":                         "1.2",
 	}
 	for key, value := range defaults {
 		v.SetDefault(key, value)
@@ -289,7 +336,10 @@ func bindEnvironment(v *viper.Viper) {
 		"storage.mysql.dsn", "storage.mysql.tls", "storage.mysql.ca", "storage.mysql.cert", "storage.mysql.key",
 		"registry.type", "registry.endpoints", "node.id", "server.http_addr", "server.https_addr",
 		"server.agent_ws_addr", "server.client_ws_addr", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
-		"agent.server_url", "agent.id", "agent.token", "client.server_url",
+		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
+		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
+		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
+		"agent.server_url", "agent.id", "agent.token", "client.server_url", "client.token",
 	}
 	for _, key := range keys {
 		_ = v.BindEnv(key)
@@ -299,6 +349,15 @@ func bindEnvironment(v *viper.Viper) {
 func Validate(cfg Config) error {
 	var problems []string
 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
+	problems = append(problems, validateSecurity(cfg.Security)...)
+	problems = append(problems, validateTLS(cfg.TLS)...)
+	problems = append(problems, validateRelay(cfg.Mode, cfg.Node.ID, cfg.Server.Relay)...)
+	if cfg.Agent.ServerURL != "" && !validWebSocketURL(cfg.Agent.ServerURL) {
+		problems = append(problems, "agent server URL must be an absolute ws:// or wss:// URL")
+	}
+	if cfg.Client.ServerURL != "" && !validWebSocketURL(cfg.Client.ServerURL) {
+		problems = append(problems, "client server URL must be an absolute ws:// or wss:// URL")
+	}
 	switch cfg.Mode {
 	case ModeLocal:
 		if cfg.Storage.Driver != StorageSQLite {
@@ -338,6 +397,151 @@ func Validate(cfg Config) error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func validateSecurity(cfg SecurityConfig) []string {
+	var problems []string
+	for _, host := range cfg.AllowedHosts {
+		if _, ok := NormalizeAllowedHost(host); !ok {
+			problems = append(problems, fmt.Sprintf("allowed host %q is invalid", host))
+		}
+	}
+	for _, origin := range cfg.AllowedOrigins {
+		if !validHTTPOrigin(origin) {
+			problems = append(problems, fmt.Sprintf("allowed origin %q must be an absolute http/https origin", origin))
+		}
+	}
+	return problems
+}
+
+// NormalizeAllowedHost validates an exact HTTP Host allowlist entry and
+// normalizes only its case. Ports remain part of the exact match.
+func NormalizeAllowedHost(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.Contains(raw, "@") || !httpguts.ValidHostHeader(raw) {
+		return "", false
+	}
+	host := raw
+	if strings.HasPrefix(raw, "[") {
+		end := strings.IndexByte(raw, ']')
+		if end < 0 || net.ParseIP(raw[1:end]) == nil {
+			return "", false
+		}
+		remainder := raw[end+1:]
+		if remainder != "" && (remainder[0] != ':' || !validHostPort(remainder[1:])) {
+			return "", false
+		}
+		return strings.ToLower(raw), true
+	}
+	if strings.Count(raw, ":") > 1 {
+		return "", false
+	}
+	if strings.Contains(raw, ":") {
+		var port string
+		var err error
+		host, port, err = net.SplitHostPort(raw)
+		if err != nil || !validHostPort(port) {
+			return "", false
+		}
+	}
+	if net.ParseIP(host) == nil && !validDNSHost(host) {
+		return "", false
+	}
+	return strings.ToLower(raw), true
+}
+
+func validHostPort(raw string) bool {
+	port, err := strconv.Atoi(raw)
+	return err == nil && port >= 1 && port <= 65535
+}
+
+func validDNSHost(raw string) bool {
+	if strings.HasSuffix(raw, ".") {
+		raw = strings.TrimSuffix(raw, ".")
+	}
+	if raw == "" || len(raw) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(raw, ".") {
+		if len(label) == 0 || len(label) > 63 || !asciiAlphaNumeric(label[0]) || !asciiAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if !asciiAlphaNumeric(label[i]) && label[i] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func asciiAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func validHTTPOrigin(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return false
+	}
+	return u.Path == "" && u.RawPath == "" && u.RawQuery == "" && u.Fragment == ""
+}
+
+func validWebSocketURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	return u.IsAbs()
+}
+
+func validateTLS(cfg TLSConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	var problems []string
+	if strings.TrimSpace(cfg.CertFile) == "" {
+		problems = append(problems, "native TLS requires a certificate file")
+	}
+	if strings.TrimSpace(cfg.KeyFile) == "" {
+		problems = append(problems, "native TLS requires a private key file")
+	}
+	if cfg.MinVersion != "1.2" && cfg.MinVersion != "1.3" {
+		problems = append(problems, "native TLS minimum version must be 1.2 or 1.3")
+	}
+	return problems
+}
+
+func validateRelay(mode, nodeID string, cfg RelayConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	var problems []string
+	if mode != ModeCluster {
+		problems = append(problems, "server relay requires cluster mode")
+	}
+	if strings.TrimSpace(nodeID) == "" {
+		problems = append(problems, "server relay requires node identity")
+	}
+	if strings.TrimSpace(cfg.Listen) == "" {
+		problems = append(problems, "server relay requires listen address")
+	}
+	if strings.TrimSpace(cfg.CA) == "" || !filepath.IsAbs(cfg.CA) {
+		problems = append(problems, "server relay CA path must be absolute")
+	}
+	if strings.TrimSpace(cfg.Cert) == "" || !filepath.IsAbs(cfg.Cert) {
+		problems = append(problems, "server relay certificate path must be absolute")
+	}
+	if strings.TrimSpace(cfg.Key) == "" || !filepath.IsAbs(cfg.Key) {
+		problems = append(problems, "server relay private key path must be absolute")
+	}
+	if strings.TrimSpace(cfg.ServerName) == "" {
+		problems = append(problems, "server relay server name is required")
+	}
+	if strings.TrimSpace(cfg.NodeToken) == "" {
+		problems = append(problems, "server relay node token is required")
+	}
+	return problems
 }
 
 var metadataNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
@@ -391,6 +595,9 @@ func (c Config) RedactedJSON() ([]byte, error) {
 	copy := c
 	copy.Storage.MySQL.DSN = redact(copy.Storage.MySQL.DSN)
 	copy.Storage.MySQL.Key = redact(copy.Storage.MySQL.Key)
+	copy.TLS.KeyFile = redact(copy.TLS.KeyFile)
+	copy.Server.Relay.Key = redact(copy.Server.Relay.Key)
+	copy.Server.Relay.NodeToken = redact(copy.Server.Relay.NodeToken)
 	return json.MarshalIndent(copy, "", "  ")
 }
 

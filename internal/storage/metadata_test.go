@@ -63,6 +63,27 @@ func TestRuntimeMetadataRepositoryEpochTakeoverAndStaleMark(t *testing.T) {
 	}
 }
 
+func TestRuntimeMetadataRepositoryTouchRefreshesOnlyMatchingEpoch(t *testing.T) {
+	db := newTestDB(t)
+	repo := db.Metadata()
+	ctx := context.Background()
+	if err := repo.Upsert(ctx, AgentRuntimeMetadata{AgentID: "agent-1", NodeID: "node-a", Epoch: 2, Revision: 1, Metadata: `{}`, Stale: true}); err != nil {
+		t.Fatal(err)
+	}
+	seen := time.Now().UTC()
+	expires := seen.Add(time.Minute)
+	if err := repo.Touch(ctx, "agent-1", 2, seen, expires); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Get(ctx, "agent-1")
+	if err != nil || got.Stale || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) {
+		t.Fatalf("touched=%+v err=%v", got, err)
+	}
+	if err := repo.Touch(ctx, "agent-1", 1, seen, expires); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale epoch touch err=%v", err)
+	}
+}
+
 func TestRuntimeMetadataRepositoryCursorPagination(t *testing.T) {
 	db := newTestDB(t)
 	repo := db.Metadata()

@@ -1,0 +1,322 @@
+# Review package: 9ea2368..db575b4
+
+## Commits
+db575b4 feat(web): add agent metadata detail view
+
+## Files changed
+ .../task-5-report.md                               | 16 ++++++
+ README.md                                          | 21 +++++++
+ docs/README.md                                     | 20 +++++++
+ docs/user-guide/server-admin.md                    | 64 ++++++++++++++++++++++
+ web/src/api/client.ts                              | 13 +++++
+ web/src/router.ts                                  |  3 +-
+ web/src/tests/routes.spec.ts                       | 27 ++++++++-
+ web/src/views/AgentDetail.vue                      | 34 ++++++++++++
+ web/src/views/Agents.vue                           |  4 +-
+ 9 files changed, 198 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-5-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-5-report.md
+new file mode 100644
+index 0000000..9aead3f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-5-report.md
+@@ -0,0 +1,16 @@
++# Task 5 report — Agent metadata admin UI
++
++Implemented the Vue 3/Element Plus Agent detail experience:
++
++- Typed Agent and runtime metadata API models and `getAgentMetadata` helper.
++- Authenticated `/agents/:id` route with loading, error, empty and stale states.
++- Metadata table showing field name, source, value/redaction, epoch/revision and timestamps.
++- Agents list detail navigation without metadata edit controls.
++- Server administrator guide covering bootstrap, dashboard, agents, policies,
++  routes, wildcard routing, tunnels, audit logs, roles, idempotency and recovery.
++
++Verification:
++
++- `cd web && npm test -- --run` — pass
++- `cd web && npm run build` — pass (Vite chunk-size warning only)
++
+diff --git a/README.md b/README.md
+index 86af77d..8bbf0bf 100644
+--- a/README.md
++++ b/README.md
+@@ -16,14 +16,35 @@ process so commands can be scaled horizontally. Configuration and storage
+ features are added incrementally by the implementation plan in
+ `docs/superpowers/plans/`.
+ 
+ Common checks:
+ 
+ ```sh
+ make test
+ make race
+ make lint
+ make build
++make web-build
+ ```
+ 
+ The project rules are maintained in [AGENTS.md](AGENTS.md); `CLAUDE.md` is a
+ compatibility pointer to that single source of truth.
++
++## User and deployment help
++
++- [Documentation index](docs/README.md)
++- [Client usage](docs/user-guide/client.md)
++- [Agent usage](docs/user-guide/agent.md)
++- [Server admin guide](docs/user-guide/server-admin.md)
++- [Managed HTTP routes](docs/user-guide/managed-http-route.md)
++- [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md)
++- [Docker deployment](docs/deployment/docker.md)
++- [Configuration](docs/operations/configuration.md)
++- [Troubleshooting](docs/operations/troubleshooting.md)
++
++Build the three container variants with:
++
++```sh
++docker build --build-arg APP=server -t tunnelmesh:server .
++docker build --build-arg APP=agent -t tunnelmesh:agent .
++docker build --build-arg APP=client -t tunnelmesh:client .
++```
+diff --git a/docs/README.md b/docs/README.md
+new file mode 100644
+index 0000000..cd36667
+--- /dev/null
++++ b/docs/README.md
+@@ -0,0 +1,20 @@
++# TunnelMesh 文档
++
++## 快速入口
++
++- [客户端使用帮助](user-guide/client.md)
++- [Agent 使用帮助](user-guide/agent.md)
++- [Server 管理后台](user-guide/server-admin.md)
++- [托管 HTTP 路由](user-guide/managed-http-route.md)
++- [SSH / websocat TCP 代理](user-guide/tcp-over-websocket-ssh.md)
++- [Docker 部署](deployment/docker.md)
++- [配置说明](operations/configuration.md)
++- [故障排查](operations/troubleshooting.md)
++- [OpenAPI](api/openapi.yaml)
++
++## 模式选择
++
++- 本地模式使用 SQLite，适合单机试用和小规模部署。
++- 集群模式使用 MySQL 管理数据；注册发现默认使用 MySQL lease，也可以切换到 etcd。
++
++所有部署都应先执行 `check-config`，再执行 `run`。生产环境建议通过环境变量或外部配置文件注入敏感配置。
+diff --git a/docs/user-guide/server-admin.md b/docs/user-guide/server-admin.md
+new file mode 100644
+index 0000000..5902abc
+--- /dev/null
++++ b/docs/user-guide/server-admin.md
+@@ -0,0 +1,64 @@
++# TunnelMesh Server 管理后台使用指南
++
++## 登录与首次凭据
++
++首次启动 Server 会在控制台输出一次管理员用户名和高强度密码。请立即保存并通过 HTTPS 访问后台登录页。数据库只保存密码哈希，不会再次显示明文密码。
++
++如果凭据遗失，在 Server 主机执行：
++
++```bash
++tunnelmesh-server admin regenerate-credentials --config tunnelmesh.yaml --confirm
++```
++
++命令会撤销旧会话并输出新凭据。生产环境建议限制控制台和数据库访问权限。
++
++## Dashboard
++
++Dashboard 用于查看 Server 健康状态、在线 Agent 数量、活动隧道和近期审计事件。部署或扩容后先检查数据库、注册中心和 WebSocket 接入状态，再创建路由。
++
++## Agent 列表与详情
++
++Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details 可查看 Agent 详情及运行时 metadata：
++
++- 当前在线/过期（Stale）状态；
++- node、epoch、revision、最后上报时间和更新时间；
++- 字段名称、来源类型（`file` 或 `env`）和值；
++- 敏感字段显示为 Redacted，后台没有编辑上报值的入口。
++
++Agent metadata 只能由 Agent 按 allowlist 上报。修改字段必须修改 Agent 配置并等待下一次上报；管理员不能通过 API 伪造上报数据。
++
++## Agent Policy
++
++Policy 页面限制 Agent 可访问的协议、目标 CIDR 和端口。建议按最小权限创建规则，例如 SSH 只允许 `tcp/22` 和明确的内网 CIDR。拒绝规则会在 Agent 侧返回 policy 错误，不会关闭其他隧道。
++
++## Explicit Route 与 Wildcard Route
++
++Routes 页面支持将某个域名/路径绑定到 Agent 的目标主机和端口。域名与路径组合必须唯一，写请求建议携带稳定的 `Idempotency-Key`。
++
++动态泛域名格式为：
++
++```text
++<agent-id>-<ip-encoding>-<port>.apps.example.com
++```
++
++IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/443，不提供公网 UDP。
++
++## Tunnel 状态
++
++Tunnels 页面显示本地 forward、publish route 和连接状态。异常时先查看 Agent online/lease 状态，再检查 policy、目标端口和 Server 审计事件。停止或重试操作应使用同一隧道 ID，避免重复创建。
++
++## 审计日志
++
++Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel 操作、metadata 读取和 SSH/TCP proxy 上下文。日志记录身份、资源、epoch/revision 和错误码，不记录 metadata 明文、SSH 私钥或会话字节。
++
++## 角色与权限
++
++- `admin`：管理所有 Agent、Policy、Route、Tunnel、用户和审计日志。
++- 普通用户：查看和操作自己拥有的 Agent 及其隧道，不能读取其他用户的 metadata。
++- 任何角色都不能通过管理 API 修改 Agent 上报值。
++
++所有 API 使用统一响应 `{ code, msg, data }`。分页使用 cursor；写请求应携带 `Idempotency-Key`，重试时复用相同 key。
++
++## 配置与排障建议
++
++优先级为命令行参数 > 环境变量 > 配置文件 > 默认值。上线前执行 `check-config`，确认本地 SQLite 或集群 MySQL、注册中心、80/443 地址和 TLS 配置正确。出现 401/403 时检查 token 与角色；出现 404 时检查 Agent ID、路由 Host/path 和 wildcard DNS；出现 stale 时检查 Agent WebSocket、租约和系统时间。
+diff --git a/web/src/api/client.ts b/web/src/api/client.ts
+index 5572338..11202bd 100644
+--- a/web/src/api/client.ts
++++ b/web/src/api/client.ts
+@@ -1,16 +1,29 @@
+ export type APIResponse<T> = { code: number; msg: string; data: T }
+ 
++export type Agent = { id: string; name: string; enabled: boolean; ownerUserId?: string; capabilities?: string }
++export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted?: boolean }
++export type AgentMetadata = {
++  agentId: string; nodeId: string; epoch: number; revision: number; stale: boolean
++  reportedAt: string; updatedAt: string; items: AgentMetadataItem[]
++}
++
+ let token = localStorage.getItem('tunnelmesh_token') || ''
+ export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
+ export function getToken() { return token }
+ 
++export function getAgents() { return api<{items: Agent[]; nextCursor?: string}>('/agents') }
++export function getAgentMetadata(agentId: string, includeStale = false) {
++  const query = includeStale ? '?includeStale=true' : ''
++  return api<AgentMetadata>(`/agents/${encodeURIComponent(agentId)}/metadata${query}`)
++}
++
+ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+   const headers = new Headers(init.headers)
+   headers.set('Accept', 'application/json')
+   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+   if (token) headers.set('Authorization', `Bearer ${token}`)
+   const response = await fetch(`/api/v1${path}`, {...init, headers})
+   const payload = await response.json().catch(() => ({msg: response.statusText}))
+   if (!response.ok) throw new Error(payload.msg || 'request failed')
+   return payload.data as T
+ }
+diff --git a/web/src/router.ts b/web/src/router.ts
+index 0862e5f..9d98c55 100644
+--- a/web/src/router.ts
++++ b/web/src/router.ts
+@@ -1,16 +1,17 @@
+ import { createRouter, createWebHistory } from 'vue-router'
+ import { useAuthStore } from './stores/auth'
+ import Login from './views/Login.vue'
+ import Dashboard from './views/Dashboard.vue'
+ import Agents from './views/Agents.vue'
++import AgentDetail from './views/AgentDetail.vue'
+ import Routes from './views/Routes.vue'
+ import Tunnels from './views/Tunnels.vue'
+ import AuditLogs from './views/AuditLogs.vue'
+ 
+ const router = createRouter({ history: createWebHistory(), routes: [
+   {path:'/login', component:Login}, {path:'/', component:Dashboard, meta:{auth:true}},
+-  {path:'/agents', component:Agents, meta:{auth:true}}, {path:'/routes', component:Routes, meta:{auth:true}},
++  {path:'/agents', component:Agents, meta:{auth:true}}, {path:'/agents/:id', component:AgentDetail, meta:{auth:true}}, {path:'/routes', component:Routes, meta:{auth:true}},
+   {path:'/tunnels', component:Tunnels, meta:{auth:true}}, {path:'/audit-logs', component:AuditLogs, meta:{auth:true, admin:true}}
+ ]})
+ router.beforeEach(async (to) => { const auth = useAuthStore(); if (auth.token && !auth.user) await auth.load(); if (to.meta.auth && !auth.user) return '/login'; if (to.meta.admin && !auth.isAdmin) return '/'; return true })
+ export default router
+diff --git a/web/src/tests/routes.spec.ts b/web/src/tests/routes.spec.ts
+index 16c3ffa..be67130 100644
+--- a/web/src/tests/routes.spec.ts
++++ b/web/src/tests/routes.spec.ts
+@@ -1,9 +1,34 @@
+-import { describe, expect, it } from 'vitest'
++import { describe, expect, it, vi } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { getAgentMetadata } from '../api/client'
+ import router from '../router'
+ 
+ describe('admin routes', () => {
+   it('defines login and managed resources', () => {
+     const paths = router.getRoutes().map(route => route.path)
+     expect(paths).toEqual(expect.arrayContaining(['/login', '/', '/agents', '/routes', '/tunnels', '/audit-logs']))
+   })
++
++  it('defines an authenticated agent detail route', () => {
++    const detail = router.getRoutes().find(route => route.path === '/agents/:id')
++    expect(detail).toBeTruthy()
++    expect(detail?.meta.auth).toBe(true)
++  })
++
++  it('calls the metadata endpoint with the agent id and stale option', async () => {
++    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { agentId: 'a1' } }) })
++    vi.stubGlobal('fetch', fetchMock)
++    await getAgentMetadata('a1', true)
++    expect(fetchMock).toHaveBeenCalledWith('/api/v1/agents/a1/metadata?includeStale=true', expect.anything())
++  })
++
++  it('agent detail view renders metadata states without edit controls', () => {
++    const source = readFileSync('src/views/AgentDetail.vue', 'utf8')
++    expect(source).toContain('Metadata')
++    expect(source).toContain('Source')
++    expect(source).toContain('Value')
++    expect(source).toContain('Stale')
++    expect(source).toContain('redacted')
++    expect(source).not.toMatch(/Edit metadata|编辑 metadata/i)
++  })
+ })
+diff --git a/web/src/views/AgentDetail.vue b/web/src/views/AgentDetail.vue
+new file mode 100644
+index 0000000..c9a1b8b
+--- /dev/null
++++ b/web/src/views/AgentDetail.vue
+@@ -0,0 +1,34 @@
++<template>
++  <section class="agent-detail">
++    <el-page-header @back="$router.push('/agents')" content="Agent details" />
++    <el-alert v-if="error" type="error" :title="error" show-icon />
++    <el-skeleton v-if="loading" :rows="5" animated />
++    <template v-else-if="metadata">
++      <el-card class="metadata-card">
++        <template #header><div class="card-header"><span>Metadata</span><el-tag v-if="metadata.stale" type="warning">Stale</el-tag><el-tag v-else type="success">Fresh</el-tag></div></template>
++        <el-descriptions :column="3" border>
++          <el-descriptions-item label="Agent ID">{{ metadata.agentId }}</el-descriptions-item>
++          <el-descriptions-item label="Node ID">{{ metadata.nodeId }}</el-descriptions-item>
++          <el-descriptions-item label="Epoch">{{ metadata.epoch }}</el-descriptions-item>
++          <el-descriptions-item label="Revision">{{ metadata.revision }}</el-descriptions-item>
++          <el-descriptions-item label="Reported at">{{ metadata.reportedAt }}</el-descriptions-item>
++          <el-descriptions-item label="Updated at">{{ metadata.updatedAt }}</el-descriptions-item>
++        </el-descriptions>
++        <el-empty v-if="!metadata.items.length" description="No metadata reported" />
++        <el-table v-else :data="metadata.items" class="metadata-table">
++          <el-table-column prop="name" label="Name" />
++          <el-table-column prop="source" label="Source" />
++          <el-table-column label="Value"><template #default="scope"><el-tag v-if="scope.row.redacted" type="info">Redacted</el-tag><span v-else>{{ scope.row.value || '—' }}</span></template></el-table-column>
++        </el-table>
++      </el-card>
++    </template>
++    <el-empty v-else description="Metadata unavailable" />
++  </section>
++</template>
++<script setup lang="ts">
++import { onMounted, ref } from 'vue'
++import { useRoute } from 'vue-router'
++import { getAgentMetadata, type AgentMetadata } from '../api/client'
++const route = useRoute(); const loading = ref(true); const error = ref(''); const metadata = ref<AgentMetadata | null>(null)
++onMounted(async () => { try { metadata.value = await getAgentMetadata(String(route.params.id), true) } catch (e) { error.value = e instanceof Error ? e.message : 'Failed to load metadata' } finally { loading.value = false } })
++</script>
+diff --git a/web/src/views/Agents.vue b/web/src/views/Agents.vue
+index 14a6770..b5887b0 100644
+--- a/web/src/views/Agents.vue
++++ b/web/src/views/Agents.vue
+@@ -1,2 +1,2 @@
+-<template><h2>Agents</h2><el-table :data="items"><el-table-column prop="name" label="Name"/><el-table-column prop="id" label="ID"/><el-table-column prop="enabled" label="Enabled"/></el-table></template>
+-<script setup lang="ts">import {ref,onMounted} from 'vue'; import {api} from '../api/client'; const items=ref<any[]>([]); onMounted(async()=>{items.value=(await api<any>('/agents')).items})</script>
++<template><h2>Agents</h2><el-table :data="items"><el-table-column prop="name" label="Name"/><el-table-column prop="id" label="ID"/><el-table-column prop="enabled" label="Enabled"/><el-table-column label="Actions"><template #default="scope"><el-button link type="primary" @click="$router.push(`/agents/${scope.row.id}`)">Details</el-button></template></el-table-column></el-table></template>
++<script setup lang="ts">import {ref,onMounted} from 'vue'; import {getAgents, type Agent} from '../api/client'; const items=ref<Agent[]>([]); onMounted(async()=>{items.value=(await getAgents()).items})</script>

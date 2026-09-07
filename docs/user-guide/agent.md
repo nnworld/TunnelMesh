@@ -97,9 +97,10 @@ Agent 主机必须满足：
 
 生产环境使用 `wss://`，不要关闭证书校验或把 Server 证书私钥放在 Agent 主机上。
 
-Agent WebSocket 握手还必须携带 `Authorization: Bearer <token>`。Server 使用同一套 API token 校验该凭据；无效或缺失 token 的连接会在 metadata hello 前被拒绝。请通过 Secret 管理系统注入 token，不要写入仓库或命令行历史。
+Agent WebSocket 握手必须携带后台创建并绑定当前 Agent 的 `agent` service token：`Authorization: Bearer <token>`。无效、过期、撤销或类型错误的连接会在 metadata hello 前被拒绝。请通过 Secret 管理系统注入 token，不要写入仓库或命令行历史。
 
-Token 还必须属于该 Agent 的 owner；管理员 token 可用于运维接管。被禁用或不存在的 Agent ID 会被拒绝。Agent 断线后会以带抖动的指数退避自动重连，并在每次连接发送新的完整 metadata hello。
+Token 还必须属于该 Agent 的 owner；被禁用或不存在的 Agent ID 会被拒绝。仅在临时迁移且显式设置 `security.allow_legacy_connection_tokens: true` 时，旧管理 token 才可用于运维接管；该路径会写入弃用审计并计划在 v0.3.0 移除。Agent 断线后会以带抖动的指数退避自动重连，并在每次连接发送新的完整 metadata hello。
+在线连接默认每 30 秒发送一次协议级 `PING`；Server 返回 `PONG` 并续期 metadata 租约（默认 5 分钟）。因此 metadata 内容不变时也不会被误标为 stale；只有连接断开、心跳停止或 epoch 被新连接替换后才会进入 stale 状态。
 
 ## 7. Docker 运行
 
@@ -145,3 +146,5 @@ nc -vzu 10.0.0.53 53
 - 不要把 Token、私钥、MySQL DSN 或完整配置提交到 Git。
 - 只授予必要的目标网段和端口 policy。
 - 发生 Agent 凭据泄露时立即在管理后台撤销并重新注册。
+
+Agent WebSocket 必须使用后台创建并绑定当前 Agent 的 `agent` service token。无效、过期、撤销或类型错误的 token 会在 metadata hello 前被拒绝。旧版管理登录 token 仅在显式开启 `security.allow_legacy_connection_tokens` 时兼容，计划在 v0.3.0 移除。

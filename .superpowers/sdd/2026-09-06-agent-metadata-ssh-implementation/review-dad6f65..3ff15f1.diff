@@ -1,0 +1,673 @@
+# Review package: dad6f65..3ff15f1
+
+## Commits
+3ff15f1 feat(agent): add allowlisted metadata collector
+
+## Files changed
+ .../task-1-report.md                               |  34 ++++
+ internal/agent/metadata.go                         | 201 +++++++++++++++++++++
+ internal/agent/metadata_test.go                    | 117 ++++++++++++
+ internal/agent/session.go                          |  21 ++-
+ internal/config/config.go                          |  68 ++++++-
+ internal/config/config_test.go                     |  39 ++++
+ 6 files changed, 477 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-1-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-1-report.md
+new file mode 100644
+index 0000000..979541b
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-1-report.md
+@@ -0,0 +1,34 @@
++# Task 1 Report: Agent Metadata Configuration and Collector
++
++## Status
++
++Implemented with TDD. The Agent now supports explicit, allowlisted metadata sources from files and environment variables, with bounded UTF-8 collection and field-scoped failures that do not close the active session.
++
++## Delivered
++
++- Added `config.MetadataSource` and `AgentConfig.Metadata` decoding through Viper.
++- Added configuration validation for source type, metadata name syntax/length, duplicate names, absolute file paths, required environment keys, wildcard rejection, sensitive names, and the 32-field limit.
++- Added `MetadataCollector.Collect(ctx)` with:
++  - explicit `file` and `env` reads only;
++  - 4 KiB per-field bound;
++  - 32 KiB aggregate JSON payload bound;
++  - one trailing newline trim, UTF-8 validation, context cancellation, deterministic field/error ordering;
++  - field-scoped errors for missing/unreadable/invalid sources.
++- Added `NewSessionWithMetadata` and `Session.CollectMetadata`; metadata failures remain separate from frame transport lifecycle.
++- Added tests for allowlisted reads, missing sources, invalid and sensitive names, relative paths, UTF-8, field and aggregate limits, deterministic ordering, config decoding, cancellation, and session non-closure.
++
++## Verification
++
++- RED observed with `go test ./internal/agent ./internal/config -run Metadata -count=1` before implementation (missing metadata types/collector).
++- `go test ./internal/agent ./internal/config -count=1`
++- `go test ./... -count=1`
++- `go test -race ./internal/agent ./internal/config`
++- `go vet ./...`
++- `git diff --check`
++
++All verification commands passed after implementation.
++
++## Concerns / follow-ups
++
++- Metadata protocol framing, persistence, server APIs, and UI remain intentionally deferred to Tasks 2–5.
++- Collector errors avoid returning source paths, environment keys, or values to keep failure reporting safe for logs and ACKs.
+diff --git a/internal/agent/metadata.go b/internal/agent/metadata.go
+new file mode 100644
+index 0000000..3167faa
+--- /dev/null
++++ b/internal/agent/metadata.go
+@@ -0,0 +1,201 @@
++package agent
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"regexp"
++	"sort"
++	"strings"
++	"unicode/utf8"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/config"
++)
++
++const (
++	DefaultMetadataMaxFields    = config.MetadataMaxFields
++	DefaultMetadataFieldBytes   = config.MetadataFieldMaxBytes
++	DefaultMetadataPayloadBytes = config.MetadataPayloadMaxBytes
++)
++
++// MetadataField is one successfully collected allowlisted value.
++type MetadataField struct {
++	Name   string `json:"name"`
++	Source string `json:"source"`
++	Value  string `json:"value"`
++}
++
++// MetadataFieldError records a source failure without exposing a path, key, or
++// value. Errors are intentionally field-scoped so data forwarding can continue.
++type MetadataFieldError struct {
++	Name   string `json:"name"`
++	Source string `json:"source"`
++	Error  string `json:"error"`
++}
++
++// MetadataSnapshot is the deterministic collection result. Fields are sorted
++// by name; Values is a convenience lookup for service and protocol callers.
++type MetadataSnapshot struct {
++	Fields       []MetadataField      `json:"fields"`
++	Values       map[string]string    `json:"values"`
++	Errors       []MetadataFieldError `json:"errors,omitempty"`
++	PayloadBytes int                  `json:"payload_bytes"`
++}
++
++// MetadataCollector reads only explicitly configured file and environment
++// sources. A source failure becomes a field error, while policy and aggregate
++// limit violations fail the collection before an oversized snapshot escapes.
++type MetadataCollector struct {
++	Sources         []config.MetadataSource
++	MaxFields       int
++	MaxFieldBytes   int
++	MaxPayloadBytes int
++}
++
++func NewMetadataCollector(sources []config.MetadataSource) *MetadataCollector {
++	return &MetadataCollector{
++		Sources:         append([]config.MetadataSource(nil), sources...),
++		MaxFields:       DefaultMetadataMaxFields,
++		MaxFieldBytes:   DefaultMetadataFieldBytes,
++		MaxPayloadBytes: DefaultMetadataPayloadBytes,
++	}
++}
++
++func (c *MetadataCollector) Collect(ctx context.Context) (MetadataSnapshot, error) {
++	if err := ctx.Err(); err != nil {
++		return MetadataSnapshot{}, err
++	}
++	if c == nil {
++		return MetadataSnapshot{Values: map[string]string{}}, nil
++	}
++	maxFields, maxFieldBytes, maxPayloadBytes := c.limits()
++	if len(c.Sources) > maxFields {
++		return MetadataSnapshot{}, fmt.Errorf("metadata field count exceeds %d", maxFields)
++	}
++	sources := append([]config.MetadataSource(nil), c.Sources...)
++	sort.SliceStable(sources, func(i, j int) bool {
++		if sources[i].Name == sources[j].Name {
++			return sources[i].Source < sources[j].Source
++		}
++		return sources[i].Name < sources[j].Name
++	})
++	snapshot := MetadataSnapshot{Values: make(map[string]string), Fields: make([]MetadataField, 0, len(sources))}
++	seen := make(map[string]struct{}, len(sources))
++	for _, source := range sources {
++		if err := ctx.Err(); err != nil {
++			return snapshot, err
++		}
++		if err := validateCollectorSource(source, seen); err != nil {
++			snapshot.Errors = append(snapshot.Errors, MetadataFieldError{Name: source.Name, Source: source.Source, Error: err.Error()})
++			continue
++		}
++		seen[source.Name] = struct{}{}
++		value, err := readMetadataSource(ctx, source, maxFieldBytes)
++		if err != nil {
++			snapshot.Errors = append(snapshot.Errors, MetadataFieldError{Name: source.Name, Source: source.Source, Error: err.Error()})
++			continue
++		}
++		snapshot.Values[source.Name] = value
++		snapshot.Fields = append(snapshot.Fields, MetadataField{Name: source.Name, Source: source.Source, Value: value})
++	}
++	sort.Slice(snapshot.Errors, func(i, j int) bool { return snapshot.Errors[i].Name < snapshot.Errors[j].Name })
++	if payload, err := json.Marshal(snapshot.Fields); err == nil {
++		snapshot.PayloadBytes = len(payload)
++		if snapshot.PayloadBytes > maxPayloadBytes {
++			return snapshot, fmt.Errorf("metadata payload exceeds %d bytes", maxPayloadBytes)
++		}
++	}
++	return snapshot, nil
++}
++
++func (c *MetadataCollector) limits() (int, int, int) {
++	maxFields, maxFieldBytes, maxPayloadBytes := c.MaxFields, c.MaxFieldBytes, c.MaxPayloadBytes
++	if maxFields <= 0 {
++		maxFields = DefaultMetadataMaxFields
++	}
++	if maxFieldBytes <= 0 {
++		maxFieldBytes = DefaultMetadataFieldBytes
++	}
++	if maxPayloadBytes <= 0 {
++		maxPayloadBytes = DefaultMetadataPayloadBytes
++	}
++	return maxFields, maxFieldBytes, maxPayloadBytes
++}
++
++var collectorNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
++var collectorSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
++
++func validateCollectorSource(source config.MetadataSource, seen map[string]struct{}) error {
++	if source.Name == "" || len(source.Name) > 64 || !collectorNamePattern.MatchString(source.Name) {
++		return errors.New("invalid metadata name")
++	}
++	if collectorSensitivePattern.MatchString(source.Name) {
++		return errors.New("sensitive metadata name")
++	}
++	if _, ok := seen[source.Name]; ok {
++		return errors.New("duplicate metadata name")
++	}
++	switch source.Source {
++	case "file":
++		if source.Path == "" || !strings.HasPrefix(source.Path, "/") {
++			return errors.New("file path must be absolute")
++		}
++	case "env":
++		if source.Key == "" {
++			return errors.New("env key is required")
++		}
++		if strings.ContainsAny(source.Key, "*?[]") {
++			return errors.New("env key cannot contain wildcard")
++		}
++	default:
++		return errors.New("source must be file or env")
++	}
++	return nil
++}
++
++func readMetadataSource(ctx context.Context, source config.MetadataSource, maxBytes int) (string, error) {
++	if err := ctx.Err(); err != nil {
++		return "", err
++	}
++	var data []byte
++	var err error
++	switch source.Source {
++	case "file":
++		file, openErr := os.Open(source.Path)
++		if openErr != nil {
++			return "", errors.New("source read failed")
++		}
++		defer file.Close()
++		data, err = io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
++	case "env":
++		var ok bool
++		value, exists := os.LookupEnv(source.Key)
++		if !exists {
++			return "", errors.New("environment value is missing")
++		}
++		ok = true
++		if ok {
++			data = []byte(value)
++		}
++	}
++	if err != nil {
++		return "", errors.New("source read failed")
++	}
++	if len(data) > maxBytes {
++		return "", fmt.Errorf("metadata field exceeds %d bytes", maxBytes)
++	}
++	if !utf8.Valid(data) {
++		return "", errors.New("metadata value is not valid UTF-8")
++	}
++	return trimOneTrailingNewline(string(data)), nil
++}
++
++func trimOneTrailingNewline(value string) string {
++	if strings.HasSuffix(value, "\r\n") {
++		return strings.TrimSuffix(value, "\r\n")
++	}
++	return strings.TrimSuffix(value, "\n")
++}
+diff --git a/internal/agent/metadata_test.go b/internal/agent/metadata_test.go
+new file mode 100644
+index 0000000..aeb5464
+--- /dev/null
++++ b/internal/agent/metadata_test.go
+@@ -0,0 +1,117 @@
++package agent
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/config"
++	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
++)
++
++type metadataTestTransport struct{ closed bool }
++
++func (t *metadataTestTransport) Send(protocol.Frame) error { return nil }
++func (t *metadataTestTransport) Receive() (protocol.Frame, error) {
++	return protocol.Frame{}, errors.New("not used")
++}
++func (t *metadataTestTransport) Close() error {
++	t.closed = true
++	return nil
++}
++
++func TestMetadataCollectorReadsAllowlistedFileAndEnvInDeterministicOrder(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "device-id")
++	if err := os.WriteFile(path, []byte("设备-01\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("TUNNELMESH_REGION", "ap-east")
++	collector := NewMetadataCollector([]config.MetadataSource{
++		{Name: "region", Source: "env", Key: "TUNNELMESH_REGION"},
++		{Name: "device_id", Source: "file", Path: path},
++	})
++	snapshot, err := collector.Collect(context.Background())
++	if err != nil {
++		t.Fatalf("Collect() error = %v", err)
++	}
++	if got := snapshot.Values["device_id"]; got != "设备-01" {
++		t.Fatalf("device_id = %q", got)
++	}
++	if got := snapshot.Values["region"]; got != "ap-east" {
++		t.Fatalf("region = %q", got)
++	}
++	if len(snapshot.Fields) != 2 || snapshot.Fields[0].Name != "device_id" || snapshot.Fields[1].Name != "region" {
++		t.Fatalf("fields are not deterministic: %+v", snapshot.Fields)
++	}
++}
++
++func TestMetadataCollectorReportsMissingSourceWithoutFailingCollection(t *testing.T) {
++	collector := NewMetadataCollector([]config.MetadataSource{{Name: "missing", Source: "env", Key: "TUNNELMESH_NOT_SET"}})
++	snapshot, err := collector.Collect(context.Background())
++	if err != nil {
++		t.Fatalf("Collect() error = %v, want per-field error only", err)
++	}
++	if len(snapshot.Errors) != 1 || snapshot.Errors[0].Name != "missing" {
++		t.Fatalf("errors = %+v", snapshot.Errors)
++	}
++}
++
++func TestSessionMetadataErrorsDoNotCloseTransport(t *testing.T) {
++	transport := &metadataTestTransport{}
++	session := NewSessionWithMetadata(transport, NewMetadataCollector([]config.MetadataSource{{Name: "missing", Source: "env", Key: "TUNNELMESH_NOT_SET"}}))
++	snapshot, err := session.CollectMetadata(context.Background())
++	if err != nil || len(snapshot.Errors) != 1 {
++		t.Fatalf("snapshot=%+v error=%v", snapshot, err)
++	}
++	if transport.closed {
++		t.Fatal("metadata collection closed the active session transport")
++	}
++}
++
++func TestMetadataCollectorRejectsFieldAndAggregateLimits(t *testing.T) {
++	t.Setenv("TUNNELMESH_BIG", strings.Repeat("x", DefaultMetadataFieldBytes+1))
++	collector := NewMetadataCollector([]config.MetadataSource{{Name: "big", Source: "env", Key: "TUNNELMESH_BIG"}})
++	snapshot, err := collector.Collect(context.Background())
++	if err != nil || len(snapshot.Errors) != 1 || !strings.Contains(strings.ToLower(snapshot.Errors[0].Error), "field") {
++		t.Fatalf("field limit snapshot=%+v error=%v", snapshot, err)
++	}
++
++	values := make([]config.MetadataSource, 0, DefaultMetadataMaxFields)
++	for i := 0; i < DefaultMetadataMaxFields; i++ {
++		key := "TUNNELMESH_META_" + string(rune('A'+i))
++		t.Setenv(key, strings.Repeat("v", DefaultMetadataFieldBytes))
++		values = append(values, config.MetadataSource{Name: "field_" + string(rune('a'+i)), Source: "env", Key: key})
++	}
++	collector = NewMetadataCollector(values)
++	collector.MaxPayloadBytes = DefaultMetadataPayloadBytes - 1
++	if _, err := collector.Collect(context.Background()); err == nil || !strings.Contains(strings.ToLower(err.Error()), "payload") {
++		t.Fatalf("payload limit error = %v", err)
++	}
++}
++
++func TestMetadataCollectorHonorsCancellationAndInvalidUTF8(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	collector := NewMetadataCollector(nil)
++	if _, err := collector.Collect(ctx); !errors.Is(err, context.Canceled) {
++		t.Fatalf("Collect() error = %v, want context cancellation", err)
++	}
++
++	dir := t.TempDir()
++	path := filepath.Join(dir, "invalid")
++	if err := os.WriteFile(path, []byte{0xff, 0xfe}, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	collector = NewMetadataCollector([]config.MetadataSource{{Name: "invalid", Source: "file", Path: path}})
++	snapshot, err := collector.Collect(context.Background())
++	if err != nil {
++		t.Fatalf("Collect() error = %v", err)
++	}
++	if len(snapshot.Errors) != 1 || !strings.Contains(strings.ToLower(snapshot.Errors[0].Error), "utf") {
++		t.Fatalf("errors = %+v", snapshot.Errors)
++	}
++}
+diff --git a/internal/agent/session.go b/internal/agent/session.go
+index a0f9805..d53d9de 100644
+--- a/internal/agent/session.go
++++ b/internal/agent/session.go
+@@ -1,22 +1,23 @@
+ package agent
+ 
+ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+-	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+ 	"io"
+ 	"math/rand"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+ )
+ 
+ var ErrStreamNotFound = errors.New("agent: stream not found")
+ var ErrDuplicateStream = errors.New("agent: duplicate stream")
+ 
+ type StreamOpenPayload struct {
+ 	AgentID    string `json:"agent_id,omitempty"`
+ 	Protocol   string `json:"protocol"`
+ 	TargetHost string `json:"target_host"`
+ 	TargetPort int    `json:"target_port"`
+@@ -168,28 +169,46 @@ func (d *StreamDispatcher) Close() error {
+ 	return nil
+ }
+ 
+ type FrameTransport interface {
+ 	Send(protocol.Frame) error
+ 	Receive() (protocol.Frame, error)
+ 	Close() error
+ }
+ type Session struct {
+ 	transport               FrameTransport
++	metadataCollector       *MetadataCollector
+ 	closed                  atomic.Bool
+ 	BaseBackoff, MaxBackoff time.Duration
+ 	Rand                    *rand.Rand
+ }
+ 
+ func NewSession(tr FrameTransport) *Session {
+ 	return &Session{transport: tr, BaseBackoff: time.Second, MaxBackoff: 30 * time.Second, Rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+ }
++
++// NewSessionWithMetadata attaches an independent metadata collector. Metadata
++// failures are returned to the caller and never close the frame transport.
++func NewSessionWithMetadata(tr FrameTransport, collector *MetadataCollector) *Session {
++	session := NewSession(tr)
++	session.metadataCollector = collector
++	return session
++}
++
++// CollectMetadata reads the configured snapshot without changing session
++// state, allowing metadata errors to remain separate from data forwarding.
++func (s *Session) CollectMetadata(ctx context.Context) (MetadataSnapshot, error) {
++	if s == nil || s.metadataCollector == nil {
++		return MetadataSnapshot{Values: map[string]string{}}, nil
++	}
++	return s.metadataCollector.Collect(ctx)
++}
+ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) error {
+ 	if s == nil || s.transport == nil {
+ 		return context.Canceled
+ 	}
+ 	defer s.Close()
+ 	done := make(chan struct{})
+ 	defer close(done)
+ 	go func() {
+ 		select {
+ 		case <-ctx.Done():
+diff --git a/internal/config/config.go b/internal/config/config.go
+index fdcfce7..062dcbb 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -2,20 +2,22 @@
+ // TunnelMesh configuration.  It is intentionally independent from command
+ // handlers so server, agent, and client can share one source of truth.
+ package config
+ 
+ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
++	"regexp"
+ 	"strings"
+ 
+ 	"github.com/spf13/viper"
+ )
+ 
+ const (
+ 	ModeLocal   = "local"
+ 	ModeCluster = "cluster"
+ 
+ 	StorageSQLite = "sqlite"
+@@ -94,24 +96,40 @@ type ServerConfig struct {
+ 	TCPBridgeEnabled bool            `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
+ }
+ 
+ type TCPBridgeConfig struct {
+ 	Enabled  bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+ 	Path     string `mapstructure:"path" json:"path" yaml:"path"`
+ 	MaxBytes int64  `mapstructure:"max_bytes" json:"max_bytes" yaml:"max_bytes"`
+ }
+ 
+ type AgentConfig struct {
+-	ServerURL string `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+-	ID        string `mapstructure:"id" json:"id" yaml:"id"`
++	ServerURL string           `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
++	ID        string           `mapstructure:"id" json:"id" yaml:"id"`
++	Metadata  []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+ }
+ 
++// MetadataSource is an explicit allowlisted host value source. File sources
++// read one configured absolute path; env sources read one configured key.
++type MetadataSource struct {
++	Name   string `mapstructure:"name" json:"name" yaml:"name"`
++	Source string `mapstructure:"source" json:"source" yaml:"source"`
++	Path   string `mapstructure:"path" json:"path" yaml:"path"`
++	Key    string `mapstructure:"key" json:"key" yaml:"key"`
++}
++
++const (
++	MetadataMaxFields       = 32
++	MetadataFieldMaxBytes   = 4 << 10
++	MetadataPayloadMaxBytes = 32 << 10
++)
++
+ type ClientConfig struct {
+ 	ServerURL string         `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+ 	Tunnels   []TunnelConfig `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
+ }
+ 
+ // TunnelConfig describes a client tunnel loaded from a configuration file.
+ // CLI flags can override these fields for one-off forwards.
+ type TunnelConfig struct {
+ 	Name       string `mapstructure:"name" json:"name" yaml:"name"`
+ 	Protocol   string `mapstructure:"protocol" json:"protocol" yaml:"protocol"`
+@@ -272,20 +290,21 @@ func bindEnvironment(v *viper.Viper) {
+ 		"server.agent_ws_addr", "server.client_ws_addr", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
+ 		"agent.server_url", "agent.id", "client.server_url",
+ 	}
+ 	for _, key := range keys {
+ 		_ = v.BindEnv(key)
+ 	}
+ }
+ 
+ func Validate(cfg Config) error {
+ 	var problems []string
++	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
+ 	switch cfg.Mode {
+ 	case ModeLocal:
+ 		if cfg.Storage.Driver != StorageSQLite {
+ 			problems = append(problems, "local mode requires sqlite storage driver")
+ 		}
+ 	case ModeCluster:
+ 		if cfg.Storage.Driver != StorageMySQL {
+ 			problems = append(problems, "cluster mode requires mysql storage driver")
+ 		}
+ 		if strings.TrimSpace(cfg.Storage.MySQL.DSN) == "" {
+@@ -313,20 +332,65 @@ func Validate(cfg Config) error {
+ 		}
+ 	default:
+ 		problems = append(problems, fmt.Sprintf("invalid registry type %q", cfg.Registry.Type))
+ 	}
+ 	if len(problems) > 0 {
+ 		return errors.New(strings.Join(problems, "; "))
+ 	}
+ 	return nil
+ }
+ 
++var metadataNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
++var metadataSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
++
++func validateMetadataSources(sources []MetadataSource) []string {
++	var problems []string
++	if len(sources) > MetadataMaxFields {
++		problems = append(problems, fmt.Sprintf("metadata field count exceeds %d", MetadataMaxFields))
++	}
++	seen := make(map[string]struct{}, len(sources))
++	for i, source := range sources {
++		prefix := fmt.Sprintf("metadata[%d]", i)
++		if source.Name == "" || len(source.Name) > 64 || !metadataNamePattern.MatchString(source.Name) {
++			problems = append(problems, prefix+" name must match [a-zA-Z0-9_.-] and be at most 64 characters")
++		}
++		if metadataSensitivePattern.MatchString(source.Name) {
++			problems = append(problems, prefix+" name is sensitive and cannot be reported")
++		}
++		if _, ok := seen[source.Name]; ok {
++			problems = append(problems, prefix+" name is duplicated")
++		}
++		seen[source.Name] = struct{}{}
++		switch source.Source {
++		case "file":
++			if !filepath.IsAbs(source.Path) {
++				problems = append(problems, prefix+" file path must be absolute")
++			}
++			if source.Key != "" {
++				problems = append(problems, prefix+" file source cannot set env key")
++			}
++		case "env":
++			if source.Key == "" {
++				problems = append(problems, prefix+" env source requires a key")
++			} else if strings.ContainsAny(source.Key, "*?[]") {
++				problems = append(problems, prefix+" env key cannot contain wildcard")
++			}
++			if source.Path != "" {
++				problems = append(problems, prefix+" env source cannot set file path")
++			}
++		default:
++			problems = append(problems, prefix+" source must be file or env")
++		}
++	}
++	return problems
++}
++
+ // RedactedJSON returns a stable, machine-readable representation safe for
+ // console output.  DSNs and private key paths are intentionally omitted.
+ func (c Config) RedactedJSON() ([]byte, error) {
+ 	copy := c
+ 	copy.Storage.MySQL.DSN = redact(copy.Storage.MySQL.DSN)
+ 	copy.Storage.MySQL.Key = redact(copy.Storage.MySQL.Key)
+ 	return json.MarshalIndent(copy, "", "  ")
+ }
+ 
+ func redact(value string) string {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index be2e0fc..553fd09 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -92,10 +92,49 @@ func TestValidateRejectsIncompleteClusterAndUnknownRegistry(t *testing.T) {
+ 	}
+ }
+ 
+ func TestLoadHonorsContextCancellation(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	cancel()
+ 	if _, err := config.Load(ctx, config.ConfigOptions{}); err == nil {
+ 		t.Fatal("Load() error = nil for cancelled context")
+ 	}
+ }
++
++func TestValidateMetadataSourcesRejectsUnsafeEntries(t *testing.T) {
++	cases := []struct {
++		name   string
++		source config.MetadataSource
++		want   string
++	}{
++		{name: "invalid name", source: config.MetadataSource{Name: "bad/name", Source: "env", Key: "REGION"}, want: "name"},
++		{name: "relative file", source: config.MetadataSource{Name: "device", Source: "file", Path: "etc/machine-id"}, want: "absolute"},
++		{name: "sensitive name", source: config.MetadataSource{Name: "api_token", Source: "env", Key: "TOKEN"}, want: "sensitive"},
++		{name: "wildcard env", source: config.MetadataSource{Name: "region", Source: "env", Key: "REGION_*"}, want: "wildcard"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
++			cfg.Agent.Metadata = []config.MetadataSource{tc.source}
++			err := config.Validate(cfg)
++			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.want) {
++				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
++			}
++		})
++	}
++}
++
++func TestLoadDecodesAgentMetadataSources(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "metadata.yaml")
++	contents := "mode: local\nstorage:\n  driver: sqlite\nagent:\n  metadata:\n    - name: region\n      source: env\n      key: TUNNELMESH_REGION\n"
++	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
++	if err != nil {
++		t.Fatalf("Load() error = %v", err)
++	}
++	if len(cfg.Agent.Metadata) != 1 || cfg.Agent.Metadata[0].Name != "region" {
++		t.Fatalf("metadata = %+v", cfg.Agent.Metadata)
++	}
++}

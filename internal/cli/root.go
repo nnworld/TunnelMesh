@@ -5,12 +5,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -36,13 +39,30 @@ func NewAgentCommand() *cobra.Command  { return NewAgentRoot() }
 func NewClientCommand() *cobra.Command { return NewClientRoot() }
 
 type rootOptions struct {
-	configFile string
-	mode       string
-	storage    string
-	autoInit   bool
-	registry   string
-	nodeID     string
-	bridge     bool
+	configFile                  string
+	mode                        string
+	storage                     string
+	autoInit                    bool
+	registry                    string
+	nodeID                      string
+	bridge                      bool
+	allowedHosts                []string
+	allowedOrigins              []string
+	allowLegacyConnectionTokens bool
+	tlsEnabled                  bool
+	tlsCertFile                 string
+	tlsKeyFile                  string
+	tlsMinVersion               string
+	relayEnabled                bool
+	relayListen                 string
+	relayEndpoint               string
+	relayCA                     string
+	relayCert                   string
+	relayKey                    string
+	relayServerName             string
+	relayNodeToken              string
+	clientServerURL             string
+	clientToken                 string
 }
 
 func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Command {
@@ -67,6 +87,23 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	flags.BoolVar(&opts.bridge, "server.tcp_bridge.enabled", false, "enable TCP-over-WebSocket bridge")
 	flags.BoolVar(&opts.bridge, "tcp-bridge", false, "enable TCP-over-WebSocket bridge")
 	flags.Bool("server.tcp_bridge_enabled", false, "enable TCP-over-WebSocket bridge (flat spelling)")
+	flags.StringSliceVar(&opts.allowedHosts, "security.allowed_hosts", nil, "exact Host values accepted by the Agent WebSocket endpoint")
+	flags.StringSliceVar(&opts.allowedOrigins, "security.allowed_origins", nil, "exact http/https Origin values accepted by Agent WebSocket")
+	flags.BoolVar(&opts.allowLegacyConnectionTokens, "security.allow_legacy_connection_tokens", false, "temporarily accept deprecated management tokens for Agent connections")
+	flags.BoolVar(&opts.tlsEnabled, "tls.enabled", false, "enable native TLS termination")
+	flags.StringVar(&opts.tlsCertFile, "tls.cert_file", "", "native TLS certificate file")
+	flags.StringVar(&opts.tlsKeyFile, "tls.key_file", "", "native TLS private key file")
+	flags.StringVar(&opts.tlsMinVersion, "tls.min_version", "", "native TLS minimum version (1.2 or 1.3)")
+	flags.BoolVar(&opts.relayEnabled, "server.relay.enabled", false, "enable authenticated server-node relay")
+	flags.StringVar(&opts.relayListen, "server.relay.listen", "", "server-node relay listen address")
+	flags.StringVar(&opts.relayEndpoint, "server.relay.endpoint", "", "server-node relay endpoint")
+	flags.StringVar(&opts.relayCA, "server.relay.ca", "", "server-node relay client CA file")
+	flags.StringVar(&opts.relayCert, "server.relay.cert", "", "server-node relay certificate file")
+	flags.StringVar(&opts.relayKey, "server.relay.key", "", "server-node relay private key file")
+	flags.StringVar(&opts.relayServerName, "server.relay.server_name", "", "server-node relay TLS server name")
+	flags.StringVar(&opts.relayNodeToken, "server.relay.node_token", "", "server-node relay token")
+	flags.StringVar(&opts.clientServerURL, "client.server_url", "", "Client WebSocket URL")
+	flags.StringVar(&opts.clientToken, "client.token", "", "Client bearer token")
 	root.AddCommand(factory(opts)...)
 	return root
 }
@@ -79,11 +116,12 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID})
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server listening on %s in %s mode\n", cfg.Server.HTTPAddr, cfg.Mode)
+			defer runtime.Close()
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server starting on %s in %s mode\n", cfg.Server.HTTPAddr, cfg.Mode)
 			return runtime.Serve(cmd.Context(), cfg.Server.HTTPAddr)
 		}),
 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
@@ -151,7 +189,9 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 				nodeID = cfg.Agent.ID
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
-			return agent.RunWebSocket(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token, cfg.Agent.ID, nodeID, 1, agent.NewMetadataCollector(cfg.Agent.Metadata), nil)
+			return agent.RunWebSocketWithHandlerFactory(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token, cfg.Agent.ID, nodeID, 1, agent.NewMetadataCollector(cfg.Agent.Metadata), func(session *agent.Session) agent.SessionFrameHandler {
+				return agent.NewStreamDispatcherWithSender(agent.Dialer{}, nil, session.Send)
+			}, agent.WebSocketRunOptions{})
 		}),
 		configCommand(opts, "register", "register this agent", func(cmd *cobra.Command, cfg config.Config) error {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent registration requested for %s\n", effectiveAgentID(cfg))
@@ -241,11 +281,58 @@ func clientForwardCommand(opts *rootOptions, proto string) *cobra.Command {
 		if targetHost == "" || targetPort < 1 || targetPort > 65535 {
 			return fmt.Errorf("%s forward requires --target-host and --target-port", proto)
 		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s forward %s -> %s:%d via %s\n", proto, listen, targetHost, targetPort, agentID)
+		if strings.TrimSpace(cfg.Client.ServerURL) == "" || strings.TrimSpace(cfg.Client.Token) == "" {
+			return fmt.Errorf("%s forward requires client.server_url and client.token", proto)
+		}
 		if len(cfg.Client.Tunnels) > 0 {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "loaded %d configured tunnel(s)\n", len(cfg.Client.Tunnels))
 		}
-		return nil
+		var active io.Closer
+		defer func() {
+			if active != nil {
+				_ = active.Close()
+			}
+		}()
+		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+			if active != nil {
+				_ = active.Close()
+				active = nil
+			}
+			opener := client.NewSessionOpener(session)
+			switch proto {
+			case "tcp":
+				forward, err := client.NewTCPForward(opener, client.TCPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				if err != nil {
+					return err
+				}
+				if err := forward.Start(cmd.Context()); err != nil {
+					return err
+				}
+				active = forward
+			case "udp":
+				forward, err := client.NewUDPForward(opener, client.UDPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				if err != nil {
+					return err
+				}
+				if err := forward.Start(cmd.Context()); err != nil {
+					return err
+				}
+				active = forward
+			case "http":
+				forward, err := client.NewHTTPForward(opener, client.HTTPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				if err != nil {
+					return err
+				}
+				if err := forward.Start(cmd.Context()); err != nil {
+					return err
+				}
+				active = forward
+			default:
+				return fmt.Errorf("unsupported forward protocol %q", proto)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s forward %s -> %s:%d via %s\n", proto, listen, targetHost, targetPort, agentID)
+			return nil
+		})
 	}
 	return cmd
 }
@@ -265,11 +352,23 @@ func clientProxyCommand(opts *rootOptions, proto string) *cobra.Command {
 		if targetHost == "" || targetPort < 1 || targetPort > 65535 {
 			return fmt.Errorf("proxy %s requires --target-host and --target-port", proto)
 		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "proxy %s %s:%d via %s\n", proto, targetHost, targetPort, agentID)
-		if cfg.Client.ServerURL == "" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "note: configure client.server_url for a live WebSocket session")
+		if strings.TrimSpace(cfg.Client.ServerURL) == "" || strings.TrimSpace(cfg.Client.Token) == "" {
+			return fmt.Errorf("proxy %s requires client.server_url and client.token", proto)
 		}
-		return nil
+		err = runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+			stream, openErr := client.NewSessionOpener(session).OpenStream(cmd.Context(), client.StreamRequest{AgentID: agentID, Protocol: proto, TargetHost: targetHost, TargetPort: targetPort})
+			if openErr != nil {
+				return openErr
+			}
+			if proxyErr := client.ProxyStdio(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), stream); proxyErr != nil {
+				return proxyErr
+			}
+			return errClientProxyComplete
+		})
+		if errors.Is(err, errClientProxyComplete) {
+			return nil
+		}
+		return err
 	}
 	return cmd
 }
@@ -318,8 +417,64 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 			values["server.tcp_bridge_enabled"] = value
 		}
 	}
+	if flags.Changed("security.allowed_hosts") {
+		values["security.allowed_hosts"] = append([]string(nil), opts.allowedHosts...)
+	}
+	if flags.Changed("security.allowed_origins") {
+		values["security.allowed_origins"] = append([]string(nil), opts.allowedOrigins...)
+	}
+	if flags.Changed("security.allow_legacy_connection_tokens") {
+		values["security.allow_legacy_connection_tokens"] = opts.allowLegacyConnectionTokens
+	}
+	if flags.Changed("tls.enabled") {
+		values["tls.enabled"] = opts.tlsEnabled
+	}
+	if flags.Changed("tls.cert_file") {
+		values["tls.cert_file"] = opts.tlsCertFile
+	}
+	if flags.Changed("tls.key_file") {
+		values["tls.key_file"] = opts.tlsKeyFile
+	}
+	if flags.Changed("tls.min_version") {
+		values["tls.min_version"] = opts.tlsMinVersion
+	}
+	if flags.Changed("server.relay.enabled") {
+		values["server.relay.enabled"] = opts.relayEnabled
+	}
+	if flags.Changed("server.relay.listen") {
+		values["server.relay.listen"] = opts.relayListen
+	}
+	if flags.Changed("server.relay.endpoint") {
+		values["server.relay.endpoint"] = opts.relayEndpoint
+	}
+	if flags.Changed("server.relay.ca") {
+		values["server.relay.ca"] = opts.relayCA
+	}
+	if flags.Changed("server.relay.cert") {
+		values["server.relay.cert"] = opts.relayCert
+	}
+	if flags.Changed("server.relay.key") {
+		values["server.relay.key"] = opts.relayKey
+	}
+	if flags.Changed("server.relay.server_name") {
+		values["server.relay.server_name"] = opts.relayServerName
+	}
+	if flags.Changed("server.relay.node_token") {
+		values["server.relay.node_token"] = opts.relayNodeToken
+	}
+	if flags.Changed("client.server_url") {
+		values["client.server_url"] = opts.clientServerURL
+	}
+	if flags.Changed("client.token") {
+		values["client.token"] = opts.clientToken
+	}
 	return values
 }
+
+var (
+	runClientWebSocket     = client.RunWebSocket
+	errClientProxyComplete = errors.New("client proxy complete")
+)
 
 func effectiveAgentID(cfg config.Config) string {
 	if cfg.Agent.ID != "" {

@@ -45,7 +45,7 @@ IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/44
 
 ## Tunnel 状态
 
-Tunnels 页面显示本地 forward、publish route 和连接状态。异常时先查看 Agent online/lease 状态，再检查 policy、目标端口和 Server 审计事件。停止或重试操作应使用同一隧道 ID，避免重复创建。
+Tunnels 页面显示本地 forward、publish route 和连接状态。异常时先查看 Agent online/lease 状态，再检查 policy、目标端口和 Server 审计事件。停止或重试操作应使用同一隧道 ID，避免重复创建。Agent metadata 的 stale 状态由 WebSocket 会话租约决定：正常在线 Agent 会通过协议级 `PING/PONG` 自动续期，断线或心跳停止超过 metadata TTL 后才显示为 stale。
 
 ## 审计日志
 
@@ -59,6 +59,20 @@ Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel 操作、meta
 
 所有 API 使用统一响应 `{ code, msg, data }`。分页使用 cursor；写请求应携带 `Idempotency-Key`，重试时复用相同 key。
 
+## Service Tokens
+
+Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`server_node` 三类服务凭据。普通用户只能为自己拥有且启用的 Agent 创建 Agent/Client token；`server_node` 仅管理员可创建。
+
+创建或轮换成功后，明文 secret 只在对话框显示一次。配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY` 后，数据库保存 AES-GCM 密文，管理员仍须通过显式 reveal API、确认头和审计流程读取；未配置密钥时保持 hash-only，旧 token 无法恢复。请立即复制到 Secret 管理系统；轮换会使旧 token 失效；撤销适用于泄露或设备退役。
+
 ## 配置与排障建议
 
 优先级为命令行参数 > 环境变量 > 配置文件 > 默认值。上线前执行 `check-config`，确认本地 SQLite 或集群 MySQL、注册中心、80/443 地址和 TLS 配置正确。出现 401/403 时检查 token 与角色；出现 404 时检查 Agent ID、路由 Host/path 和 wildcard DNS；出现 stale 时检查 Agent WebSocket、租约和系统时间。
+
+### Token secret reveal
+
+The token list and normal token detail APIs never return bearer secrets. With the encryption key configured, an administrator can call `POST /api/v1/tokens/{tokenId}/reveal` with `X-Token-Reveal-Confirm` and a unique `Idempotency-Key`. The response is audited and marked `no-store`; treat the returned value as sensitive. Legacy tokens created before encryption must be rotated first.
+
+### Logical traceroute
+
+Run `POST /api/v1/agents/{agentId}/trace` to inspect the authenticated path from client through server/relay nodes to the agent, then read the result with `GET /api/v1/traces/{traceId}`. Regular users receive topology-safe hops. Administrators may set `includeSensitive=true` to see private addresses and peer certificate metadata. `includeSecrets` is rejected; use the dedicated reveal endpoint instead.

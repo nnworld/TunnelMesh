@@ -39,6 +39,9 @@ const (
 	FrameAgentHello
 	FrameAgentMetadataUpdate
 	FrameAgentMetadataAck
+	FrameTraceStart
+	FrameTraceHop
+	FrameTraceEnd
 )
 
 // Descriptive aliases keep call sites readable while retaining the wire names.
@@ -54,6 +57,9 @@ const (
 	FrameTypeAgentHello     = FrameAgentHello
 	FrameTypeMetadataUpdate = FrameAgentMetadataUpdate
 	FrameTypeMetadataAck    = FrameAgentMetadataAck
+	FrameTypeTraceStart     = FrameTraceStart
+	FrameTypeTraceHop       = FrameTraceHop
+	FrameTypeTraceEnd       = FrameTraceEnd
 	FrameClose              = FrameHalfClose
 )
 
@@ -86,7 +92,7 @@ func (f Frame) Validate() error {
 	if isMetadataFrame(f.Type) && len(f.Payload) > MaxMetadataPayload {
 		return fmt.Errorf("%w: %d", ErrPayloadTooLarge, len(f.Payload))
 	}
-	if f.StreamID == 0 && f.Type != FrameGoAway && f.Type != FramePing && f.Type != FramePong && !isMetadataFrame(f.Type) {
+	if f.StreamID == 0 && f.Type != FrameGoAway && f.Type != FramePing && f.Type != FramePong && !isMetadataFrame(f.Type) && !isTraceFrame(f.Type) {
 		return ErrInvalidFrame
 	}
 	if f.Type == FrameWindowUpdate && f.Window == 0 {
@@ -100,6 +106,8 @@ func knownFrameType(t FrameType) bool { return t >= FrameOpenStream && t <= Fram
 func isMetadataFrame(t FrameType) bool {
 	return t >= FrameAgentHello && t <= FrameAgentMetadataAck
 }
+
+func isTraceFrame(t FrameType) bool { return t >= FrameTraceStart && t <= FrameTraceEnd }
 
 // AgentMetadataItem is one allowlisted value sent in a metadata snapshot.
 type AgentMetadataItem struct {

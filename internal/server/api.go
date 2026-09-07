@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -22,16 +23,19 @@ import (
 // storage interfaces so the handler remains usable with SQLite, MySQL, and
 // small in-memory fakes in tests.
 type API struct {
-	DB       *storage.DB
-	Auth     *auth.AuthService
-	users    storage.UserRepository
-	agents   storage.AgentRepository
-	policies storage.PolicyRepository
-	tunnels  storage.TunnelRepository
-	audits   storage.AuditRepository
-	idem     storage.IdempotencyRepository
-	routeMu  sync.Mutex
-	service  *apiService
+	DB           *storage.DB
+	Auth         *auth.AuthService
+	users        storage.UserRepository
+	agents       storage.AgentRepository
+	policies     storage.PolicyRepository
+	tunnels      storage.TunnelRepository
+	audits       storage.AuditRepository
+	idem         storage.IdempotencyRepository
+	routeMu      sync.Mutex
+	service      *apiService
+	tokenService *TokenService
+	traceroute   *TracerouteService
+	probeService *ProbeService
 }
 
 // apiService is the application layer between HTTP handlers and storage. It
@@ -57,6 +61,9 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 	if db != nil {
 		a.users, a.agents, a.policies, a.tunnels, a.audits, a.idem = db.Users(), db.Agents(), db.Policies(), db.Tunnels(), db.Audits(), db.Idempotency()
 		a.service = &apiService{agents: a.agents, metadata: NewAgentMetadataService(db.Metadata()), policies: a.policies, tunnels: a.tunnels, audits: a.audits}
+		a.tokenService = NewTokenService(db)
+		a.traceroute = NewTracerouteService(db)
+		a.probeService = NewProbeService(db)
 	}
 	return a
 }
@@ -233,6 +240,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleTunnels(w, r, p, parts[1:])
 	case "audit-logs", "audits":
 		a.handleAudits(w, r, p)
+	case "tokens":
+		a.handleTokens(w, r, p, parts[1:])
+	case "traces":
+		a.handleTraces(w, r, p, parts[1:])
 	default:
 		writeAPIError(w, http.StatusNotFound, "not found")
 	}
@@ -290,6 +301,14 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 		return
 	}
 	id := parts[0]
+	if len(parts) >= 2 && parts[1] == "trace" {
+		a.handleAgentTrace(w, r, p, id)
+		return
+	}
+	if len(parts) >= 2 && (parts[1] == "diagnose" || parts[1] == "probes") {
+		a.handleAgentProbes(w, r, p, id, parts[1])
+		return
+	}
 	if len(parts) >= 2 && parts[1] == "metadata" {
 		a.handleAgentMetadata(w, r, p, id)
 		return
@@ -350,6 +369,126 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (a *API) handleAgentProbes(w http.ResponseWriter, r *http.Request, p auth.Principal, agentID, action string) {
+	if a.probeService == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "probe service unavailable")
+		return
+	}
+	if action == "probes" {
+		if r.Method != http.MethodGet {
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		agent, err := a.service.GetAgent(r.Context(), agentID)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		if !isAdmin(p) && agent.OwnerUserID != p.UserID {
+			writeAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		page, err := a.DB.ProbeResults().ListByAgent(r.Context(), agentID, r.URL.Query().Get("cursor"), queryLimit(r))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		items := make([]any, len(page.Items))
+		for i := range page.Items {
+			items[i] = page.Items[i]
+		}
+		writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var input struct {
+		Kind      string `json:"kind"`
+		Host      string `json:"host"`
+		Port      int    `json:"port"`
+		TimeoutMs int    `json:"timeoutMs"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	timeout := time.Duration(input.TimeoutMs) * time.Millisecond
+	result, err := a.probeService.Diagnose(r.Context(), p, agentID, DiagnoseRequest{Kind: input.Kind, Host: input.Host, Port: input.Port, Timeout: timeout})
+	if err != nil {
+		if errors.Is(err, auth.ErrForbidden) {
+			writeAPIError(w, http.StatusForbidden, "forbidden")
+		} else {
+			writeStorageError(w, err)
+		}
+		return
+	}
+	a.audit(r.Context(), p, "agent.diagnose", "agent", agentID)
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *API) handleAgentTrace(w http.ResponseWriter, r *http.Request, p auth.Principal, agentID string) {
+	if r.Method != http.MethodPost || a.traceroute == nil {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	agent, err := a.service.GetAgent(r.Context(), agentID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if !isAdmin(p) && agent.OwnerUserID != p.UserID {
+		writeAPIError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	var request protocol.TraceRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	request.AgentID = agentID
+	includeSensitive := request.IncludeSensitive && isAdmin(p)
+	if request.IncludeSensitive && !isAdmin(p) {
+		writeAPIError(w, http.StatusForbidden, "admin role required for sensitive trace fields")
+		return
+	}
+	if request.IncludeSecrets {
+		writeAPIError(w, http.StatusForbidden, "trace secrets require the token reveal endpoint")
+		return
+	}
+	result, err := a.traceroute.StartForUser(r.Context(), p.UserID, request, includeSensitive, false)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	a.audit(r.Context(), p, "agent.trace", "agent", agentID)
+	if includeSensitive {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *API) handleTraces(w http.ResponseWriter, r *http.Request, p auth.Principal, parts []string) {
+	if r.Method != http.MethodGet || len(parts) != 1 || a.traceroute == nil {
+		writeAPIError(w, http.StatusNotFound, "not found")
+		return
+	}
+	result, err := a.traceroute.GetForUser(r.Context(), parts[0], p.UserID, isAdmin(p))
+	if err != nil {
+		writeAPIError(w, http.StatusNotFound, "trace not found")
+		return
+	}
+	if result.TraceID == "" {
+		writeAPIError(w, http.StatusNotFound, "trace not found")
+		return
+	}
+	if isAdmin(p) {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 type agentMetadataResponse struct {

@@ -1,0 +1,1013 @@
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/config/config.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/config/config.go
+index 68ee16f..fecd60a 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/config/config.go
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/config/config.go
+@@ -100,6 +100,7 @@ type ServerConfig struct {
+ 	ClientWSAddr     string          `mapstructure:"client_ws_addr" json:"client_ws_addr" yaml:"client_ws_addr"`
+ 	TCPBridge        TCPBridgeConfig `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
+ 	TCPBridgeEnabled bool            `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
++	Relay            RelayConfig     `mapstructure:"relay" json:"relay" yaml:"relay"`
+ }
+ 
+ type TCPBridgeConfig struct {
+@@ -108,6 +109,19 @@ type TCPBridgeConfig struct {
+ 	MaxBytes int64  `mapstructure:"max_bytes" json:"max_bytes" yaml:"max_bytes"`
+ }
+ 
++// RelayConfig is deliberately separate from public HTTP/native TLS settings.
++// NodeToken is never serialized in config output.
++type RelayConfig struct {
++	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
++	Listen     string `mapstructure:"listen" json:"listen" yaml:"listen"`
++	Endpoint   string `mapstructure:"endpoint" json:"endpoint" yaml:"endpoint"`
++	CA         string `mapstructure:"ca" json:"ca" yaml:"ca"`
++	Cert       string `mapstructure:"cert" json:"cert" yaml:"cert"`
++	Key        string `mapstructure:"key" json:"key" yaml:"key"`
++	ServerName string `mapstructure:"server_name" json:"server_name" yaml:"server_name"`
++	NodeToken  string `mapstructure:"node_token" json:"-" yaml:"-"`
++}
++
+ type SecurityConfig struct {
+ 	AllowedHosts   []string `mapstructure:"allowed_hosts" json:"allowed_hosts" yaml:"allowed_hosts"`
+ 	AllowedOrigins []string `mapstructure:"allowed_origins" json:"allowed_origins" yaml:"allowed_origins"`
+@@ -295,6 +309,13 @@ func setDefaults(v *viper.Viper) {
+ 		"server.tcp_bridge.enabled":               true,
+ 		"server.tcp_bridge.path":                  "/ws/tcp",
+ 		"server.tcp_bridge.max_bytes":             int64(64 << 10),
++		"server.relay.enabled":                    false,
++		"server.relay.listen":                     "",
++		"server.relay.endpoint":                   "",
++		"server.relay.ca":                         "",
++		"server.relay.cert":                       "",
++		"server.relay.key":                        "",
++		"server.relay.server_name":                "",
+ 		"security.allowed_hosts":                  []string{},
+ 		"security.allowed_origins":                []string{},
+ 		"security.allow_legacy_connection_tokens": false,
+@@ -317,6 +338,7 @@ func bindEnvironment(v *viper.Viper) {
+ 		"server.agent_ws_addr", "server.client_ws_addr", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
+ 		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
+ 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
++		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
+ 		"agent.server_url", "agent.id", "agent.token", "client.server_url", "client.token",
+ 	}
+ 	for _, key := range keys {
+@@ -329,6 +351,7 @@ func Validate(cfg Config) error {
+ 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
+ 	problems = append(problems, validateSecurity(cfg.Security)...)
+ 	problems = append(problems, validateTLS(cfg.TLS)...)
++	problems = append(problems, validateRelay(cfg.Mode, cfg.Node.ID, cfg.Server.Relay)...)
+ 	if cfg.Agent.ServerURL != "" && !validWebSocketURL(cfg.Agent.ServerURL) {
+ 		problems = append(problems, "agent server URL must be an absolute ws:// or wss:// URL")
+ 	}
+@@ -489,6 +512,38 @@ func validateTLS(cfg TLSConfig) []string {
+ 	return problems
+ }
+ 
++func validateRelay(mode, nodeID string, cfg RelayConfig) []string {
++	if !cfg.Enabled {
++		return nil
++	}
++	var problems []string
++	if mode != ModeCluster {
++		problems = append(problems, "server relay requires cluster mode")
++	}
++	if strings.TrimSpace(nodeID) == "" {
++		problems = append(problems, "server relay requires node identity")
++	}
++	if strings.TrimSpace(cfg.Listen) == "" && strings.TrimSpace(cfg.Endpoint) == "" {
++		problems = append(problems, "server relay requires listen or endpoint")
++	}
++	if strings.TrimSpace(cfg.CA) == "" || !filepath.IsAbs(cfg.CA) {
++		problems = append(problems, "server relay CA path must be absolute")
++	}
++	if strings.TrimSpace(cfg.Cert) == "" || !filepath.IsAbs(cfg.Cert) {
++		problems = append(problems, "server relay certificate path must be absolute")
++	}
++	if strings.TrimSpace(cfg.Key) == "" || !filepath.IsAbs(cfg.Key) {
++		problems = append(problems, "server relay private key path must be absolute")
++	}
++	if strings.TrimSpace(cfg.ServerName) == "" {
++		problems = append(problems, "server relay server name is required")
++	}
++	if strings.TrimSpace(cfg.NodeToken) == "" {
++		problems = append(problems, "server relay node token is required")
++	}
++	return problems
++}
++
+ var metadataNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+ var metadataSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
+ 
+@@ -541,6 +596,8 @@ func (c Config) RedactedJSON() ([]byte, error) {
+ 	copy.Storage.MySQL.DSN = redact(copy.Storage.MySQL.DSN)
+ 	copy.Storage.MySQL.Key = redact(copy.Storage.MySQL.Key)
+ 	copy.TLS.KeyFile = redact(copy.TLS.KeyFile)
++	copy.Server.Relay.Key = redact(copy.Server.Relay.Key)
++	copy.Server.Relay.NodeToken = redact(copy.Server.Relay.NodeToken)
+ 	return json.MarshalIndent(copy, "", "  ")
+ }
+ 
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/config/config_test.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/config/config_test.go
+index 2268991..88074fe 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/config/config_test.go
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/config/config_test.go
+@@ -182,6 +182,9 @@ func TestLoadClientTokenPrecedenceAndRedaction(t *testing.T) {
+ 			t.Fatalf("redacted config leaked %q: %s", secret, data)
+ 		}
+ 	}
++	if strings.Contains(string(data), "/file/key.pem") {
++		t.Fatalf("redacted config leaked relay private key path: %s", data)
++	}
+ }
+ 
+ func TestLoadSecurityAndNativeTLSDefaults(t *testing.T) {
+@@ -281,3 +284,45 @@ func TestRedactedJSONHidesNativeTLSPrivateKeyPath(t *testing.T) {
+ 		t.Fatalf("redacted config leaked TLS private key path: %s", data)
+ 	}
+ }
++
++func TestLoadRelayConfigPrecedenceAndRedaction(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "relay.yaml")
++	file := "mode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: file-dsn\n    tls: true\nnode:\n  id: file-node\nserver:\n  relay:\n    enabled: true\n    listen: 127.0.0.1:9443\n    ca: /file/ca.pem\n    cert: /file/cert.pem\n    key: /file/key.pem\n    server_name: file.relay\n    node_token: file-secret\n"
++	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("TUNNELMESH_SERVER_RELAY_NODE_TOKEN", "env-secret")
++	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path, CLI: map[string]any{
++		"node.id":                  "cli-node",
++		"server.relay.endpoint":    "relay.example:9443",
++		"server.relay.node_token":  "cli-secret",
++		"server.relay.server_name": "cli.relay",
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.Node.ID != "cli-node" || cfg.Server.Relay.Endpoint != "relay.example:9443" || cfg.Server.Relay.NodeToken != "cli-secret" {
++		t.Fatalf("relay precedence mismatch: node=%q relay=%+v", cfg.Node.ID, cfg.Server.Relay)
++	}
++	data, err := cfg.RedactedJSON()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, secret := range []string{"file-secret", "env-secret", "cli-secret"} {
++		if strings.Contains(string(data), secret) {
++			t.Fatalf("redacted config leaked %q: %s", secret, data)
++		}
++	}
++}
++
++func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *testing.T) {
++	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", CA: "ca.pem", Cert: "cert.pem", Key: "key.pem", ServerName: "relay.local"}}}
++	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "absolute") || !strings.Contains(err.Error(), "node token") {
++		t.Fatalf("Validate() error = %v, want absolute paths and node token failures", err)
++	}
++	cfg.Server.Relay.CA, cfg.Server.Relay.Cert, cfg.Server.Relay.Key, cfg.Server.Relay.NodeToken = "/ca.pem", "/cert.pem", "/key.pem", "secret"
++	if err := config.Validate(cfg); err != nil {
++		t.Fatalf("Validate(valid relay) error = %v", err)
++	}
++}
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth.go
+new file mode 100644
+index 0000000..be2dd5a
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth.go
+@@ -0,0 +1,211 @@
++package relay
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"errors"
++	"net"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/auth"
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/credentials"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/peer"
++	"google.golang.org/grpc/status"
++)
++
++const (
++	serverNodeAuthorizationMetadata = "authorization"
++	serverNodeIDMetadata            = "x-tunnelmesh-node-id"
++	serverNodeEpochMetadata         = "x-tunnelmesh-node-epoch"
++)
++
++// ServerNodePrincipal is the authenticated caller identity for an inter-node
++// relay stream. It is deliberately separate from StreamRequest.NodeID, which
++// remains the target route selected by the caller.
++type ServerNodePrincipal struct {
++	NodeID  string
++	Epoch   int64
++	TokenID string
++}
++
++type serverNodePrincipalContextKey struct{}
++
++// ServerNodePrincipalFromContext returns the identity established by the
++// server stream interceptor. Handlers must not derive caller identity from the
++// first application message.
++func ServerNodePrincipalFromContext(ctx context.Context) (ServerNodePrincipal, bool) {
++	principal, ok := ctx.Value(serverNodePrincipalContextKey{}).(ServerNodePrincipal)
++	return principal, ok
++}
++
++// NewServerNodeStreamInterceptor authenticates every relay stream before its
++// handler can receive the first target-routing message. TLS peer verification
++// is performed by grpc credentials; this interceptor additionally checks that
++// the verified leaf certificate contains the exact caller node SAN.
++func NewServerNodeStreamInterceptor(credentialsService *auth.CredentialService, nodes storage.NodeRepository) grpc.StreamServerInterceptor {
++	return func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
++		principal, err := authenticateServerNode(stream.Context(), credentialsService, nodes)
++		if err != nil {
++			return err
++		}
++		return handler(srv, &serverNodeContextStream{ServerStream: stream, ctx: context.WithValue(stream.Context(), serverNodePrincipalContextKey{}, principal)})
++	}
++}
++
++type serverNodeContextStream struct {
++	grpc.ServerStream
++	ctx context.Context
++}
++
++func (s *serverNodeContextStream) Context() context.Context { return s.ctx }
++
++func authenticateServerNode(ctx context.Context, credentialsService *auth.CredentialService, nodes storage.NodeRepository) (ServerNodePrincipal, error) {
++	callerNodeID, callerEpoch, rawToken, err := parseServerNodeMetadata(ctx)
++	if err != nil {
++		return ServerNodePrincipal{}, err
++	}
++	cert, err := verifiedPeerCertificate(ctx)
++	if err != nil {
++		return ServerNodePrincipal{}, err
++	}
++	if !certificateHasExactSAN(cert, callerNodeID) {
++		return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay peer identity denied")
++	}
++	identity, err := credentialsService.ValidateAs(ctx, rawToken, storage.TokenTypeServerNode)
++	if err != nil {
++		return ServerNodePrincipal{}, status.Error(codes.Unauthenticated, "relay authentication failed")
++	}
++	if identity.NodeID != callerNodeID {
++		return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay credential denied")
++	}
++	if nodes == nil {
++		return ServerNodePrincipal{}, status.Error(codes.Unauthenticated, "relay authentication failed")
++	}
++	node, err := nodes.Get(ctx, callerNodeID)
++	if err != nil {
++		return ServerNodePrincipal{}, status.Error(codes.Unauthenticated, "relay authentication failed")
++	}
++	if node.ExpiresAt != nil && !node.ExpiresAt.After(nowUTC()) {
++		return ServerNodePrincipal{}, status.Error(codes.FailedPrecondition, "relay node is expired")
++	}
++	if node.Epoch != callerEpoch {
++		return ServerNodePrincipal{}, status.Error(codes.FailedPrecondition, "relay node epoch is stale")
++	}
++	return ServerNodePrincipal{NodeID: callerNodeID, Epoch: callerEpoch, TokenID: identity.TokenID}, nil
++}
++
++// nowUTC is a variable to keep expiration checks deterministic in focused
++// tests without exposing clock policy to relay callers.
++var nowUTC = func() time.Time { return time.Now().UTC() }
++
++func parseServerNodeMetadata(ctx context.Context) (string, int64, string, error) {
++	md, ok := metadata.FromIncomingContext(ctx)
++	if !ok {
++		return "", 0, "", status.Error(codes.Unauthenticated, "relay metadata missing")
++	}
++	one := func(key string) (string, error) {
++		values := md.Get(key)
++		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
++			return "", status.Error(codes.Unauthenticated, "relay metadata invalid")
++		}
++		return values[0], nil
++	}
++	authorization, err := one(serverNodeAuthorizationMetadata)
++	if err != nil {
++		return "", 0, "", err
++	}
++	if !strings.HasPrefix(authorization, "Bearer ") || strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer ")) == "" || strings.ContainsAny(strings.TrimPrefix(authorization, "Bearer "), " \t\r\n") {
++		return "", 0, "", status.Error(codes.Unauthenticated, "relay metadata invalid")
++	}
++	rawToken := strings.TrimPrefix(authorization, "Bearer ")
++	callerNodeID, err := one(serverNodeIDMetadata)
++	if err != nil || strings.TrimSpace(callerNodeID) != callerNodeID {
++		return "", 0, "", status.Error(codes.Unauthenticated, "relay metadata invalid")
++	}
++	epochRaw, err := one(serverNodeEpochMetadata)
++	if err != nil {
++		return "", 0, "", err
++	}
++	epoch, err := strconv.ParseInt(epochRaw, 10, 64)
++	if err != nil || epoch <= 0 {
++		return "", 0, "", status.Error(codes.Unauthenticated, "relay metadata invalid")
++	}
++	return callerNodeID, epoch, rawToken, nil
++}
++
++func verifiedPeerCertificate(ctx context.Context) (*x509.Certificate, error) {
++	p, ok := peer.FromContext(ctx)
++	if !ok || p.AuthInfo == nil {
++		return nil, status.Error(codes.Unauthenticated, "relay peer certificate missing")
++	}
++	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
++	if !ok || tlsInfo.State.Version < tls.VersionTLS12 || len(tlsInfo.State.PeerCertificates) == 0 || len(tlsInfo.State.VerifiedChains) == 0 {
++		return nil, status.Error(codes.Unauthenticated, "relay peer certificate invalid")
++	}
++	return tlsInfo.State.PeerCertificates[0], nil
++}
++
++func certificateHasExactSAN(cert *x509.Certificate, nodeID string) bool {
++	if cert == nil || nodeID == "" {
++		return false
++	}
++	for _, dnsName := range cert.DNSNames {
++		if strings.Contains(dnsName, "*") {
++			continue
++		}
++		if strings.EqualFold(dnsName, nodeID) {
++			return true
++		}
++	}
++	if ip := net.ParseIP(nodeID); ip != nil {
++		for _, candidate := range cert.IPAddresses {
++			if candidate.Equal(ip) {
++				return true
++			}
++		}
++	}
++	for _, rawURI := range cert.URIs {
++		if rawURI != nil && rawURI.String() == nodeID {
++			return true
++		}
++	}
++	return false
++}
++
++// NewServerNodeStreamClientInterceptor injects the caller identity on every
++// stream. The raw token remains in outgoing metadata only and is never copied
++// into request payloads or errors.
++func NewServerNodeStreamClientInterceptor(nodeID string, epoch int64, rawToken string) grpc.StreamClientInterceptor {
++	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
++		if strings.TrimSpace(nodeID) == "" || epoch <= 0 || strings.TrimSpace(rawToken) == "" || strings.ContainsAny(rawToken, " \t\r\n") {
++			return nil, status.Error(codes.Unauthenticated, "relay client identity is invalid")
++		}
++		ctx = metadata.AppendToOutgoingContext(ctx, serverNodeAuthorizationMetadata, "Bearer "+rawToken, serverNodeIDMetadata, nodeID, serverNodeEpochMetadata, strconv.FormatInt(epoch, 10))
++		return streamer(ctx, desc, cc, method, opts...)
++	}
++}
++
++// NewRelayServerTLSConfig applies the relay-specific mTLS policy. Public HTTP
++// TLS settings must not be reused for this listener.
++func NewRelayServerTLSConfig(cert tls.Certificate, roots *x509.CertPool) (*tls.Config, error) {
++	if len(cert.Certificate) == 0 || cert.PrivateKey == nil || roots == nil {
++		return nil, errors.New("relay: server certificate, private key, and client CA are required")
++	}
++	return &tls.Config{Certificates: []tls.Certificate{cert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots, MinVersion: tls.VersionTLS12}, nil
++}
++
++// NewRelayClientTLSConfig applies the relay client certificate and strict
++// server verification policy.
++func NewRelayClientTLSConfig(cert tls.Certificate, roots *x509.CertPool, serverName string) (*tls.Config, error) {
++	if len(cert.Certificate) == 0 || cert.PrivateKey == nil || roots == nil || strings.TrimSpace(serverName) == "" {
++		return nil, errors.New("relay: client certificate, root CAs, and server name are required")
++	}
++	return &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: roots, ServerName: serverName, MinVersion: tls.VersionTLS12, InsecureSkipVerify: false}, nil
++}
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth_test.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth_test.go
+new file mode 100644
+index 0000000..a228d33
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/server_node_auth_test.go
+@@ -0,0 +1,384 @@
++package relay
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"errors"
++	"io"
++	"math/big"
++	"net"
++	"net/url"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/auth"
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/credentials"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
++)
++
++func TestAuthenticatedGRPCRelayValidMTLSAndServerNodeToken(t *testing.T) {
++	ctx := context.Background()
++	db, err := storage.OpenSQLite(ctx, "file:relay-auth-valid?mode=memory&cache=shared")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	authService := auth.NewAuthService(db)
++	owner, err := authService.CreateUser(ctx, "relay-owner", "relay-password", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
++		t.Fatal(err)
++	}
++	credentialsService := auth.NewCredentialService(db)
++	defer credentialsService.Close()
++	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
++	var handlerCalls atomic.Int32
++	var principal ServerNodePrincipal
++	var targetRequest StreamRequest
++	server := grpc.NewServer(
++		grpc.Creds(credentials.NewTLS(serverTLS)),
++		grpc.ChainStreamInterceptor(NewServerNodeStreamInterceptor(credentialsService, db.Nodes())),
++	)
++	RegisterRelayServer(server, NewRelayServer(func(ctx context.Context, request StreamRequest) (io.ReadWriteCloser, error) {
++		handlerCalls.Add(1)
++		principal, _ = ServerNodePrincipalFromContext(ctx)
++		targetRequest = request
++		return newEchoConn(), nil
++	}))
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	go server.Serve(ln)
++	defer server.Stop()
++
++	client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", AgentID: "agent-a", Epoch: 7, StreamID: 1, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer stream.Close()
++	if _, err := stream.Write([]byte("hello")); err != nil {
++		t.Fatal(err)
++	}
++	buf := make([]byte, 5)
++	if _, err := io.ReadFull(stream, buf); err != nil {
++		t.Fatal(err)
++	}
++	if string(buf) != "hello" {
++		t.Fatalf("stream data = %q, want hello", buf)
++	}
++	if handlerCalls.Load() != 1 {
++		t.Fatalf("handler calls = %d, want 1", handlerCalls.Load())
++	}
++	if principal.NodeID != "node-a" || principal.Epoch != 7 || targetRequest.NodeID != "target-node" {
++		t.Fatalf("principal=%+v target=%+v, caller and target identities were not separated", principal, targetRequest)
++	}
++}
++
++func TestAuthenticatedGRPCRelayRejectsStaleEpochBeforeHandler(t *testing.T) {
++	ctx := context.Background()
++	db, err := storage.OpenSQLite(ctx, "file:relay-auth-stale?mode=memory&cache=shared")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	authService := auth.NewAuthService(db)
++	owner, err := authService.CreateUser(ctx, "relay-stale-owner", "relay-password", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
++		t.Fatal(err)
++	}
++	credentialsService := auth.NewCredentialService(db)
++	defer credentialsService.Close()
++	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
++	var handlerCalls atomic.Int32
++	server := grpc.NewServer(
++		grpc.Creds(credentials.NewTLS(serverTLS)),
++		grpc.ChainStreamInterceptor(NewServerNodeStreamInterceptor(credentialsService, db.Nodes())),
++	)
++	RegisterRelayServer(server, NewRelayServer(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
++		handlerCalls.Add(1)
++		return newEchoConn(), nil
++	}))
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	go server.Serve(ln)
++	defer server.Stop()
++
++	client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 6, created.Secret, clientTLS)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 6})
++	if err == nil {
++		defer stream.Close()
++		_, err = stream.Read(make([]byte, 1))
++	}
++	if status.Code(err) != codes.FailedPrecondition {
++		t.Fatalf("OpenStream error = %v, code=%v, want FailedPrecondition", err, status.Code(err))
++	}
++	if handlerCalls.Load() != 0 {
++		t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
++	}
++}
++
++func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
++	tests := []struct {
++		name      string
++		certNode  string
++		tokenType storage.TokenType
++		revoke    bool
++		expired   bool
++		wantCode  codes.Code
++	}{
++		{name: "certificate SAN mismatch", certNode: "node-b", tokenType: storage.TokenTypeServerNode, wantCode: codes.PermissionDenied},
++		{name: "wrong token type", certNode: "node-a", tokenType: storage.TokenTypeClient, wantCode: codes.Unauthenticated},
++		{name: "revoked token", certNode: "node-a", tokenType: storage.TokenTypeServerNode, revoke: true, wantCode: codes.Unauthenticated},
++		{name: "expired node", certNode: "node-a", tokenType: storage.TokenTypeServerNode, expired: true, wantCode: codes.Unauthenticated},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			ctx := context.Background()
++			db, err := storage.OpenSQLite(ctx, "file:relay-auth-failure-"+strings.ReplaceAll(tt.name, " ", "-")+"?mode=memory&cache=shared")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer db.Close()
++			authService := auth.NewAuthService(db)
++			owner, err := authService.CreateUser(ctx, "owner-"+strings.ReplaceAll(tt.name, " ", "-"), "password", "user")
++			if err != nil {
++				t.Fatal(err)
++			}
++			node := storage.ServerNode{ID: "node-a", Epoch: 7}
++			if err := db.Nodes().Create(ctx, node); err != nil {
++				t.Fatal(err)
++			}
++			credentialsService := auth.NewCredentialService(db)
++			defer credentialsService.Close()
++			input := auth.CreateTokenInput{Type: tt.tokenType, OwnerUserID: owner.ID}
++			if tt.tokenType == storage.TokenTypeServerNode {
++				input.NodeID = "node-a"
++			}
++			created, err := credentialsService.Create(ctx, input)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if tt.expired {
++				expired := time.Now().Add(-time.Minute)
++				node.ExpiresAt = &expired
++				if err := db.Nodes().Update(ctx, node); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if tt.revoke {
++				if err := credentialsService.Revoke(ctx, created.TokenID); err != nil {
++					t.Fatal(err)
++				}
++			}
++			_, serverTLS, clientTLS := testRelayCertificates(t, tt.certNode)
++			var handlerCalls atomic.Int32
++			grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)), grpc.ChainStreamInterceptor(NewServerNodeStreamInterceptor(credentialsService, db.Nodes())))
++			RegisterRelayServer(grpcServer, NewRelayServer(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
++				handlerCalls.Add(1)
++				return newEchoConn(), nil
++			}))
++			ln, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer ln.Close()
++			go grpcServer.Serve(ln)
++			defer grpcServer.Stop()
++			client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer client.Close()
++			stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 7})
++			if err == nil {
++				defer stream.Close()
++				_, err = stream.Read(make([]byte, 1))
++			}
++			if status.Code(err) != tt.wantCode {
++				t.Fatalf("OpenStream error = %v, code=%v, want %v", err, status.Code(err), tt.wantCode)
++			}
++			if handlerCalls.Load() != 0 {
++				t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
++			}
++		})
++	}
++}
++
++func TestServerNodeMetadataRejectsMissingAndDuplicateValues(t *testing.T) {
++	base := metadata.Pairs(serverNodeAuthorizationMetadata, "Bearer secret", serverNodeIDMetadata, "node-a", serverNodeEpochMetadata, "7")
++	if _, _, _, err := parseServerNodeMetadata(metadata.NewIncomingContext(context.Background(), base)); err != nil {
++		t.Fatalf("valid metadata rejected: %v", err)
++	}
++	duplicate := metadata.Join(base, metadata.Pairs(serverNodeEpochMetadata, "8"))
++	if _, _, _, err := parseServerNodeMetadata(metadata.NewIncomingContext(context.Background(), duplicate)); status.Code(err) != codes.Unauthenticated {
++		t.Fatalf("duplicate metadata error = %v, want Unauthenticated", err)
++	}
++	missing := metadata.NewIncomingContext(context.Background(), metadata.Pairs(serverNodeAuthorizationMetadata, "Bearer secret", serverNodeIDMetadata, "node-a"))
++	if _, _, _, err := parseServerNodeMetadata(missing); status.Code(err) != codes.Unauthenticated {
++		t.Fatalf("missing metadata error = %v, want Unauthenticated", err)
++	}
++}
++
++func TestServerNodeClientInterceptorInjectsCallerMetadata(t *testing.T) {
++	interceptor := NewServerNodeStreamClientInterceptor("node-a", 7, "raw-secret")
++	var got metadata.MD
++	streamer := func(ctx context.Context, _ *grpc.StreamDesc, _ *grpc.ClientConn, _ string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
++		got, _ = metadata.FromOutgoingContext(ctx)
++		return nil, nil
++	}
++	_, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/relay", streamer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got.Get(serverNodeAuthorizationMetadata)[0] != "Bearer raw-secret" || got.Get(serverNodeIDMetadata)[0] != "node-a" || got.Get(serverNodeEpochMetadata)[0] != "7" {
++		t.Fatalf("injected metadata = %v", got)
++	}
++}
++
++func TestRelayTLSHelpersRejectMissingClientCertificateAndCA(t *testing.T) {
++	if _, err := NewRelayServerTLSConfig(tls.Certificate{}, x509.NewCertPool()); err == nil {
++		t.Fatal("server TLS accepted missing certificate")
++	}
++	if _, err := NewRelayClientTLSConfig(tls.Certificate{}, x509.NewCertPool(), "relay.local"); err == nil {
++		t.Fatal("client TLS accepted missing certificate")
++	}
++	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
++	if _, err := NewRelayServerTLSConfig(serverTLS.Certificates[0], nil); err == nil {
++		t.Fatal("server TLS accepted missing client CA")
++	}
++	if _, err := NewRelayClientTLSConfig(clientTLS.Certificates[0], nil, "relay.local"); err == nil {
++		t.Fatal("client TLS accepted missing root CA")
++	}
++}
++
++func TestCertificateSANMatchingIsExactAndDoesNotFallbackToCN(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		cert *x509.Certificate
++		node string
++		want bool
++	}{
++		{name: "exact DNS", cert: &x509.Certificate{DNSNames: []string{"Node-A"}}, node: "node-a", want: true},
++		{name: "wildcard denied", cert: &x509.Certificate{DNSNames: []string{"*.example"}}, node: "node.example", want: false},
++		{name: "CN fallback denied", cert: &x509.Certificate{Subject: pkix.Name{CommonName: "node-a"}}, node: "node-a", want: false},
++		{name: "URI exact", cert: &x509.Certificate{URIs: []*url.URL{{Scheme: "spiffe", Host: "tunnelmesh", Path: "/node-a"}}}, node: "spiffe://tunnelmesh/node-a", want: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := certificateHasExactSAN(tc.cert, tc.node); got != tc.want {
++				t.Fatalf("certificateHasExactSAN() = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func testRelayCertificates(t *testing.T, nodeID string) (*x509.CertPool, *tls.Config, *tls.Config) {
++	t.Helper()
++	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "TunnelMesh Test CA"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
++	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caCert, err := x509.ParseCertificate(caDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++	newLeaf := func(serial int64, dns string, server bool) tls.Certificate {
++		key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++		if keyErr != nil {
++			t.Fatal(keyErr)
++		}
++		leaf := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "ignored"}, DNSNames: []string{dns}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
++		if server {
++			leaf.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
++		}
++		der, certErr := x509.CreateCertificate(rand.Reader, leaf, caCert, &key.PublicKey, caKey)
++		if certErr != nil {
++			t.Fatal(certErr)
++		}
++		return tls.Certificate{Certificate: [][]byte{der, caDER}, PrivateKey: key}
++	}
++	serverCert := newLeaf(2, "relay.local", true)
++	clientCert := newLeaf(3, nodeID, false)
++	pool := x509.NewCertPool()
++	pool.AddCert(caCert)
++	return pool, &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}, &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, ServerName: "relay.local", MinVersion: tls.VersionTLS12}
++}
++
++type echoConn struct {
++	mu     sync.Mutex
++	closed bool
++	data   chan []byte
++}
++
++func newEchoConn() *echoConn { return &echoConn{data: make(chan []byte, 4)} }
++func (c *echoConn) Read(p []byte) (int, error) {
++	b, ok := <-c.data
++	if !ok {
++		return 0, io.EOF
++	}
++	n := copy(p, b)
++	return n, nil
++}
++func (c *echoConn) Write(p []byte) (int, error) {
++	c.mu.Lock()
++	closed := c.closed
++	c.mu.Unlock()
++	if closed {
++		return 0, errors.New("closed")
++	}
++	c.data <- append([]byte(nil), p...)
++	return len(p), nil
++}
++func (c *echoConn) Close() error {
++	c.mu.Lock()
++	if !c.closed {
++		c.closed = true
++		close(c.data)
++	}
++	c.mu.Unlock()
++	return nil
++}
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/relay/transport.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/transport.go
+index ae224e3..a674d35 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/relay/transport.go
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/relay/transport.go
+@@ -5,6 +5,7 @@ import (
+ 	"crypto/tls"
+ 	"errors"
+ 	"io"
++	"strings"
+ 	"sync"
+ 
+ 	"google.golang.org/grpc"
+@@ -213,12 +214,41 @@ func DialGRPCNode(ctx context.Context, endpoint string, cfg *tls.Config) (*GRPCN
+ 	if cfg == nil || len(cfg.Certificates) == 0 || cfg.RootCAs == nil {
+ 		return nil, errors.New("relay: mTLS requires client certificate and root CAs")
+ 	}
++	if cfg.ServerName == "" || cfg.InsecureSkipVerify || cfg.MinVersion < tls.VersionTLS12 {
++		return nil, errors.New("relay: client TLS requires server name, verification, and TLS 1.2+")
++	}
+ 	conn, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(credentials.NewTLS(cfg)), grpc.WithBlock())
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	return &GRPCNodeTransport{conn: conn, tlsConfig: cfg}, nil
+ }
++
++// DialAuthenticatedGRPCNode creates the production server-node relay client.
++// Authentication metadata is attached by an interceptor to every stream.
++func DialAuthenticatedGRPCNode(ctx context.Context, endpoint, nodeID string, epoch int64, rawToken string, cfg *tls.Config) (*GRPCNodeTransport, error) {
++	if strings.TrimSpace(nodeID) == "" || epoch <= 0 || strings.TrimSpace(rawToken) == "" {
++		return nil, errors.New("relay: server-node identity is required")
++	}
++	if cfg == nil || len(cfg.Certificates) == 0 || cfg.RootCAs == nil || cfg.ServerName == "" || cfg.InsecureSkipVerify || cfg.MinVersion < tls.VersionTLS12 {
++		return nil, errors.New("relay: authenticated mTLS requires client certificate, root CAs, server name, and TLS 1.2+")
++	}
++	conn, err := grpc.DialContext(ctx, endpoint,
++		grpc.WithTransportCredentials(credentials.NewTLS(cfg)),
++		grpc.WithChainStreamInterceptor(NewServerNodeStreamClientInterceptor(nodeID, epoch, rawToken)),
++		grpc.WithBlock(),
++	)
++	if err != nil {
++		return nil, err
++	}
++	return &GRPCNodeTransport{conn: conn, tlsConfig: cfg}, nil
++}
++
++// DialGRPCNodeAuthenticated is retained as an explicit spelling for callers
++// migrating from the unauthenticated low-level constructor.
++func DialGRPCNodeAuthenticated(ctx context.Context, endpoint, nodeID string, epoch int64, rawToken string, cfg *tls.Config) (*GRPCNodeTransport, error) {
++	return DialAuthenticatedGRPCNode(ctx, endpoint, nodeID, epoch, rawToken, cfg)
++}
+ func (n *GRPCNodeTransport) OpenStream(ctx context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
+ 	if n == nil || n.conn == nil {
+ 		return nil, ErrNodeDisconnected
+@@ -288,6 +318,8 @@ func NewTLSClientConfig(serverName string, roots *tls.Config) *tls.Config {
+ 	}
+ 	c := roots.Clone()
+ 	c.ServerName = serverName
++	c.MinVersion = tls.VersionTLS12
++	c.InsecureSkipVerify = false
+ 	return c
+ }
+ 
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/server/runtime.go b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/server/runtime.go
+index 1dd5799..82ce686 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-before/internal/server/runtime.go
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-7-after/internal/server/runtime.go
+@@ -3,15 +3,21 @@ package server
+ import (
+ 	"context"
+ 	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
+ 	"encoding/hex"
+ 	"errors"
++	"fmt"
+ 	"log/slog"
+ 	"net"
+ 	"net/http"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+ 	"golang.org/x/net/websocket"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials"
+ 
+ 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+@@ -31,6 +37,8 @@ const (
+ type RuntimeConfig struct {
+ 	Security config.SecurityConfig
+ 	TLS      config.TLSConfig
++	Relay    config.RelayConfig
++	NodeID   string
+ }
+ 
+ // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
+@@ -45,6 +53,8 @@ type ServerRuntime struct {
+ 	ClientAuthorizer StreamAuthorizer
+ 	ClientTransport  relay.NodeTransport
+ 	LocalAgentRelay  *AgentRelayTransport
++	relayServer      *grpc.Server
++	relayListener    net.Listener
+ 	config           RuntimeConfig
+ }
+ 
+@@ -56,7 +66,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
+ 		return nil, ErrRuntimeDatabaseRequired
+ 	}
+ 	authService := auth.NewAuthService(db)
+-	credentials := auth.NewCredentialService(db)
++	credentialService := auth.NewCredentialService(db)
+ 	var runtimeConfig RuntimeConfig
+ 	if len(options) > 0 {
+ 		runtimeConfig = options[0]
+@@ -65,7 +75,28 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
+ 	}
+ 	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
+ 	localAgentRelay := NewAgentRelayTransport(agentSessions)
+-	return &ServerRuntime{DB: db, AgentSessions: agentSessions, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentials, ClientAuthorizer: NewCredentialStreamAuthorizer(credentials), ClientTransport: localAgentRelay, LocalAgentRelay: localAgentRelay, config: runtimeConfig}, nil
++	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: localAgentRelay, LocalAgentRelay: localAgentRelay, config: runtimeConfig}
++	if runtimeConfig.Relay.Enabled {
++		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
++			_ = credentialService.Close()
++			return nil, errors.New("server runtime: relay requires node identity")
++		}
++		tlsConfig, err := loadRelayServerTLS(runtimeConfig.Relay)
++		if err != nil {
++			_ = credentialService.Close()
++			return nil, err
++		}
++		listener, err := net.Listen("tcp", runtimeConfig.Relay.Listen)
++		if err != nil {
++			_ = credentialService.Close()
++			return nil, fmt.Errorf("server runtime: listen relay: %w", err)
++		}
++		runtime.relayListener = listener
++		runtime.relayServer = grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)), grpc.ChainStreamInterceptor(relay.NewServerNodeStreamInterceptor(credentialService, db.Nodes())))
++		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServer(localAgentRelay.OpenStream))
++	}
++	runtime.Credentials = credentialService
++	return runtime, nil
+ }
+ 
+ // Close releases runtime-owned background workers. The caller continues to
+@@ -78,12 +109,40 @@ func (r *ServerRuntime) Close() error {
+ 	if r.LocalAgentRelay != nil {
+ 		relayErr = r.LocalAgentRelay.Close()
+ 	}
++	if r.relayServer != nil {
++		r.relayServer.Stop()
++	}
++	if r.relayListener != nil {
++		_ = r.relayListener.Close()
++	}
+ 	if r.Credentials != nil {
+ 		credentialErr = r.Credentials.Close()
+ 	}
+ 	return errors.Join(relayErr, credentialErr)
+ }
+ 
++// DialRelayNode is the authenticated production client path for a cluster
++// relay. It intentionally has no unauthenticated fallback.
++func (r *ServerRuntime) DialRelayNode(ctx context.Context, endpoint string, epoch int64) (*relay.GRPCNodeTransport, error) {
++	if r == nil || !r.config.Relay.Enabled {
++		return nil, errors.New("server runtime: authenticated relay is disabled")
++	}
++	if strings.TrimSpace(endpoint) == "" {
++		endpoint = r.config.Relay.Endpoint
++	}
++	if strings.TrimSpace(endpoint) == "" {
++		return nil, errors.New("server runtime: relay endpoint is required")
++	}
++	if epoch <= 0 {
++		return nil, errors.New("server runtime: relay epoch is required")
++	}
++	tlsConfig, err := loadRelayClientTLS(r.config.Relay)
++	if err != nil {
++		return nil, err
++	}
++	return relay.DialAuthenticatedGRPCNode(ctx, endpoint, r.config.NodeID, epoch, r.config.Relay.NodeToken, tlsConfig)
++}
++
+ // Handler exposes management API, embedded web assets, and the Agent WebSocket
+ // endpoint under /ws/agent. Scoped Agent credentials are validated before the
+ // optional AgentSessionConfig.Authenticate policy runs.
+@@ -250,6 +309,9 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
+ 		return err
+ 	}
+ 	srv := &http.Server{Handler: r.Handler(), ReadHeaderTimeout: 10 * time.Second}
++	if r.relayServer != nil && r.relayListener != nil {
++		go func() { _ = r.relayServer.Serve(r.relayListener) }()
++	}
+ 	errCh := make(chan error, 1)
+ 	go func() { errCh <- srv.Serve(serveListener) }()
+ 	select {
+@@ -266,6 +328,38 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
+ 	}
+ }
+ 
++func loadRelayServerTLS(cfg config.RelayConfig) (*tls.Config, error) {
++	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
++	if err != nil {
++		return nil, fmt.Errorf("server runtime: load relay certificate: %w", err)
++	}
++	caPEM, err := os.ReadFile(cfg.CA)
++	if err != nil {
++		return nil, fmt.Errorf("server runtime: read relay CA: %w", err)
++	}
++	roots := x509.NewCertPool()
++	if !roots.AppendCertsFromPEM(caPEM) {
++		return nil, errors.New("server runtime: relay CA contains no certificates")
++	}
++	return relay.NewRelayServerTLSConfig(cert, roots)
++}
++
++func loadRelayClientTLS(cfg config.RelayConfig) (*tls.Config, error) {
++	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
++	if err != nil {
++		return nil, fmt.Errorf("server runtime: load relay client certificate: %w", err)
++	}
++	caPEM, err := os.ReadFile(cfg.CA)
++	if err != nil {
++		return nil, fmt.Errorf("server runtime: read relay client CA: %w", err)
++	}
++	roots := x509.NewCertPool()
++	if !roots.AppendCertsFromPEM(caPEM) {
++		return nil, errors.New("server runtime: relay client CA contains no certificates")
++	}
++	return relay.NewRelayClientTLSConfig(cert, roots, cfg.ServerName)
++}
++
+ type xNetWSFrameConn struct{ conn *websocket.Conn }
+ 
+ func (c *xNetWSFrameConn) ReadMessage() (int, []byte, error) {

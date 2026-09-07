@@ -6,35 +6,101 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/migrations"
 )
 
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 2
+	SchemaVersion = 5
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
 
 type DB struct {
-	sql         *sql.DB
-	driver      string
-	users       UserRepository
-	tokens      TokenRepository
-	agents      AgentRepository
-	policies    PolicyRepository
-	tunnels     TunnelRepository
-	nodes       NodeRepository
-	metadata    AgentMetadataRepository
-	leases      LeaseRepository
-	audits      AuditRepository
-	idempotency IdempotencyRepository
+	sql           *sql.DB
+	driver        string
+	users         UserRepository
+	tokens        TokenRepository
+	serviceTokens ServiceTokenRepository
+	agents        AgentRepository
+	policies      PolicyRepository
+	tunnels       TunnelRepository
+	nodes         NodeRepository
+	metadata      AgentMetadataRepository
+	runtimeStats  AgentRuntimeStatsRepository
+	probeResults  AgentProbeResultRepository
+	leases        LeaseRepository
+	audits        AuditRepository
+	idempotency   IdempotencyRepository
+	metrics       *observability.Metrics
+}
+
+// ServiceTokenMutationRepositories groups every repository that participates
+// in an authorized service-token mutation. Each repository is bound to the
+// same transaction so authorization facts and the credential write cannot
+// observe different database states.
+type ServiceTokenMutationRepositories struct {
+	Tokens      ServiceTokenRepository
+	Audits      AuditRepository
+	Idempotency IdempotencyRepository
+	Users       UserRepository
+	Agents      AgentRepository
+	Nodes       NodeRepository
+}
+
+// ServiceTokenTransaction atomically applies service-token lifecycle changes
+// and their audit record using repositories bound to the same transaction.
+// It is retained for Task 2 callers; mutation paths that also persist replay
+// metadata should use ServiceTokenMutationTransaction.
+func (d *DB) ServiceTokenTransaction(ctx context.Context, fn func(ServiceTokenRepository, AuditRepository) error) error {
+	return d.ServiceTokenMutationTransaction(ctx, func(tokens ServiceTokenRepository, audits AuditRepository, _ IdempotencyRepository) error {
+		return fn(tokens, audits)
+	})
+}
+
+// ServiceTokenMutationTransaction commits a service-token mutation, its audit
+// event, and non-secret idempotency metadata as one database fact.
+func (d *DB) ServiceTokenMutationTransaction(ctx context.Context, fn func(ServiceTokenRepository, AuditRepository, IdempotencyRepository) error) error {
+	return d.ServiceTokenAuthorizedMutationTransaction(ctx, func(repos ServiceTokenMutationRepositories) error {
+		return fn(repos.Tokens, repos.Audits, repos.Idempotency)
+	})
+}
+
+// ServiceTokenAuthorizedMutationTransaction commits authorization reads,
+// service-token lifecycle state, audit events, and replay metadata as one
+// database fact. SQLite takes a writer lock before any authorization read;
+// MySQL repositories use locking reads for mutable resource facts.
+func (d *DB) ServiceTokenAuthorizedMutationTransaction(ctx context.Context, fn func(ServiceTokenMutationRepositories) error) error {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if d.driver == DriverSQLite {
+		if _, err := tx.ExecContext(ctx, `UPDATE schema_meta SET version=version WHERE id=1`); err != nil {
+			return err
+		}
+	}
+	repos := ServiceTokenMutationRepositories{
+		Tokens:      &serviceTokenRepo{db: tx, driver: d.driver, lockReads: true},
+		Audits:      &auditRepo{db: tx},
+		Idempotency: &idempotencyRepo{db: tx},
+		Users:       &userRepo{db: tx, driver: d.driver, lockReads: true},
+		Agents:      &agentRepo{db: tx, driver: d.driver, lockReads: true},
+		Nodes:       &nodeRepo{db: tx, driver: d.driver, lockReads: true},
+	}
+	if err := fn(repos); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // AuthTransaction executes user/token/audit changes in one database
@@ -49,7 +115,7 @@ func (d *DB) AuthTransaction(ctx context.Context, fn func(UserRepository, TokenR
 		_ = tx.Rollback()
 		return err
 	}
-	users := &userRepo{db: tx}
+	users := &userRepo{db: tx, driver: d.driver, lockReads: true}
 	tokens := &tokenRepo{db: tx}
 	audits := &auditRepo{db: tx}
 	if err := fn(users, tokens, audits); err != nil {
@@ -104,6 +170,25 @@ func Open(ctx context.Context, driver, dsn string, autoInit bool) (*DB, error) {
 	return newDB(db, driver), nil
 }
 
+// OpenWithMetrics attaches bounded storage instrumentation without changing
+// the storage ownership or transaction behavior of Open.
+func OpenWithMetrics(ctx context.Context, driver, dsn string, autoInit bool, metrics *observability.Metrics) (*DB, error) {
+	started := time.Now()
+	db, err := Open(ctx, driver, dsn, autoInit)
+	if err != nil {
+		if metrics != nil {
+			class := observability.NormalizeErrorClass(err)
+			metrics.ObserveProbe("storage", "failure", class, time.Since(started))
+		}
+		return nil, err
+	}
+	db.metrics = metrics
+	if metrics != nil {
+		metrics.ObserveProbe("storage", "success", "", time.Since(started))
+	}
+	return db, nil
+}
+
 // OpenConfig consumes the already-validated storage settings produced by
 // internal/config and keeps driver-specific DSN selection inside storage.
 func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
@@ -115,7 +200,23 @@ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
 }
 
 func newDB(db *sql.DB, driver string) *DB {
-	return &DB{sql: db, driver: driver, users: &userRepo{db}, tokens: &tokenRepo{db}, agents: &agentRepo{db}, policies: &policyRepo{db}, tunnels: &tunnelRepo{db}, nodes: &nodeRepo{db}, metadata: NewAgentMetadataRepositoryWithDriver(db, driver), leases: NewLeaseRepositoryWithDriver(db, driver), audits: &auditRepo{db}, idempotency: &idempotencyRepo{db}}
+	return &DB{
+		sql:           db,
+		driver:        driver,
+		users:         &userRepo{db: db, driver: driver},
+		tokens:        &tokenRepo{db: db},
+		serviceTokens: NewServiceTokenRepositoryWithDriver(db, driver),
+		agents:        &agentRepo{db: db, driver: driver},
+		policies:      &policyRepo{db},
+		tunnels:       &tunnelRepo{db},
+		nodes:         &nodeRepo{db: db, driver: driver},
+		metadata:      NewAgentMetadataRepositoryWithDriver(db, driver),
+		runtimeStats:  NewAgentRuntimeStatsRepository(db),
+		probeResults:  NewAgentProbeResultRepository(db),
+		leases:        NewLeaseRepositoryWithDriver(db, driver),
+		audits:        &auditRepo{db},
+		idempotency:   &idempotencyRepo{db},
+	}
 }
 
 func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
@@ -168,7 +269,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "users", "agents", "agent_runtime_metadata"} {
+	for _, table := range []string{"schema_meta", "users", "agents", "agent_runtime_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
@@ -192,22 +293,36 @@ func (d *DB) Close() error {
 	}
 	return d.sql.Close()
 }
-func (d *DB) Ping(ctx context.Context) error { return d.sql.PingContext(ctx) }
-func (d *DB) SQL() *sql.DB                   { return d.sql }
-func (d *DB) Driver() string                 { return d.driver }
+func (d *DB) Ping(ctx context.Context) error {
+	err := d.sql.PingContext(ctx)
+	if d.metrics != nil {
+		result, class := "success", ""
+		if err != nil {
+			result, class = "failure", observability.NormalizeErrorClass(err)
+		}
+		d.metrics.ObserveStage("storage", "ping", result, class, 0)
+		d.metrics.ObserveProbe("storage", result, class, 0)
+	}
+	return err
+}
+func (d *DB) SQL() *sql.DB   { return d.sql }
+func (d *DB) Driver() string { return d.driver }
 func (d *DB) SchemaVersion(ctx context.Context) (int, error) {
 	var v int
 	err := d.sql.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
 	return v, err
 }
-func (d *DB) Users() UserRepository                  { return d.users }
-func (d *DB) Tokens() TokenRepository                { return d.tokens }
-func (d *DB) Agents() AgentRepository                { return d.agents }
-func (d *DB) Policies() PolicyRepository             { return d.policies }
-func (d *DB) Tunnels() TunnelRepository              { return d.tunnels }
-func (d *DB) Nodes() NodeRepository                  { return d.nodes }
-func (d *DB) Metadata() AgentMetadataRepository      { return d.metadata }
-func (d *DB) AgentMetadata() AgentMetadataRepository { return d.metadata }
-func (d *DB) Leases() LeaseRepository                { return d.leases }
-func (d *DB) Audits() AuditRepository                { return d.audits }
-func (d *DB) Idempotency() IdempotencyRepository     { return d.idempotency }
+func (d *DB) Users() UserRepository                     { return d.users }
+func (d *DB) Tokens() TokenRepository                   { return d.tokens }
+func (d *DB) ServiceTokens() ServiceTokenRepository     { return d.serviceTokens }
+func (d *DB) Agents() AgentRepository                   { return d.agents }
+func (d *DB) Policies() PolicyRepository                { return d.policies }
+func (d *DB) Tunnels() TunnelRepository                 { return d.tunnels }
+func (d *DB) Nodes() NodeRepository                     { return d.nodes }
+func (d *DB) Metadata() AgentMetadataRepository         { return d.metadata }
+func (d *DB) AgentMetadata() AgentMetadataRepository    { return d.metadata }
+func (d *DB) RuntimeStats() AgentRuntimeStatsRepository { return d.runtimeStats }
+func (d *DB) ProbeResults() AgentProbeResultRepository  { return d.probeResults }
+func (d *DB) Leases() LeaseRepository                   { return d.leases }
+func (d *DB) Audits() AuditRepository                   { return d.audits }
+func (d *DB) Idempotency() IdempotencyRepository        { return d.idempotency }

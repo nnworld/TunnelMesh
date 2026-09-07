@@ -28,6 +28,33 @@ type TokenRepository interface {
 	List(context.Context, string, int) (Page[APIToken], error)
 }
 
+type ServiceTokenFilter struct {
+	OwnerUserID string
+	Type        TokenType
+	AgentID     string
+	NodeID      string
+}
+
+type ServiceTokenRepository interface {
+	Create(context.Context, ServiceToken) error
+	Get(context.Context, string) (ServiceToken, error)
+	GetByHash(context.Context, string) (ServiceToken, error)
+	List(context.Context, ServiceTokenFilter, string, int) (Page[ServiceToken], error)
+	Revoke(context.Context, string, time.Time) error
+	TouchLastUsed(context.Context, string, time.Time) error
+	Rotate(context.Context, string, ServiceToken, time.Time) error
+}
+
+// ServiceTokenSecretRepository is an optional extension implemented by the
+// SQL repository. Keeping it separate preserves compatibility with validation
+// fakes that only need hash-based authentication.
+type ServiceTokenSecretRepository interface {
+	ServiceTokenRepository
+	MarkSecretRead(context.Context, string, time.Time) error
+}
+
+var ErrServiceTokenRevoked = errors.New("service token is already revoked")
+
 type AgentRepository interface {
 	Create(context.Context, Agent) error
 	Get(context.Context, string) (Agent, error)
@@ -67,6 +94,25 @@ type AgentMetadataRepository interface {
 	Get(context.Context, string) (AgentRuntimeMetadata, error)
 	List(context.Context, string, int) (Page[AgentRuntimeMetadata], error)
 	MarkStale(context.Context, string, int64) error
+	Touch(context.Context, string, int64, time.Time, time.Time) error
+}
+
+var ErrRuntimeStatsStaleEpoch = errors.New("runtime stats epoch is stale")
+
+// ErrStaleEpoch is a concise compatibility alias used by callers that share
+// fencing errors across runtime metadata, leases and history repositories.
+var ErrStaleEpoch = ErrRuntimeStatsStaleEpoch
+
+type AgentRuntimeStatsRepository interface {
+	Append(context.Context, AgentRuntimeStats) error
+	ListRange(context.Context, string, time.Time, time.Time, string, int) (Page[AgentRuntimeStats], error)
+	DeleteBefore(context.Context, string, time.Time) error
+}
+
+type AgentProbeResultRepository interface {
+	Create(context.Context, AgentProbeResult) error
+	ListByAgent(context.Context, string, string, int) (Page[AgentProbeResult], error)
+	DeleteBefore(context.Context, time.Time) error
 }
 
 type LeaseRepository interface {
@@ -97,12 +143,31 @@ type AtomicIdempotencyRepository interface {
 
 // Constructor helpers are useful for services that own a database/sql handle
 // directly (for example tests or read-only reporting jobs).
-func NewUserRepository(db *sql.DB) UserRepository     { return &userRepo{db} }
-func NewTokenRepository(db *sql.DB) TokenRepository   { return &tokenRepo{db} }
-func NewAgentRepository(db *sql.DB) AgentRepository   { return &agentRepo{db} }
+func NewUserRepository(db *sql.DB) UserRepository {
+	return &userRepo{db: db, driver: DriverSQLite}
+}
+func NewTokenRepository(db *sql.DB) TokenRepository { return &tokenRepo{db} }
+func NewServiceTokenRepository(db *sql.DB) ServiceTokenRepository {
+	return NewServiceTokenRepositoryWithDriver(db, DriverSQLite)
+}
+func NewServiceTokenRepositoryWithDriver(db *sql.DB, driver string) ServiceTokenRepository {
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if driver == "sqlite3" {
+		driver = DriverSQLite
+	}
+	if driver != DriverMySQL && driver != DriverSQLite {
+		panic(fmt.Sprintf("unsupported service token repository driver %q", driver))
+	}
+	return &serviceTokenRepo{db: db, starter: db, driver: driver}
+}
+func NewAgentRepository(db *sql.DB) AgentRepository {
+	return &agentRepo{db: db, driver: DriverSQLite}
+}
 func NewPolicyRepository(db *sql.DB) PolicyRepository { return &policyRepo{db} }
 func NewTunnelRepository(db *sql.DB) TunnelRepository { return &tunnelRepo{db} }
-func NewNodeRepository(db *sql.DB) NodeRepository     { return &nodeRepo{db} }
+func NewNodeRepository(db *sql.DB) NodeRepository {
+	return &nodeRepo{db: db, driver: DriverSQLite}
+}
 func NewAgentMetadataRepository(db *sql.DB) AgentMetadataRepository {
 	return &agentMetadataRepo{db: db, driver: DriverSQLite}
 }
@@ -111,6 +176,13 @@ func NewAgentMetadataRepositoryWithDriver(db *sql.DB, driver string) AgentMetada
 		return &agentMetadataRepo{db: db, driver: DriverMySQL}
 	}
 	return &agentMetadataRepo{db: db, driver: DriverSQLite}
+}
+
+func NewAgentRuntimeStatsRepository(db *sql.DB) AgentRuntimeStatsRepository {
+	return &agentRuntimeStatsRepo{db: db}
+}
+func NewAgentProbeResultRepository(db *sql.DB) AgentProbeResultRepository {
+	return &agentProbeResultRepo{db: db}
 }
 
 // NewLeaseRepository is retained for SQLite callers. MySQL callers must use
@@ -142,12 +214,18 @@ type sqlRepositories struct{ db *sql.DB }
 func (r *sqlRepositories) CreateUser(ctx context.Context, v User) error {
 	return r.users().Create(ctx, v)
 }
-func (r *sqlRepositories) users() *userRepo      { return &userRepo{r.db} }
-func (r *sqlRepositories) tokens() *tokenRepo    { return &tokenRepo{r.db} }
-func (r *sqlRepositories) agents() *agentRepo    { return &agentRepo{r.db} }
+func (r *sqlRepositories) users() *userRepo {
+	return &userRepo{db: r.db, driver: DriverSQLite}
+}
+func (r *sqlRepositories) tokens() *tokenRepo { return &tokenRepo{r.db} }
+func (r *sqlRepositories) agents() *agentRepo {
+	return &agentRepo{db: r.db, driver: DriverSQLite}
+}
 func (r *sqlRepositories) policies() *policyRepo { return &policyRepo{r.db} }
 func (r *sqlRepositories) tunnels() *tunnelRepo  { return &tunnelRepo{r.db} }
-func (r *sqlRepositories) nodes() *nodeRepo      { return &nodeRepo{r.db} }
+func (r *sqlRepositories) nodes() *nodeRepo {
+	return &nodeRepo{db: r.db, driver: DriverSQLite}
+}
 func (r *sqlRepositories) leases() *leaseRepo {
 	return NewLeaseRepositoryWithDriver(r.db, DriverSQLite).(*leaseRepo)
 }
@@ -234,7 +312,15 @@ type dbExecutor interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-type userRepo struct{ db dbExecutor }
+type transactionStarter interface {
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
+type userRepo struct {
+	db        dbExecutor
+	driver    string
+	lockReads bool
+}
 
 func (r *userRepo) Create(ctx context.Context, v User) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "user")
@@ -247,7 +333,11 @@ func (r *userRepo) Create(ctx context.Context, v User) error {
 func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
 	var v User
 	var created, updated string
-	err := r.db.QueryRowContext(ctx, `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE id=?`, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
+	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE id=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
 	return v, err
@@ -255,7 +345,11 @@ func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
 func (r *userRepo) GetByUsername(ctx context.Context, n string) (User, error) {
 	var v User
 	var created, updated string
-	err := r.db.QueryRowContext(ctx, `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE username=?`, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
+	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE username=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
 	return v, err
@@ -403,7 +497,221 @@ func (r *tokenRepo) List(ctx context.Context, cursor string, limit int) (Page[AP
 	return p, nil
 }
 
-type agentRepo struct{ db *sql.DB }
+const serviceTokenColumns = `id,token_type,owner_user_id,agent_id,node_id,token_prefix,token_hash,secret_ciphertext,secret_nonce,secret_key_id,secret_version,secret_last_read_at,scope,expires_at,revoked_at,last_used_at,created_at,updated_at`
+
+type serviceTokenRepo struct {
+	db        dbExecutor
+	starter   transactionStarter
+	driver    string
+	lockReads bool
+}
+
+func (r *serviceTokenRepo) Create(ctx context.Context, v ServiceToken) error {
+	return createServiceToken(ctx, r.db, v)
+}
+
+func createServiceToken(ctx context.Context, db dbExecutor, v ServiceToken) error {
+	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "stok")
+	_, err := db.ExecContext(ctx, `INSERT INTO service_tokens(id,token_type,owner_user_id,agent_id,node_id,token_prefix,token_hash,secret_ciphertext,secret_nonce,secret_key_id,secret_version,secret_last_read_at,scope,expires_at,revoked_at,last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.Type, nullableString(v.OwnerUserID), nullableString(v.AgentID), nullableString(v.NodeID), v.Prefix, v.TokenHash, nullableString(v.SecretCiphertext), nullableString(v.SecretNonce), nullableString(v.SecretKeyID), nullableInt(v.SecretVersion), nullableTime(v.SecretLastReadAt), v.Scope, nullableTime(v.ExpiresAt), nullableTime(v.RevokedAt), nullableTime(v.LastUsedAt), tm(v.CreatedAt), tm(v.UpdatedAt))
+	return err
+}
+
+func (r *serviceTokenRepo) Get(ctx context.Context, id string) (ServiceToken, error) {
+	query := `SELECT ` + serviceTokenColumns + ` FROM service_tokens WHERE id=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	return scanServiceToken(r.db.QueryRowContext(ctx, query, id))
+}
+
+func (r *serviceTokenRepo) GetByHash(ctx context.Context, hash string) (ServiceToken, error) {
+	query := `SELECT ` + serviceTokenColumns + ` FROM service_tokens WHERE token_hash=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	return scanServiceToken(r.db.QueryRowContext(ctx, query, hash))
+}
+
+func (r *serviceTokenRepo) List(ctx context.Context, filter ServiceTokenFilter, cursor string, limit int) (Page[ServiceToken], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	conditions := make([]string, 0, 5)
+	args := make([]any, 0, 6)
+	if filter.OwnerUserID != "" {
+		conditions = append(conditions, `owner_user_id=?`)
+		args = append(args, filter.OwnerUserID)
+	}
+	if filter.Type != "" {
+		conditions = append(conditions, `token_type=?`)
+		args = append(args, filter.Type)
+	}
+	if filter.AgentID != "" {
+		conditions = append(conditions, `agent_id=?`)
+		args = append(args, filter.AgentID)
+	}
+	if filter.NodeID != "" {
+		conditions = append(conditions, `node_id=?`)
+		args = append(args, filter.NodeID)
+	}
+	if decoded := decodeCursor(cursor); decoded != "" {
+		conditions = append(conditions, `id>?`)
+		args = append(args, decoded)
+	}
+	query := `SELECT ` + serviceTokenColumns + ` FROM service_tokens`
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[ServiceToken]{}, err
+	}
+	defer rows.Close()
+	page := Page[ServiceToken]{}
+	for rows.Next() {
+		token, err := scanServiceToken(rows)
+		if err != nil {
+			return Page[ServiceToken]{}, err
+		}
+		page.Items = append(page.Items, token)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[ServiceToken]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+	}
+	return page, nil
+}
+
+func (r *serviceTokenRepo) Revoke(ctx context.Context, id string, when time.Time) error {
+	when = timeOrNow(when)
+	res, err := r.db.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, tm(when), tm(when), id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		return nil
+	}
+	record, err := r.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if record.RevokedAt != nil {
+		return ErrServiceTokenRevoked
+	}
+	return fmt.Errorf("revoke service token %q made no state transition", id)
+}
+
+func (r *serviceTokenRepo) TouchLastUsed(ctx context.Context, id string, when time.Time) error {
+	when = timeOrNow(when)
+	res, err := r.db.ExecContext(ctx, `UPDATE service_tokens SET last_used_at=?,updated_at=? WHERE id=?`, tm(when), tm(when), id)
+	return checkAffected(res, err)
+}
+
+func (r *serviceTokenRepo) MarkSecretRead(ctx context.Context, id string, when time.Time) error {
+	when = timeOrNow(when)
+	res, err := r.db.ExecContext(ctx, `UPDATE service_tokens SET secret_last_read_at=?,updated_at=? WHERE id=?`, tm(when), tm(when), id)
+	return checkAffected(res, err)
+}
+
+func (r *serviceTokenRepo) Rotate(ctx context.Context, oldID string, replacement ServiceToken, when time.Time) error {
+	when = timeOrNow(when)
+	if r.starter == nil {
+		return rotateServiceToken(ctx, r.db, r.driver, oldID, replacement, when)
+	}
+	tx, err := r.starter.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := rotateServiceToken(ctx, tx, r.driver, oldID, replacement, when); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rotateServiceToken(ctx context.Context, db dbExecutor, driver, oldID string, replacement ServiceToken, when time.Time) error {
+	query := `SELECT revoked_at FROM service_tokens WHERE id=?`
+	if driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	var revoked sql.NullString
+	if err := db.QueryRowContext(ctx, query, oldID).Scan(&revoked); err != nil {
+		return err
+	}
+	if parseTM(revoked) != nil {
+		return ErrServiceTokenRevoked
+	}
+	if err := createServiceToken(ctx, db, replacement); err != nil {
+		return err
+	}
+	res, err := db.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, tm(when), tm(when), oldID)
+	return checkAffected(res, err)
+}
+
+type serviceTokenScanner interface {
+	Scan(...any) error
+}
+
+func scanServiceToken(scanner serviceTokenScanner) (ServiceToken, error) {
+	var token ServiceToken
+	var tokenType string
+	var owner, agent, node sql.NullString
+	var ciphertext, nonce, keyID, scope sql.NullString
+	var secretVersion sql.NullInt64
+	var secretRead, expires, revoked, lastUsed, created, updated sql.NullString
+	err := scanner.Scan(&token.ID, &tokenType, &owner, &agent, &node, &token.Prefix, &token.TokenHash, &ciphertext, &nonce, &keyID, &secretVersion, &secretRead, &scope, &expires, &revoked, &lastUsed, &created, &updated)
+	if err != nil {
+		return ServiceToken{}, err
+	}
+	token.Type = TokenType(tokenType)
+	if owner.Valid {
+		token.OwnerUserID = owner.String
+	}
+	if agent.Valid {
+		token.AgentID = agent.String
+	}
+	if node.Valid {
+		token.NodeID = node.String
+	}
+	if ciphertext.Valid {
+		token.SecretCiphertext = ciphertext.String
+	}
+	if nonce.Valid {
+		token.SecretNonce = nonce.String
+	}
+	if keyID.Valid {
+		token.SecretKeyID = keyID.String
+	}
+	if secretVersion.Valid {
+		token.SecretVersion = int(secretVersion.Int64)
+	}
+	token.SecretLastReadAt = parseTM(secretRead)
+	token.Scope = scope.String
+	token.ExpiresAt = parseTM(expires)
+	token.RevokedAt = parseTM(revoked)
+	token.LastUsedAt = parseTM(lastUsed)
+	if created.Valid {
+		token.CreatedAt = parseTime(created.String)
+	}
+	if updated.Valid {
+		token.UpdatedAt = parseTime(updated.String)
+	}
+	return token, nil
+}
+
+type agentRepo struct {
+	db        dbExecutor
+	driver    string
+	lockReads bool
+}
 
 func (r *agentRepo) Create(ctx context.Context, v Agent) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "agent")
@@ -416,7 +724,11 @@ func (r *agentRepo) Create(ctx context.Context, v Agent) error {
 func (r *agentRepo) Get(ctx context.Context, id string) (Agent, error) {
 	var v Agent
 	var c, u string
-	err := r.db.QueryRowContext(ctx, `SELECT id,name,owner_user_id,capabilities,enabled,created_at,updated_at FROM agents WHERE id=?`, id).Scan(&v.ID, &v.Name, &v.OwnerUserID, &v.Capabilities, &v.Enabled, &c, &u)
+	query := `SELECT id,name,owner_user_id,capabilities,enabled,created_at,updated_at FROM agents WHERE id=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Name, &v.OwnerUserID, &v.Capabilities, &v.Enabled, &c, &u)
 	v.CreatedAt = parseTime(c)
 	v.UpdatedAt = parseTime(u)
 	return v, err
@@ -655,7 +967,11 @@ func nullableInt(v int) any {
 	return v
 }
 
-type nodeRepo struct{ db *sql.DB }
+type nodeRepo struct {
+	db        dbExecutor
+	driver    string
+	lockReads bool
+}
 
 func (r *nodeRepo) Create(ctx context.Context, v ServerNode) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "node")
@@ -668,7 +984,11 @@ func (r *nodeRepo) Create(ctx context.Context, v ServerNode) error {
 func (r *nodeRepo) Get(ctx context.Context, id string) (ServerNode, error) {
 	var v ServerNode
 	var meta, seen, exp, created, updated sql.NullString
-	err := r.db.QueryRowContext(ctx, `SELECT id,address,epoch,metadata,last_seen_at,expires_at,created_at,updated_at FROM server_nodes WHERE id=?`, id).Scan(&v.ID, &v.Address, &v.Epoch, &meta, &seen, &exp, &created, &updated)
+	query := `SELECT id,address,epoch,metadata,last_seen_at,expires_at,created_at,updated_at FROM server_nodes WHERE id=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Address, &v.Epoch, &meta, &seen, &exp, &created, &updated)
 	if meta.Valid {
 		v.Metadata = meta.String
 	}
@@ -839,6 +1159,187 @@ func (r *agentMetadataRepo) MarkStale(ctx context.Context, id string, epoch int6
 	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_metadata SET stale=1,updated_at=? WHERE agent_id=? AND epoch<=?`, tm(time.Now().UTC()), id, epoch)
 	return checkAffected(res, err)
 }
+func (r *agentMetadataRepo) Touch(ctx context.Context, id string, epoch int64, lastSeenAt, expiresAt time.Time) error {
+	if id == "" || epoch <= 0 || expiresAt.IsZero() {
+		return errors.New("invalid runtime metadata lease")
+	}
+	if lastSeenAt.IsZero() {
+		lastSeenAt = time.Now().UTC()
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_metadata SET last_seen_at=?,expires_at=?,stale=0,updated_at=? WHERE agent_id=? AND epoch=?`, tm(lastSeenAt), tm(expiresAt), tm(time.Now().UTC()), id, epoch)
+	return checkAffected(res, err)
+}
+
+type agentRuntimeStatsRepo struct{ db *sql.DB }
+
+func (r *agentRuntimeStatsRepo) Append(ctx context.Context, v AgentRuntimeStats) error {
+	if r == nil || r.db == nil || v.AgentID == "" || v.NodeID == "" || v.WindowStart.IsZero() {
+		return errors.New("invalid runtime stats identity")
+	}
+	if v.WindowEnd.IsZero() {
+		v.WindowEnd = v.WindowStart.Add(time.Minute)
+	}
+	if v.Epoch <= 0 || v.WindowEnd.Before(v.WindowStart) || v.WindowEnd.Sub(v.WindowStart) > time.Minute || v.Connections < 0 || v.ActiveStreams < 0 || v.BytesIn < 0 || v.BytesOut < 0 || v.HeartbeatTotal < 0 || v.HeartbeatSuccess < 0 || v.HeartbeatRTTP50 < 0 || v.HeartbeatRTTP95 < 0 || v.Reconnects < 0 || v.StreamErrors < 0 {
+		return errors.New("invalid bounded runtime stats")
+	}
+	if v.ID == "" {
+		v.ID = newID("runtime-stat")
+	}
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = time.Now().UTC()
+	}
+	// INSERT ... SELECT makes the lease fact and history write one database
+	// statement, so a takeover cannot race between a process-side check and
+	// the insert. The statement is supported by both SQLite and MySQL.
+	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_runtime_stats(id,agent_id,node_id,epoch,window_start,window_end,connections,active_streams,bytes_in,bytes_out,heartbeat_total,heartbeat_success,heartbeat_rtt_p50_us,heartbeat_rtt_p95_us,reconnects,stream_errors,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM agent_runtime_leases WHERE agent_id=? AND node_id=? AND epoch=?`, v.ID, v.AgentID, v.NodeID, v.Epoch, tm(v.WindowStart), tm(v.WindowEnd), v.Connections, v.ActiveStreams, v.BytesIn, v.BytesOut, v.HeartbeatTotal, v.HeartbeatSuccess, v.HeartbeatRTTP50.Microseconds(), v.HeartbeatRTTP95.Microseconds(), v.Reconnects, v.StreamErrors, tm(v.CreatedAt), v.AgentID, v.NodeID, v.Epoch)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrRuntimeStatsStaleEpoch
+	}
+	return nil
+}
+
+func (r *agentRuntimeStatsRepo) ListRange(ctx context.Context, agentID string, from, to time.Time, cursor string, limit int) (Page[AgentRuntimeStats], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	args := []any{agentID, tm(from), tm(to)}
+	q := `SELECT id,agent_id,node_id,epoch,window_start,window_end,connections,active_streams,bytes_in,bytes_out,heartbeat_total,heartbeat_success,heartbeat_rtt_p50_us,heartbeat_rtt_p95_us,reconnects,stream_errors,created_at FROM agent_runtime_stats WHERE agent_id=? AND window_start>=? AND window_start<?`
+	if c := decodeCursor(cursor); c != "" {
+		var start string
+		var cursorAgent string
+		if err := r.db.QueryRowContext(ctx, `SELECT agent_id,window_start FROM agent_runtime_stats WHERE id=?`, c).Scan(&cursorAgent, &start); err != nil {
+			return Page[AgentRuntimeStats]{}, err
+		}
+		if cursorAgent != agentID || start < tm(from) || start >= tm(to) {
+			return Page[AgentRuntimeStats]{}, errors.New("invalid runtime stats cursor")
+		}
+		q += ` AND (window_start>? OR (window_start=? AND id>?))`
+		args = append(args, start, start, c)
+	}
+	q += ` ORDER BY window_start,id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return Page[AgentRuntimeStats]{}, err
+	}
+	defer rows.Close()
+	page := Page[AgentRuntimeStats]{}
+	for rows.Next() {
+		var v AgentRuntimeStats
+		var start, end, created string
+		var p50, p95 int64
+		if err := rows.Scan(&v.ID, &v.AgentID, &v.NodeID, &v.Epoch, &start, &end, &v.Connections, &v.ActiveStreams, &v.BytesIn, &v.BytesOut, &v.HeartbeatTotal, &v.HeartbeatSuccess, &p50, &p95, &v.Reconnects, &v.StreamErrors, &created); err != nil {
+			return Page[AgentRuntimeStats]{}, err
+		}
+		v.WindowStart, v.WindowEnd, v.CreatedAt = parseTime(start), parseTime(end), parseTime(created)
+		v.HeartbeatRTTP50, v.HeartbeatRTTP95 = time.Duration(p50)*time.Microsecond, time.Duration(p95)*time.Microsecond
+		page.Items = append(page.Items, v)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[AgentRuntimeStats]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+	}
+	return page, nil
+}
+
+func (r *agentRuntimeStatsRepo) DeleteBefore(ctx context.Context, agentID string, before time.Time) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM agent_runtime_stats WHERE agent_id=? AND window_start<?`, agentID, tm(before))
+	return err
+}
+
+var allowedProbeErrorClasses = map[string]struct{}{
+	"": {}, "none": {}, "timeout": {}, "dns_timeout": {}, "connect_timeout": {}, "read_timeout": {},
+	"connection_refused": {}, "policy_denied": {}, "epoch_stale": {}, "unsupported": {}, "cancelled": {},
+	"internal": {}, "http_status": {}, "invalid_response": {},
+}
+
+type agentProbeResultRepo struct{ db *sql.DB }
+
+func (r *agentProbeResultRepo) Create(ctx context.Context, v AgentProbeResult) error {
+	if r == nil || r.db == nil || v.ProbeID == "" || v.AgentID == "" || v.Kind == "" || v.Result == "" {
+		return errors.New("invalid probe result")
+	}
+	if _, ok := allowedProbeErrorClasses[v.ErrorClass]; !ok {
+		return errors.New("probe error class is not bounded")
+	}
+	if v.NodeID == "" || v.Epoch <= 0 || v.Duration < 0 || len(v.ErrorClass) > 64 || len(v.Kind) > 32 || len(v.Result) > 32 {
+		return errors.New("probe result field too long")
+	}
+	if v.ObservedAt.IsZero() {
+		v.ObservedAt = time.Now().UTC()
+	}
+	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_probe_results(probe_id,agent_id,node_id,epoch,kind,result,error_class,duration_us,observed_at) SELECT ?,?,?,?,?,?,?,?,? FROM agent_runtime_leases WHERE agent_id=? AND node_id=? AND epoch=?`, v.ProbeID, v.AgentID, v.NodeID, v.Epoch, v.Kind, v.Result, v.ErrorClass, v.Duration.Microseconds(), tm(v.ObservedAt), v.AgentID, v.NodeID, v.Epoch)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrRuntimeStatsStaleEpoch
+	}
+	return nil
+}
+
+func (r *agentProbeResultRepo) ListByAgent(ctx context.Context, agentID, cursor string, limit int) (Page[AgentProbeResult], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	args := []any{agentID}
+	q := `SELECT probe_id,agent_id,node_id,epoch,kind,result,error_class,duration_us,observed_at FROM agent_probe_results WHERE agent_id=?`
+	if c := decodeCursor(cursor); c != "" {
+		var observed string
+		var cursorAgent string
+		if err := r.db.QueryRowContext(ctx, `SELECT agent_id,observed_at FROM agent_probe_results WHERE probe_id=?`, c).Scan(&cursorAgent, &observed); err != nil {
+			return Page[AgentProbeResult]{}, err
+		}
+		if cursorAgent != agentID {
+			return Page[AgentProbeResult]{}, errors.New("invalid probe cursor")
+		}
+		q += ` AND (observed_at>? OR (observed_at=? AND probe_id>?))`
+		args = append(args, observed, observed, c)
+	}
+	q += ` ORDER BY observed_at,probe_id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return Page[AgentProbeResult]{}, err
+	}
+	defer rows.Close()
+	page := Page[AgentProbeResult]{}
+	for rows.Next() {
+		var v AgentProbeResult
+		var duration int64
+		var observed string
+		if err := rows.Scan(&v.ProbeID, &v.AgentID, &v.NodeID, &v.Epoch, &v.Kind, &v.Result, &v.ErrorClass, &duration, &observed); err != nil {
+			return Page[AgentProbeResult]{}, err
+		}
+		v.Duration, v.ObservedAt = time.Duration(duration)*time.Microsecond, parseTime(observed)
+		page.Items = append(page.Items, v)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[AgentProbeResult]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ProbeID)
+	}
+	return page, nil
+}
+
+func (r *agentProbeResultRepo) DeleteBefore(ctx context.Context, before time.Time) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM agent_probe_results WHERE observed_at<?`, tm(before))
+	return err
+}
 
 type leaseRepo struct {
 	db     *sql.DB
@@ -1006,7 +1507,7 @@ func (r *auditRepo) List(ctx context.Context, cursor string, limit int) (Page[Au
 	return p, nil
 }
 
-type idempotencyRepo struct{ db *sql.DB }
+type idempotencyRepo struct{ db dbExecutor }
 
 func (r *idempotencyRepo) Claim(ctx context.Context, v IdempotencyRecord) (IdempotencyRecord, bool, error) {
 	if v.Key == "" {

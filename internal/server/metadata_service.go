@@ -128,5 +128,19 @@ func (s *AgentMetadataService) MarkStale(ctx context.Context, agentID string, ep
 	return s.repo.MarkStale(ctx, agentID, epoch)
 }
 
+// Touch refreshes the runtime lease without changing the metadata revision.
+// Heartbeats use this path so unchanged metadata remains fresh while the
+// authenticated Agent WebSocket is alive.
+func (s *AgentMetadataService) Touch(ctx context.Context, agentID string, epoch int64, ttl time.Duration) error {
+	if s == nil || s.repo == nil {
+		return errors.New("metadata repository is required")
+	}
+	if strings.TrimSpace(agentID) == "" || epoch <= 0 || ttl <= 0 {
+		return errors.New("metadata lease is invalid")
+	}
+	now := time.Now().UTC()
+	return s.repo.Touch(ctx, agentID, epoch, now, now.Add(ttl))
+}
+
 var metadataNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 var sensitiveMetadataRE = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)

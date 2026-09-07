@@ -54,6 +54,28 @@ paths:
         '401': {description: Unauthenticated}
         '403': {description: Agent is not owned by the caller}
         '404': {description: Agent or metadata snapshot not found, or snapshot is stale without includeStale=true}
+  /api/v1/agents/{agentId}/trace:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Run a logical client-to-agent traceroute
+      description: Follows authenticated client, server, relay and agent hops. Sensitive fields are administrator-only and secrets are never returned by this endpoint.
+      security: [{bearerAuth: []}]
+      requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TraceRequest'}}}}
+      responses: {'200': {description: Trace result, content: {application/json: {schema: {$ref: '#/components/schemas/TraceEnvelope'}}}}, '403': {description: Forbidden sensitive request}}
+  /api/v1/agents/{agentId}/diagnose:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Run an authorized TCP, HTTP, or UDP network probe
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DiagnoseRequest'}}}}
+      responses: {'200': {description: Bounded probe result}, '403': {description: Agent is not owned by caller}}
+  /api/v1/agents/{agentId}/probes:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: List bounded probe history
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
+      responses: {'200': {description: Cursor page of probe summaries}}
   /api/v1/agents/{agentId}/policies:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     get: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}], responses: {'200': {description: Policies}}}
@@ -81,6 +103,96 @@ paths:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnel}}}
     put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+  /api/v1/tokens:
+    get:
+      summary: List scoped service Token metadata
+      description: Admins may filter all Tokens by owner and type. Non-admin callers can list only Tokens they own. Stored hashes and issued secrets are never returned. Status is derived from lifecycle timestamps and current owner/resource availability.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/TokenTypeFilter'}
+        - {$ref: '#/components/parameters/TokenOwnerFilter'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Cursor page of redacted Token metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenPageEnvelope'}}}}
+        '400': {description: Invalid Token type or pagination input}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: A non-admin requested another owner's Tokens}
+    post:
+      summary: Create a scoped service Token
+      description: |
+        The plaintext `secret` is returned exactly once on the first successful request. When `TUNNELMESH_TOKEN_ENCRYPTION_KEY` is configured it is encrypted at rest and can be recovered only through the administrator reveal endpoint; otherwise existing hash-only behavior applies. Reusing the same `Idempotency-Key` with the same request returns the same Token ID and metadata with `secret` omitted and `replayed=true`. Reusing a key for another request, or observing a request still in progress, returns 409.
+
+        Admins may create `agent`, `client`, and `server_node` Tokens. Non-admin owners may create an `agent` Token only for an enabled Agent they own, or a `client` Token whose scoped Agents are all enabled and owned by them. Non-admin callers cannot create `server_node` Tokens.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TokenCreateRequest'}
+      responses:
+        '201': {description: Token created, or safely replayed without its secret, content: {application/json: {schema: {$ref: '#/components/schemas/TokenMutationEnvelope'}}}}
+        '400': {description: Invalid type, binding, expiry, scope, JSON, or Idempotency-Key}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Owner/resource authorization denied}
+        '409': {description: Idempotency-Key conflict or request in progress}
+  /api/v1/tokens/{tokenId}:
+    parameters:
+      - {name: tokenId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read redacted scoped service Token metadata
+      description: Returns dynamically derived status without the Token hash or plaintext secret.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Redacted Token metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenMetadataEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Token is not owned by the non-admin caller}
+        '404': {description: Token not found}
+  /api/v1/tokens/{tokenId}/rotate:
+    parameters:
+      - {name: tokenId, in: path, required: true, schema: {type: string}}
+      - {$ref: '#/components/parameters/IdempotencyKey'}
+    post:
+      summary: Atomically rotate and revoke a scoped service Token
+      description: Creates a replacement and revokes the old Token in one transaction. The replacement secret is returned once; an idempotent replay returns the same replacement metadata with no secret and `replayed=true`.
+      security: [{bearerAuth: []}]
+      responses:
+        '201': {description: Replacement Token created, or safely replayed, content: {application/json: {schema: {$ref: '#/components/schemas/TokenMutationEnvelope'}}}}
+        '400': {description: Invalid Idempotency-Key}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Token is not owned by the non-admin caller}
+        '404': {description: Token not found}
+        '409': {description: Token cannot be rotated or idempotency request conflicts/is in progress}
+  /api/v1/tokens/{tokenId}/revoke:
+    parameters:
+      - {name: tokenId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Revoke a scoped service Token
+      description: Revocation is idempotent and returns redacted metadata with dynamically derived `revoked` status.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Token revoked, content: {application/json: {schema: {$ref: '#/components/schemas/TokenMetadataEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Token is not owned by the non-admin caller}
+        '404': {description: Token not found}
+        '409': {description: Concurrent lifecycle conflict}
+  /api/v1/tokens/{tokenId}/reveal:
+    parameters: [{name: tokenId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Reveal an encrypted service-token secret
+      description: Administrator-only, audited, no-store response. Requires X-Token-Reveal-Confirm and Idempotency-Key. Hash-only legacy tokens must be rotated first.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: X-Token-Reveal-Confirm, in: header, required: true, schema: {type: string}}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses: {'200': {description: One-time secret, content: {application/json: {schema: {$ref: '#/components/schemas/TokenRevealEnvelope'}}}}, '403': {description: Admin permission required}, '409': {description: Secret is not recoverable}}
+  /api/v1/traces/{traceId}:
+    parameters: [{name: traceId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: Read a previously completed logical traceroute
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Trace result, content: {application/json: {schema: {$ref: '#/components/schemas/TraceEnvelope'}}}}, '404': {description: Trace not found}}
   /api/v1/audit-logs:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Audit records}}}
 components:
@@ -91,6 +203,8 @@ components:
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
     IncludeStale: {name: includeStale, in: query, description: Include an expired or explicitly stale snapshot, schema: {type: boolean, default: false}}
     IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 255}}
+    TokenTypeFilter: {name: type, in: query, schema: {type: string, enum: [agent, client, server_node]}}
+    TokenOwnerFilter: {name: owner, in: query, description: Owner user ID; admin-only when it differs from the current user, schema: {type: string}}
   schemas:
     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
     LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
@@ -123,3 +237,110 @@ components:
         redacted: {type: boolean}
     PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
     TunnelRequest: {type: object, required: [agentId, targetHost, targetPort], properties: {agentId: {type: string}, protocol: {type: string}, domain: {type: string}, pathPrefix: {type: string}, targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, publicPort: {type: integer}, status: {type: string}, config: {type: object}}}
+    TokenScope:
+      type: object
+      additionalProperties: false
+      properties:
+        agentIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}}
+        protocols: {type: array, maxItems: 4, uniqueItems: true, items: {type: string, enum: [tcp, udp, http, ws, websocket]}}
+        targetCIDRs: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, description: IPv4 or IPv6 CIDR}}
+        targetPorts: {type: array, maxItems: 1024, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}}
+    TokenCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type: {type: string, enum: [agent, client, server_node]}
+        ownerUserId: {type: string, description: Defaults to the authenticated management user; only admins may name another owner}
+        agentId: {type: string, description: Required only for agent Tokens}
+        nodeId: {type: string, description: Required only for server_node Tokens}
+        scope:
+          allOf: [{$ref: '#/components/schemas/TokenScope'}]
+          description: Optional narrowing scope; omission is equivalent to an empty scope
+        expiresAt: {type: string, format: date-time, description: Optional future expiration time}
+    TokenMetadata:
+      type: object
+      additionalProperties: false
+      required: [id, type, ownerUserId, prefix, scope, status, createdAt, updatedAt, replayed]
+      properties:
+        id: {type: string}
+        type: {type: string, enum: [agent, client, server_node]}
+        ownerUserId: {type: string}
+        agentId: {type: string}
+        nodeId: {type: string}
+        prefix: {type: string, description: Short non-secret display prefix}
+        scope: {$ref: '#/components/schemas/TokenScope'}
+        status: {type: string, enum: [active, revoked, expired, unavailable], description: Derived from timestamps and current owner/bound-resource state}
+        expiresAt: {type: string, format: date-time}
+        revokedAt: {type: string, format: date-time}
+        lastUsedAt: {type: string, format: date-time}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        replayed: {type: boolean, description: True only for an idempotent create/rotate replay}
+    TokenMutation:
+      allOf:
+        - {$ref: '#/components/schemas/TokenMetadata'}
+        - type: object
+          properties:
+            secret: {type: string, readOnly: true, description: One-time plaintext credential; present only on the first successful create or rotate response and never on replay}
+    TokenMetadataEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/TokenMetadata'}
+    TokenMutationEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/TokenMutation'}
+    TokenPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/TokenMetadata'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    TokenPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/TokenPage'}
+    TokenReveal:
+      type: object
+      required: [tokenId, type, secret, revealedAt, oneTime]
+      properties:
+        tokenId: {type: string}
+        type: {type: string}
+        secret: {type: string, readOnly: true}
+        expiresAt: {type: string, format: date-time}
+        revealedAt: {type: string, format: date-time}
+        oneTime: {type: boolean}
+    TokenRevealEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/TokenReveal'}}
+    TraceRequest:
+      type: object
+      properties:
+        timeoutMs: {type: integer, minimum: 100, maximum: 30000}
+        maxHops: {type: integer, minimum: 1, maximum: 16}
+        verbose: {type: boolean}
+        includeSensitive: {type: boolean}
+        includeSecrets: {type: boolean}
+    TraceEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {type: object}}
+    DiagnoseRequest:
+      type: object
+      required: [kind, host, port]
+      properties:
+        kind: {type: string, enum: [tcp, http, udp]}
+        host: {type: string, maxLength: 255}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        timeoutMs: {type: integer, minimum: 10, maximum: 30000}

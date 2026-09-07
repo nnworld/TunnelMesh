@@ -1,0 +1,382 @@
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/deployment/docker.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/deployment/docker.md
+index 6233e23..fb74075 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/deployment/docker.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/deployment/docker.md
+@@ -64,3 +64,11 @@ Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent W
+ - 升级前备份 MySQL/SQLite，并先在一台节点灰度验证。
+ - schema 自动初始化关闭时，必须先执行受控的数据库迁移，再启动应用。
+ - 回滚使用上一版本镜像，并保留兼容的数据库 schema。
++
++服务凭据建议使用 Compose/Kubernetes Secret 注入，而不是写入镜像或 YAML：
++
++```bash
++docker run --rm --env-file ./secrets/tunnelmesh-client.env tunnelmesh:client run
++```
++
++首次创建 Agent/Client token 后，把 secret 写入权限为 `0600` 的 Secret 文件；轮换时先下发新 secret、验证新连接，再撤销旧 secret。集群 relay 还需要独立的 `server_node` token、mTLS 证书和显式 `server.relay.listen`。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/operations/configuration.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/operations/configuration.md
+index 7155ca6..6b9eebe 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/operations/configuration.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/operations/configuration.md
+@@ -75,3 +75,14 @@ tunnelmesh-server --config tunnelmesh.yaml admin regenerate-credentials --confir
+ ```
+ 
+ 旧 Token 会被撤销。不要把命令输出写入共享日志或工单系统。
++
++## Service token 配置
++
++Service token 在后台 Tokens 页面创建，明文只返回一次。Agent 使用 `agent.token`，Client 使用 `client.token`，均可由环境变量覆盖：
++
++```bash
++export TUNNELMESH_AGENT_TOKEN='one-time-agent-secret'
++export TUNNELMESH_CLIENT_TOKEN='one-time-client-secret'
++```
++
++`server_node` token 必须与集群节点 ID 绑定，并和 relay mTLS 证书一起配置。生产环境不把 token 放进提交的配置文件；`print-config` 不会输出明文。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/operations/troubleshooting.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/operations/troubleshooting.md
+index ae24cdb..89b0bb8 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/operations/troubleshooting.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/operations/troubleshooting.md
+@@ -40,6 +40,15 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
+ - 看到 WebSocket 文本帧错误时，检查客户端是否误用了 text 模式。
+ - 使用 `ssh -vvv` 和 `websocat -v` 获取握手与关闭原因。
+ 
++## Service token 失败
++
++- 401：检查 token 是否为空、类型是否正确、是否已过期或已撤销；`agent` 连接 `/ws/agent`，`client` 连接 `/ws/client`。
++- 403：检查 token owner、Agent 绑定、scope 与 Agent Policy 的交集。
++- 409：轮换/撤销并发冲突时，复用同一个 `Idempotency-Key` 重试；不要期待再次返回 secret。
++- Server-node relay 失败：检查节点 ID、epoch、证书 SAN 是否精确匹配、CA 是否正确，以及 `server.relay.listen` 是否已监听。
++
++明文 secret 只在创建/轮换响应出现一次。不要从日志、审计记录或数据库恢复 token；遗失时直接轮换并撤销旧 token。
++
+ ## 数据安全
+ 
+ 排障日志中可以保留 trace ID、Agent ID、路由 ID 和错误码，但不能输出密码、Bearer Token、私钥或完整 DSN。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/agent.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/agent.md
+index 7c8b276..100cb38 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/agent.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/agent.md
+@@ -146,3 +146,5 @@ nc -vzu 10.0.0.53 53
+ - 不要把 Token、私钥、MySQL DSN 或完整配置提交到 Git。
+ - 只授予必要的目标网段和端口 policy。
+ - 发生 Agent 凭据泄露时立即在管理后台撤销并重新注册。
++
++Agent WebSocket 必须使用后台创建并绑定当前 Agent 的 `agent` service token。无效、过期、撤销或类型错误的 token 会在 metadata hello 前被拒绝。旧版管理登录 token 仅在显式开启 `security.allow_legacy_connection_tokens` 时兼容，计划在 v0.3.0 移除。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/client.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/client.md
+index 0801ee7..bbaaabf 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/client.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/client.md
+@@ -192,3 +192,13 @@ client:
+ - Agent ID、Token 和配置文件权限应限制为服务用户可读。
+ - 不要把 Token、密码和 MySQL DSN 提交到 Git。
+ - 调整目标网段、端口和 CIDR 策略时，同时检查服务端 policy。
++
++生产环境使用后台创建的 `client` service token，并通过配置、环境变量或 Secret 注入：
++
++```yaml
++client:
++  server_url: wss://tunnel.example.com/ws/client
++  token: ${TUNNELMESH_CLIENT_TOKEN}
++```
++
++Token scope 只能缩小 Agent Policy。每个 TCP、UDP、HTTP 或 proxy stream 都会重新校验 Agent、协议、目标 CIDR 和端口；轮换/撤销后重新连接即可使用新凭据。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/server-admin.md b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/server-admin.md
+index 2adf5e4..fec6e5c 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/docs/user-guide/server-admin.md
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/docs/user-guide/server-admin.md
+@@ -59,6 +59,12 @@ Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel 操作、meta
+ 
+ 所有 API 使用统一响应 `{ code, msg, data }`。分页使用 cursor；写请求应携带 `Idempotency-Key`，重试时复用相同 key。
+ 
++## Service Tokens
++
++Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`server_node` 三类服务凭据。普通用户只能为自己拥有且启用的 Agent 创建 Agent/Client token；`server_node` 仅管理员可创建。
++
++创建或轮换成功后，明文 secret 只在对话框显示一次。请立即复制到 Secret 管理系统；列表、审计日志和数据库只保留前缀与 hash。关闭对话框或刷新页面后无法恢复 secret。轮换会使旧 token 失效；撤销适用于泄露或设备退役。
++
+ ## 配置与排障建议
+ 
+ 优先级为命令行参数 > 环境变量 > 配置文件 > 默认值。上线前执行 `check-config`，确认本地 SQLite 或集群 MySQL、注册中心、80/443 地址和 TLS 配置正确。出现 401/403 时检查 token 与角色；出现 404 时检查 Agent ID、路由 Host/path 和 wildcard DNS；出现 stale 时检查 Agent WebSocket、租约和系统时间。
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/App.vue b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/App.vue
+index cbf59ae..6e59b9c 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/App.vue
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/App.vue
+@@ -1,2 +1,2 @@
+-<template><el-container><el-header>TunnelMesh Admin <el-button v-if="auth.user" link @click="auth.logout(); router.push('/login')">Logout</el-button></el-header><el-container v-if="auth.user"><el-aside width="210px"><el-menu router><el-menu-item index="/">Dashboard</el-menu-item><el-menu-item index="/agents">Agents</el-menu-item><el-menu-item index="/routes">Routes</el-menu-item><el-menu-item index="/tunnels">Tunnels</el-menu-item><el-menu-item v-if="auth.isAdmin" index="/audit-logs">Audit logs</el-menu-item></el-menu></el-aside><el-main><router-view/></el-main></el-container><router-view v-else/></el-container></template>
++<template><el-container><el-header>TunnelMesh Admin <el-button v-if="auth.user" link @click="auth.logout(); router.push('/login')">Logout</el-button></el-header><el-container v-if="auth.user"><el-aside width="210px"><el-menu router><el-menu-item index="/">Dashboard</el-menu-item><el-menu-item index="/agents">Agents</el-menu-item><el-menu-item index="/routes">Routes</el-menu-item><el-menu-item index="/tunnels">Tunnels</el-menu-item><el-menu-item index="/tokens">Tokens</el-menu-item><el-menu-item v-if="auth.isAdmin" index="/audit-logs">Audit logs</el-menu-item></el-menu></el-aside><el-main><router-view/></el-main></el-container><router-view v-else/></el-container></template>
+ <script setup lang="ts">import { useAuthStore } from './stores/auth'; import router from './router'; const auth=useAuthStore()</script>
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/api/client.ts b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/api/client.ts
+index 04e678a..f858d64 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/api/client.ts
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/api/client.ts
+@@ -7,11 +7,37 @@ export type AgentMetadata = {
+   reportedAt: string; updatedAt: string; items: AgentMetadataItem[]
+ }
+ 
++export type TokenType = 'agent' | 'client' | 'server_node'
++export type TokenScope = { agentIds?: string[]; protocols?: string[]; targetCIDRs?: string[]; targetPorts?: number[] }
++export type ServiceToken = {
++  id: string; type: TokenType; ownerUserId: string; agentId?: string; nodeId?: string
++  prefix: string; scope: TokenScope; status: string; expiresAt?: string; revokedAt?: string
++  lastUsedAt?: string; createdAt: string; updatedAt: string; secret?: string; replayed?: boolean
++}
++
++export type TokenPage = { items: ServiceToken[]; nextCursor?: string; hasMore?: boolean }
++
+ let token = localStorage.getItem('tunnelmesh_token') || ''
+ export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
+ export function getToken() { return token }
+ 
+ export function getAgents() { return api<{items: Agent[]; nextCursor?: string}>('/agents') }
++export function listTokens(params: { type?: TokenType; cursor?: string } = {}) {
++  const query = new URLSearchParams()
++  if (params.type) query.set('type', params.type)
++  if (params.cursor) query.set('cursor', params.cursor)
++  const suffix = query.toString() ? `?${query.toString()}` : ''
++  return api<TokenPage>(`/tokens${suffix}`)
++}
++export function createToken(input: { type: TokenType; agentId?: string; nodeId?: string; scope?: TokenScope; expiresAt?: string }, idempotencyKey: string) {
++  return api<ServiceToken>('/tokens', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(input) })
++}
++export function rotateToken(id: string, idempotencyKey: string) {
++  return api<ServiceToken>(`/tokens/${encodeURIComponent(id)}/rotate`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey } })
++}
++export function revokeToken(id: string) {
++  return api<ServiceToken>(`/tokens/${encodeURIComponent(id)}/revoke`, { method: 'POST' })
++}
+ export function getAgentMetadata(agentId: string, includeStale = false) {
+   const query = includeStale ? '?includeStale=true' : ''
+   return api<AgentMetadata>(`/agents/${encodeURIComponent(agentId)}/metadata${query}`)
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/routes.spec.ts b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/api/routes.spec.ts
+similarity index 70%
+rename from .superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/routes.spec.ts
+rename to .superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/api/routes.spec.ts
+index be67130..b31a626 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/routes.spec.ts
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/api/routes.spec.ts
+@@ -15,6 +15,22 @@ describe('admin routes', () => {
+     expect(detail?.meta.auth).toBe(true)
+   })
+ 
++  it('defines an authenticated token management route', () => {
++    const tokens = router.getRoutes().find(route => route.path === '/tokens')
++    expect(tokens).toBeTruthy()
++    expect(tokens?.meta.auth).toBe(true)
++  })
++
++  it('exposes token lifecycle controls without persisting one-time secrets', () => {
++    const source = readFileSync('src/views/Tokens.vue', 'utf8')
++    expect(source).toContain('Create token')
++    expect(source).toContain('Rotate')
++    expect(source).toContain('Revoke')
++    expect(source).toContain('secret')
++    expect(source).toContain('clearSecret')
++    expect(source).toContain('scope')
++  })
++
+   it('calls the metadata endpoint with the agent id and stale option', async () => {
+     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { agentId: 'a1' } }) })
+     vi.stubGlobal('fetch', fetchMock)
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/client.ts b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/client.ts
+deleted file mode 100644
+index 04e678a..0000000
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/client.ts
++++ /dev/null
+@@ -1,29 +0,0 @@
+-export type APIResponse<T> = { code: number; msg: string; data: T }
+-
+-export type Agent = { id: string; name: string; enabled: boolean; ownerUserId?: string; capabilities?: string[] }
+-export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted: boolean }
+-export type AgentMetadata = {
+-  agentId: string; nodeId: string; epoch: number; revision: number; stale: boolean
+-  reportedAt: string; updatedAt: string; items: AgentMetadataItem[]
+-}
+-
+-let token = localStorage.getItem('tunnelmesh_token') || ''
+-export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
+-export function getToken() { return token }
+-
+-export function getAgents() { return api<{items: Agent[]; nextCursor?: string}>('/agents') }
+-export function getAgentMetadata(agentId: string, includeStale = false) {
+-  const query = includeStale ? '?includeStale=true' : ''
+-  return api<AgentMetadata>(`/agents/${encodeURIComponent(agentId)}/metadata${query}`)
+-}
+-
+-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+-  const headers = new Headers(init.headers)
+-  headers.set('Accept', 'application/json')
+-  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+-  if (token) headers.set('Authorization', `Bearer ${token}`)
+-  const response = await fetch(`/api/v1${path}`, {...init, headers})
+-  const payload = await response.json().catch(() => ({msg: response.statusText}))
+-  if (!response.ok) throw new Error(payload.msg || 'request failed')
+-  return payload.data as T
+-}
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/components/TokenSecretDialog.vue b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/components/TokenSecretDialog.vue
+new file mode 100644
+index 0000000..72f0a9f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/components/TokenSecretDialog.vue
+@@ -0,0 +1,21 @@
++<template>
++  <el-dialog :model-value="Boolean(secret)" title="Copy this secret now" width="520px" @close="$emit('close')">
++    <el-alert type="warning" :closable="false" title="The secret is shown once. It is not stored in the browser or returned by later requests." />
++    <el-input class="secret" :model-value="secret" readonly>
++      <template #append><el-button @click="copy">Copy</el-button></template>
++    </el-input>
++    <template #footer><el-button type="primary" @click="$emit('close')">I saved it</el-button></template>
++  </el-dialog>
++</template>
++
++<script setup lang="ts">
++const props = defineProps<{ secret: string }>()
++const emit = defineEmits<{ close: [] }>()
++async function copy() {
++  await navigator.clipboard?.writeText(props.secret)
++}
++</script>
++
++<style scoped>
++.secret { margin-top: 18px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
++</style>
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/router.ts b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/router.ts
+index 9d98c55..3d1c723 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/router.ts
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/router.ts
+@@ -7,11 +7,12 @@ import AgentDetail from './views/AgentDetail.vue'
+ import Routes from './views/Routes.vue'
+ import Tunnels from './views/Tunnels.vue'
+ import AuditLogs from './views/AuditLogs.vue'
++import Tokens from './views/Tokens.vue'
+ 
+ const router = createRouter({ history: createWebHistory(), routes: [
+   {path:'/login', component:Login}, {path:'/', component:Dashboard, meta:{auth:true}},
+   {path:'/agents', component:Agents, meta:{auth:true}}, {path:'/agents/:id', component:AgentDetail, meta:{auth:true}}, {path:'/routes', component:Routes, meta:{auth:true}},
+-  {path:'/tunnels', component:Tunnels, meta:{auth:true}}, {path:'/audit-logs', component:AuditLogs, meta:{auth:true, admin:true}}
++  {path:'/tunnels', component:Tunnels, meta:{auth:true}}, {path:'/tokens', component:Tokens, meta:{auth:true}}, {path:'/audit-logs', component:AuditLogs, meta:{auth:true, admin:true}}
+ ]})
+ router.beforeEach(async (to) => { const auth = useAuthStore(); if (auth.token && !auth.user) await auth.load(); if (to.meta.auth && !auth.user) return '/login'; if (to.meta.admin && !auth.isAdmin) return '/'; return true })
+ export default router
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/tests/routes.spec.ts b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/tests/routes.spec.ts
+index be67130..b31a626 100644
+--- a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-before/web/src/tests/routes.spec.ts
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/tests/routes.spec.ts
+@@ -15,6 +15,22 @@ describe('admin routes', () => {
+     expect(detail?.meta.auth).toBe(true)
+   })
+ 
++  it('defines an authenticated token management route', () => {
++    const tokens = router.getRoutes().find(route => route.path === '/tokens')
++    expect(tokens).toBeTruthy()
++    expect(tokens?.meta.auth).toBe(true)
++  })
++
++  it('exposes token lifecycle controls without persisting one-time secrets', () => {
++    const source = readFileSync('src/views/Tokens.vue', 'utf8')
++    expect(source).toContain('Create token')
++    expect(source).toContain('Rotate')
++    expect(source).toContain('Revoke')
++    expect(source).toContain('secret')
++    expect(source).toContain('clearSecret')
++    expect(source).toContain('scope')
++  })
++
+   it('calls the metadata endpoint with the agent id and stale option', async () => {
+     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { agentId: 'a1' } }) })
+     vi.stubGlobal('fetch', fetchMock)
+diff --git a/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/views/Tokens.vue b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/views/Tokens.vue
+new file mode 100644
+index 0000000..383a226
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-scoped-token-auth-implementation/task-8-after/web/src/views/Tokens.vue
+@@ -0,0 +1,89 @@
++<template>
++  <section class="tokens-page">
++    <div class="hero">
++      <div>
++        <p class="eyebrow">CREDENTIAL CONTROL</p>
++        <h1>Service tokens</h1>
++        <p class="lede">Issue narrow credentials for Agents, Clients, and server-node relay. Secrets appear once.</p>
++      </div>
++      <el-button type="primary" @click="openCreate">Create token</el-button>
++    </div>
++
++    <el-card shadow="never" class="table-card">
++      <div class="toolbar">
++        <el-select v-model="filterType" clearable placeholder="All types" @change="reload">
++          <el-option label="Agent" value="agent" />
++          <el-option label="Client" value="client" />
++          <el-option v-if="auth.isAdmin" label="Server node" value="server_node" />
++        </el-select>
++        <el-button :loading="loading" @click="reload">Refresh</el-button>
++      </div>
++      <el-table :data="items" v-loading="loading" row-key="id">
++        <el-table-column prop="prefix" label="Prefix" width="130" />
++        <el-table-column prop="type" label="Type" width="130" />
++        <el-table-column prop="ownerUserId" label="Owner" min-width="150" />
++        <el-table-column label="Binding" min-width="160"><template #default="{ row }">{{ row.agentId || row.nodeId || 'Scoped' }}</template></el-table-column>
++        <el-table-column prop="status" label="State" width="120" />
++        <el-table-column label="Expires" width="180"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
++        <el-table-column label="Last used" width="180"><template #default="{ row }">{{ formatDate(row.lastUsedAt) }}</template></el-table-column>
++        <el-table-column label="Actions" width="220" fixed="right">
++          <template #default="{ row }">
++            <el-button link type="primary" :disabled="row.status === 'revoked'" @click="rotate(row)">Rotate</el-button>
++            <el-button link type="danger" :disabled="row.status === 'revoked'" @click="revoke(row)">Revoke</el-button>
++          </template>
++        </el-table-column>
++      </el-table>
++      <div v-if="nextCursor" class="pager"><el-button :loading="loading" @click="loadMore">Load more</el-button></div>
++      <el-empty v-if="!loading && items.length === 0" description="No service tokens yet" />
++    </el-card>
++
++    <el-dialog v-model="createVisible" title="Create service token" width="560px" @closed="resetForm">
++      <el-form label-position="top">
++        <el-form-item label="Type"><el-select v-model="form.type" :disabled="!auth.isAdmin && form.type === 'server_node'"><el-option label="Agent" value="agent" /><el-option label="Client" value="client" /><el-option v-if="auth.isAdmin" label="Server node" value="server_node" /></el-select></el-form-item>
++        <el-form-item v-if="form.type === 'agent'" label="Agent ID"><el-input v-model="form.agentId" placeholder="agent id" /></el-form-item>
++        <el-form-item v-if="form.type === 'server_node'" label="Node ID"><el-input v-model="form.nodeId" placeholder="server node id" /></el-form-item>
++        <el-form-item v-if="form.type === 'client'" label="Agent IDs (one per line)"><el-input v-model="agentIdsText" type="textarea" :rows="3" placeholder="agent-a&#10;agent-b" /></el-form-item>
++        <el-form-item label="Protocols"><el-checkbox-group v-model="form.scope.protocols"><el-checkbox label="tcp" /><el-checkbox label="udp" /><el-checkbox label="http" /><el-checkbox label="websocket" /></el-checkbox-group></el-form-item>
++        <el-form-item label="Target CIDRs"><el-input v-model="cidrsText" placeholder="10.0.0.0/24, 192.168.1.0/24" /></el-form-item>
++        <el-form-item label="Target ports"><el-input v-model="portsText" placeholder="22, 80, 443" /></el-form-item>
++        <el-form-item label="Expires at (optional)"><el-date-picker v-model="form.expiresAt" type="datetime" value-format="YYYY-MM-DDTHH:mm:ssZ" /></el-form-item>
++      </el-form>
++      <template #footer><el-button @click="createVisible = false">Cancel</el-button><el-button type="primary" :loading="saving" @click="create">Create token</el-button></template>
++    </el-dialog>
++    <TokenSecretDialog :secret="secret" @close="clearSecret" />
++  </section>
++</template>
++
++<script setup lang="ts">
++import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
++import { ElMessage, ElMessageBox } from 'element-plus'
++import { createToken, listTokens, revokeToken, rotateToken, type ServiceToken, type TokenType } from '../api/client'
++import { useAuthStore } from '../stores/auth'
++import TokenSecretDialog from '../components/TokenSecretDialog.vue'
++
++const auth = useAuthStore(); const items = ref<ServiceToken[]>([]); const nextCursor = ref(''); const loading = ref(false); const saving = ref(false); const filterType = ref<TokenType | ''>(''); const createVisible = ref(false); const secret = ref('')
++const form = reactive<{ type: TokenType; agentId: string; nodeId: string; expiresAt: string; scope: { agentIds: string[]; protocols: string[]; targetCIDRs: string[]; targetPorts: number[] } }>({ type: 'client', agentId: '', nodeId: '', expiresAt: '', scope: { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] } })
++const agentIdsText = ref(''); const cidrsText = ref(''); const portsText = ref('')
++function formatDate(value?: string) { return value ? new Date(value).toLocaleString() : '—' }
++function clearSecret() { secret.value = '' }
++function openCreate() { createVisible.value = true }
++function resetForm() { form.type = 'client'; form.agentId = ''; form.nodeId = ''; form.expiresAt = ''; form.scope = { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] }; agentIdsText.value = ''; cidrsText.value = ''; portsText.value = '' }
++async function reload() { loading.value = true; try { const page = await listTokens({ type: filterType.value || undefined }); items.value = page.items; nextCursor.value = page.nextCursor || '' } finally { loading.value = false } }
++async function loadMore() { if (!nextCursor.value) return; loading.value = true; try { const page = await listTokens({ type: filterType.value || undefined, cursor: nextCursor.value }); items.value.push(...page.items); nextCursor.value = page.nextCursor || '' } finally { loading.value = false } }
++async function create() { saving.value = true; try { form.scope.agentIds = agentIdsText.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean); form.scope.targetCIDRs = cidrsText.value.split(',').map(v => v.trim()).filter(Boolean); form.scope.targetPorts = portsText.value.split(',').map(v => Number(v.trim())).filter(v => Number.isInteger(v) && v > 0); const created = await createToken({ type: form.type, agentId: form.agentId || undefined, nodeId: form.nodeId || undefined, scope: form.scope, expiresAt: form.expiresAt || undefined }, crypto.randomUUID()); createVisible.value = false; secret.value = created.secret || ''; await reload(); ElMessage.success('Token created') } catch (error) { ElMessage.error(error instanceof Error ? error.message : 'Token creation failed') } finally { saving.value = false } }
++async function rotate(row: ServiceToken) { await ElMessageBox.confirm('Rotating revokes the current token immediately. Continue?', 'Rotate token', { type: 'warning' }); const rotated = await rotateToken(row.id, crypto.randomUUID()); secret.value = rotated.secret || ''; await reload() }
++async function revoke(row: ServiceToken) { await ElMessageBox.confirm('Revoked tokens cannot be used again. Continue?', 'Revoke token', { type: 'warning' }); await revokeToken(row.id); ElMessage.success('Token revoked'); await reload() }
++onMounted(reload); onBeforeUnmount(clearSecret)
++</script>
++
++<style scoped>
++.tokens-page { max-width: 1400px; margin: 0 auto; }
++.hero { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 24px; }
++.eyebrow { color: #6b7a90; letter-spacing: .16em; font-size: 11px; font-weight: 700; margin: 0 0 8px; }
++h1 { margin: 0; color: #14233b; font-size: 30px; }
++.lede { color: #66758a; margin: 8px 0 0; }
++.table-card { border: 1px solid #e7edf4; border-radius: 14px; }
++.toolbar { display: flex; gap: 12px; margin-bottom: 18px; }
++.pager { display: flex; justify-content: center; padding: 18px 0 4px; }
++@media (max-width: 720px) { .hero { align-items: start; flex-direction: column; } }
++</style>

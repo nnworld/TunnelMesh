@@ -1,0 +1,312 @@
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health.go
+new file mode 100644
+index 0000000..73b768e
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health.go
+@@ -0,0 +1,74 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++)
++
++// ComponentStatus is the bounded readiness state of one runtime dependency.
++// Error is retained for internal diagnostics but is never serialized by the
++// health endpoint, because dependency errors can contain credentials or URLs.
++type ComponentStatus struct {
++	Name    string
++	Healthy bool
++	Error   string
++}
++
++// HealthChecker supplies process liveness and dependency readiness checks.
++type HealthChecker interface {
++	Live(context.Context) error
++	Ready(context.Context) []ComponentStatus
++}
++
++// NewHealthHandler mounts liveness, readiness, and Prometheus endpoints.
++func NewHealthHandler(checker HealthChecker, metrics http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		switch r.URL.Path {
++		case "/health/live":
++			if checker != nil && checker.Live(r.Context()) != nil {
++				writeHealthJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unhealthy"})
++				return
++			}
++			writeHealthJSON(w, http.StatusOK, map[string]any{"status": "ok"})
++		case "/health/ready":
++			components := []ComponentStatus(nil)
++			if checker != nil {
++				components = checker.Ready(r.Context())
++			}
++			ready := len(components) > 0
++			safe := make([]map[string]any, 0, len(components))
++			for _, component := range components {
++				if !component.Healthy {
++					ready = false
++				}
++				safe = append(safe, map[string]any{"name": component.Name, "healthy": component.Healthy})
++			}
++			status := http.StatusOK
++			state := "ready"
++			if !ready {
++				status = http.StatusServiceUnavailable
++				state = "not_ready"
++			}
++			writeHealthJSON(w, status, map[string]any{"status": state, "components": safe})
++		case "/metrics":
++			if metrics == nil {
++				http.NotFound(w, r)
++				return
++			}
++			metrics.ServeHTTP(w, r)
++		default:
++			http.NotFound(w, r)
++		}
++	})
++}
++
++func writeHealthJSON(w http.ResponseWriter, status int, body any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(body)
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health_test.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health_test.go
+new file mode 100644
+index 0000000..480cc8f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/health_test.go
+@@ -0,0 +1,66 @@
++package server
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++type fakeHealthChecker struct {
++	liveErr error
++	ready   []ComponentStatus
++}
++
++func (f fakeHealthChecker) Live(context.Context) error              { return f.liveErr }
++func (f fakeHealthChecker) Ready(context.Context) []ComponentStatus { return f.ready }
++
++func TestHealthHandlerLivenessDoesNotDependOnReadiness(t *testing.T) {
++	h := NewHealthHandler(fakeHealthChecker{ready: []ComponentStatus{{Name: "database", Healthy: false}}}, nil)
++	r := httptest.NewRequest(http.MethodGet, "/health/live", nil)
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if w.Code != http.StatusOK {
++		t.Fatalf("live status=%d, want %d", w.Code, http.StatusOK)
++	}
++}
++
++func TestHealthHandlerReadinessReturns503WithoutSensitiveDetails(t *testing.T) {
++	h := NewHealthHandler(fakeHealthChecker{ready: []ComponentStatus{{Name: "database", Healthy: false, Error: "mysql://user:secret@host/db"}}}, nil)
++	r := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("ready status=%d, want %d", w.Code, http.StatusServiceUnavailable)
++	}
++	body := w.Body.String()
++	if strings.Contains(body, "mysql://") || strings.Contains(body, "secret") {
++		t.Fatalf("readiness leaked sensitive detail: %q", body)
++	}
++}
++
++func TestHealthHandlerMetricsUsesPrometheusContentType(t *testing.T) {
++	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
++		_, _ = w.Write([]byte("# HELP tunnelmesh_ready readiness\n"))
++	})
++	h := NewHealthHandler(fakeHealthChecker{}, metrics)
++	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/plain") {
++		t.Fatalf("metrics status=%d content-type=%q", w.Code, w.Header().Get("Content-Type"))
++	}
++}
++
++func TestWebHandlerHealthRoutesPrecedeSPAFallback(t *testing.T) {
++	h := NewWebHandler(http.NotFoundHandler(), nil, nil, NewHealthHandler(fakeHealthChecker{}, http.NotFoundHandler()))
++	for _, path := range []string{"/health/live", "/health/ready", "/metrics"} {
++		w := httptest.NewRecorder()
++		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
++		if w.Code == http.StatusOK && strings.Contains(w.Body.String(), "<!doctype html") {
++			t.Fatalf("%s was swallowed by SPA fallback", path)
++		}
++	}
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-before/internal/server/runtime.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/runtime.go
+index 6cb27a0..c532391 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-before/internal/server/runtime.go
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/runtime.go
+@@ -13,14 +13,18 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 	"golang.org/x/net/websocket"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials"
+ 
+ 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/config"
++	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
+@@ -35,10 +39,11 @@ const (
+ )
+ 
+ type RuntimeConfig struct {
+-	Security config.SecurityConfig
+-	TLS      config.TLSConfig
+-	Relay    config.RelayConfig
+-	NodeID   string
++	Security        config.SecurityConfig
++	TLS             config.TLSConfig
++	Relay           config.RelayConfig
++	NodeID          string
++	MetricsRegistry *prometheus.Registry
+ }
+ 
+ // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
+@@ -56,6 +61,9 @@ type ServerRuntime struct {
+ 	relayServer      *grpc.Server
+ 	relayListener    net.Listener
+ 	config           RuntimeConfig
++	metricsRegistry  *prometheus.Registry
++	metrics          *observability.Metrics
++	closed           atomic.Bool
+ }
+ 
+ // NewServerRuntime creates the server runtime with durable Agent metadata
+@@ -76,6 +84,12 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
+ 	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
+ 	localAgentRelay := NewAgentRelayTransport(agentSessions)
+ 	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: localAgentRelay, LocalAgentRelay: localAgentRelay, config: runtimeConfig}
++	registry := runtimeConfig.MetricsRegistry
++	if registry == nil {
++		registry = prometheus.NewRegistry()
++	}
++	runtime.metricsRegistry = registry
++	runtime.metrics = observability.NewMetrics(registry)
+ 	if runtimeConfig.Relay.Enabled {
+ 		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
+ 			_ = credentialService.Close()
+@@ -105,6 +119,7 @@ func (r *ServerRuntime) Close() error {
+ 	if r == nil {
+ 		return nil
+ 	}
++	r.closed.Store(true)
+ 	var relayErr, credentialErr error
+ 	if r.LocalAgentRelay != nil {
+ 		relayErr = r.LocalAgentRelay.Close()
+@@ -150,7 +165,37 @@ func (r *ServerRuntime) Handler() http.Handler {
+ 	if r == nil {
+ 		return http.NotFoundHandler()
+ 	}
+-	return NewWebHandler(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler())
++	health := NewHealthHandler(r, promhttp.HandlerFor(r.metricsRegistry, promhttp.HandlerOpts{}))
++	return NewWebHandler(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health)
++}
++
++// Live reports process responsiveness and intentionally performs no I/O.
++func (r *ServerRuntime) Live(context.Context) error {
++	if r == nil || r.closed.Load() {
++		return errors.New("runtime is closed")
++	}
++	return nil
++}
++
++// Ready checks only bounded dependency state and returns component names and
++// booleans to callers; detailed errors stay out of the HTTP response.
++func (r *ServerRuntime) Ready(ctx context.Context) []ComponentStatus {
++	if r == nil || r.closed.Load() {
++		return []ComponentStatus{{Name: "runtime", Healthy: false, Error: "runtime unavailable"}}
++	}
++	checkCtx, cancel := context.WithTimeout(ctx, time.Second)
++	defer cancel()
++	components := []ComponentStatus{{Name: "database", Healthy: r.DB != nil}}
++	if r.DB != nil {
++		if err := r.DB.Ping(checkCtx); err != nil {
++			components[0].Healthy = false
++			components[0].Error = err.Error()
++		}
++	}
++	if r.config.Relay.Enabled {
++		components = append(components, ComponentStatus{Name: "relay", Healthy: r.relayListener != nil})
++	}
++	return components
+ }
+ 
+ func (r *ServerRuntime) agentWebSocketHandler() http.Handler {
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-before/internal/server/web.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/web.go
+index 04a678a..4c27e6d 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-before/internal/server/web.go
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-2-after/internal/server/web.go
+@@ -14,9 +14,17 @@ import (
+ //go:embed web_dist
+ var webDist embed.FS
+ 
+-func NewWebHandler(api http.Handler, ws http.Handler, clientWS ...http.Handler) http.Handler {
++func NewWebHandler(api http.Handler, ws http.Handler, handlers ...http.Handler) http.Handler {
+ 	root, _ := fs.Sub(webDist, "web_dist")
+ 	static := http.FileServer(http.FS(root))
++	var healthHandler http.Handler
++	var clientWS http.Handler
++	if len(handlers) > 0 {
++		clientWS = handlers[0]
++	}
++	if len(handlers) > 1 {
++		healthHandler = handlers[1]
++	}
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if strings.HasPrefix(r.URL.Path, "/api/") {
+ 			if api == nil {
+@@ -26,6 +34,14 @@ func NewWebHandler(api http.Handler, ws http.Handler, clientWS ...http.Handler)
+ 			}
+ 			return
+ 		}
++		if strings.HasPrefix(r.URL.Path, "/health/") || r.URL.Path == "/metrics" {
++			if healthHandler == nil {
++				http.NotFound(w, r)
++			} else {
++				healthHandler.ServeHTTP(w, r)
++			}
++			return
++		}
+ 		if r.URL.Path == "/ws/agent" {
+ 			if ws == nil {
+ 				http.NotFound(w, r)
+@@ -35,10 +51,10 @@ func NewWebHandler(api http.Handler, ws http.Handler, clientWS ...http.Handler)
+ 			return
+ 		}
+ 		if r.URL.Path == "/ws/client" {
+-			if len(clientWS) == 0 || clientWS[0] == nil {
++			if clientWS == nil {
+ 				http.NotFound(w, r)
+ 			} else {
+-				clientWS[0].ServeHTTP(w, r)
++				clientWS.ServeHTTP(w, r)
+ 			}
+ 			return
+ 		}

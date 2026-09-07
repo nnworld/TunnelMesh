@@ -40,7 +40,12 @@ compatibility pointer to that single source of truth.
 - [Managed HTTP routes](docs/user-guide/managed-http-route.md)
 - [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md)
 - [Docker deployment](docs/deployment/docker.md)
+- [Nginx/WSS configuration](docs/deployment/nginx.md)
+- [Cross-platform binary releases](docs/deployment/binary-release.md)
 - [Configuration](docs/operations/configuration.md)
+- [Observability and unified Grafana dashboard](docs/operations/observability.md)
+- [Network probes](docs/operations/network-probes.md)
+- [Logging](docs/operations/logging.md)
 - [Troubleshooting](docs/operations/troubleshooting.md)
 
 Build the three container variants with:

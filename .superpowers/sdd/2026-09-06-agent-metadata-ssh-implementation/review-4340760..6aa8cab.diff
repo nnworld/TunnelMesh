@@ -1,0 +1,30 @@
+# Review package: 4340760..6aa8cab
+
+## Commits
+6aa8cab test(e2e): cover agent metadata SSH proxy flows
+
+## Files changed
+ .../sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md
+index cbf551f..e81c80e 100644
+--- a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md
+@@ -11,12 +11,14 @@
+ 
+ The first focused E2E run exposed a cleanup hang in the test double when a stream ignored half-close. The fixture was corrected to model a target that observes `CloseWrite`; the existing bridge then cleanly closes both ends on disconnect without adding a second SSH protocol.
+ 
+ ## Verification
+ 
+ - `go test ./internal/e2e -run AgentMetadataSSH -count=1`
+ - `go test ./... -count=1`
+ - `go test -race ./...`
+ - `go vet ./...`
+ - `git diff --check`
++- `cd web && npm test -- --run`
++- `cd web && npm run build`
+ 
+-Web and Docker verification should be reported separately if their local dependencies or daemon are unavailable.
++Docker verification was unavailable because the `docker` executable is not installed in the environment; no Docker build or Compose validation was attempted.

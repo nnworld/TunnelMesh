@@ -1,0 +1,756 @@
+# Review package: 91c9d17..4340760
+
+## Commits
+4340760 test(e2e): cover agent metadata SSH proxy flows
+
+## Files changed
+ .../task-6-report.md                               |  22 ++
+ README.md                                          |  12 +-
+ docs/user-guide/agent.md                           | 141 +++++++++++++
+ docs/user-guide/client.md                          | 194 +++++++++++++++++
+ docs/user-guide/tcp-over-websocket-ssh.md          |  81 +++++++
+ internal/e2e/agent_metadata_ssh_test.go            | 233 +++++++++++++++++++++
+ 6 files changed, 681 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md
+new file mode 100644
+index 0000000..cbf551f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-report.md
+@@ -0,0 +1,22 @@
++# Task 6 Report: SSH Documentation and Integration Coverage
++
++## Scope
++
++- Added `internal/e2e/agent_metadata_ssh_test.go` covering raw TCP byte integrity for SSH-like handshake and command/exit-status bytes, policy denial, reconnect replacement and stale cleanup, and bridge disconnect cleanup.
++- Expanded Agent documentation with explicit file/env metadata allowlists, limits, redaction, stale behavior, and the no-command-exec boundary.
++- Expanded Client and SSH-over-WebSocket documentation with TCP/UDP/HTTP/publish/proxy usage, SSH public-key/ssh-agent setup, `tunnelmesh-client` and `websocat` ProxyCommand examples, remote command exit-code behavior, and policy/security guidance.
++- Updated README capability summary and security boundary.
++
++## Test notes
++
++The first focused E2E run exposed a cleanup hang in the test double when a stream ignored half-close. The fixture was corrected to model a target that observes `CloseWrite`; the existing bridge then cleanly closes both ends on disconnect without adding a second SSH protocol.
++
++## Verification
++
++- `go test ./internal/e2e -run AgentMetadataSSH -count=1`
++- `go test ./... -count=1`
++- `go test -race ./...`
++- `go vet ./...`
++- `git diff --check`
++
++Web and Docker verification should be reported separately if their local dependencies or daemon are unavailable.
+diff --git a/README.md b/README.md
+index 8bbf0bf..8e95295 100644
+--- a/README.md
++++ b/README.md
+@@ -1,14 +1,16 @@
+ # TunnelMesh
+ 
+-TunnelMesh is a Go platform for authenticated Agent tunnels, local client
+-forwarding, managed HTTP routes, and TCP-over-WebSocket access.
++TunnelMesh is a Go platform for authenticated Agent tunnels, controlled Agent
++metadata, local TCP/UDP/HTTP forwarding, managed HTTP/HTTPS/WebSocket routes,
++and TCP-over-WebSocket SSH access. Public Server exposure remains HTTP/HTTPS;
++public UDP is not supported.
+ 
+ The repository ships three commands:
+ 
+ - `tunnelmesh-server` — public API, routing, and tunnel coordination server.
+ - `tunnelmesh-agent` — outbound Agent connection and target dialer.
+ - `tunnelmesh-client` — local forwarding and user-facing tunnel client.
+ 
+ ## Development
+ 
+ The default local mode uses SQLite and keeps runtime state external to the
+@@ -41,10 +43,16 @@ compatibility pointer to that single source of truth.
+ - [Configuration](docs/operations/configuration.md)
+ - [Troubleshooting](docs/operations/troubleshooting.md)
+ 
+ Build the three container variants with:
+ 
+ ```sh
+ docker build --build-arg APP=server -t tunnelmesh:server .
+ docker build --build-arg APP=agent -t tunnelmesh:agent .
+ docker build --build-arg APP=client -t tunnelmesh:client .
+ ```
++
++The client supports `forward tcp`, `forward udp`, `forward http`, `publish
++http`, and `proxy tcp`. Agents only read metadata from explicit `file` or `env`
++allowlist entries; they do not execute arbitrary commands. SSH public-key or
++`ssh-agent` authentication remains on the target host, and remote command exit
++codes are returned by SSH itself.
+diff --git a/docs/user-guide/agent.md b/docs/user-guide/agent.md
+new file mode 100644
+index 0000000..72eecab
+--- /dev/null
++++ b/docs/user-guide/agent.md
+@@ -0,0 +1,141 @@
++# tunnelmesh-agent 使用帮助
++
++`tunnelmesh-agent` 部署在被访问的主机或内网中。它主动通过 TLS WebSocket 连接 Server，Server 和 `tunnelmesh-client` 不需要直接访问 Agent 所在网络。
++
++## 1. 最小配置
++
++```yaml
++mode: local
++agent:
++  server_url: wss://tunnel.example.com/ws/agent/v1
++  id: agent-devbox
++```
++
++也可以使用环境变量：
++
++```bash
++export TUNNELMESH_MODE=local
++export TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1
++export TUNNELMESH_AGENT_ID=agent-devbox
++```
++
++配置优先级为：命令行参数 > 环境变量 > 配置文件 > 默认值。
++
++## 2. 检查身份和配置
++
++打印 Agent ID：
++
++```bash
++tunnelmesh-agent --config agent.yaml id
++```
++
++验证配置：
++
++```bash
++tunnelmesh-agent --config agent.yaml check-config
++```
++
++Agent ID 是路由和客户端命令引用 Agent 的稳定标识。生产环境不要在多台主机上复用同一个 ID；若 ID 由设备信息生成，应在设备生命周期内保持不变。
++
++## 3. 注册和运行
++
++```bash
++tunnelmesh-agent --config agent.yaml register
++tunnelmesh-agent --config agent.yaml run
++```
++
++`register` 用于显式检查/登记 Agent；长期运行使用 `run`。Agent 启动后会主动连接 Server，并通过心跳维护在线状态。网络短暂中断时，客户端应重连并重新建立会话，不应依赖固定的 Server 入站连接。
++
++## 4. Agent 提供的能力
++
++Agent 负责从所在网络连接目标服务：
++
++- TCP：连接内网 TCP 服务并转发有序字节流。
++- UDP：连接内网 UDP 服务并保持 datagram 边界和源地址 association。
++- HTTP：连接内网 HTTP 服务，支持请求转发和 WebSocket Upgrade。
++- TCP-over-WebSocket：为 SSH 等原始 TCP 协议提供 binary WebSocket 字节桥。
++
++Agent 不负责公开监听公网端口；公网入口由 Server 的 80/443 处理。目标主机、目标端口、CIDR 和端口白名单由 Server policy 约束。
++
++## 5. 受控 metadata 上报
++
++Agent 只读取配置中明确列出的文件字段或环境变量，不会扫描整个文件系统，也不会上传全部环境变量。示例：
++
++```yaml
++agent:
++  server_url: wss://tunnel.example.com/ws/agent/v1
++  id: agent-devbox
++  metadata:
++    - name: device_id
++      source: file
++      path: /etc/machine-id
++    - name: firmware_version
++      source: file
++      path: /etc/tunnelmesh/firmware-version
++    - name: region
++      source: env
++      key: TUNNELMESH_REGION
++```
++
++`file` 必须使用绝对路径，`env` 必须指定单个变量名；字段名只能包含字母、数字、`.`、`_` 和 `-`。单个 Agent 最多上报 32 个字段，单字段最多 4 KiB，总 payload 最多 32 KiB。读取失败只标记该字段，不会中断 TCP、UDP 或 HTTP 转发。
++
++名称包含 `password`、`token`、`secret`、`private_key` 或 `dsn` 的字段会被遮罩；管理 API 只返回 `redacted: true`，不会返回原值。Server 保存最新快照和 epoch/revision；会话过期后快照标记为 stale，管理 API 默认隐藏 stale 数据，使用 `includeStale=true` 才读取最后安全快照。
++
++metadata 不支持命令执行、shell 插值或任意路径读取。需要执行命令时应使用宿主机已有的 SSH 认证和审计边界，参见 [SSH over WebSocket](tcp-over-websocket-ssh.md)。
++
++## 6. 网络和 TLS 要求
++
++Agent 主机必须满足：
++
++1. 能解析并访问 Server 的 DNS 名称。
++2. 能访问 Server 的 HTTPS/WSS 端口，通常是 443。
++3. 系统时间准确，能够校验 Server 证书。
++4. 能从 Agent 网络访问被代理的目标地址和端口。
++5. 防火墙允许 Agent 到 Server 的出站连接以及到目标服务的内网连接。
++
++生产环境使用 `wss://`，不要关闭证书校验或把 Server 证书私钥放在 Agent 主机上。
++
++## 7. Docker 运行
++
++```bash
++docker build --build-arg APP=agent -t tunnelmesh:agent .
++docker run --rm \
++  -e TUNNELMESH_MODE=local \
++  -e TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1 \
++  -e TUNNELMESH_AGENT_ID=agent-devbox \
++  tunnelmesh:agent run
++```
++
++Agent 容器通常不需要暴露端口。它只需要出站访问 Server 和目标内网服务；在 Kubernetes 或 Compose 中使用 Secret 注入证书、Token 等敏感配置。
++
++## 8. 故障排查
++
++### `check-config` 失败
++
++检查 `mode`、`agent.server_url` 和 `agent.id`，并确认配置文件格式正确。使用 `--config` 指向实际挂载路径。
++
++### Agent 一直离线
++
++- 用 `curl` 或 TLS 工具确认 Server 的 443 可达。
++- 检查 WSS 路径是否为 `/ws/agent/v1`，以及反向代理是否透传 Upgrade。
++- 检查证书的域名、系统时间和 CA 信任链。
++- 检查 Agent ID 是否与另一台在线主机重复。
++- 查看 Server 的 Agent lease、heartbeat 和认证日志。
++
++### 目标服务不可达
++
++在 Agent 主机上直接测试目标连接，例如：
++
++```bash
++nc -vz db.internal 5432
++nc -vzu 10.0.0.53 53
++```
++
++如果本机可达但 TunnelMesh 仍被拒绝，检查 Server policy 的 target host、target port、CIDR 和协议配置。
++
++## 9. 安全建议
++
++- Agent 配置文件权限设置为 `0600`，服务使用独立系统用户运行。
++- 不要把 Token、私钥、MySQL DSN 或完整配置提交到 Git。
++- 只授予必要的目标网段和端口 policy。
++- 发生 Agent 凭据泄露时立即在管理后台撤销并重新注册。
+diff --git a/docs/user-guide/client.md b/docs/user-guide/client.md
+new file mode 100644
+index 0000000..0801ee7
+--- /dev/null
++++ b/docs/user-guide/client.md
+@@ -0,0 +1,194 @@
++# tunnelmesh-client 使用帮助
++
++## 1. 准备配置
++
++`tunnelmesh-client` 支持配置文件、环境变量和命令行参数，优先级为：命令行参数 > 环境变量 > 配置文件 > 默认值。
++
++最小配置示例：
++
++```yaml
++mode: local
++client:
++  server_url: wss://tunnel.example.com/client
++```
++
++使用配置文件执行登录命令时会自动加载并校验配置：
++
++```bash
++tunnelmesh-client --config tunnelmesh.yaml login
++```
++
++常用环境变量：
++
++```bash
++export TUNNELMESH_MODE=local
++export TUNNELMESH_CLIENT_SERVER_URL=wss://tunnel.example.com/client
++```
++
++## 2. 登录和查看 Agent
++
++```bash
++tunnelmesh-client --config tunnelmesh.yaml login
++tunnelmesh-client --config tunnelmesh.yaml agent
++tunnelmesh-client --config tunnelmesh.yaml status
++```
++
++## 3. 支持能力总览
++
++| 命令 | 协议 | 方向 | 说明 |
++| --- | --- | --- | --- |
++| `forward tcp` | TCP | 本地监听 → Agent 内网服务 | 有序字节流 |
++| `forward udp` | UDP | 本地监听 → Agent 内网服务 | 保留 datagram 边界，按源地址复用 association |
++| `forward http` | HTTP | 本地监听 → Agent 内网 HTTP 服务 | 适合本地 Web 服务 |
++| `publish http` | HTTP/HTTPS/WebSocket | Server 公网入口 → Agent 服务 | 通过管理路由或 wildcard 域名访问 |
++| `proxy tcp` | TCP | stdin/stdout ↔ Agent 内网服务 | 用于 SSH `ProxyCommand` 和 websocat |
++| `tunnel status/stop` | - | 本地隧道管理 | 查看或停止配置的隧道 |
++
++公网 Server 入口不开放公网 UDP；UDP 仅支持通过 `forward udp` 从用户侧发起到 Agent 内网。
++
++## 4. TCP 转发
++
++把本地 `127.0.0.1:15432` 转发到 Agent 所在内网的 `db.internal:5432`：
++
++```bash
++tunnelmesh-client forward tcp \
++  --listen 127.0.0.1:15432 \
++  --agent <agent-id> \
++  --target-host db.internal \
++  --target-port 5432
++```
++
++## 5. UDP 转发
++
++UDP 使用 datagram 边界，每个 UDP 报文保持独立；同一个本地源地址会复用 association：
++
++```bash
++tunnelmesh-client forward udp \
++  --listen 127.0.0.1:15353 \
++  --agent <agent-id> \
++  --target-host 10.0.0.53 \
++  --target-port 53
++```
++
++公网入口不直接监听 UDP；需要公网 UDP 时，应在目标网络内放置 UDP 网关，再通过 TCP/HTTP 或其他受支持入口接入。
++
++## 6. TCP 和 UDP 同时转发
++
++TCP 和 UDP 使用不同的操作系统传输层命名空间，因此可以同时使用相同的数字端口。例如下面两个命令可以并行运行：
++
++```bash
++# TCP/5432：数据库连接
++tunnelmesh-client forward tcp \
++  --listen 127.0.0.1:5432 \
++  --agent agent-db \
++  --target-host db.internal \
++  --target-port 5432
++
++# UDP/5432：另一个 UDP 服务
++tunnelmesh-client forward udp \
++  --listen 127.0.0.1:5432 \
++  --agent agent-net \
++  --target-host dns.internal \
++  --target-port 5432
++```
++
++注意：
++
++- `TCP/5432` 和 `UDP/5432` 可以并存；两个 TCP 或两个 UDP 监听不能占用同一地址端口。
++- 若使用同一个端口，必须确认两个目标服务的协议不同；客户端不会把 TCP 数据转成 UDP，也不会把 UDP 数据转成 TCP。
++- IPv4/IPv6 双栈、容器网络和系统安全策略可能改变端口绑定行为，出现 bind 错误时请明确指定监听地址。
++- 配置文件中也可以定义两条隧道，只要 `protocol` 分别是 `tcp` 和 `udp`。
++
++## 7. HTTP 转发和发布
++
++本地 HTTP 服务可以通过 `forward http` 或管理后台创建托管路由：
++
++```bash
++tunnelmesh-client forward http \
++  --listen 127.0.0.1:18080 \
++  --agent <agent-id> \
++  --target-host 127.0.0.1 \
++  --target-port 8080
++```
++
++托管域名、路径和目标端口等长期配置建议通过 Web 管理后台或 `/api/v1/routes` 管理，避免把生产路由写入临时命令行历史。
++
++`publish` 当前用于 HTTP/HTTPS/WebSocket 托管路由；不能把 `tcp` 或 `udp` 作为公网 Server 监听协议。需要 TCP 访问时使用 `proxy tcp` 或 Server 的 TCP-over-WebSocket bridge。
++
++## 8. 原始 TCP 代理
++
++`proxy tcp` 从 stdin 读取字节并把响应写回 stdout，适用于 SSH：
++
++```bash
++tunnelmesh-client proxy tcp \
++  --agent agent-devbox \
++  --target-host 127.0.0.1 \
++  --target-port 22
++```
++
++更常见的公网 SSH 场景参见 [SSH over WebSocket](tcp-over-websocket-ssh.md)。
++
++## 9. SSH 公钥和远程命令
++
++TunnelMesh 不保存 SSH 私钥，也不替代目标主机的 `sshd`。先在目标主机安装公钥，再用本地私钥或 `ssh-agent` 完成认证：
++
++```bash
++ssh-copy-id -i ~/.ssh/id_ed25519.pub devuser@target-host
++ssh-add ~/.ssh/id_ed25519
++```
++
++通过现有 TCP proxy 建立 SSH：
++
++```bash
++ssh \
++  -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
++  devuser@agent-devbox
++```
++
++远程命令仍由 SSH 负责解析、授权和返回退出码；TunnelMesh 只转发字节。例如：
++
++```bash
++ssh \
++  -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
++  devuser@agent-devbox 'uname -a && systemctl is-active sshd'
++```
++
++Server policy 应只允许目标 Agent、目标地址和 TCP/22。SSH 连接失败时先检查 `authorized_keys`、`ssh-agent`、目标主机用户和 policy；TunnelMesh 不会把密码或私钥写入日志。
++
++`command-exec`（由 Server 直接执行任意命令）不属于当前协议，也没有隐藏入口。若未来需要该能力，必须另行设计命令白名单、RBAC、审批、PTY、超时、输出上限和审计。
++
++## 10. 停止和查看状态
++
++```bash
++tunnelmesh-client tunnel status
++tunnelmesh-client tunnel stop
++tunnelmesh-client stop
++```
++
++## 11. 配置文件中的多个隧道
++
++```yaml
++mode: local
++client:
++  server_url: wss://tunnel.example.com/client
++  tunnels:
++    - name: postgres
++      protocol: tcp
++      listen: 127.0.0.1:15432
++      agent_id: agent-db
++      target_host: db.internal
++      target_port: 5432
++    - name: dns
++      protocol: udp
++      listen: 127.0.0.1:15353
++      agent_id: agent-net
++      target_host: 10.0.0.53
++      target_port: 53
++```
++
++## 安全建议
++
++- 生产环境必须使用 `wss://`，并校验证书链。
++- Agent ID、Token 和配置文件权限应限制为服务用户可读。
++- 不要把 Token、密码和 MySQL DSN 提交到 Git。
++- 调整目标网段、端口和 CIDR 策略时，同时检查服务端 policy。
+diff --git a/docs/user-guide/tcp-over-websocket-ssh.md b/docs/user-guide/tcp-over-websocket-ssh.md
+new file mode 100644
+index 0000000..7cdf09a
+--- /dev/null
++++ b/docs/user-guide/tcp-over-websocket-ssh.md
+@@ -0,0 +1,81 @@
++# SSH over WebSocket
++
++TunnelMesh 支持通过 Server 的 WebSocket TCP bridge 传输 SSH 原始字节。SSH 仍由目标主机的 `sshd` 负责用户认证、授权和退出码；TunnelMesh 不增加第二套 SSH 或 command-exec 协议。
++
++## 前置条件
++
++1. 在目标主机的 `~/.ssh/authorized_keys` 安装公钥，或让本地 `ssh-agent` 持有对应私钥。
++2. Server policy 允许目标 Agent、目标地址和 TCP/22。
++3. Agent 能从内网连接目标主机的 22 端口；Server 只需暴露 80/443。
++
++例如：
++
++```bash
++ssh-copy-id -i ~/.ssh/id_ed25519.pub devuser@target-host
++ssh-add ~/.ssh/id_ed25519
++```
++
++## tunnelmesh-client ProxyCommand
++
++本地 client 直接复用 TCP proxy，适用于显式 Agent/目标地址：
++
++```sshconfig
++Host tunnelmesh-agent
++    HostName ignored-by-proxy
++    User devuser
++    ProxyCommand tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22
++```
++
++临时执行：
++
++```bash
++ssh -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
++  devuser@ignored-by-proxy
++```
++
++## websocat 命令
++
++```bash
++websocat --binary -B 65536 - \
++  'wss://8081-agent-id.apps.example.com'
++```
++
++`--binary` 保证 WebSocket 使用 binary message，`-B 65536` 控制缓冲区大小。实际 URL 需替换为你的显式路由或动态 wildcard 路由。
++
++## SSH ProxyCommand
++
++```sshconfig
++Host tunnelmesh-agent
++    HostName ignored-by-proxy
++    User nami
++    ProxyCommand websocat --binary -B 65536 - "wss://8081-agent-id.apps.example.com"
++```
++
++也可以临时执行：
++
++```bash
++ssh -o 'ProxyCommand=websocat --binary -B 65536 - wss://8081-agent-id.apps.example.com' \
++  nami@ignored-by-proxy
++```
++
++通过 SSH 执行远程命令时，退出码由 SSH 原样返回：
++
++```bash
++ssh -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
++  devuser@ignored-by-proxy 'uname -a && systemctl is-active sshd'
++echo "ssh exit=$?"
++```
++
++## 安全边界
++
++- TunnelMesh 只传输 SSH 的 TCP 字节，不解析用户名、私钥或命令内容。
++- 不要把私钥、密码或完整 SSH 配置放入 Agent metadata；敏感 metadata 会被遮罩。
++- 任意命令执行不是本期能力；不要把 `proxy tcp` 当作绕过 `sshd` 的 shell 通道。
++
++## 约束
++
++- WebSocket endpoint 必须指向 Server 的 TCP bridge 路径或已配置的 TCP route。
++- Server 只负责转发字节，不解析 SSH 协议。
++- 生产环境使用 `wss://` 和有效证书。
++- 遇到 404 时检查域名、路径和 wildcard DNS；遇到 502/504 时检查 Agent 在线状态和目标端口。
++- 遇到 binary message 错误时确认 `websocat` 使用了 `--binary`。
+diff --git a/internal/e2e/agent_metadata_ssh_test.go b/internal/e2e/agent_metadata_ssh_test.go
+new file mode 100644
+index 0000000..f669fd8
+--- /dev/null
++++ b/internal/e2e/agent_metadata_ssh_test.go
+@@ -0,0 +1,233 @@
++package e2e
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/client"
++	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
++	"github.com/tunnelmesh/tunnelmesh/internal/relay"
++	"github.com/tunnelmesh/tunnelmesh/internal/routing"
++	"github.com/tunnelmesh/tunnelmesh/internal/server"
++)
++
++type sshDuplex struct {
++	mu         sync.Mutex
++	written    bytes.Buffer
++	read       *bytes.Reader
++	closed     bool
++	closeWrite bool
++}
++
++func newSSHDuplex(response []byte) *sshDuplex {
++	return &sshDuplex{read: bytes.NewReader(response)}
++}
++
++func (s *sshDuplex) Read(p []byte) (int, error) { return s.read.Read(p) }
++
++func (s *sshDuplex) Write(p []byte) (int, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return 0, io.ErrClosedPipe
++	}
++	return s.written.Write(p)
++}
++
++func (s *sshDuplex) CloseWrite() error {
++	s.mu.Lock()
++	s.closeWrite = true
++	s.mu.Unlock()
++	return nil
++}
++
++func (s *sshDuplex) Close() error {
++	s.mu.Lock()
++	s.closed = true
++	s.mu.Unlock()
++	return nil
++}
++
++func (s *sshDuplex) Written() []byte {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return append([]byte(nil), s.written.Bytes()...)
++}
++
++func (s *sshDuplex) CloseWriteCalled() bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.closeWrite
++}
++
++func TestAgentMetadataSSHByteIntegrityAndExitStatus(t *testing.T) {
++	sshHandshake := []byte("SSH-2.0-TunnelMeshTest\r\n")
++	remoteCommand := []byte{0, 0, 0, 20, 0, 0, 0, 4, 'e', 'x', 'e', 'c', 0, 0, 0, 0}
++	exitStatus := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
++	stream := newSSHDuplex(append([]byte("SSH-2.0-target\r\n"), exitStatus...))
++	var output bytes.Buffer
++	input := bytes.NewReader(append(append([]byte{}, sshHandshake...), remoteCommand...))
++	if err := client.ProxyStdio(context.Background(), input, &output, stream); err != nil {
++		t.Fatal(err)
++	}
++	if got := stream.Written(); !bytes.Equal(got, append(sshHandshake, remoteCommand...)) {
++		t.Fatalf("SSH bytes changed in proxy: got %x", got)
++	}
++	if !bytes.Equal(output.Bytes(), append([]byte("SSH-2.0-target\r\n"), exitStatus...)) {
++		t.Fatalf("remote bytes changed in proxy: got %x", output.Bytes())
++	}
++	if !stream.CloseWriteCalled() {
++		t.Fatal("proxy did not propagate stdin EOF as a half-close")
++	}
++}
++
++func TestAgentMetadataSSHPolicyDenial(t *testing.T) {
++	policy, err := routing.NewPolicy([]string{"10.0.0.0/8"}, []int{22})
++	if err != nil {
++		t.Fatal(err)
++	}
++	resolver := routing.NewRouteResolver([]routing.Route{{Domain: "ssh.example.com", AgentID: "agent-1", TargetHost: "10.0.0.8", TargetPort: 2200, AllowedCIDRs: []string{"10.0.0.0/8"}, AllowedPorts: []int{22}}}, routing.WithPolicy(policy))
++	if _, err := resolver.ResolveHTTP("ssh.example.com", "/"); !errors.Is(err, routing.ErrPortNotAllowed) {
++		t.Fatalf("expected policy denial, got %v", err)
++	}
++}
++
++type e2eTransport struct {
++	sent   chan protocol.Frame
++	closed chan struct{}
++}
++
++func newE2ETransport() *e2eTransport {
++	return &e2eTransport{sent: make(chan protocol.Frame, 8), closed: make(chan struct{})}
++}
++
++func (t *e2eTransport) Send(frame protocol.Frame) error {
++	select {
++	case <-t.closed:
++		return io.ErrClosedPipe
++	default:
++	}
++	t.sent <- frame
++	return nil
++}
++
++func (t *e2eTransport) Close() error {
++	select {
++	case <-t.closed:
++	default:
++		close(t.closed)
++	}
++	return nil
++}
++
++func TestAgentMetadataSSHReconnectCleanup(t *testing.T) {
++	manager := server.NewAgentSessionManager(server.AgentSessionConfig{})
++	oldTransport := newE2ETransport()
++	old, err := manager.Register(context.Background(), server.AgentRegistration{AgentID: "agent-1", NodeID: "node-a", Epoch: 1}, oldTransport)
++	if err != nil {
++		t.Fatal(err)
++	}
++	newTransport := newE2ETransport()
++	current, err := manager.Register(context.Background(), server.AgentRegistration{AgentID: "agent-1", NodeID: "node-b", Epoch: 2}, newTransport)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got, ok := manager.Get("agent-1"); !ok || got != current {
++		t.Fatal("reconnect did not replace current session")
++	}
++	select {
++	case <-oldTransport.closed:
++	case <-time.After(time.Second):
++		t.Fatal("old session was not closed after reconnect")
++	}
++	manager.RemoveSession("agent-1", old)
++	if got, ok := manager.Get("agent-1"); !ok || got != current {
++		t.Fatal("stale cleanup removed the replacement session")
++	}
++	manager.RemoveSession("agent-1", current)
++	if _, ok := manager.Get("agent-1"); ok {
++		t.Fatal("current session remained after cleanup")
++	}
++}
++
++type e2eBridgeStream struct {
++	bytes.Buffer
++	closed chan struct{}
++}
++
++func (s *e2eBridgeStream) Read([]byte) (int, error) { <-s.closed; return 0, io.EOF }
++func (s *e2eBridgeStream) CloseWrite() error {
++	select {
++	case <-s.closed:
++	default:
++		close(s.closed)
++	}
++	return nil
++}
++func (s *e2eBridgeStream) Close() error {
++	select {
++	case <-s.closed:
++	default:
++		close(s.closed)
++	}
++	return nil
++}
++
++type e2eBridgeWS struct {
++	msgs   [][]byte
++	closed chan struct{}
++}
++
++func (w *e2eBridgeWS) ReadMessage() (int, []byte, error) {
++	if len(w.msgs) == 0 {
++		return 0, nil, io.EOF
++	}
++	msg := w.msgs[0]
++	w.msgs = w.msgs[1:]
++	return 2, msg, nil
++}
++func (w *e2eBridgeWS) WriteMessage(_ int, _ []byte) error { return nil }
++func (w *e2eBridgeWS) Close() error {
++	select {
++	case <-w.closed:
++	default:
++		close(w.closed)
++	}
++	return nil
++}
++
++type e2eBridgeOpener struct{ stream io.ReadWriteCloser }
++
++func (o e2eBridgeOpener) OpenStream(context.Context, relay.StreamRequest) (io.ReadWriteCloser, error) {
++	return o.stream, nil
++}
++func (o e2eBridgeOpener) Close() error { return nil }
++
++func TestAgentMetadataSSHBridgeDisconnectCleanup(t *testing.T) {
++	stream := &e2eBridgeStream{closed: make(chan struct{})}
++	ws := &e2eBridgeWS{msgs: [][]byte{[]byte("ssh-handshake")}, closed: make(chan struct{})}
++	handler := &server.TCPBridgeHandler{
++		Resolver: routing.NewRouteResolver([]routing.Route{{Domain: "ssh.example.com", AgentID: "agent-1", TargetHost: "10.0.0.8", TargetPort: 22}}),
++		Opener:   e2eBridgeOpener{stream: stream},
++	}
++	if err := handler.Handle(context.Background(), ws, "ssh.example.com"); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-stream.closed:
++	case <-time.After(time.Second):
++		t.Fatal("target stream was not closed after websocket disconnect")
++	}
++}
++
++func TestAgentMetadataSSHPolicyRejectsLoopbackTarget(t *testing.T) {
++	if err := (&routing.Policy{}).Validate(net.ParseIP("127.0.0.1"), 22); !errors.Is(err, routing.ErrDangerousAddress) {
++		t.Fatalf("expected loopback policy denial, got %v", err)
++	}
++}

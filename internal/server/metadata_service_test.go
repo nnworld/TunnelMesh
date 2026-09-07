@@ -72,3 +72,9 @@ func (r *fakeMetadataRepo) MarkStale(context.Context, string, int64) error {
 	r.value.Stale = true
 	return nil
 }
+func (r *fakeMetadataRepo) Touch(_ context.Context, _ string, _ int64, lastSeenAt, expiresAt time.Time) error {
+	r.value.LastSeenAt = lastSeenAt
+	r.value.ExpiresAt = &expiresAt
+	r.value.Stale = false
+	return nil
+}

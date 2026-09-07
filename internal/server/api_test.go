@@ -52,6 +52,27 @@ func apiJSON(t *testing.T, h http.Handler, method, path, token, idem string, bod
 	return w
 }
 
+func apiJSONWithHeaders(t *testing.T, h http.Handler, method, path, token string, headers map[string]string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var b bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&b).Encode(body)
+	}
+	r := httptest.NewRequest(method, path, &b)
+	if body != nil {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	for key, value := range headers {
+		r.Header.Set(key, value)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w
+}
+
 func apiToken(t *testing.T, api *API, username, password string) string {
 	t.Helper()
 	result, err := auth.NewAuthService(api.DB).Login(context.Background(), username, password)

@@ -100,3 +100,18 @@
 ## Execution Notes
 
 Implement tasks in order because each task produces interfaces consumed by later tasks. Keep metadata reporting independent from data forwarding so malformed or stale metadata cannot interrupt TCP/UDP/HTTP streams. If arbitrary command execution is requested later, stop and create a separate design.
+
+## Implementation ledger
+
+The implementation is integrated on `main` through commit `163fe12` and the
+follow-up heartbeat lease fix in the working tree. Tasks 1–6 are implemented;
+the final verification set is green for Go tests, race tests, vet, frontend
+tests/build, Compose YAML parsing, and `git diff --check`. Docker image builds
+remain environment-dependent because the current host does not provide a
+`docker` executable.
+
+The Agent runtime sends a protocol-level `PING` every minute by default. The
+Server answers with `PONG`, updates the session heartbeat, and refreshes the
+current epoch's metadata lease without changing its revision. This prevents a
+healthy Agent with unchanged metadata from becoming stale solely because the
+five-minute metadata TTL elapsed.

@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: TunnelMesh
+    orgId: 1
+    folder: TunnelMesh
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards/tunnelmesh

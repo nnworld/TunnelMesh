@@ -1,0 +1,38 @@
+groups:
+  - name: tunnelmesh-alerts
+    rules:
+      - alert: TunnelMeshServerNotReady
+        expr: absent(tunnelmesh_ready{component="server"}) or min(tunnelmesh_ready{component="server"}) < 1
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: TunnelMesh server is not ready}
+      - alert: TunnelMeshAgentOffline
+        expr: absent(tunnelmesh_connections_active{component="agent"}) or sum(tunnelmesh_connections_active{component="agent"}) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: No active TunnelMesh agent connection}
+      - alert: TunnelMeshHeartbeatMisses
+        expr: absent(tunnelmesh_heartbeat_total) or sum(rate(tunnelmesh_heartbeat_total{result=~"miss|timeout"}[5m])) > 0
+        for: 3m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh heartbeat misses detected}
+      - alert: TunnelMeshRelayFailures
+        expr: absent(tunnelmesh_relay_total) or sum(rate(tunnelmesh_relay_total{result=~"failed|error"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh relay failures detected}
+      - alert: TunnelMeshStorageFailures
+        expr: absent(tunnelmesh_storage_errors_total) or sum(rate(tunnelmesh_storage_errors_total[5m])) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: TunnelMesh storage failures detected}
+      - alert: TunnelMeshProbeDegraded
+        expr: absent(tunnelmesh_probe_total) or tunnelmesh:probe:success_ratio5m < 0.95
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh probe success ratio is degraded}
+      - alert: TunnelMeshMetricsMissing
+        expr: absent(tunnelmesh_ready)
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: TunnelMesh metrics scrape is absent}

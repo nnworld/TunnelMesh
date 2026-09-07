@@ -27,6 +27,40 @@ type APIToken struct {
 // Token is retained as a concise alias for callers that use the domain term.
 type Token = APIToken
 
+// TokenType identifies the service principal that may present a credential.
+type TokenType string
+
+const (
+	TokenTypeAgent      TokenType = "agent"
+	TokenTypeClient     TokenType = "client"
+	TokenTypeServerNode TokenType = "server_node"
+)
+
+// ServiceToken stores a one-way service credential and its authorization
+// scope. Lifecycle state is derived from the timestamp fields.
+type ServiceToken struct {
+	ID          string
+	OwnerUserID string
+	AgentID     string
+	NodeID      string
+	Prefix      string
+	TokenHash   string
+	// SecretCiphertext and SecretNonce are base64-encoded AES-GCM values. They
+	// are intentionally absent for legacy hash-only tokens.
+	SecretCiphertext string
+	SecretNonce      string
+	SecretKeyID      string
+	SecretVersion    int
+	SecretLastReadAt *time.Time
+	Scope            string
+	Type             TokenType
+	ExpiresAt        *time.Time
+	RevokedAt        *time.Time
+	LastUsedAt       *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
 type Agent struct {
 	ID           string
 	Name         string
@@ -95,6 +129,43 @@ type AgentRuntimeMetadata struct {
 	ExpiresAt  *time.Time
 	Stale      bool
 	UpdatedAt  time.Time
+}
+
+// AgentRuntimeStats is a bounded, one-minute aggregate. It deliberately
+// contains counters and quantiles only; payloads, targets and identifiers
+// with unbounded cardinality never enter the history table.
+type AgentRuntimeStats struct {
+	ID               string
+	AgentID          string
+	NodeID           string
+	Epoch            int64
+	WindowStart      time.Time
+	WindowEnd        time.Time
+	Connections      int64
+	ActiveStreams    int64
+	BytesIn          int64
+	BytesOut         int64
+	HeartbeatTotal   int64
+	HeartbeatSuccess int64
+	HeartbeatRTTP50  time.Duration
+	HeartbeatRTTP95  time.Duration
+	Reconnects       int64
+	StreamErrors     int64
+	CreatedAt        time.Time
+}
+
+// AgentProbeResult is the persisted probe summary. Response bodies and
+// arbitrary error text are intentionally not represented by this model.
+type AgentProbeResult struct {
+	ProbeID    string
+	AgentID    string
+	NodeID     string
+	Epoch      int64
+	Kind       string
+	Result     string
+	ErrorClass string
+	Duration   time.Duration
+	ObservedAt time.Time
 }
 
 type AgentLease struct {

@@ -1,0 +1,280 @@
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/agent/session.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/agent/session.go
+index d9e6b04..06dbc00 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/agent/session.go
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/agent/session.go
+@@ -11,6 +11,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+ )
+ 
+@@ -37,6 +38,7 @@ type StreamDispatcher struct {
+ 	generation uint64
+ 	mu         sync.Mutex
+ 	send       FrameSender
++	metrics    *observability.Metrics
+ 	readers    sync.WaitGroup
+ 	closed     bool
+ }
+@@ -75,6 +77,15 @@ func NewStreamDispatcherWithSender(d Dialer, override StreamDialFunc, sender Fra
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	return &StreamDispatcher{ctx: ctx, cancel: cancel, dial: override, streams: make(map[uint32]*streamEntry), send: sender}
+ }
++
++// SetMetrics attaches the process-scoped observer without changing the
++// transport contract used by existing callers.
++func (d *StreamDispatcher) SetMetrics(metrics *observability.Metrics) {
++	if d != nil {
++		d.metrics = metrics
++	}
++}
++
+ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
+ 	if d == nil {
+ 		return ErrStreamNotFound
+@@ -90,6 +101,9 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
+ 		}
+ 		c, err := d.dial(d.ctx, p.Protocol, p.TargetHost, p.TargetPort)
+ 		if err != nil {
++			if d.metrics != nil {
++				d.metrics.ObserveStream(p.Protocol, "failed", observability.NormalizeErrorClass(err))
++			}
+ 			return err
+ 		}
+ 		d.mu.Lock()
+@@ -109,6 +123,9 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
+ 		d.readers.Add(1)
+ 		d.mu.Unlock()
+ 		go d.readBack(f.StreamID, entry)
++		if d.metrics != nil {
++			d.metrics.ObserveStream(p.Protocol, "accepted", "")
++		}
+ 		return nil
+ 	case protocol.FrameData:
+ 		d.mu.Lock()
+@@ -122,6 +139,9 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
+ 			return d.rejectAndClose(f.StreamID, entry, protocol.ErrInvalidFrame)
+ 		}
+ 		written, err := entry.conn.Write(f.Payload)
++		if d.metrics != nil && written > 0 {
++			d.metrics.ObserveBytes("agent", "inbound", entry.protocol, int64(written))
++		}
+ 		if err == nil && written != len(f.Payload) {
+ 			err = io.ErrShortWrite
+ 		}
+@@ -291,6 +311,8 @@ type Session struct {
+ 	BaseBackoff, MaxBackoff time.Duration
+ 	HeartbeatInterval       time.Duration
+ 	Rand                    *rand.Rand
++	Metrics                 *observability.Metrics
++	heartbeatSentNanos      atomic.Int64
+ }
+ 
+ func NewSession(tr FrameTransport) *Session {
+@@ -422,6 +444,7 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
+ 			for {
+ 				select {
+ 				case <-ticker.C:
++					s.heartbeatSentNanos.Store(time.Now().UnixNano())
+ 					_ = s.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing})
+ 				case <-done:
+ 					return
+@@ -462,6 +485,13 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
+ 			continue
+ 		}
+ 		if f.Type == protocol.FramePong {
++			if s.Metrics != nil {
++				rtt := time.Duration(0)
++				if sent := s.heartbeatSentNanos.Load(); sent > 0 {
++					rtt = time.Since(time.Unix(0, sent))
++				}
++				s.Metrics.ObserveHeartbeat("agent", "pong", rtt)
++			}
+ 			continue
+ 		}
+ 		if onFrame != nil {
+@@ -475,6 +505,9 @@ func (s *Session) Close() error {
+ 	if s.closed.Swap(true) {
+ 		return nil
+ 	}
++	if s.Metrics != nil {
++		s.Metrics.ObserveConnection("agent", "websocket", "closed", "")
++	}
+ 	s.sendMu.Lock()
+ 	defer s.sendMu.Unlock()
+ 	return s.transport.Close()
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/agent/websocket.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/agent/websocket.go
+index 82fa576..8b413ca 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/agent/websocket.go
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/agent/websocket.go
+@@ -12,6 +12,7 @@ import (
+ 
+ 	"golang.org/x/net/websocket"
+ 
++	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+ )
+ 
+@@ -29,6 +30,7 @@ type WebSocketRunOptions struct {
+ 	MaxBackoff        time.Duration
+ 	HeartbeatInterval time.Duration
+ 	Rand              *rand.Rand
++	Metrics           *observability.Metrics
+ }
+ 
+ const defaultHeartbeatInterval = 30 * time.Second
+@@ -91,9 +93,15 @@ func runWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string,
+ 		if err := ctx.Err(); err != nil {
+ 			return err
+ 		}
++		stageStarted := time.Now()
+ 		transport, err := DialWebSocket(ctx, serverURL, token)
+ 		if err == nil {
++			if options.Metrics != nil {
++				options.Metrics.ObserveConnection("agent", "websocket", "started", "")
++				options.Metrics.ObserveStage("agent", "websocket_upgrade", "success", "", time.Since(stageStarted))
++			}
+ 			session := NewSessionWithMetadata(transport, collector)
++			session.Metrics = options.Metrics
+ 			session.BaseBackoff, session.MaxBackoff, session.Rand = base, max, rng
+ 			session.HeartbeatInterval = heartbeat
+ 			session.SetMetadataIdentity(agentID, nodeID, currentEpoch)
+@@ -113,6 +121,9 @@ func runWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string,
+ 				return ctx.Err()
+ 			}
+ 			currentEpoch++
++		} else if options.Metrics != nil {
++			options.Metrics.ObserveConnection("agent", "websocket", "failed", observability.NormalizeErrorClass(err))
++			options.Metrics.ObserveStage("agent", "websocket_upgrade", "failure", observability.NormalizeErrorClass(err), time.Since(stageStarted))
+ 		}
+ 		attempt++
+ 		delay := base
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/observability/integration_test.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/observability/integration_test.go
+new file mode 100644
+index 0000000..8ff01d3
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/observability/integration_test.go
+@@ -0,0 +1,59 @@
++package observability_test
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/agent"
++	"github.com/tunnelmesh/tunnelmesh/internal/observability"
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++)
++
++func TestAgentDialAndStorageFailuresAreInstrumented(t *testing.T) {
++	reg := prometheus.NewRegistry()
++	metrics := observability.NewMetrics(reg)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer cancel()
++	_ = agent.RunWebSocketWithOptions(ctx, "ws://127.0.0.1:1/ws", "token", "agent-1", "node-1", 1, nil, nil, agent.WebSocketRunOptions{
++		BaseBackoff: time.Millisecond,
++		MaxBackoff:  time.Millisecond,
++		Metrics:     metrics,
++	})
++
++	db, err := storage.OpenWithMetrics(context.Background(), storage.DriverSQLite, ":memory:", true, metrics)
++	if err != nil {
++		t.Fatalf("open sqlite: %v", err)
++	}
++	_ = db.Close()
++	_ = db.Ping(context.Background())
++
++	families, err := reg.Gather()
++	if err != nil {
++		t.Fatalf("gather metrics: %v", err)
++	}
++	var exposition strings.Builder
++	for _, family := range families {
++		exposition.WriteString(family.GetName())
++		for _, metric := range family.GetMetric() {
++			for _, label := range metric.GetLabel() {
++				exposition.WriteByte(' ')
++				exposition.WriteString(label.GetName())
++				exposition.WriteByte('=')
++				exposition.WriteString(label.GetValue())
++			}
++		}
++		exposition.WriteByte('\n')
++	}
++	text := exposition.String()
++	if !strings.Contains(text, "tunnelmesh_connections_total") || !strings.Contains(text, "tunnelmesh_connection_stage_duration_seconds") {
++		t.Fatalf("agent failure metric missing: %s", text)
++	}
++	if !strings.Contains(text, "tunnelmesh_probe_total") || !strings.Contains(text, "storage") {
++		t.Fatalf("storage probe metric missing: %s", text)
++	}
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/storage/db.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/storage/db.go
+index c746039..0cee2e3 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-before/internal/storage/db.go
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-3-after/internal/storage/db.go
+@@ -11,6 +11,7 @@ import (
+ 	_ "modernc.org/sqlite"
+ 
+ 	"github.com/tunnelmesh/tunnelmesh/internal/config"
++	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+ 	"github.com/tunnelmesh/tunnelmesh/migrations"
+ )
+ 
+@@ -36,6 +37,7 @@ type DB struct {
+ 	leases        LeaseRepository
+ 	audits        AuditRepository
+ 	idempotency   IdempotencyRepository
++	metrics       *observability.Metrics
+ }
+ 
+ // ServiceTokenMutationRepositories groups every repository that participates
+@@ -165,6 +167,17 @@ func Open(ctx context.Context, driver, dsn string, autoInit bool) (*DB, error) {
+ 	return newDB(db, driver), nil
+ }
+ 
++// OpenWithMetrics attaches bounded storage instrumentation without changing
++// the storage ownership or transaction behavior of Open.
++func OpenWithMetrics(ctx context.Context, driver, dsn string, autoInit bool, metrics *observability.Metrics) (*DB, error) {
++	db, err := Open(ctx, driver, dsn, autoInit)
++	if err != nil {
++		return nil, err
++	}
++	db.metrics = metrics
++	return db, nil
++}
++
+ // OpenConfig consumes the already-validated storage settings produced by
+ // internal/config and keeps driver-specific DSN selection inside storage.
+ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
+@@ -267,9 +280,20 @@ func (d *DB) Close() error {
+ 	}
+ 	return d.sql.Close()
+ }
+-func (d *DB) Ping(ctx context.Context) error { return d.sql.PingContext(ctx) }
+-func (d *DB) SQL() *sql.DB                   { return d.sql }
+-func (d *DB) Driver() string                 { return d.driver }
++func (d *DB) Ping(ctx context.Context) error {
++	err := d.sql.PingContext(ctx)
++	if d.metrics != nil {
++		result, class := "success", ""
++		if err != nil {
++			result, class = "failure", observability.NormalizeErrorClass(err)
++		}
++		d.metrics.ObserveStage("storage", "ping", result, class, 0)
++		d.metrics.ObserveProbe("storage", result, class, 0)
++	}
++	return err
++}
++func (d *DB) SQL() *sql.DB   { return d.sql }
++func (d *DB) Driver() string { return d.driver }
+ func (d *DB) SchemaVersion(ctx context.Context) (int, error) {
+ 	var v int
+ 	err := d.sql.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)

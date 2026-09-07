@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -69,7 +70,21 @@ func ServeAgentFrames(tr *WSFrameTransport, onFrame func(protocol.Frame) error) 
 // control frames through the fenced session manager while preserving the
 // existing callback path for stream frames.
 func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error) error {
-	return serveAgentSession(ctx, manager, registration, tr, nil, onFrame)
+	return serveAgentSession(ctx, manager, registration, tr, nil, func(_ *AgentSession, frame protocol.Frame) error {
+		if onFrame == nil {
+			return nil
+		}
+		return onFrame(frame)
+	}, nil)
+}
+
+func ServeAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error, metrics *observability.Metrics) error {
+	return serveAgentSessionWithMetrics(ctx, manager, registration, tr, nil, func(_ *AgentSession, frame protocol.Frame) error {
+		if onFrame == nil {
+			return nil
+		}
+		return onFrame(frame)
+	}, nil, metrics)
 }
 
 // ServeAgentSessionWithInitialFrame is used by WebSocket adapters that must
@@ -77,22 +92,58 @@ func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, regist
 // The frame is processed through the same metadata fencing path as all later
 // frames, then the session remains attached to the transport until EOF.
 func ServeAgentSessionWithInitialFrame(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial protocol.Frame, onFrame func(protocol.Frame) error) error {
-	return serveAgentSession(ctx, manager, registration, tr, &initial, onFrame)
+	return serveAgentSession(ctx, manager, registration, tr, &initial, func(_ *AgentSession, frame protocol.Frame) error {
+		if onFrame == nil {
+			return nil
+		}
+		return onFrame(frame)
+	}, nil)
 }
 
-func serveAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(protocol.Frame) error) error {
+func serveAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession)) error {
+	return serveAgentSessionWithMetrics(ctx, manager, registration, tr, initial, onFrame, onClose, nil)
+}
+
+func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
 	if manager == nil || tr == nil {
 		return ErrSessionClosed
 	}
 	session, err := manager.Register(ctx, registration, tr)
 	if err != nil {
+		if metrics != nil {
+			metrics.ObserveConnection("server", "agent", "failed", observability.NormalizeErrorClass(err))
+		}
 		return err
 	}
-	defer manager.RemoveSession(registration.AgentID, session)
+	if metrics != nil {
+		metrics.ObserveConnection("server", "agent", "started", "")
+	}
+	defer func() {
+		if metrics != nil {
+			metrics.ObserveConnection("server", "agent", "closed", "")
+		}
+		manager.RemoveSession(registration.AgentID, session)
+		if onClose != nil {
+			onClose(session)
+		}
+	}()
 	handle := func(frame protocol.Frame) error {
+		if frame.Type == protocol.FramePing || frame.Type == protocol.FramePong {
+			// Heartbeats keep both the live session timestamp and unchanged
+			// metadata snapshots fresh. A transient metadata-store failure must
+			// not tear down an otherwise healthy forwarding channel.
+			_ = manager.RefreshMetadataLease(ctx, registration.AgentID, registration.Epoch)
+			if frame.Type == protocol.FramePing {
+				return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload})
+			}
+			if metrics != nil {
+				metrics.ObserveHeartbeat("server", "pong", 0)
+			}
+			return nil
+		}
 		if frame.Type != protocol.FrameAgentHello && frame.Type != protocol.FrameAgentMetadataUpdate {
 			if onFrame != nil {
-				return onFrame(frame)
+				return onFrame(session, frame)
 			}
 			return nil
 		}

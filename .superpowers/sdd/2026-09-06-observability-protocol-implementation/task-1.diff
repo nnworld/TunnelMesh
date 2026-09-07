@@ -1,0 +1,558 @@
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-before/go.mod b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/go.mod
+index 597b2c4..c909b14 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-before/go.mod
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/go.mod
+@@ -4,19 +4,22 @@ go 1.23
+ 
+ require (
+ 	github.com/go-sql-driver/mysql v1.8.1
++	github.com/prometheus/client_golang v1.20.5
+ 	github.com/spf13/cobra v1.8.1
+ 	github.com/spf13/viper v1.19.0
+ 	go.etcd.io/etcd/api/v3 v3.5.15
+ 	go.etcd.io/etcd/client/v3 v3.5.15
+-	golang.org/x/crypto v0.21.0
+-	golang.org/x/net v0.23.0
++	golang.org/x/crypto v0.24.0
++	golang.org/x/net v0.26.0
+ 	google.golang.org/grpc v1.62.1
+-	google.golang.org/protobuf v1.33.0
++	google.golang.org/protobuf v1.34.2
+ 	modernc.org/sqlite v1.36.0
+ )
+ 
+ require (
+ 	filippo.io/edwards25519 v1.1.0 // indirect
++	github.com/beorn7/perks v1.0.1 // indirect
++	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+ 	github.com/coreos/go-semver v0.3.0 // indirect
+ 	github.com/coreos/go-systemd/v22 v22.3.2 // indirect
+ 	github.com/dustin/go-humanize v1.0.1 // indirect
+@@ -26,11 +29,16 @@ require (
+ 	github.com/google/uuid v1.6.0 // indirect
+ 	github.com/hashicorp/hcl v1.0.0 // indirect
+ 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
++	github.com/kylelemons/godebug v1.1.0 // indirect
+ 	github.com/magiconair/properties v1.8.7 // indirect
+ 	github.com/mattn/go-isatty v0.0.20 // indirect
+ 	github.com/mitchellh/mapstructure v1.5.0 // indirect
++	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/ncruces/go-strftime v0.1.9 // indirect
+ 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
++	github.com/prometheus/client_model v0.6.1 // indirect
++	github.com/prometheus/common v0.55.0 // indirect
++	github.com/prometheus/procfs v0.15.1 // indirect
+ 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+ 	github.com/sagikazarmark/locafero v0.4.0 // indirect
+ 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
+@@ -45,7 +53,7 @@ require (
+ 	go.uber.org/zap v1.21.0 // indirect
+ 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
+ 	golang.org/x/sys v0.30.0 // indirect
+-	golang.org/x/text v0.14.0 // indirect
++	golang.org/x/text v0.16.0 // indirect
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20240311132316-a219d84964c2 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240314234333-6e1732d8331c // indirect
+ 	gopkg.in/ini.v1 v1.67.0 // indirect
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-before/go.sum b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/go.sum
+index 20e772d..3cde005 100644
+--- a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-before/go.sum
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/go.sum
+@@ -2,6 +2,10 @@ filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=
+ filippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
+ github.com/benbjohnson/clock v1.1.0 h1:Q92kusRqC1XV2MjkWETPvjJVqKetz1OzxZB7mHJLju8=
+ github.com/benbjohnson/clock v1.1.0/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=
++github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
++github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
++github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
++github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
+ github.com/coreos/go-semver v0.3.0 h1:wkHLiw0WNATZnSG7epLsujiMCgPAc9xhjJ4tgnAxmfM=
+ github.com/coreos/go-semver v0.3.0/go.mod h1:nnelYz7RCh+5ahJtPPxZlU+153eP4D4r3EedlOD2RNk=
+ github.com/coreos/go-systemd/v22 v22.3.2 h1:D9/bQk5vlXQFZ6Kwuu6zaiXJ9oTPe68++AzAJc1DzSI=
+@@ -43,12 +47,16 @@ github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
+ github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=
+ github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
+ github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
++github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
++github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+ github.com/magiconair/properties v1.8.7 h1:IeQXZAiQcpL9mgcAe1Nu6cX9LLw6ExEHKjN0VQdvPDY=
+ github.com/magiconair/properties v1.8.7/go.mod h1:Dhd985XPs7jluiymwWYZ0G4Z61jb3vdS329zhj2hYo0=
+ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
+ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+ github.com/mitchellh/mapstructure v1.5.0 h1:jeMsZIYE/09sWLaz43PL7Gy6RuMjD2eJVyuac5Z2hdY=
+ github.com/mitchellh/mapstructure v1.5.0/go.mod h1:bFUtVrKA4DC2yAKiSyO/QUcy7e+RRV2QTWOzhPopBRo=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
+ github.com/ncruces/go-strftime v0.1.9 h1:bY0MQC28UADQmHmaF5dgpLmImcShSi2kHU9XLdhx/f4=
+ github.com/ncruces/go-strftime v0.1.9/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
+ github.com/pelletier/go-toml/v2 v2.2.2 h1:aYUidT7k73Pcl9nb2gScu7NSrKCSHIDE89b3+6Wq+LM=
+@@ -59,6 +67,14 @@ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINE
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRIccs7FGNTlIRMkT8wgtp5eCXdBlqhYGL6U=
+ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/prometheus/client_golang v1.20.5 h1:cxppBPuYhUnsO6yo/aoRol4L7q7UFfdm+bR9r+8l63Y=
++github.com/prometheus/client_golang v1.20.5/go.mod h1:PIEt8X02hGcP8JWbeHyeZ53Y/jReSnHgO035n//V5WE=
++github.com/prometheus/client_model v0.6.1 h1:ZKSh/rekM+n3CeS952MLRAdFwIKqeY8b62p8ais2e9E=
++github.com/prometheus/client_model v0.6.1/go.mod h1:OrxVMOVHjw3lKMa8+x6HeMGkHMQyHDk9E3jmP2AmGiY=
++github.com/prometheus/common v0.55.0 h1:KEi6DK7lXW/m7Ig5i47x0vRzuBsHuvJdi5ee6Y3G1dc=
++github.com/prometheus/common v0.55.0/go.mod h1:2SECS4xJG1kd8XF9IcM1gMX6510RAEL65zxzNImwdc8=
++github.com/prometheus/procfs v0.15.1 h1:YagwOFzUgYfKKHX6Dr+sHT7km/hxC76UB0learggepc=
++github.com/prometheus/procfs v0.15.1/go.mod h1:fB45yRUv8NstnjriLhBQLuOUt+WW4BsoGhij/e3PBqk=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
+ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
+ github.com/rogpeppe/go-internal v1.9.0 h1:73kH8U+JUqXU8lRuOHeVHaa/SZPifC7BkcraZVejAe8=
+@@ -117,6 +133,8 @@ golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8U
+ golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+ golang.org/x/crypto v0.21.0 h1:X31++rzVUdKhX5sWmSOFZxx8UW/ldWx55cbf08iNAMA=
+ golang.org/x/crypto v0.21.0/go.mod h1:0BP7YvVV9gBbVKyeTG0Gyn+gZm94bibOW5BjDEYAOMs=
++golang.org/x/crypto v0.24.0 h1:mnl8DM0o513X8fdIkmyFE/5hTYxbwYOjDS/+rK6qpRI=
++golang.org/x/crypto v0.24.0/go.mod h1:Z1PMYSOR5nyMcyAVAIQSKCDwalqy85Aqn1x3Ws4L5DM=
+ golang.org/x/exp v0.0.0-20230905200255-921286631fa9 h1:GoHiUyI/Tp2nVkLI2mCxVkOjsbSXD66ic0XW0js0R9g=
+ golang.org/x/exp v0.0.0-20230905200255-921286631fa9/go.mod h1:S2oDrQGGwySpoQPVqRShND87VCbxmc6bL1Yd2oYrm6k=
+ golang.org/x/lint v0.0.0-20190930215403-16217165b5de/go.mod h1:6SW0HCj/g11FgYtHlgUYUwCkIfeOF89ocIRzGO/8vkc=
+@@ -133,6 +151,8 @@ golang.org/x/net v0.0.0-20201021035429-f5854403a974/go.mod h1:sp8m0HH+o8qH0wwXwY
+ golang.org/x/net v0.0.0-20210405180319-a5a99cb37ef4/go.mod h1:p54w0d4576C0XHj96bSt6lcn1PtDYWL6XObtHCRCNQM=
+ golang.org/x/net v0.23.0 h1:7EYJ93RZ9vYSZAIb2x3lnuvqO5zneoD6IvWjuhfxjTs=
+ golang.org/x/net v0.23.0/go.mod h1:JKghWKKOSdJwpW2GEx0Ja7fmaKnMsbu+MWVZTokSYmg=
++golang.org/x/net v0.26.0 h1:soB7SVo0PWrY4vPW/+ay0jKDNScG2X9wFeYlXIvJsOQ=
++golang.org/x/net v0.26.0/go.mod h1:5YKkiSynbBIh3p6iOc/vibscux0x38BZDkn8sCUPxHE=
+ golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+@@ -153,6 +173,8 @@ golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+ golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=
+ golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
++golang.org/x/text v0.16.0 h1:a94ExnEXNtEwYLGJSIUxnWoxoRz/ZcCsV63ROupILh4=
++golang.org/x/text v0.16.0/go.mod h1:GhwF1Be+LQoKShO3cGOHzqOgRrGaYc9AvblQOmPVHnI=
+ golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+ golang.org/x/tools v0.0.0-20190311212946-11955173bddd/go.mod h1:LCzVGOaR6xXOjkQ3onu1FJEFr0SW1gC7cKk1uF8kGRs=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+@@ -173,6 +195,8 @@ google.golang.org/grpc v1.62.1 h1:B4n+nfKzOICUXMgyrNd19h/I9oH0L1pizfk1d4zSgTk=
+ google.golang.org/grpc v1.62.1/go.mod h1:IWTG0VlJLCh1SkC58F7np9ka9mx/WNkjl4PGJaiq+QE=
+ google.golang.org/protobuf v1.33.0 h1:uNO2rsAINq/JlFpSdYEKIZ0uKD/R9cpdv0T+yoGwGmI=
+ google.golang.org/protobuf v1.33.0/go.mod h1:c6P6GXX6sHbq/GpV6MGZEdwhWPcYBgnhAHhKbcUYpos=
++google.golang.org/protobuf v1.34.2 h1:6xV6lTsCfpGD21XK49h7MhtcApnLqkfYgPcdHftf6hg=
++google.golang.org/protobuf v1.34.2/go.mod h1:qYOHts0dSfpeUzUFpOMr/WGzszTmLH+DiWniOlNbLDw=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 h1:YR8cESwS4TdDjEe65xsg0ogRM/Nc3DYOhEAlW+xobZo=
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events.go
+new file mode 100644
+index 0000000..741e1fd
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events.go
+@@ -0,0 +1,113 @@
++package observability
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net"
++	"strings"
++	"time"
++)
++
++const redactedValue = "[redacted]"
++
++// StageEvent is a transport-safe diagnostic event. Sensitive fields are retained only
++// long enough to produce a redacted record and are never serialized verbatim.
++type StageEvent struct {
++	TraceID      string            `json:"trace_id,omitempty"`
++	ConnectionID string            `json:"connection_id,omitempty"`
++	AgentID      string            `json:"agent_id,omitempty"`
++	TokenID      string            `json:"token_id,omitempty"`
++	Component    string            `json:"component,omitempty"`
++	Stage        string            `json:"stage,omitempty"`
++	Result       string            `json:"result,omitempty"`
++	ErrorClass   string            `json:"error_class,omitempty"`
++	Target       string            `json:"target,omitempty"`
++	Payload      string            `json:"payload,omitempty"`
++	Metadata     map[string]string `json:"metadata,omitempty"`
++	StartedAt    time.Time         `json:"started_at,omitempty"`
++	EndedAt      time.Time         `json:"ended_at,omitempty"`
++	Attempt      int               `json:"attempt,omitempty"`
++}
++
++func (e StageEvent) MarshalJSON() ([]byte, error) {
++	type safeEvent struct {
++		TraceID, ConnectionID, AgentID, Component, Stage, Result, ErrorClass string
++		TokenID, Target, Payload                                             string
++		Metadata                                                             map[string]string
++		StartedAt, EndedAt                                                   time.Time
++		Attempt                                                              int
++	}
++	s := safeEvent{TraceID: e.TraceID, ConnectionID: e.ConnectionID, AgentID: e.AgentID, Component: e.Component, Stage: e.Stage, Result: e.Result, ErrorClass: e.ErrorClass, StartedAt: e.StartedAt, EndedAt: e.EndedAt, Attempt: e.Attempt}
++	if e.TokenID != "" {
++		s.TokenID = redactedValue
++	}
++	if e.Target != "" {
++		s.Target = redactedValue
++	}
++	if e.Payload != "" {
++		s.Payload = redactedValue
++	}
++	if len(e.Metadata) > 0 {
++		s.Metadata = make(map[string]string, len(e.Metadata))
++		for key, value := range e.Metadata {
++			if sensitiveKey(key) {
++				s.Metadata[key] = redactedValue
++			} else {
++				s.Metadata[key] = value
++			}
++		}
++	}
++	return json.Marshal(s)
++}
++
++func sensitiveKey(key string) bool {
++	key = strings.ToLower(key)
++	for _, word := range []string{"token", "authorization", "password", "secret", "private_key", "payload", "target", "response", "ssh", "credential"} {
++		if strings.Contains(key, word) {
++			return true
++		}
++	}
++	return false
++}
++
++// NormalizeErrorClass maps arbitrary errors to a small, stable set of classes.
++func NormalizeErrorClass(err error) string {
++	if err == nil {
++		return ""
++	}
++	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
++		return "timeout"
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) {
++		return "dns"
++	}
++	var netErr net.Error
++	if errors.As(err, &netErr) && netErr.Timeout() {
++		return "timeout"
++	}
++	message := strings.ToLower(err.Error())
++	switch {
++	case strings.Contains(message, "dns"), strings.Contains(message, "no such host"), strings.Contains(message, "lookup"):
++		return "dns"
++	case strings.Contains(message, "tls"), strings.Contains(message, "certificate"):
++		return "tls"
++	case strings.Contains(message, "websocket"):
++		return "websocket_upgrade"
++	case strings.Contains(message, "bearer"), strings.Contains(message, "authentication"), strings.Contains(message, "unauthenticated"), strings.Contains(message, "invalid token"):
++		return "authentication"
++	case strings.Contains(message, "permission"), strings.Contains(message, "forbidden"), strings.Contains(message, "authorization"):
++		return "authorization"
++	case strings.Contains(message, "policy"):
++		return "policy"
++	case strings.Contains(message, "backpressure"), strings.Contains(message, "buffer full"):
++		return "backpressure"
++	case strings.Contains(message, "reset"), strings.Contains(message, "broken pipe"):
++		return "reset"
++	case strings.Contains(message, "refused"), strings.Contains(message, "unreachable"), strings.Contains(message, "no route"):
++		return "target_unavailable"
++	default:
++		return "internal"
++	}
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events_test.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events_test.go
+new file mode 100644
+index 0000000..9fc531f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/events_test.go
+@@ -0,0 +1,70 @@
++package observability
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestStageEventRedactsSecretsTargetsAndPayloads(t *testing.T) {
++	event := StageEvent{
++		TraceID:      "trace-1",
++		ConnectionID: "conn-1",
++		TokenID:      "token-secret",
++		Component:    "server",
++		Stage:        "websocket_upgrade",
++		Result:       "failure",
++		ErrorClass:   NormalizeErrorClass(errors.New("dial tcp 10.0.0.8:443: connection refused")),
++		Target:       "10.0.0.8:443",
++		Payload:      "Authorization: Bearer super-secret",
++		Metadata: map[string]string{
++			"authorization": "Bearer super-secret",
++			"region":        "cn-east-1",
++		},
++		StartedAt: time.Unix(10, 0),
++		EndedAt:   time.Unix(11, 0),
++	}
++
++	b, err := json.Marshal(event)
++	if err != nil {
++		t.Fatalf("marshal event: %v", err)
++	}
++	text := string(b)
++	for _, secret := range []string{"token-secret", "10.0.0.8:443", "Bearer super-secret", "super-secret"} {
++		if strings.Contains(text, secret) {
++			t.Fatalf("event leaked sensitive value %q: %s", secret, text)
++		}
++	}
++	if !strings.Contains(text, "[redacted]") || !strings.Contains(text, "cn-east-1") {
++		t.Fatalf("event did not preserve safe fields and redaction marker: %s", text)
++	}
++}
++
++func TestNormalizeErrorClassIsBounded(t *testing.T) {
++	dnsErr := &net.DNSError{Err: "no such host", Name: "internal.example"}
++	cases := []struct {
++		name string
++		err  error
++		want string
++	}{
++		{name: "nil", err: nil, want: ""},
++		{name: "dns", err: dnsErr, want: "dns"},
++		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
++		{name: "authentication", err: errors.New("invalid bearer token"), want: "authentication"},
++		{name: "authorization", err: errors.New("permission denied"), want: "authorization"},
++		{name: "reset", err: errors.New("connection reset by peer"), want: "reset"},
++		{name: "target", err: errors.New("connection refused"), want: "target_unavailable"},
++		{name: "internal", err: errors.New("a unique user payload 123"), want: "internal"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := NormalizeErrorClass(tc.err); got != tc.want {
++				t.Fatalf("NormalizeErrorClass() = %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics.go
+new file mode 100644
+index 0000000..833aff5
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics.go
+@@ -0,0 +1,125 @@
++package observability
++
++import (
++	"strings"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++// Metrics owns the bounded Prometheus collectors used by runtime observers.
++// A registry is injected so tests and embedded users never mutate the global registry.
++type Metrics struct {
++	connectionsTotal        *prometheus.CounterVec
++	connectionsActive       *prometheus.GaugeVec
++	connectionStageDuration *prometheus.HistogramVec
++	heartbeatTotal          *prometheus.CounterVec
++	heartbeatRTT            *prometheus.HistogramVec
++	bytesTotal              *prometheus.CounterVec
++	streamsActive           *prometheus.GaugeVec
++	streamsTotal            *prometheus.CounterVec
++	streamErrorsTotal       *prometheus.CounterVec
++	probeTotal              *prometheus.CounterVec
++	probeDuration           *prometheus.HistogramVec
++	ready                   *prometheus.GaugeVec
++}
++
++// NewMetrics creates and registers a complete metrics set. Nil creates an isolated registry.
++func NewMetrics(reg *prometheus.Registry) *Metrics {
++	if reg == nil {
++		reg = prometheus.NewRegistry()
++	}
++	m := &Metrics{
++		connectionsTotal:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_connections_total", Help: "Total connection attempts by result."}, []string{"component", "mode", "result", "error_class"}),
++		connectionsActive:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_connections_active", Help: "Current active connections."}, []string{"component", "mode"}),
++		connectionStageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_connection_stage_duration_seconds", Help: "Connection stage duration in seconds."}, []string{"component", "stage", "result", "error_class"}),
++		heartbeatTotal:          prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_heartbeat_total", Help: "Total heartbeat outcomes."}, []string{"component", "result"}),
++		heartbeatRTT:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_heartbeat_rtt_seconds", Help: "Heartbeat round-trip time in seconds."}, []string{"component"}),
++		bytesTotal:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_bytes_total", Help: "Total bytes transferred."}, []string{"component", "direction", "protocol"}),
++		streamsActive:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_streams_active", Help: "Current active logical streams."}, []string{"protocol"}),
++		streamsTotal:            prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_streams_total", Help: "Total logical stream outcomes."}, []string{"protocol", "result", "error_class"}),
++		streamErrorsTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_errors_total", Help: "Total logical stream errors."}, []string{"protocol", "error_class"}),
++		probeTotal:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_probe_total", Help: "Total probe outcomes."}, []string{"probe_kind", "result", "error_class"}),
++		probeDuration:           prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_probe_duration_seconds", Help: "Probe duration in seconds."}, []string{"probe_kind", "result", "error_class"}),
++		ready:                   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_ready", Help: "Readiness state, one when ready."}, []string{"component"}),
++	}
++	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.ready)
++	return m
++}
++
++func label(value string) string {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return ""
++	}
++	if len(value) > 64 {
++		value = value[:64]
++	}
++	for i, r := range value {
++		if r < 0x20 || r == 0x7f {
++			value = value[:i] + "_" + value[i+1:]
++		}
++	}
++	return value
++}
++
++func (m *Metrics) ObserveConnection(component, mode, result, errorClass string) {
++	component, mode, result, errorClass = label(component), label(mode), label(result), label(errorClass)
++	m.connectionsTotal.WithLabelValues(component, mode, result, errorClass).Inc()
++	switch result {
++	case "started", "active", "connected":
++		m.connectionsActive.WithLabelValues(component, mode).Inc()
++	case "closed", "disconnected", "failed", "error":
++		m.connectionsActive.WithLabelValues(component, mode).Dec()
++	}
++}
++
++func (m *Metrics) ObserveStage(component, stage, result, errorClass string, duration time.Duration) {
++	if duration < 0 {
++		duration = 0
++	}
++	m.connectionStageDuration.WithLabelValues(label(component), label(stage), label(result), label(errorClass)).Observe(duration.Seconds())
++}
++
++func (m *Metrics) ObserveHeartbeat(component, result string, rtt time.Duration) {
++	m.heartbeatTotal.WithLabelValues(label(component), label(result)).Inc()
++	if rtt >= 0 {
++		m.heartbeatRTT.WithLabelValues(label(component)).Observe(rtt.Seconds())
++	}
++}
++
++func (m *Metrics) ObserveBytes(component, direction, protocol string, n int64) {
++	if n > 0 {
++		m.bytesTotal.WithLabelValues(label(component), label(direction), label(protocol)).Add(float64(n))
++	}
++}
++
++func (m *Metrics) ObserveStream(protocol, result, errorClass string) {
++	protocol, result, errorClass = label(protocol), label(result), label(errorClass)
++	m.streamsTotal.WithLabelValues(protocol, result, errorClass).Inc()
++	if errorClass != "" {
++		m.streamErrorsTotal.WithLabelValues(protocol, errorClass).Inc()
++	}
++	switch result {
++	case "accepted", "started", "active", "open":
++		m.streamsActive.WithLabelValues(protocol).Inc()
++	case "closed", "reset", "rejected", "failed":
++		m.streamsActive.WithLabelValues(protocol).Dec()
++	}
++}
++
++func (m *Metrics) ObserveProbe(kind, result, errorClass string, duration time.Duration) {
++	kind, result, errorClass = label(kind), label(result), label(errorClass)
++	m.probeTotal.WithLabelValues(kind, result, errorClass).Inc()
++	if duration >= 0 {
++		m.probeDuration.WithLabelValues(kind, result, errorClass).Observe(duration.Seconds())
++	}
++}
++
++func (m *Metrics) SetReady(component string, ready bool) {
++	value := float64(0)
++	if ready {
++		value = 1
++	}
++	m.ready.WithLabelValues(label(component)).Set(value)
++}
+diff --git a/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics_test.go b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics_test.go
+new file mode 100644
+index 0000000..45c6347
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-observability-protocol-implementation/task-1-after/internal/observability/metrics_test.go
+@@ -0,0 +1,87 @@
++package observability
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/testutil"
++)
++
++func TestMetricsUsesInjectedRegistryAndBoundedLabels(t *testing.T) {
++	reg := prometheus.NewRegistry()
++	m := NewMetrics(reg)
++	m.ObserveConnection("server", "agent", "success", "")
++	m.ObserveStage("server", "websocket_upgrade", "success", "", 25*time.Millisecond)
++	m.ObserveHeartbeat("agent", "pong", 10*time.Millisecond)
++	m.ObserveBytes("server", "inbound", "tcp", 42)
++	m.ObserveStream("tcp", "accepted", "")
++	m.ObserveProbe("tcp", "success", "", 5*time.Millisecond)
++	m.SetReady("server", true)
++
++	if got := testutil.ToFloat64(m.connectionsTotal.WithLabelValues("server", "agent", "success", "")); got != 1 {
++		t.Fatalf("connections_total = %v, want 1", got)
++	}
++
++	families, err := reg.Gather()
++	if err != nil {
++		t.Fatalf("collect metrics: %v", err)
++	}
++	var exposition strings.Builder
++	for _, family := range families {
++		fmt.Fprintln(&exposition, family.GetName())
++		for _, metric := range family.GetMetric() {
++			for _, label := range metric.GetLabel() {
++				fmt.Fprintf(&exposition, "%s=%s ", label.GetName(), label.GetValue())
++			}
++		}
++	}
++	text := exposition.String()
++	for _, forbidden := range []string{"token_id", "connection_id", "stream_id", "target", "secret", "token"} {
++		if strings.Contains(text, forbidden) {
++			t.Fatalf("metric exposition contains forbidden label/token %q:\n%s", forbidden, text)
++		}
++	}
++	if !strings.Contains(text, "tunnelmesh_connections_total") ||
++		!strings.Contains(text, "tunnelmesh_connection_stage_duration_seconds") ||
++		!strings.Contains(text, "tunnelmesh_ready") {
++		t.Fatalf("metric exposition is missing expected metric families:\n%s", text)
++	}
++}
++
++func TestMetricsRegistryIsolation(t *testing.T) {
++	first := prometheus.NewRegistry()
++	second := prometheus.NewRegistry()
++	m1 := NewMetrics(first)
++	_ = NewMetrics(second)
++	m1.ObserveBytes("server", "outbound", "http", 7)
++
++	if err := testutil.GatherAndCompare(second, strings.NewReader("")); err != nil {
++		t.Fatalf("second registry unexpectedly contains first registry metrics: %v", err)
++	}
++}
++
++func TestMetricsObserveDurationsAndActiveState(t *testing.T) {
++	reg := prometheus.NewRegistry()
++	m := NewMetrics(reg)
++	m.ObserveConnection("client", "client", "started", "")
++	m.ObserveConnection("client", "client", "closed", "")
++	m.ObserveStage("client", "auth", "failure", "authentication", 100*time.Millisecond)
++	m.ObserveStream("tcp", "accepted", "")
++	m.ObserveStream("tcp", "reset", "reset")
++
++	if got := testutil.ToFloat64(m.connectionsActive.WithLabelValues("client", "client")); got != 0 {
++		t.Fatalf("connections_active = %v, want 0", got)
++	}
++	if got := testutil.ToFloat64(m.streamsActive.WithLabelValues("tcp")); got != 0 {
++		t.Fatalf("streams_active = %v, want 0", got)
++	}
++	if got := testutil.ToFloat64(m.connectionsTotal.WithLabelValues("client", "client", "started", "")); got != 1 {
++		t.Fatalf("started connection count = %v, want 1", got)
++	}
++	if got := testutil.ToFloat64(m.streamsTotal.WithLabelValues("tcp", "reset", "reset")); got != 1 {
++		t.Fatalf("reset stream count = %v, want 1", got)
++	}
++}

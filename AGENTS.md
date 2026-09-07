@@ -28,10 +28,12 @@ TunnelMesh 是一个 Go 实现的内网穿透与服务代理平台，包含三�
 - `internal/auth/`：用户、Token、Argon2id、RBAC 和管理员恢复。
 - `internal/storage/`：数据库连接、DDL 初始化和 Repository 实现。
 - `internal/registry/`：MySQL lease、etcd 注册发现和 epoch fencing。
-- `internal/protocol/`：WebSocket frame、stream 状态机和 UDP association 协议。
+- `internal/protocol/`：WebSocket frame、能力协商、稳定错误码、stream 状态机、UDP association 和逻辑 traceroute 协议。
 - `internal/session/`、`internal/relay/`：会话管理、跨节点 relay 和流生命周期。
 - `internal/routing/`、`internal/server/`：路由解析、HTTP/WS/TCP 接入和管理 API。
 - `internal/client/`、`internal/agent/`：客户端转发、Agent 会话和内网服务连接。
+- `internal/proxy/`：HTTP CONNECT、SOCKS5、PROXY protocol v2 等入口握手解析；解析器不得绕过路由策略。
+- `internal/observability/`：Prometheus 指标、结构化事件和 W3C traceparent 上下文传播。
 - `web/`：管理后台源码；生产产物由 Go embed 提供给服务端。
 - `docs/`：架构、协议、部署、运维和用户帮助文档。
 
@@ -64,6 +66,14 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 - 所有权限校验在服务端完成；不能信任客户端传入的 owner、agent 或 role。
 - OpenAPI 文档位于 `docs/api/openapi.yaml`，每次接口行为变更必须同步更新。
 
+### 已批准的管理 API
+
+- `POST /api/v1/tokens/{tokenId}/reveal`：仅管理员可用，必须提供 `X-Token-Reveal-Confirm`、`Idempotency-Key` 和 `acknowledgeRisk=true`；响应必须 `Cache-Control: no-store`，并写入审计日志。
+- `POST /api/v1/agents/{agentId}/trace`、`GET /api/v1/traces/{traceId}`：逻辑 traceroute，不是 ICMP traceroute。普通用户只能读取脱敏 hop；管理员可显式请求内网 IP、真实连接地址和证书元数据。
+- `POST /api/v1/agents/{agentId}/diagnose`、`GET /api/v1/agents/{agentId}/probes`：TCP/HTTP/UDP 探针摘要，不返回或持久化响应体。
+
+新增管理 API 必须同步更新 OpenAPI、`docs/README.md` 和对应用户帮助文档，并覆盖未授权、越权、分页、幂等和错误响应测试。
+
 ### Web 管理后台
 
 - 使用 Element Plus 作为 UI 组件库。
@@ -77,6 +87,9 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 - 不在源码中硬编码密码、Token、私钥或生产 DSN。
 - 首次启动管理员凭据只通过安全的控制台输出和恢复流程处理。
 - 本地、集群 MySQL、集群 etcd 的配置示例和操作步骤必须同步维护到 `docs/`。
+- 可恢复的 service-token secret 使用 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM，支持 base64/hex）和可选 `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`；密钥只能由环境变量或外部 Secret Manager 注入。
+- 集群中所有 Server/relay 节点必须配置一致的 `TUNNELMESH_TRACE_SIGNING_KEY`，用于 traceroute hop 签名链校验。
+- 配置优先级、`auto-init`、密钥注入和 schema version 变更必须同时验证 SQLite 与 MySQL 兼容性。
 
 ## 开发流程：TDD
 
@@ -89,6 +102,21 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 5. 运行完整验证后再提交。
 
 核心模块禁止只靠手工验证；跨层行为必须有集成测试，关键用户链路必须有 E2E 冒烟测试。
+
+### 安全功能边界
+
+- service-token 认证仍使用 hash 校验；为满足管理员显式 reveal 需求，新建/轮换 token 额外保存 AES-GCM 密文、nonce、key id 和版本。禁止明文入库。
+- 普通 token 列表、审计日志、Prometheus、普通 traceroute 和错误日志不得包含 secret、密码、私钥、完整 Authorization header 或会话字节。
+- `includeSensitive=true` 仅管理员可用；`includeSecrets=true` 不得通过 traceroute 返回，必须使用独立 reveal API。
+- Agent 上报 metadata 只能来自 allowlist 的文件/环境变量项；名称匹配敏感模式时必须清空值并标记 `redacted=true`。
+- 所有目标地址在 Agent 侧再次进行 SSRF、回环、私网、链路本地、CIDR 和端口策略校验。
+- 继续不实现：ICMP、TUN/L2 VPN、P2P NAT traversal、任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路，不能扩展为通用命令执行 API。
+
+### 协议演进约束
+
+- 新 frame 必须加入 `internal/protocol/frame.go` 的版本化类型，并通过 capability negotiation 后才能使用；未知扩展必须安全拒绝。
+- 已有协议基础包括 flow-control、UDP association、GOAWAY/drain、trace frame 和稳定错误码；任何状态机变化必须覆盖重复 ID、EOF、半关闭、超时、窗口耗尽和 stale epoch。
+- 代理协议模块必须保持 Handler → Service → Repository/Adapter 分层；握手解析器只解析和校验，不直接建立未授权连接。
 
 ## 必须执行的验证
 

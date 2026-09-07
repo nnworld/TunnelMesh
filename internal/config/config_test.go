@@ -158,3 +158,176 @@ func TestLoadReadsAgentBearerTokenFromEnvironmentWithoutRedactionLeak(t *testing
 		t.Fatalf("redacted config leaked agent token: %s", data)
 	}
 }
+
+func TestLoadClientTokenPrecedenceAndRedaction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client-token.yaml")
+	if err := os.WriteFile(path, []byte("client:\n  server_url: wss://file.example/ws/client\n  token: file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TUNNELMESH_CLIENT_TOKEN", "env-secret")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path, CLI: map[string]any{"client.token": "cli-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Client.Token != "cli-secret" {
+		t.Fatalf("Client.Token = %q, want CLI value", cfg.Client.Token)
+	}
+	data, err := cfg.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"file-secret", "env-secret", "cli-secret"} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("redacted config leaked %q: %s", secret, data)
+		}
+	}
+	if strings.Contains(string(data), "/file/key.pem") {
+		t.Fatalf("redacted config leaked relay private key path: %s", data)
+	}
+}
+
+func TestLoadSecurityAndNativeTLSDefaults(t *testing.T) {
+	t.Setenv("TUNNELMESH_SECURITY_ALLOW_LEGACY_CONNECTION_TOKENS", "")
+	t.Setenv("TUNNELMESH_TLS_ENABLED", "")
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Security.AllowLegacyConnectionTokens {
+		t.Fatal("legacy connection tokens are enabled by default")
+	}
+	if cfg.TLS.Enabled {
+		t.Fatal("native TLS is enabled by default")
+	}
+	if cfg.TLS.MinVersion != "1.2" {
+		t.Fatalf("TLS.MinVersion = %q, want 1.2", cfg.TLS.MinVersion)
+	}
+}
+
+func TestLoadSecurityAndNativeTLSPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "security.yaml")
+	contents := "security:\n  allowed_hosts: [file.example]\n  allowed_origins: [https://file.example]\n  allow_legacy_connection_tokens: false\ntls:\n  enabled: false\n  cert_file: file-cert.pem\n  key_file: file-key.pem\n  min_version: \"1.2\"\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TUNNELMESH_SECURITY_ALLOWED_HOSTS", "env.example,second.example")
+	t.Setenv("TUNNELMESH_SECURITY_ALLOW_LEGACY_CONNECTION_TOKENS", "true")
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{
+		ConfigFile: path,
+		CLI: map[string]any{
+			"security.allowed_origins": []string{"https://cli.example"},
+			"tls.enabled":              true,
+			"tls.cert_file":            "cli-cert.pem",
+			"tls.key_file":             "cli-key.pem",
+			"tls.min_version":          "1.3",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.AllowedHosts) != 2 || cfg.Security.AllowedHosts[0] != "env.example" || cfg.Security.AllowedHosts[1] != "second.example" {
+		t.Fatalf("AllowedHosts = %v, want environment value", cfg.Security.AllowedHosts)
+	}
+	if len(cfg.Security.AllowedOrigins) != 1 || cfg.Security.AllowedOrigins[0] != "https://cli.example" {
+		t.Fatalf("AllowedOrigins = %v, want CLI value", cfg.Security.AllowedOrigins)
+	}
+	if !cfg.Security.AllowLegacyConnectionTokens {
+		t.Fatal("environment legacy migration flag did not win over file")
+	}
+	if !cfg.TLS.Enabled || cfg.TLS.CertFile != "cli-cert.pem" || cfg.TLS.KeyFile != "cli-key.pem" || cfg.TLS.MinVersion != "1.3" {
+		t.Fatalf("TLS = %+v, want CLI values", cfg.TLS)
+	}
+}
+
+func TestValidateRejectsUnsafeSecurityAndNativeTLSConfiguration(t *testing.T) {
+	base := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "host with userinfo delimiter", edit: func(cfg *config.Config) { cfg.Security.AllowedHosts = []string{"allowed.example@evil.example"} }, want: "allowed host"},
+		{name: "host with invalid port", edit: func(cfg *config.Config) { cfg.Security.AllowedHosts = []string{"allowed.example:not-a-port"} }, want: "allowed host"},
+		{name: "origin with path", edit: func(cfg *config.Config) { cfg.Security.AllowedOrigins = []string{"https://allowed.example/path"} }, want: "allowed origin"},
+		{name: "origin with websocket scheme", edit: func(cfg *config.Config) { cfg.Security.AllowedOrigins = []string{"wss://allowed.example"} }, want: "allowed origin"},
+		{name: "TLS missing key", edit: func(cfg *config.Config) {
+			cfg.TLS = config.TLSConfig{Enabled: true, CertFile: "cert.pem", MinVersion: "1.2"}
+		}, want: "private key"},
+		{name: "TLS invalid minimum", edit: func(cfg *config.Config) {
+			cfg.TLS = config.TLSConfig{Enabled: true, CertFile: "cert.pem", KeyFile: "key.pem", MinVersion: "1.1"}
+		}, want: "minimum version"},
+		{name: "relative agent URL", edit: func(cfg *config.Config) { cfg.Agent.ServerURL = "/ws/agent" }, want: "agent server url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRedactedJSONHidesNativeTLSPrivateKeyPath(t *testing.T) {
+	cfg := config.Config{TLS: config.TLSConfig{KeyFile: "/secrets/native-tls.key"}}
+	data, err := cfg.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "/secrets/native-tls.key") {
+		t.Fatalf("redacted config leaked TLS private key path: %s", data)
+	}
+}
+
+func TestLoadRelayConfigPrecedenceAndRedaction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relay.yaml")
+	file := "mode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: file-dsn\n    tls: true\nnode:\n  id: file-node\nserver:\n  relay:\n    enabled: true\n    listen: 127.0.0.1:9443\n    ca: /file/ca.pem\n    cert: /file/cert.pem\n    key: /file/key.pem\n    server_name: file.relay\n    node_token: file-secret\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TUNNELMESH_SERVER_RELAY_NODE_TOKEN", "env-secret")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path, CLI: map[string]any{
+		"node.id":                  "cli-node",
+		"server.relay.endpoint":    "relay.example:9443",
+		"server.relay.node_token":  "cli-secret",
+		"server.relay.server_name": "cli.relay",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Node.ID != "cli-node" || cfg.Server.Relay.Endpoint != "relay.example:9443" || cfg.Server.Relay.NodeToken != "cli-secret" {
+		t.Fatalf("relay precedence mismatch: node=%q relay=%+v", cfg.Node.ID, cfg.Server.Relay)
+	}
+	data, err := cfg.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"file-secret", "env-secret", "cli-secret"} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("redacted config leaked %q: %s", secret, data)
+		}
+	}
+}
+
+func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *testing.T) {
+	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", CA: "ca.pem", Cert: "cert.pem", Key: "key.pem", ServerName: "relay.local"}}}
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "absolute") || !strings.Contains(err.Error(), "node token") {
+		t.Fatalf("Validate() error = %v, want absolute paths and node token failures", err)
+	}
+	cfg.Server.Relay.CA, cfg.Server.Relay.Cert, cfg.Server.Relay.Key, cfg.Server.Relay.NodeToken = "/ca.pem", "/cert.pem", "/key.pem", "secret"
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate(valid relay) error = %v", err)
+	}
+	cfg.Server.Relay.Listen = ""
+	cfg.Server.Relay.Endpoint = "relay.example:9443"
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("Validate(endpoint-only relay) error = %v, want listen requirement", err)
+	}
+}

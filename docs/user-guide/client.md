@@ -192,3 +192,30 @@ client:
 - Agent ID、Token 和配置文件权限应限制为服务用户可读。
 - 不要把 Token、密码和 MySQL DSN 提交到 Git。
 - 调整目标网段、端口和 CIDR 策略时，同时检查服务端 policy。
+
+生产环境使用后台创建的 `client` service token，并通过配置、环境变量或 Secret 注入：
+
+```yaml
+client:
+  server_url: wss://tunnel.example.com/ws/client
+```
+
+配置文件不会展开 `${...}` 占位符；请通过环境变量或命令行注入 token：
+
+```bash
+export TUNNELMESH_CLIENT_TOKEN='one-time-client-secret'
+```
+
+Token scope 只能缩小 Agent Policy。每个 TCP、UDP、HTTP 或 proxy stream 都会重新校验 Agent、协议、目标 CIDR 和端口；轮换/撤销后重新连接即可使用新凭据。
+## 逻辑 traceroute
+
+管理 API 可从已认证的 client 路径发起到指定 Agent 的逻辑 traceroute：
+
+```bash
+curl -sS -H "Authorization: Bearer $TM_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"maxHops":16,"timeoutMs":3000}' \
+  https://mesh.example.com/api/v1/agents/agent-a/trace
+```
+
+结果中的 hop 是 TunnelMesh 的 client、server/relay、服务端节点和 agent，不是 ICMP 路由器。普通用户只看到脱敏拓扑；管理员如需私网地址、真实 peer 地址或证书元数据，才设置 `includeSensitive=true`。Bearer secret 永远不通过 traceroute 返回。

@@ -15,6 +15,24 @@ describe('admin routes', () => {
     expect(detail?.meta.auth).toBe(true)
   })
 
+  it('defines an authenticated token management route', () => {
+    const tokens = router.getRoutes().find(route => route.path === '/tokens')
+    expect(tokens).toBeTruthy()
+    expect(tokens?.meta.auth).toBe(true)
+  })
+
+  it('exposes token lifecycle controls without persisting one-time secrets', () => {
+    const source = readFileSync('src/views/Tokens.vue', 'utf8')
+    expect(source).toContain('Create token')
+    expect(source).toContain('Rotate')
+    expect(source).toContain('Revoke')
+    expect(source).toContain('secret')
+    expect(source).toContain('clearSecret')
+    expect(source).toContain('scope')
+    expect(source).toContain('Rotate failed')
+    expect(source).toContain('Revoke failed')
+  })
+
   it('calls the metadata endpoint with the agent id and stale option', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { agentId: 'a1' } }) })
     vi.stubGlobal('fetch', fetchMock)

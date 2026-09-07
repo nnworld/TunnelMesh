@@ -1,0 +1,85 @@
+# Review package: 7e34c1f..9ea2368
+
+## Commits
+9ea2368 feat(api): expose agent metadata read endpoint
+
+## Files changed
+ .../task-4-fix-report.md                                      | 11 +++++++++++
+ internal/server/metadata_api_test.go                          |  4 ++++
+ internal/server/metadata_service.go                           |  2 +-
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-fix-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-fix-report.md
+new file mode 100644
+index 0000000..1ecea6f
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-fix-report.md
+@@ -0,0 +1,11 @@
++# Task 4 Fix Report
++
++## Contract correction
++
++Metadata API items now always serialize the `redacted` property. Ordinary fields explicitly return `redacted: false`, while sensitive fields continue to return `redacted: true` with the value omitted.
++
++## Verification
++
++- Added a regression assertion for `redacted:false` on ordinary metadata items.
++- Confirmed the assertion failed before the JSON tag fix.
++- Focused MetadataAPI tests pass after changing the tag to `json:"redacted"`.
+diff --git a/internal/server/metadata_api_test.go b/internal/server/metadata_api_test.go
+index 1655116..293f5ca 100644
+--- a/internal/server/metadata_api_test.go
++++ b/internal/server/metadata_api_test.go
+@@ -92,20 +92,24 @@ func TestMetadataAPI(t *testing.T) {
+ 		}
+ 		for _, key := range []string{"metadata", "lastSeenAt", "expiresAt"} {
+ 			if _, ok := data[key]; ok {
+ 				t.Fatalf("internal field %q leaked: %+v", key, data)
+ 			}
+ 		}
+ 		items, ok := data["items"].([]any)
+ 		if !ok || len(items) != 3 {
+ 			t.Fatalf("items = %#v", data["items"])
+ 		}
++		ordinary, ok := items[0].(map[string]any)
++		if !ok || ordinary["redacted"] != false {
++			t.Fatalf("ordinary item must include redacted=false: %#v", items[0])
++		}
+ 		redacted, ok := items[2].(map[string]any)
+ 		if !ok || redacted["value"] != nil || redacted["redacted"] != true {
+ 			t.Fatalf("sensitive item = %#v", items[2])
+ 		}
+ 	})
+ 
+ 	t.Run("admin can read", func(t *testing.T) {
+ 		data := checkResponse(t, adminToken)
+ 		if data["agentId"] != agent.ID {
+ 			t.Fatalf("agentId = %#v", data["agentId"])
+diff --git a/internal/server/metadata_service.go b/internal/server/metadata_service.go
+index e52fb81..d4caec1 100644
+--- a/internal/server/metadata_service.go
++++ b/internal/server/metadata_service.go
+@@ -15,21 +15,21 @@ import (
+ const (
+ 	maxMetadataFields    = 32
+ 	maxMetadataBytes     = 32 << 10
+ 	maxMetadataItemBytes = 4 << 10
+ )
+ 
+ type MetadataItem struct {
+ 	Name     string `json:"name"`
+ 	Source   string `json:"source"`
+ 	Value    string `json:"value,omitempty"`
+-	Redacted bool   `json:"redacted,omitempty"`
++	Redacted bool   `json:"redacted"`
+ }
+ type AgentMetadataInput struct {
+ 	AgentID    string
+ 	NodeID     string
+ 	Epoch      int64
+ 	Revision   int64
+ 	Items      []MetadataItem
+ 	ReportedAt time.Time
+ 	ExpiresAt  *time.Time
+ }

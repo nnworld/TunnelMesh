@@ -1,0 +1,505 @@
+# Review package: 71b5d6c..fd7d8d0
+
+## Commits
+fd7d8d0 feat(api): expose agent metadata read endpoint
+
+## Files changed
+ .../task-4-report.md                               |  24 +++
+ docs/api/openapi.yaml                              |  45 ++++++
+ internal/server/api.go                             |  57 ++++++-
+ internal/server/api_test.go                        |   9 ++
+ internal/server/metadata_api_test.go               | 172 +++++++++++++++++++++
+ 5 files changed, 306 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-report.md
+new file mode 100644
+index 0000000..1118924
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-4-report.md
+@@ -0,0 +1,24 @@
++# Task 4 Report: Metadata API, OpenAPI, and Audit Behavior
++
++## Scope
++
++Implemented the read-only runtime metadata API for agents:
++
++- `GET /api/v1/agents/{agentId}/metadata`
++- optional `includeStale=true` query parameter
++- unified `{code,msg,data}` responses
++- owner/admin authorization with metadata existence protected behind agent authorization
++- bounded public serialization that excludes stored JSON, expiry, and last-seen internals
++- sensitive metadata values remain redacted
++- successful reads emit `agent.metadata.read` audit events
++- metadata write methods return `405 Method Not Allowed`
++
++## Stale semantics
++
++Expired or explicitly stale snapshots return `404` by default. A caller with access to the agent may opt in with `includeStale=true`; the response then returns the last snapshot with `stale: true`.
++
++## Verification
++
++- Added API coverage for unauthenticated, owner/admin, unrelated user, missing metadata, stale opt-in, redaction, bounded serialization, audit behavior, and write-method rejection.
++- Ran the focused test red phase before implementation and confirmed it failed because the route returned the public agent response.
++- Ran the focused green test after implementation: `go test ./internal/server -run MetadataAPI -count=1`.
+diff --git a/docs/api/openapi.yaml b/docs/api/openapi.yaml
+index 2db5b7b..9ebd90f 100644
+--- a/docs/api/openapi.yaml
++++ b/docs/api/openapi.yaml
+@@ -29,20 +29,38 @@ paths:
+       security: [{ bearerAuth: [] }]
+       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}
+       responses: {'201': {description: Created}, '403': {description: Forbidden}, '409': {description: Conflict}}
+   /api/v1/agents/{agentId}:
+     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+     get: {security: [{bearerAuth: []}], responses: {'200': {description: Agent}, '404': {description: Not found}}}
+     put: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
+     patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
+     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
++  /api/v1/agents/{agentId}/metadata:
++    parameters:
++      - {name: agentId, in: path, required: true, schema: {type: string}}
++      - {$ref: '#/components/parameters/IncludeStale'}
++    get:
++      summary: Read the latest runtime metadata reported by an agent
++      description: Stale snapshots are omitted by default. Set includeStale=true to read the last stale snapshot marked with stale=true. Runtime metadata is read-only through this API.
++      security: [{bearerAuth: []}]
++      responses:
++        '200':
++          description: Runtime metadata snapshot
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/AgentMetadataEnvelope'
++        '401': {description: Unauthenticated}
++        '403': {description: Agent is not owned by the caller}
++        '404': {description: Agent or metadata snapshot not found, or snapshot is stale without includeStale=true}
+   /api/v1/agents/{agentId}/policies:
+     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+     get: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}], responses: {'200': {description: Policies}}}
+     post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'201': {description: Created}}}
+   /api/v1/agents/{agentId}/policies/{policyId}:
+     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}, {name: policyId, in: path, required: true, schema: {type: string}}]
+     get: {security: [{bearerAuth: []}], responses: {'200': {description: Policy}}}
+     put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
+     patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
+     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+@@ -64,17 +82,44 @@ paths:
+     put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
+     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+   /api/v1/audit-logs:
+     get: {security: [{bearerAuth: []}], responses: {'200': {description: Audit records}}}
+ components:
+   securitySchemes:
+     bearerAuth: {type: http, scheme: bearer}
+   parameters:
+     Cursor: {name: cursor, in: query, schema: {type: string}}
+     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
++    IncludeStale: {name: includeStale, in: query, description: Include an expired or explicitly stale snapshot, schema: {type: boolean, default: false}}
+     IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 255}}
+   schemas:
+     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
+     LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
+     AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
++    AgentMetadataEnvelope:
++      allOf:
++        - $ref: '#/components/schemas/Envelope'
++        - type: object
++          properties:
++            data: {$ref: '#/components/schemas/AgentMetadata'}
++    AgentMetadata:
++      type: object
++      required: [agentId, nodeId, epoch, revision, stale, reportedAt, updatedAt, items]
++      properties:
++        agentId: {type: string}
++        nodeId: {type: string}
++        epoch: {type: integer, format: int64}
++        revision: {type: integer, format: int64}
++        stale: {type: boolean}
++        reportedAt: {type: string, format: date-time}
++        updatedAt: {type: string, format: date-time}
++        items: {type: array, items: {$ref: '#/components/schemas/AgentMetadataItem'}}
++    AgentMetadataItem:
++      type: object
++      required: [name, source, redacted]
++      properties:
++        name: {type: string}
++        source: {type: string, enum: [file, env]}
++        value: {type: string, description: Omitted for redacted sensitive fields}
++        redacted: {type: boolean}
+     PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
+     TunnelRequest: {type: object, required: [agentId, targetHost, targetPort], properties: {agentId: {type: string}, protocol: {type: string}, domain: {type: string}, pathPrefix: {type: string}, targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, publicPort: {type: integer}, status: {type: string}, config: {type: object}}}
+diff --git a/internal/server/api.go b/internal/server/api.go
+index 0092712..fa1fe99 100644
+--- a/internal/server/api.go
++++ b/internal/server/api.go
+@@ -32,37 +32,38 @@ type API struct {
+ 	idem     storage.IdempotencyRepository
+ 	routeMu  sync.Mutex
+ 	service  *apiService
+ }
+ 
+ // apiService is the application layer between HTTP handlers and storage. It
+ // owns validation and repository orchestration; handlers are responsible only
+ // for transport decoding, authorization, and response rendering.
+ type apiService struct {
+ 	agents   storage.AgentRepository
++	metadata *AgentMetadataService
+ 	policies storage.PolicyRepository
+ 	tunnels  storage.TunnelRepository
+ 	audits   storage.AuditRepository
+ }
+ 
+ // APIServer is kept as a descriptive alias for integrations that call the
+ // management application a server rather than an API.
+ type APIServer = API
+ 
+ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
+ 	if authService == nil && db != nil {
+ 		authService = auth.NewAuthService(db)
+ 	}
+ 	a := &API{DB: db, Auth: authService}
+ 	if db != nil {
+ 		a.users, a.agents, a.policies, a.tunnels, a.audits, a.idem = db.Users(), db.Agents(), db.Policies(), db.Tunnels(), db.Audits(), db.Idempotency()
+-		a.service = &apiService{agents: a.agents, policies: a.policies, tunnels: a.tunnels, audits: a.audits}
++		a.service = &apiService{agents: a.agents, metadata: NewAgentMetadataService(db.Metadata()), policies: a.policies, tunnels: a.tunnels, audits: a.audits}
+ 	}
+ 	return a
+ }
+ 
+ func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentRequest) (storage.Agent, error) {
+ 	if strings.TrimSpace(req.Name) == "" {
+ 		return storage.Agent{}, errors.New("name is required")
+ 	}
+ 	v := storage.Agent{Name: strings.TrimSpace(req.Name), OwnerUserID: owner, Capabilities: encodeStrings(req.Capabilities), Enabled: true}
+ 	if req.Enabled != nil {
+@@ -105,20 +106,26 @@ func (s *apiService) CreateTunnel(ctx context.Context, v storage.Tunnel) (storag
+ 		}
+ 	}
+ 	if latest.ID != "" {
+ 		return latest, nil
+ 	}
+ 	return storage.Tunnel{}, sql.ErrNoRows
+ }
+ func (s *apiService) GetAgent(ctx context.Context, id string) (storage.Agent, error) {
+ 	return s.agents.Get(ctx, id)
+ }
++func (s *apiService) GetAgentMetadataView(ctx context.Context, id string) (AgentMetadataView, error) {
++	if s == nil || s.metadata == nil {
++		return AgentMetadataView{}, errors.New("metadata service unavailable")
++	}
++	return s.metadata.GetView(ctx, id)
++}
+ func (s *apiService) ListAgents(ctx context.Context, cursor string, limit int) (storage.Page[storage.Agent], error) {
+ 	return s.agents.List(ctx, cursor, limit)
+ }
+ func (s *apiService) UpdateAgent(ctx context.Context, v storage.Agent) error {
+ 	return s.agents.Update(ctx, v)
+ }
+ func (s *apiService) DeleteAgent(ctx context.Context, id string) error {
+ 	return s.agents.Delete(ctx, id)
+ }
+ func (s *apiService) GetPolicy(ctx context.Context, id string) (storage.AgentPolicy, error) {
+@@ -276,20 +283,24 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
+ 				writeAPIError(w, http.StatusForbidden, "admin role required")
+ 				return
+ 			}
+ 			a.createAgent(w, r, p)
+ 		default:
+ 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+ 		}
+ 		return
+ 	}
+ 	id := parts[0]
++	if len(parts) >= 2 && parts[1] == "metadata" {
++		a.handleAgentMetadata(w, r, p, id)
++		return
++	}
+ 	if len(parts) >= 2 && parts[1] == "policies" {
+ 		a.handlePolicies(w, r, p, id, parts[2:])
+ 		return
+ 	}
+ 	agent, err := a.service.GetAgent(r.Context(), id)
+ 	if err != nil {
+ 		writeStorageError(w, err)
+ 		return
+ 	}
+ 	if !isAdmin(p) && agent.OwnerUserID != p.UserID {
+@@ -334,20 +345,64 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
+ 			writeStorageError(w, err)
+ 			return
+ 		}
+ 		a.audit(r.Context(), p, "agent.deleted", "agent", id)
+ 		writeJSON(w, http.StatusOK, map[string]string{"id": id})
+ 	default:
+ 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+ 	}
+ }
+ 
++type agentMetadataResponse struct {
++	AgentID    string         `json:"agentId"`
++	NodeID     string         `json:"nodeId"`
++	Epoch      int64          `json:"epoch"`
++	Revision   int64          `json:"revision"`
++	Stale      bool           `json:"stale"`
++	ReportedAt time.Time      `json:"reportedAt"`
++	UpdatedAt  time.Time      `json:"updatedAt"`
++	Items      []MetadataItem `json:"items"`
++}
++
++func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth.Principal, agentID string) {
++	// Resolve and authorize the parent agent before looking up metadata so a
++	// caller cannot use metadata existence to probe another user's resources.
++	agent, err := a.service.GetAgent(r.Context(), agentID)
++	if err != nil {
++		writeStorageError(w, err)
++		return
++	}
++	if !isAdmin(p) && agent.OwnerUserID != p.UserID {
++		writeAPIError(w, http.StatusForbidden, "forbidden")
++		return
++	}
++	if r.Method != http.MethodGet {
++		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
++		return
++	}
++	view, err := a.service.GetAgentMetadataView(r.Context(), agentID)
++	if err != nil {
++		writeStorageError(w, err)
++		return
++	}
++	if view.Stale && !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("includeStale")), "true") {
++		writeAPIError(w, http.StatusNotFound, "metadata not found")
++		return
++	}
++	data := agentMetadataResponse{
++		AgentID: view.AgentID, NodeID: view.NodeID, Epoch: view.Epoch, Revision: view.Revision,
++		Stale: view.Stale, ReportedAt: view.ReportedAt, UpdatedAt: view.UpdatedAt, Items: view.Items,
++	}
++	a.audit(r.Context(), p, "agent.metadata.read", "agent_runtime_metadata", agentID)
++	writeJSON(w, http.StatusOK, data)
++}
++
+ type agentRequest struct {
+ 	Name         string   `json:"name"`
+ 	Capabilities []string `json:"capabilities"`
+ 	Enabled      *bool    `json:"enabled"`
+ }
+ 
+ func (a *API) listAgents(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+ 	page, err := a.listAgentsForOwner(r.Context(), p, r.URL.Query().Get("cursor"), queryLimit(r))
+ 	if err != nil {
+ 		writeStorageError(w, err)
+diff --git a/internal/server/api_test.go b/internal/server/api_test.go
+index 83cb8ce..140bb6f 100644
+--- a/internal/server/api_test.go
++++ b/internal/server/api_test.go
+@@ -45,20 +45,29 @@ func apiJSON(t *testing.T, h http.Handler, method, path, token, idem string, bod
+ 		r.Header.Set("Authorization", "Bearer "+token)
+ 	}
+ 	if idem != "" {
+ 		r.Header.Set("Idempotency-Key", idem)
+ 	}
+ 	w := httptest.NewRecorder()
+ 	h.ServeHTTP(w, r)
+ 	return w
+ }
+ 
++func apiToken(t *testing.T, api *API, username, password string) string {
++	t.Helper()
++	result, err := auth.NewAuthService(api.DB).Login(context.Background(), username, password)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return result.Token
++}
++
+ func TestAPIAuthAndRBAC(t *testing.T) {
+ 	api, _, user := apiTestServer(t)
+ 	h := api.Handler()
+ 	r := apiJSON(t, h, http.MethodGet, "/api/v1/agents", "", "", nil)
+ 	if r.Code != http.StatusUnauthorized {
+ 		t.Fatalf("unauthenticated status = %d", r.Code)
+ 	}
+ 	login := apiJSON(t, h, http.MethodPost, "/api/v1/auth/login", "", "", map[string]string{"username": "alice", "password": "alice-pass"})
+ 	if login.Code != http.StatusOK {
+ 		t.Fatalf("login status = %d: %s", login.Code, login.Body.String())
+diff --git a/internal/server/metadata_api_test.go b/internal/server/metadata_api_test.go
+new file mode 100644
+index 0000000..66898b8
+--- /dev/null
++++ b/internal/server/metadata_api_test.go
+@@ -0,0 +1,172 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/auth"
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++)
++
++func TestMetadataAPI(t *testing.T) {
++	api, admin, owner := apiTestServer(t)
++	ctx := context.Background()
++	other, err := auth.NewAuthService(api.DB).CreateUser(ctx, "bob", "bob-pass", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	agent := storage.Agent{ID: "agent-metadata", Name: "metadata-agent", OwnerUserID: owner.ID, Capabilities: `[]`, Enabled: true}
++	if err := api.DB.Agents().Create(ctx, agent); err != nil {
++		t.Fatal(err)
++	}
++
++	ownerToken := apiToken(t, api, owner.Username, "alice-pass")
++	adminToken := apiToken(t, api, admin.Username, "admin-pass")
++	otherToken := apiToken(t, api, other.Username, "bob-pass")
++
++	t.Run("unauthenticated", func(t *testing.T) {
++		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", "", "", nil)
++		if response.Code != http.StatusUnauthorized {
++			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
++		}
++	})
++
++	t.Run("missing metadata is not found", func(t *testing.T) {
++		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", ownerToken, "", nil)
++		if response.Code != http.StatusNotFound {
++			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
++		}
++	})
++
++	if _, err := NewAgentMetadataService(api.DB.Metadata()).Upsert(ctx, AgentMetadataInput{
++		AgentID:    agent.ID,
++		NodeID:     "node-1",
++		Epoch:      12,
++		Revision:   4,
++		ReportedAt: time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC),
++		Items: []MetadataItem{
++			{Name: "device_id", Source: "file", Value: "dev-123"},
++			{Name: "region", Source: "env", Value: "cn-east-1"},
++			{Name: "password", Source: "env", Value: "do-not-leak"},
++		},
++	}); err != nil {
++		t.Fatal(err)
++	}
++
++	checkResponse := func(t *testing.T, token string) map[string]any {
++		t.Helper()
++		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", token, "", nil)
++		if response.Code != http.StatusOK {
++			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
++		}
++		var envelope struct {
++			Code int            `json:"code"`
++			Msg  string         `json:"msg"`
++			Data map[string]any `json:"data"`
++		}
++		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
++			t.Fatal(err)
++		}
++		if envelope.Code != http.StatusOK || envelope.Msg != http.StatusText(http.StatusOK) {
++			t.Fatalf("envelope = %+v", envelope)
++		}
++		return envelope.Data
++	}
++
++	t.Run("owner gets bounded redacted view", func(t *testing.T) {
++		data := checkResponse(t, ownerToken)
++		for _, key := range []string{"agentId", "nodeId", "epoch", "revision", "stale", "reportedAt", "updatedAt", "items"} {
++			if _, ok := data[key]; !ok {
++				t.Fatalf("missing response field %q: %+v", key, data)
++			}
++		}
++		for _, key := range []string{"metadata", "lastSeenAt", "expiresAt"} {
++			if _, ok := data[key]; ok {
++				t.Fatalf("internal field %q leaked: %+v", key, data)
++			}
++		}
++		items, ok := data["items"].([]any)
++		if !ok || len(items) != 3 {
++			t.Fatalf("items = %#v", data["items"])
++		}
++		redacted, ok := items[2].(map[string]any)
++		if !ok || redacted["value"] != nil || redacted["redacted"] != true {
++			t.Fatalf("sensitive item = %#v", items[2])
++		}
++	})
++
++	t.Run("admin can read", func(t *testing.T) {
++		data := checkResponse(t, adminToken)
++		if data["agentId"] != agent.ID {
++			t.Fatalf("agentId = %#v", data["agentId"])
++		}
++	})
++
++	t.Run("unrelated user is forbidden", func(t *testing.T) {
++		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", otherToken, "", nil)
++		if response.Code != http.StatusForbidden {
++			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
++		}
++	})
++
++	t.Run("metadata writes are not exposed", func(t *testing.T) {
++		response := apiJSON(t, api.Handler(), http.MethodPost, "/api/v1/agents/agent-metadata/metadata", ownerToken, "", map[string]any{"items": []any{}})
++		if response.Code != http.StatusMethodNotAllowed {
++			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
++		}
++	})
++
++	t.Run("read is audited", func(t *testing.T) {
++		page, err := api.DB.Audits().List(ctx, "", 100)
++		if err != nil {
++			t.Fatal(err)
++		}
++		found := false
++		for _, audit := range page.Items {
++			if audit.Action == "agent.metadata.read" && audit.ResourceID == agent.ID {
++				found = true
++				break
++			}
++		}
++		if !found {
++			t.Fatalf("metadata read audit not found: %+v", page.Items)
++		}
++	})
++
++	t.Run("stale requires opt in", func(t *testing.T) {
++		expired := time.Now().UTC().Add(-time.Minute)
++		if err := api.DB.Metadata().Upsert(ctx, storage.AgentRuntimeMetadata{
++			AgentID:    agent.ID,
++			NodeID:     "node-1",
++			Epoch:      13,
++			Revision:   1,
++			Metadata:   `{"items":[{"name":"region","source":"env","value":"cn-east-1"}]}`,
++			ReportedAt: time.Now().UTC().Add(-2 * time.Hour),
++			ExpiresAt:  &expired,
++		}); err != nil {
++			t.Fatal(err)
++		}
++		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", ownerToken, "", nil)
++		if response.Code != http.StatusNotFound {
++			t.Fatalf("default stale status = %d, body = %s", response.Code, response.Body.String())
++		}
++		response = apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata?includeStale=true", ownerToken, "", nil)
++		if response.Code != http.StatusOK {
++			t.Fatalf("include stale status = %d, body = %s", response.Code, response.Body.String())
++		}
++		var envelope struct {
++			Data struct {
++				Stale bool `json:"stale"`
++			} `json:"data"`
++		}
++		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
++			t.Fatal(err)
++		}
++		if !envelope.Data.Stale {
++			t.Fatalf("stale response = %s", response.Body.String())
++		}
++	})
++}

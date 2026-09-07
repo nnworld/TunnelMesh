@@ -1,0 +1,254 @@
+# Review package: dc49e0f..24ef85d
+
+## Commits
+24ef85d fix(server): validate agent bearer tokens
+
+## Files changed
+ .../final-integration-report.md                    |  3 +-
+ .../progress.md                                    |  1 +
+ docs/deployment/docker.md                          |  2 ++
+ docs/user-guide/agent.md                           |  2 ++
+ internal/cli/root.go                               | 11 +++++-
+ internal/server/runtime_test.go                    | 41 ++++++++++++++++------
+ 6 files changed, 48 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/final-integration-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/final-integration-report.md
+index 81ccfef..8086bc2 100644
+--- a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/final-integration-report.md
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/final-integration-report.md
+@@ -1,21 +1,22 @@
+ # Final Integration Report
+ 
+ ## Metadata session integration
+ 
+ - `AgentSessionConfig.MetadataService` now persists authenticated Agent metadata frames through `AgentMetadataService.Upsert`.
+ - Agent and node identity are fenced against the authenticated session; revision overflow and service validation failures return structured ACK errors without closing the data session.
+ - `ServeAgentSession` now uses the configured service path, so accepted frames are visible through the SQLite repository and `/api/v1/agents/{agentId}/metadata`.
+ - Session replacement uses identity-aware cleanup: closing an old epoch cannot stale a newer replacement. Removing the current session marks its metadata stale while holding the manager lock, preventing a same-epoch reconnect from racing with stale marking.
+ - `NewAgentSessionManagerWithMetadata` provides the production wiring point: server startup can pass `storage.DB.Metadata()` (or another repository) once, then reuse the manager for every `ServeAgentSession` call.
+ - `NewServerRuntime` is the process-level startup factory used by `tunnelmesh-server run`; it wires the management API, embedded Web UI, and authenticated `/ws/agent` endpoint. The CLI now binds the configured HTTP address and shuts down gracefully with command context cancellation.
+-- Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token; deployments inject `AgentSessionConfig.Authenticate` to validate agent credentials. Accepted hello frames persist metadata with a five-minute expiry by default.
++- Agent WebSocket registration is derived from the authenticated metadata hello (`agent_id`, `node_id`, `epoch`) plus the bearer token. The CLI runtime validates that bearer through `AuthService.ValidateToken`; embedders can inject an equivalent `AgentSessionConfig.Authenticate` policy. Accepted hello frames persist metadata with a five-minute expiry by default.
++- The built-in HTTP listener does not terminate TLS; production deployments must use a reverse proxy or load balancer for HTTPS/WSS termination.
+ 
+ ## Schema compatibility
+ 
+ - Schema version is now `2`.
+ - Auto-init migrates existing version-1 databases after applying the portable DDL.
+ - `auto-init=false` validates both schema version and required tables, including `agent_runtime_metadata`, and fails fast when the runtime metadata table is missing.
+ 
+ ## Deliverables
+ 
+ The final commit includes the requested project instructions, Docker/Compose files, deployment and operations guides, user guides, and metadata/SSH plan/spec artifacts without deleting existing content.
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/progress.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/progress.md
+index bfa8164..9f7d5b6 100644
+--- a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/progress.md
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/progress.md
+@@ -31,10 +31,11 @@
+ - Ruling: Treat SSH public-key proxy as the first-class command execution path — host sshd remains the authorization boundary; cost is requiring SSH service and key setup on the host.
+ 
+ ## Task status
+ 
+ - Task 1: complete (commits dad6f65..3ff15f1, fix baf2b54; review clean)
+ - Task 2: complete (commits baf2b54..fad1114, fix 870912b; review clean)
+ - Task 3: complete (commits 870912b..4c344a6, fix 71b5d6c; review clean)
+ - Task 4: complete (commits 71b5d6c..7e34c1f, fix 9ea2368; review clean)
+ - Task 5: complete (commits 9ea2368..db575b4, fix 91c9d17; review clean)
+ - Task 6: complete (commits 91c9d17..6aa8cab, fix bd6e289; review clean)
++- Runtime integration residuals: complete (commits 512bf2e, dc49e0f, bearer-token validation and TLS deployment documentation)
+diff --git a/docs/deployment/docker.md b/docs/deployment/docker.md
+index c26c9cb..6233e23 100644
+--- a/docs/deployment/docker.md
++++ b/docs/deployment/docker.md
+@@ -48,17 +48,19 @@ export TUNNELMESH_REGISTRY_ENDPOINTS='https://etcd-1:2379,https://etcd-2:2379'
+ docker run --rm \
+   -v "$PWD/data/server:/var/lib/tunnelmesh" \
+   -e TUNNELMESH_MODE=local \
+   -e TUNNELMESH_STORAGE_AUTO_INIT=true \
+   -p 80:80 -p 443:443 \
+   tunnelmesh:server run
+ ```
+ 
+ 配置优先级仍为：命令行参数 > 环境变量 > 配置文件 > 默认值。容器内推荐使用环境变量或挂载只读配置文件。
+ 
++Server 的内置 HTTP runtime 负责提供管理 API、嵌入式 Web 和 Agent WebSocket，但当前监听器本身不终止 TLS。生产部署必须在反向代理或负载均衡器处终止 HTTPS/WSS，再将受保护的内部 HTTP 连接转发到 Server；同时为 Agent 注入有效的 API bearer token。
++
+ ## 安全与升级
+ 
+ - 镜像以非 root 用户运行。
+ - 生产环境将 TLS 证书、MySQL DSN 和 Token 放在 Secret 管理系统中。
+ - 升级前备份 MySQL/SQLite，并先在一台节点灰度验证。
+ - schema 自动初始化关闭时，必须先执行受控的数据库迁移，再启动应用。
+ - 回滚使用上一版本镜像，并保留兼容的数据库 schema。
+diff --git a/docs/user-guide/agent.md b/docs/user-guide/agent.md
+index 72eecab..9332dfa 100644
+--- a/docs/user-guide/agent.md
++++ b/docs/user-guide/agent.md
+@@ -88,20 +88,22 @@ metadata 不支持命令执行、shell 插值或任意路径读取。需要执
+ Agent 主机必须满足：
+ 
+ 1. 能解析并访问 Server 的 DNS 名称。
+ 2. 能访问 Server 的 HTTPS/WSS 端口，通常是 443。
+ 3. 系统时间准确，能够校验 Server 证书。
+ 4. 能从 Agent 网络访问被代理的目标地址和端口。
+ 5. 防火墙允许 Agent 到 Server 的出站连接以及到目标服务的内网连接。
+ 
+ 生产环境使用 `wss://`，不要关闭证书校验或把 Server 证书私钥放在 Agent 主机上。
+ 
++Agent WebSocket 握手还必须携带 `Authorization: Bearer <token>`。Server 使用同一套 API token 校验该凭据；无效或缺失 token 的连接会在 metadata hello 前被拒绝。请通过 Secret 管理系统注入 token，不要写入仓库或命令行历史。
++
+ ## 7. Docker 运行
+ 
+ ```bash
+ docker build --build-arg APP=agent -t tunnelmesh:agent .
+ docker run --rm \
+   -e TUNNELMESH_MODE=local \
+   -e TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1 \
+   -e TUNNELMESH_AGENT_ID=agent-devbox \
+   tunnelmesh:agent run
+ ```
+diff --git a/internal/cli/root.go b/internal/cli/root.go
+index da41caf..2d5c5ab 100644
+--- a/internal/cli/root.go
++++ b/internal/cli/root.go
+@@ -71,21 +71,30 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
+ }
+ 
+ func serverCommands(opts *rootOptions) []*cobra.Command {
+ 	return []*cobra.Command{
+ 		configCommand(opts, "run", "start the TunnelMesh server", func(cmd *cobra.Command, cfg config.Config) error {
+ 			db, err := storage.OpenConfig(cmd.Context(), cfg.Storage)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			defer db.Close()
+-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{})
++			authService := auth.NewAuthService(db)
++			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{
++				Authenticate: func(ctx context.Context, registration server.AgentRegistration) error {
++					if strings.TrimSpace(registration.Token) == "" {
++						return server.ErrAuthentication
++					}
++					_, err := authService.ValidateToken(ctx, registration.Token)
++					return err
++				},
++			})
+ 			if err != nil {
+ 				return err
+ 			}
+ 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server listening on %s in %s mode\n", cfg.Server.HTTPAddr, cfg.Mode)
+ 			return runtime.Serve(cmd.Context(), cfg.Server.HTTPAddr)
+ 		}),
+ 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
+ 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
+ 			return nil
+ 		}),
+diff --git a/internal/server/runtime_test.go b/internal/server/runtime_test.go
+index ed93e63..56d5960 100644
+--- a/internal/server/runtime_test.go
++++ b/internal/server/runtime_test.go
+@@ -55,25 +55,26 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if err := db.Agents().Create(context.Background(), storage.Agent{ID: "agent-ws", Name: "agent-ws", OwnerUserID: user.ID, Enabled: true}); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	login, err := authService.Login(context.Background(), user.Username, "runtime-pass")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(_ context.Context, registration AgentRegistration) error {
+-		if registration.Token != "agent-secret" {
++	runtime, err := NewServerRuntime(db, AgentSessionConfig{Authenticate: func(ctx context.Context, registration AgentRegistration) error {
++		if registration.Token == "" {
+ 			return ErrAuthentication
+ 		}
+-		return nil
++		_, err := authService.ValidateToken(ctx, registration.Token)
++		return err
+ 	}})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	listener, err := net.Listen("tcp", "127.0.0.1:0")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+@@ -88,35 +89,46 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
+ 		t.Fatalf("web status=%d", resp.StatusCode)
+ 	}
+ 	_, _ = io.Copy(io.Discard, resp.Body)
+ 	_ = resp.Body.Close()
+ 
+ 	wsURL := "ws://" + listener.Addr().String() + "/ws/agent"
+ 	config, err := websocket.NewConfig(wsURL, baseURL)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	config.Header.Set("Authorization", "Bearer agent-secret")
+-	ws, err := websocket.DialConfig(config)
++	payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{AgentID: "agent-ws", NodeID: "node-ws", Epoch: 1, Revision: 1, Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}}})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	defer ws.Close()
+-	payload, err := protocol.EncodeAgentMetadataPayload(protocol.AgentMetadataPayload{AgentID: "agent-ws", NodeID: "node-ws", Epoch: 1, Revision: 1, Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: "east"}}})
++	config.Header.Set("Authorization", "Bearer invalid-token")
++	invalidWS, err := websocket.DialConfig(config)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	var frame bytes.Buffer
+-	if err := protocol.NewEncoder(&frame).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentHello, Payload: payload}); err != nil {
++	if err := websocket.Message.Send(invalidWS, frameBytes(t, protocol.FrameAgentHello, payload)); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if err := websocket.Message.Send(ws, frame.Bytes()); err != nil {
++	_ = invalidWS.SetReadDeadline(time.Now().Add(time.Second))
++	var rejected []byte
++	if err := websocket.Message.Receive(invalidWS, &rejected); err == nil {
++		t.Fatal("invalid API token unexpectedly received an acknowledgement")
++	}
++	_ = invalidWS.Close()
++
++	config.Header.Set("Authorization", "Bearer "+login.Token)
++	ws, err := websocket.DialConfig(config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws.Close()
++	if err := websocket.Message.Send(ws, frameBytes(t, protocol.FrameAgentHello, payload)); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	var ackBytes []byte
+ 	if err := websocket.Message.Receive(ws, &ackBytes); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	ackFrame, err := protocol.NewDecoder(bytes.NewReader(ackBytes)).ReadFrame()
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -147,10 +159,19 @@ func TestServerRuntimeServesAPIAndAgentWebSocket(t *testing.T) {
+ 		t.Fatal("runtime did not stop")
+ 	}
+ 	var envelope map[string]any
+ 	if err := json.Unmarshal(body, &envelope); err != nil {
+ 		t.Fatalf("invalid API JSON: %v", err)
+ 	}
+ 	if envelope["data"] == nil {
+ 		t.Fatalf("metadata API response missing data: %v", envelope)
+ 	}
+ }
++
++func frameBytes(t *testing.T, typ protocol.FrameType, payload []byte) []byte {
++	t.Helper()
++	var frame bytes.Buffer
++	if err := protocol.NewEncoder(&frame).WriteFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: typ, Payload: payload}); err != nil {
++		t.Fatal(err)
++	}
++	return frame.Bytes()
++}

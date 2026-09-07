@@ -1,0 +1,25 @@
+[Unit]
+Description=TunnelMesh Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tunnelmesh
+Group=tunnelmesh
+WorkingDirectory=/var/lib/tunnelmesh-agent
+ExecStartPre=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml check-config
+ExecStart=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml run
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tunnelmesh-agent
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -11,6 +11,8 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
 
 `print-config` 输出的是脱敏后的有效配置。重点检查 mode、storage.driver、MySQL DSN、TLS、node.id 和 registry.type。
 
+服务日志位置和 systemd/Docker/macOS/Windows 查看命令见 [日志位置与查看方式](logging.md)。
+
 ## schema 错误
 
 - 自动初始化关闭时，确认数据库已经执行 `migrations/ddl.sql`。
@@ -26,6 +28,8 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
 4. 检查 Server 节点租约是否过期，以及集群节点时间是否同步。
 5. 确认目标服务从 Agent 所在网络可达，而不是只在 Server 主机可达。
 
+全链路探针可通过 `POST /api/v1/agents/{agentId}/diagnose` 发起 TCP/HTTP/UDP 诊断，并通过 `GET /api/v1/agents/{agentId}/probes` 查看受限结果摘要；目标响应体不会被保存或返回。详见 [全链路网络探针](network-probes.md)。
+
 ## HTTP 路由失败
 
 - 404：检查域名、pathPrefix、wildcard DNS 和 API 路由是否匹配。
@@ -39,6 +43,15 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
 - 检查 ProxyCommand URL 是否使用 `wss://` 和正确的域名/端口编码。
 - 看到 WebSocket 文本帧错误时，检查客户端是否误用了 text 模式。
 - 使用 `ssh -vvv` 和 `websocat -v` 获取握手与关闭原因。
+
+## Service token 失败
+
+- 401：检查 token 是否为空、类型是否正确、是否已过期或已撤销；`agent` 连接 `/ws/agent`，`client` 连接 `/ws/client`。
+- 403：检查 token owner、Agent 绑定、scope 与 Agent Policy 的交集。
+- 409：轮换/撤销并发冲突时，复用同一个 `Idempotency-Key` 重试；不要期待再次返回 secret。
+- Server-node relay 失败：检查节点 ID、epoch、证书 SAN 是否精确匹配、CA 是否正确，以及 `server.relay.listen` 是否已监听。
+
+明文 secret 只在创建/轮换响应出现一次。不要从日志、审计记录或数据库恢复 token；遗失时直接轮换并撤销旧 token。
 
 ## 数据安全
 

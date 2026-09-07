@@ -1,0 +1,315 @@
+# Review package: 6aa8cab..bd6e289
+
+## Commits
+bd6e289 fix(ssh): audit TCP bridge sessions
+
+## Files changed
+ .../task-6-fix-report.md                           | 16 +++++++++
+ docs/user-guide/tcp-over-websocket-ssh.md          |  8 ++---
+ internal/e2e/agent_metadata_ssh_test.go            |  5 ++-
+ internal/server/tcp_bridge.go                      | 40 ++++++++++++++++++++--
+ internal/server/tcp_bridge_test.go                 | 29 ++++++++++++++++
+ 5 files changed, 91 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-fix-report.md b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-fix-report.md
+new file mode 100644
+index 0000000..759940b
+--- /dev/null
++++ b/.superpowers/sdd/2026-09-06-agent-metadata-ssh-implementation/task-6-fix-report.md
+@@ -0,0 +1,16 @@
++# Task 6 Review Fix Report
++
++## Corrections
++
++- Added an injected `TCPBridgeAuditEvent` hook for `tcp_proxy.open` and `tcp_proxy.close`. Events contain Agent ID, target host/port, and authenticated user context from the request context; SSH payloads, commands, credentials, and private keys are never included.
++- Added server bridge assertions for open/close audit actions and context propagation.
++- Updated dynamic wildcard SSH examples to the implemented `<agent-id>-<a>-<b>-<c>-<d>-<port>.apps.example.com` format, while documenting explicit route URLs separately.
++- Changed the SSH-like E2E response fixture to carry a nonzero exit-status byte and assert that it is preserved.
++
++The E2E bridge test uses the existing `WSConn` seam because the repository intentionally does not select a concrete WebSocket library. This exercises the handler's binary-message bridge path; a network-level WebSocket acceptance test belongs with the deployment's chosen WebSocket adapter.
++
++## Verification
++
++- Focused bridge and E2E tests pass.
++- Full Go tests, race tests, vet, diff check, web tests, and web build pass.
++- Docker/Compose validation remains unavailable because the `docker` executable is not installed.
+diff --git a/docs/user-guide/tcp-over-websocket-ssh.md b/docs/user-guide/tcp-over-websocket-ssh.md
+index 7cdf09a..0ce1ebd 100644
+--- a/docs/user-guide/tcp-over-websocket-ssh.md
++++ b/docs/user-guide/tcp-over-websocket-ssh.md
+@@ -30,38 +30,38 @@ Host tunnelmesh-agent
+ 
+ ```bash
+ ssh -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
+   devuser@ignored-by-proxy
+ ```
+ 
+ ## websocat 命令
+ 
+ ```bash
+ websocat --binary -B 65536 - \
+-  'wss://8081-agent-id.apps.example.com'
++  'wss://agent-devbox-10-0-0-8-22.apps.example.com'
+ ```
+ 
+-`--binary` 保证 WebSocket 使用 binary message，`-B 65536` 控制缓冲区大小。实际 URL 需替换为你的显式路由或动态 wildcard 路由。
++`--binary` 保证 WebSocket 使用 binary message，`-B 65536` 控制缓冲区大小。动态 wildcard 的格式是 `<agent-id>-<ip-octet>-<ip-octet>-<ip-octet>-<ip-octet>-<port>.apps.example.com`，因此上例会访问 Agent `agent-devbox` 的 `10.0.0.8:22`。如果使用显式托管路由，请把 URL 替换为该路由配置的域名和路径（例如由 Server 管理 API 创建的 `ssh.example.com` route）。
+ 
+ ## SSH ProxyCommand
+ 
+ ```sshconfig
+ Host tunnelmesh-agent
+     HostName ignored-by-proxy
+     User nami
+-    ProxyCommand websocat --binary -B 65536 - "wss://8081-agent-id.apps.example.com"
++    ProxyCommand websocat --binary -B 65536 - "wss://agent-devbox-10-0-0-8-22.apps.example.com"
+ ```
+ 
+ 也可以临时执行：
+ 
+ ```bash
+-ssh -o 'ProxyCommand=websocat --binary -B 65536 - wss://8081-agent-id.apps.example.com' \
++ssh -o 'ProxyCommand=websocat --binary -B 65536 - wss://agent-devbox-10-0-0-8-22.apps.example.com' \
+   nami@ignored-by-proxy
+ ```
+ 
+ 通过 SSH 执行远程命令时，退出码由 SSH 原样返回：
+ 
+ ```bash
+ ssh -o 'ProxyCommand=tunnelmesh-client --config tunnelmesh.yaml proxy tcp --agent agent-devbox --target-host 127.0.0.1 --target-port 22' \
+   devuser@ignored-by-proxy 'uname -a && systemctl is-active sshd'
+ echo "ssh exit=$?"
+ ```
+diff --git a/internal/e2e/agent_metadata_ssh_test.go b/internal/e2e/agent_metadata_ssh_test.go
+index f669fd8..c8a8349 100644
+--- a/internal/e2e/agent_metadata_ssh_test.go
++++ b/internal/e2e/agent_metadata_ssh_test.go
+@@ -62,33 +62,36 @@ func (s *sshDuplex) Written() []byte {
+ 
+ func (s *sshDuplex) CloseWriteCalled() bool {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 	return s.closeWrite
+ }
+ 
+ func TestAgentMetadataSSHByteIntegrityAndExitStatus(t *testing.T) {
+ 	sshHandshake := []byte("SSH-2.0-TunnelMeshTest\r\n")
+ 	remoteCommand := []byte{0, 0, 0, 20, 0, 0, 0, 4, 'e', 'x', 'e', 'c', 0, 0, 0, 0}
+-	exitStatus := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
++	exitStatus := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42}
+ 	stream := newSSHDuplex(append([]byte("SSH-2.0-target\r\n"), exitStatus...))
+ 	var output bytes.Buffer
+ 	input := bytes.NewReader(append(append([]byte{}, sshHandshake...), remoteCommand...))
+ 	if err := client.ProxyStdio(context.Background(), input, &output, stream); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if got := stream.Written(); !bytes.Equal(got, append(sshHandshake, remoteCommand...)) {
+ 		t.Fatalf("SSH bytes changed in proxy: got %x", got)
+ 	}
+ 	if !bytes.Equal(output.Bytes(), append([]byte("SSH-2.0-target\r\n"), exitStatus...)) {
+ 		t.Fatalf("remote bytes changed in proxy: got %x", output.Bytes())
+ 	}
++	if output.Bytes()[len(output.Bytes())-1] != 42 {
++		t.Fatalf("nonzero SSH exit status was not preserved: %x", output.Bytes())
++	}
+ 	if !stream.CloseWriteCalled() {
+ 		t.Fatal("proxy did not propagate stdin EOF as a half-close")
+ 	}
+ }
+ 
+ func TestAgentMetadataSSHPolicyDenial(t *testing.T) {
+ 	policy, err := routing.NewPolicy([]string{"10.0.0.0/8"}, []int{22})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/server/tcp_bridge.go b/internal/server/tcp_bridge.go
+index 8bd0458..803a85d 100644
+--- a/internal/server/tcp_bridge.go
++++ b/internal/server/tcp_bridge.go
+@@ -18,29 +18,43 @@ var (
+ 	ErrBridgeTooLarge  = errors.New("tcp bridge: websocket message exceeds limit")
+ 	ErrBridgeRefused   = errors.New("tcp bridge: target refused")
+ )
+ 
+ // WSUpgrader is deliberately small so the server package does not force a
+ // particular WebSocket implementation on embedders.
+ type WSUpgrader interface {
+ 	Upgrade(http.ResponseWriter, *http.Request) (WSConn, error)
+ }
+ 
++// TCPBridgeAuditEvent carries connection metadata only. It deliberately has
++// no payload field so SSH bytes, credentials, and command contents cannot
++// enter audit records through the bridge hook.
++type TCPBridgeAuditEvent struct {
++	Action     string
++	UserID     string
++	Username   string
++	AgentID    string
++	TargetHost string
++	TargetPort int
++	Error      string
++}
++
+ // TCPBridgeHandler maps exactly one WebSocket connection to one agent stream.
+ // It is intended for raw SSH/websocat bytes and therefore never base64 encodes
+ // or coalesces application messages.
+ type TCPBridgeHandler struct {
+ 	Resolver *routing.RouteResolver
+ 	Opener   relay.NodeTransport
+ 	Upgrade  WSUpgrader
+ 	MaxBytes int64
+ 	Timeout  time.Duration
++	Audit    func(context.Context, TCPBridgeAuditEvent)
+ }
+ 
+ func (h *TCPBridgeHandler) maxBytes() int64 {
+ 	if h == nil || h.MaxBytes <= 0 || h.MaxBytes > 64<<10 {
+ 		return 64 << 10
+ 	}
+ 	return h.MaxBytes
+ }
+ 
+ func (h *TCPBridgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -54,53 +68,75 @@ func (h *TCPBridgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	ctx := r.Context()
+ 	if h.Timeout > 0 {
+ 		var cancel context.CancelFunc
+ 		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
+ 		defer cancel()
+ 	}
+ 	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+ 	if err != nil {
++		h.emitAudit(ctx, "tcp_proxy.open", route, err)
+ 		http.Error(w, "target refused", http.StatusBadGateway)
+ 		return
+ 	}
++	h.emitAudit(ctx, "tcp_proxy.open", route, nil)
+ 	defer stream.Close()
+ 	ws, err := h.Upgrade.Upgrade(w, r)
+ 	if err != nil {
++		h.emitAudit(ctx, "tcp_proxy.close", route, err)
+ 		return
+ 	}
+ 	defer ws.Close()
+-	_ = h.bridge(ctx, ws, stream)
++	err = h.bridge(ctx, ws, stream)
++	h.emitAudit(ctx, "tcp_proxy.close", route, err)
+ }
+ 
+ // Handle is useful to tests and adapters which already completed a WebSocket
+ // upgrade. host may include a Host header port.
+ func (h *TCPBridgeHandler) Handle(ctx context.Context, ws WSConn, host string) error {
+ 	if h == nil || h.Resolver == nil || h.Opener == nil {
+ 		return ErrBridgeRefused
+ 	}
+ 	if h.Timeout > 0 {
+ 		var cancel context.CancelFunc
+ 		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
+ 		defer cancel()
+ 	}
+ 	route, err := h.Resolver.ResolveHTTP(host, "/")
+ 	if err != nil {
+ 		return err
+ 	}
+ 	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+ 	if err != nil {
++		h.emitAudit(ctx, "tcp_proxy.open", route, err)
+ 		return ErrBridgeRefused
+ 	}
++	h.emitAudit(ctx, "tcp_proxy.open", route, nil)
+ 	defer stream.Close()
+-	return h.bridge(ctx, ws, stream)
++	err = h.bridge(ctx, ws, stream)
++	h.emitAudit(ctx, "tcp_proxy.close", route, err)
++	return err
++}
++
++func (h *TCPBridgeHandler) emitAudit(ctx context.Context, action string, route routing.Route, bridgeErr error) {
++	if h == nil || h.Audit == nil {
++		return
++	}
++	event := TCPBridgeAuditEvent{Action: action, AgentID: route.AgentID, TargetHost: route.TargetHost, TargetPort: route.TargetPort}
++	if p, ok := principalFromContext(ctx); ok {
++		event.UserID, event.Username = p.UserID, p.Username
++	}
++	if bridgeErr != nil {
++		event.Error = bridgeErr.Error()
++	}
++	h.Audit(ctx, event)
+ }
+ 
+ func (h *TCPBridgeHandler) bridge(ctx context.Context, ws WSConn, stream io.ReadWriteCloser) error {
+ 	if ws == nil || stream == nil {
+ 		return ErrBridgeRefused
+ 	}
+ 	ctx, cancel := context.WithCancel(ctx)
+ 	defer cancel()
+ 	watchDone := make(chan struct{})
+ 	defer close(watchDone)
+diff --git a/internal/server/tcp_bridge_test.go b/internal/server/tcp_bridge_test.go
+index 9597400..7e754bb 100644
+--- a/internal/server/tcp_bridge_test.go
++++ b/internal/server/tcp_bridge_test.go
+@@ -1,19 +1,20 @@
+ package server
+ 
+ import (
+ 	"context"
+ 	"io"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
++	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
+ 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
+ )
+ 
+ type fakeWS struct {
+ 	msgs [][]byte
+ 	out  [][]byte
+ }
+ 
+ type blockingWS struct{ closed chan struct{} }
+@@ -110,10 +111,38 @@ func TestTCPBridgeHandleBinaryAndLimit(t *testing.T) {
+ 	conn := &echoConn{closed: make(chan struct{})}
+ 	h := &TCPBridgeHandler{Resolver: routing.NewRouteResolver([]routing.Route{{Domain: "example.com", AgentID: "a", TargetHost: "10.0.0.1", TargetPort: 22}}), Opener: bridgeOpener{conn: conn}, MaxBytes: 64 << 10}
+ 	ws := &fakeWS{msgs: [][]byte{[]byte("ssh")}}
+ 	if err := h.Handle(context.Background(), ws, "example.com"); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if conn.String() != "ssh" {
+ 		t.Fatalf("got %q", conn.String())
+ 	}
+ }
++
++func TestTCPBridgeAuditIncludesUserAndTargetContext(t *testing.T) {
++	conn := &echoConn{closed: make(chan struct{})}
++	ws := &fakeWS{msgs: [][]byte{[]byte("ssh")}}
++	var events []TCPBridgeAuditEvent
++	h := &TCPBridgeHandler{
++		Resolver: routing.NewRouteResolver([]routing.Route{{Domain: "example.com", AgentID: "agent-ssh", TargetHost: "10.0.0.8", TargetPort: 22}}),
++		Opener:   bridgeOpener{conn: conn},
++		Audit: func(_ context.Context, event TCPBridgeAuditEvent) {
++			events = append(events, event)
++		},
++	}
++	ctx := withPrincipal(context.Background(), auth.Principal{UserID: "user-1", Username: "alice", Role: "user"})
++	if err := h.Handle(ctx, ws, "example.com"); err != nil {
++		t.Fatal(err)
++	}
++	if len(events) != 2 {
++		t.Fatalf("audit events=%+v", events)
++	}
++	for _, event := range events {
++		if event.AgentID != "agent-ssh" || event.TargetHost != "10.0.0.8" || event.TargetPort != 22 || event.UserID != "user-1" || event.Username != "alice" {
++			t.Fatalf("audit context=%+v", event)
++		}
++	}
++	if events[0].Action != "tcp_proxy.open" || events[1].Action != "tcp_proxy.close" {
++		t.Fatalf("audit actions=%+v", events)
++	}
++}

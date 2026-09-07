@@ -122,6 +122,7 @@ type MetadataSource struct {
 - metadata 更新失败不应关闭正常 Agent 数据流；ACK 返回字段级错误。
 - 重连后 Agent 必须重新上报完整快照，而不是只发送增量。
 - session 关闭或租约过期后，Server 将 metadata 标记 stale，不删除最后一次安全值。
+- Agent 在线期间默认每 1 分钟发送协议级 `PING`；Server 返回 `PONG` 并刷新 `last_seen_at`/`expires_at`，所以 metadata 内容不变也不会因 TTL 自然过期而误报 stale。
 
 ## 数据模型
 
