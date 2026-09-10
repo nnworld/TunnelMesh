@@ -23,3 +23,21 @@ func TestStreamOpenPayloadIsTheSharedWireModel(t *testing.T) {
 		t.Fatalf("payload = %s, want %s", payload, want)
 	}
 }
+
+func TestStreamOpenPayloadCarriesUpstreamDomainAndTLSOptions(t *testing.T) {
+	payload, err := json.Marshal(protocol.StreamOpenPayload{
+		Protocol:      "http",
+		TargetHost:    "10.0.0.1",
+		TargetPort:    443,
+		TargetScheme:  "https",
+		HostHeader:    "service.internal.example.com",
+		TLSServerName: "service.internal.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"protocol":"http","target_host":"10.0.0.1","target_port":443,"target_scheme":"https","host_header":"service.internal.example.com","tls_server_name":"service.internal.example.com"}`
+	if string(payload) != want {
+		t.Fatalf("payload = %s, want %s", payload, want)
+	}
+}

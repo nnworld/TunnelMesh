@@ -1,6 +1,8 @@
 package proxy_test
 
 import (
+	"bytes"
+
 	"github.com/tunnelmesh/tunnelmesh/internal/proxy"
 	"net"
 	"testing"
@@ -22,6 +24,109 @@ func TestParseSOCKS5Connect(t *testing.T) {
 		t.Fatalf("request=%+v err=%v", request, err)
 	}
 	_ = net.IPv4(127, 0, 0, 1)
+}
+
+func TestReadSOCKS5Methods(t *testing.T) {
+	methods, err := proxy.ReadSOCKS5Methods(bytes.NewReader([]byte{5, 2, 0, 2}))
+	if err != nil || len(methods) != 2 || methods[0] != 0 || methods[1] != 2 {
+		t.Fatalf("methods=%v err=%v", methods, err)
+	}
+	if _, err := proxy.ReadSOCKS5Methods(bytes.NewReader([]byte{5, 0})); err == nil {
+		t.Fatal("empty method list was accepted")
+	}
+	if _, err := proxy.ReadSOCKS5Methods(bytes.NewReader([]byte{4, 1, 0})); err == nil {
+		t.Fatal("invalid SOCKS version was accepted")
+	}
+}
+
+func TestSOCKS5MethodSelection(t *testing.T) {
+	if !proxy.SupportsSOCKS5NoAuth([]byte{1, 0, 2}) {
+		t.Fatal("no-auth method was not detected")
+	}
+	if proxy.SupportsSOCKS5NoAuth([]byte{1, 2}) {
+		t.Fatal("no-auth was incorrectly detected")
+	}
+	if !proxy.SupportsSOCKS5UsernamePassword([]byte{0, 2}) {
+		t.Fatal("username/password method was not detected")
+	}
+	if proxy.SupportsSOCKS5UsernamePassword([]byte{0, 1}) {
+		t.Fatal("username/password was incorrectly detected")
+	}
+	if got := proxy.EncodeSOCKS5MethodSelection(0xff); !bytes.Equal(got, []byte{5, 0xff}) {
+		t.Fatalf("method selection=%x", got)
+	}
+}
+
+func TestReadSOCKS5UsernamePassword(t *testing.T) {
+	raw := append([]byte{1, 5}, []byte("alice")...)
+	raw = append(raw, 6)
+	raw = append(raw, []byte("secret")...)
+	credentials, err := proxy.ReadSOCKS5UsernamePassword(bytes.NewReader(raw))
+	if err != nil || credentials.Username != "alice" || credentials.Password != "secret" {
+		t.Fatalf("credentials=%+v err=%v", credentials, err)
+	}
+	if _, err := proxy.ReadSOCKS5UsernamePassword(bytes.NewReader([]byte{2, 0, 0})); err == nil {
+		t.Fatal("invalid RFC 1929 version was accepted")
+	}
+	if _, err := proxy.ReadSOCKS5UsernamePassword(bytes.NewReader([]byte{1, 255})); err == nil {
+		t.Fatal("truncated username was accepted")
+	}
+}
+
+func TestEncodeSOCKS5UsernamePasswordReply(t *testing.T) {
+	if got := proxy.EncodeSOCKS5UsernamePasswordReply(true); !bytes.Equal(got, []byte{1, 0}) {
+		t.Fatalf("success reply=%x", got)
+	}
+	if got := proxy.EncodeSOCKS5UsernamePasswordReply(false); !bytes.Equal(got, []byte{1, 1}) {
+		t.Fatalf("failure reply=%x", got)
+	}
+}
+
+func TestReadSOCKS5RequestSupportsAddressTypes(t *testing.T) {
+	requests := []struct {
+		name string
+		raw  []byte
+		host string
+		port int
+	}{
+		{"ipv4", []byte{5, 1, 0, 1, 127, 0, 0, 1, 0x1f, 0x90}, "127.0.0.1", 8080},
+		{"domain", append(append([]byte{5, 1, 0, 3, 11}, []byte("example.com")...), 0, 80), "example.com", 80},
+		{"ipv6", []byte{5, 1, 0, 4, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x53, 0x00, 0x50}, "2001:db8::53", 80},
+	}
+	for _, test := range requests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := proxy.ReadSOCKS5Request(bytes.NewReader(test.raw))
+			if err != nil || request.Command != proxy.SOCKS5Connect || request.Host != test.host || request.Port != test.port {
+				t.Fatalf("request=%+v err=%v", request, err)
+			}
+		})
+	}
+}
+
+func TestReadSOCKS5RequestKeepsUnsupportedCommand(t *testing.T) {
+	request, err := proxy.ReadSOCKS5Request(bytes.NewReader([]byte{5, 3, 0, 1, 127, 0, 0, 1, 0, 80}))
+	if err != nil || request.Command == proxy.SOCKS5Connect || request.Host != "127.0.0.1" || request.Port != 80 {
+		t.Fatalf("request=%+v err=%v", request, err)
+	}
+}
+
+func TestReadSOCKS5RequestRejectsMalformedInput(t *testing.T) {
+	if _, err := proxy.ReadSOCKS5Request(bytes.NewReader([]byte{4, 1, 0, 1, 127, 0, 0, 1, 0, 80})); err == nil {
+		t.Fatal("invalid SOCKS version was accepted")
+	}
+	if _, err := proxy.ReadSOCKS5Request(bytes.NewReader([]byte{5, 1, 1, 1, 127, 0, 0, 1, 0, 80})); err == nil {
+		t.Fatal("invalid reserved byte was accepted")
+	}
+	if _, err := proxy.ReadSOCKS5Request(bytes.NewReader([]byte{5, 1, 0, 3, 0, 0, 80})); err == nil {
+		t.Fatal("empty domain was accepted")
+	}
+}
+
+func TestEncodeSOCKS5Reply(t *testing.T) {
+	want := []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	if got := proxy.EncodeSOCKS5Reply(proxy.SOCKS5ReplySucceeded); !bytes.Equal(got, want) {
+		t.Fatalf("reply=%x want=%x", got, want)
+	}
 }
 
 func TestParseProxyV2LocalTCP4(t *testing.T) {

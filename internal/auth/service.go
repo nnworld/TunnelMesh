@@ -87,7 +87,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (Log
 		return LoginResult{}, errors.New("auth repositories are required")
 	}
 	u, err := s.users.GetByUsername(ctx, strings.TrimSpace(username))
-	if err != nil || u.Disabled || !verifyPassword(password, u.PasswordHash) {
+	if err != nil || u.Disabled || u.DeletedAt != nil || !verifyPassword(password, u.PasswordHash) {
 		return LoginResult{}, ErrInvalidCredentials
 	}
 	plain, err := randomToken(32)
@@ -109,7 +109,7 @@ func (s *AuthService) ValidateToken(ctx context.Context, plain string) (Principa
 		return Principal{}, ErrUnauthenticated
 	}
 	u, err := s.users.Get(ctx, t.UserID)
-	if err != nil || u.Disabled {
+	if err != nil || u.Disabled || u.DeletedAt != nil {
 		return Principal{}, ErrUnauthenticated
 	}
 	return Principal{UserID: u.ID, Username: u.Username, Role: u.Role}, nil

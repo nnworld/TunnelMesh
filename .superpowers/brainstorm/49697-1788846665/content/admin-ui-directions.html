@@ -1,0 +1,23 @@
+<h2>后台管理 UI 方向</h2>
+<p class="subtitle">请选择更接近 TunnelMesh 管理后台的整体布局方向</p>
+
+<div class="cards" data-multiselect>
+  <div class="card" data-choice="control-room" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#0d1b2a;padding:14px;min-height:210px;color:#d9f3ff;font-family:system-ui">
+      <div style="display:flex;gap:10px;height:180px">
+        <div style="width:64px;background:#13283e;border-radius:8px;padding:10px 6px;font-size:9px;line-height:2.4">TM<br>⌂<br>◉<br>⇄<br>⚿<br>⚙</div>
+        <div style="flex:1"><div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:14px"><b>Control room</b><span>中文 | EN</span></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px"><div style="background:#173551;padding:10px;border-radius:6px;font-size:9px">Agents<br><b style="font-size:20px">24</b></div><div style="background:#173551;padding:10px;border-radius:6px;font-size:9px">Tunnels<br><b style="font-size:20px">18</b></div><div style="background:#173551;padding:10px;border-radius:6px;font-size:9px">Health<br><b style="font-size:20px;color:#68e0a2">99.9%</b></div></div><div style="margin-top:9px;height:70px;background:#173551;border-radius:6px;padding:9px;font-size:9px">Traffic & events timeline</div></div>
+      </div>
+    </div>
+    <div class="card-body"><h3>A · Control room</h3><p>深色运维风格，强调实时状态、拓扑和告警，适合管理员高频使用。</p></div>
+  </div>
+
+  <div class="card" data-choice="calm-console" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#f4f7fb;padding:14px;min-height:210px;color:#24324a;font-family:system-ui">
+      <div style="display:flex;gap:10px;height:180px"><div style="width:64px;background:#fff;border:1px solid #e3eaf2;border-radius:8px;padding:10px 6px;font-size:9px;line-height:2.4;color:#55708f">TM<br>Dashboard<br>Agents<br>Routes<br>Tokens<br>Users</div><div style="flex:1"><div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:14px"><b>Dashboard</b><span>Admin ▾</span></div><div style="background:#fff;border:1px solid #e3eaf2;padding:12px;border-radius:8px"><div style="font-size:9px;color:#718198">Overview</div><div style="font-size:23px;font-weight:700;margin:4px 0">Stable & connected</div><div style="display:flex;gap:6px"><span style="background:#e6f7ef;color:#24875a;padding:4px 7px;border-radius:99px;font-size:8px">24 agents online</span><span style="background:#edf3ff;color:#3565b5;padding:4px 7px;border-radius:99px;font-size:8px">18 tunnels</span></div></div><div style="margin-top:9px;height:70px;background:#fff;border:1px solid #e3eaf2;border-radius:8px;padding:9px;font-size:9px">Activity overview</div></div></div>
+    </div>
+    <div class="card-body"><h3>B · Calm console</h3><p>浅色 SaaS 管理台，层次清晰、阅读舒适，适合日常账号和资源管理。</p></div>
+  </div>
+</div>
+
+<div class="section"><h3>本期都会包含</h3><p>中文/英文自动识别与切换、修改密码、管理员添加与管理子账号、统一表格/表单/空状态/错误提示样式。</p></div>

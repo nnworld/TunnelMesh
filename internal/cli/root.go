@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -39,6 +40,7 @@ func NewAgentCommand() *cobra.Command  { return NewAgentRoot() }
 func NewClientCommand() *cobra.Command { return NewClientRoot() }
 
 type rootOptions struct {
+	binaryName                  string
 	configFile                  string
 	mode                        string
 	storage                     string
@@ -46,6 +48,7 @@ type rootOptions struct {
 	registry                    string
 	nodeID                      string
 	bridge                      bool
+	dynamicSuffix               string
 	allowedHosts                []string
 	allowedOrigins              []string
 	allowLegacyConnectionTokens bool
@@ -66,7 +69,7 @@ type rootOptions struct {
 }
 
 func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Command {
-	opts := &rootOptions{}
+	opts := &rootOptions{binaryName: use}
 	root := &cobra.Command{
 		Use:           use,
 		Short:         "TunnelMesh " + strings.TrimPrefix(use, "tunnelmesh-") + " command",
@@ -87,6 +90,7 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	flags.BoolVar(&opts.bridge, "server.tcp_bridge.enabled", false, "enable TCP-over-WebSocket bridge")
 	flags.BoolVar(&opts.bridge, "tcp-bridge", false, "enable TCP-over-WebSocket bridge")
 	flags.Bool("server.tcp_bridge_enabled", false, "enable TCP-over-WebSocket bridge (flat spelling)")
+	flags.StringVar(&opts.dynamicSuffix, "server.dynamic_suffix", "", "DNS suffix for dynamic managed routes")
 	flags.StringSliceVar(&opts.allowedHosts, "security.allowed_hosts", nil, "exact Host values accepted by the Agent WebSocket endpoint")
 	flags.StringSliceVar(&opts.allowedOrigins, "security.allowed_origins", nil, "exact http/https Origin values accepted by Agent WebSocket")
 	flags.BoolVar(&opts.allowLegacyConnectionTokens, "security.allow_legacy_connection_tokens", false, "temporarily accept deprecated management tokens for Agent connections")
@@ -116,7 +120,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix})
 			if err != nil {
 				return err
 			}
@@ -132,6 +136,21 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "database initialization requested for %s\n", cfg.Storage.Driver)
 			return nil
 		}),
+		{
+			Use:   "init-node-id",
+			Short: "generate and persist the cluster node identity",
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				if strings.TrimSpace(opts.configFile) == "" {
+					return errors.New("--config is required")
+				}
+				id, err := config.InitializeNodeID(opts.configFile, config.DefaultNodeIDPath)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "node identity: %s\n", id)
+				return nil
+			},
+		},
 		configCommand(opts, "print-config", "print the effective redacted configuration", func(cmd *cobra.Command, cfg config.Config) error {
 			data, err := cfg.RedactedJSON()
 			if err != nil {
@@ -146,6 +165,29 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 
 func adminCommand(opts *rootOptions) *cobra.Command {
 	admin := &cobra.Command{Use: "admin", Short: "administrator operations"}
+	bootstrap := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "create the first administrator account",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.Load(cmd.Context(), config.ConfigOptions{ConfigFile: opts.configFile, CLI: changedFlags(cmd, opts)})
+			if err != nil {
+				return err
+			}
+			db, err := storage.OpenConfig(cmd.Context(), cfg.Storage)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			creds, err := auth.NewBootstrapService(db).BootstrapAdmin(cmd.Context())
+			if err != nil {
+				return err
+			}
+			// Credentials are deliberately emitted only to the command's output
+			// stream, never logs or HTTP responses.
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "admin username: %s\nadmin password: %s\n", creds.Username, creds.Password)
+			return nil
+		},
+	}
 	regenerate := &cobra.Command{
 		Use:   "regenerate-credentials",
 		Short: "rotate administrator credentials and revoke old sessions",
@@ -174,7 +216,7 @@ func adminCommand(opts *rootOptions) *cobra.Command {
 		},
 	}
 	regenerate.Flags().Bool("confirm", false, "confirm credential rotation")
-	admin.AddCommand(regenerate)
+	admin.AddCommand(bootstrap, regenerate)
 	return admin
 }
 
@@ -189,9 +231,18 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 				nodeID = cfg.Agent.ID
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
-			return agent.RunWebSocketWithHandlerFactory(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token, cfg.Agent.ID, nodeID, 1, agent.NewMetadataCollector(cfg.Agent.Metadata), func(session *agent.Session) agent.SessionFrameHandler {
-				return agent.NewStreamDispatcherWithSender(agent.Dialer{}, nil, session.Send)
-			}, agent.WebSocketRunOptions{})
+			return agent.RunConnectionPool(cmd.Context(), agent.WebSocketPoolOptions{
+				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
+				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
+				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
+				Factory: func(session *agent.Session, _ string) agent.SessionFrameHandler {
+					return agent.NewStreamDispatcherWithSender(agent.Dialer{}, nil, session.Send)
+				},
+				Min: cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
+				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
+				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
+				Cooldown:           cfg.Agent.Connections.Cooldown,
+			})
 		}),
 		configCommand(opts, "register", "register this agent", func(cmd *cobra.Command, cfg config.Config) error {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent registration requested for %s\n", effectiveAgentID(cfg))
@@ -219,7 +270,7 @@ func clientCommands(opts *rootOptions) []*cobra.Command {
 		configCommand(opts, "status", "show local tunnel status", clientShellRun("status")),
 	}
 	forward := &cobra.Command{Use: "forward", Short: "create a local forward"}
-	forward.AddCommand(clientForwardCommand(opts, "tcp"), clientForwardCommand(opts, "udp"), clientForwardCommand(opts, "http"))
+	forward.AddCommand(clientForwardCommand(opts, "tcp"), clientForwardCommand(opts, "udp"), clientForwardCommand(opts, "http"), clientSOCKS5ForwardCommand(opts), clientHTTPProxyForwardCommand(opts))
 	forward.RunE = func(cmd *cobra.Command, _ []string) error {
 		cfg, err := loadClientConfig(cmd, opts)
 		if err != nil {
@@ -337,6 +388,148 @@ func clientForwardCommand(opts *rootOptions, proto string) *cobra.Command {
 	return cmd
 }
 
+func clientSOCKS5ForwardCommand(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{Use: "socks5", Short: "local SOCKS5 CONNECT forward"}
+	var listen, agentID, authMode string
+	var allowRemote bool
+	var authURL string
+	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:0", "local listen address")
+	cmd.Flags().StringVar(&agentID, "agent", "", "Agent identity")
+	cmd.Flags().StringVar(&authMode, "auth", "none", "SOCKS5 auth mode (none or password)")
+	cmd.Flags().BoolVar(&allowRemote, "allow-remote", false, "allow non-loopback listening")
+	cmd.Flags().StringVar(&authURL, "auth-url", "", "remote validation URL")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(cfg.Client.ServerURL) == "" || strings.TrimSpace(cfg.Client.Token) == "" {
+			return fmt.Errorf("socks5 forward requires client.server_url and client.token")
+		}
+		if strings.TrimSpace(agentID) == "" {
+			return fmt.Errorf("socks5 forward requires --agent")
+		}
+		if authMode != "none" && authMode != "password" {
+			return fmt.Errorf("socks5 forward requires --auth none or --auth password")
+		}
+		username := ""
+		password := ""
+		if authMode == "password" {
+			username = os.Getenv("TUNNELMESH_SOCKS5_USERNAME")
+			password = os.Getenv("TUNNELMESH_SOCKS5_PASSWORD")
+			if username == "" || password == "" {
+				return fmt.Errorf("socks5 password auth requires TUNNELMESH_SOCKS5_USERNAME and TUNNELMESH_SOCKS5_PASSWORD")
+			}
+		}
+		var active io.Closer
+		defer func() {
+			if active != nil {
+				_ = active.Close()
+			}
+		}()
+		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+			if active != nil {
+				_ = active.Close()
+				active = nil
+			}
+			forward, err := client.NewSOCKS5Forward(client.NewSessionOpener(session), client.SOCKS5ForwardConfig{
+				ListenAddr:  listen,
+				AgentID:     agentID,
+				AllowRemote: allowRemote,
+				AuthMode:    client.SOCKS5AuthMode(authMode),
+				Username:    username,
+				Password:    password,
+				AuthURL:     authURL,
+			})
+			if err != nil {
+				return err
+			}
+			if err := forward.Start(cmd.Context()); err != nil {
+				return err
+			}
+			active = forward
+			addr := listen
+			if forward.Addr() != nil {
+				addr = forward.Addr().String()
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "socks5 forward %s -> agent %s auth %s\n", addr, agentID, authMode)
+			return nil
+		})
+	}
+	return cmd
+}
+
+func clientHTTPProxyForwardCommand(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{Use: "http-proxy", Short: "local standard HTTP proxy forward"}
+	var listen, agentID, authMode string
+	var allowRemote bool
+	var authURL string
+	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:8080", "local listen address")
+	cmd.Flags().StringVar(&agentID, "agent", "", "Agent identity")
+	cmd.Flags().StringVar(&authMode, "auth", "none", "HTTP proxy auth mode (none or basic)")
+	cmd.Flags().BoolVar(&allowRemote, "allow-remote", false, "allow non-loopback listening")
+	cmd.Flags().StringVar(&authURL, "auth-url", "", "remote validation URL")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg, err := loadClientConfig(cmd, opts)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(cfg.Client.ServerURL) == "" || strings.TrimSpace(cfg.Client.Token) == "" {
+			return fmt.Errorf("http-proxy forward requires client.server_url and client.token")
+		}
+		if strings.TrimSpace(agentID) == "" {
+			return fmt.Errorf("http-proxy forward requires --agent")
+		}
+		if authMode != "none" && authMode != "basic" {
+			return fmt.Errorf("http-proxy forward requires --auth none or --auth basic")
+		}
+		username := ""
+		password := ""
+		if authMode == "basic" {
+			username = os.Getenv("TUNNELMESH_HTTP_PROXY_USERNAME")
+			password = os.Getenv("TUNNELMESH_HTTP_PROXY_PASSWORD")
+			if username == "" || password == "" {
+				return fmt.Errorf("http-proxy basic auth requires TUNNELMESH_HTTP_PROXY_USERNAME and TUNNELMESH_HTTP_PROXY_PASSWORD")
+			}
+		}
+		var active io.Closer
+		defer func() {
+			if active != nil {
+				_ = active.Close()
+			}
+		}()
+		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+			if active != nil {
+				_ = active.Close()
+				active = nil
+			}
+			forward, err := client.NewHTTPProxyForward(client.NewSessionOpener(session), client.HTTPProxyForwardConfig{
+				ListenAddr:  listen,
+				AgentID:     agentID,
+				AllowRemote: allowRemote,
+				AuthMode:    client.HTTPProxyAuthMode(authMode),
+				Username:    username,
+				Password:    password,
+				AuthURL:     authURL,
+			})
+			if err != nil {
+				return err
+			}
+			if err := forward.Start(cmd.Context()); err != nil {
+				return err
+			}
+			active = forward
+			addr := listen
+			if forward.Addr() != nil {
+				addr = forward.Addr().String()
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "http-proxy forward %s -> agent %s auth %s\n", addr, agentID, authMode)
+			return nil
+		})
+	}
+	return cmd
+}
+
 func clientProxyCommand(opts *rootOptions, proto string) *cobra.Command {
 	cmd := &cobra.Command{Use: proto, Short: "raw " + proto + " stdio proxy"}
 	var targetHost, agentID string
@@ -381,6 +574,18 @@ func configCommand(opts *rootOptions, name, short string, run func(*cobra.Comman
 			cfg, err := config.Load(cmd.Context(), config.ConfigOptions{
 				ConfigFile: opts.configFile,
 				CLI:        changedFlags(cmd, opts),
+				NodeIDPath: func() string {
+					if name == "run" {
+						return config.DefaultNodeIDPath
+					}
+					return ""
+				}(),
+				AgentInstanceIDPath: func() string {
+					if name == "run" && opts.binaryName == "tunnelmesh-agent" {
+						return config.DefaultAgentInstanceIDPath
+					}
+					return ""
+				}(),
 			})
 			if err != nil {
 				return err
@@ -458,6 +663,9 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 	}
 	if flags.Changed("server.relay.server_name") {
 		values["server.relay.server_name"] = opts.relayServerName
+	}
+	if flags.Changed("server.dynamic_suffix") {
+		values["server.dynamic_suffix"] = opts.dynamicSuffix
 	}
 	if flags.Changed("server.relay.node_token") {
 		values["server.relay.node_token"] = opts.relayNodeToken

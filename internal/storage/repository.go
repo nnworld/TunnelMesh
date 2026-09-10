@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +19,23 @@ type UserRepository interface {
 	Update(context.Context, User) error
 	Delete(context.Context, string) error
 	List(context.Context, string, int) (Page[User], error)
+}
+
+type AccountStatus string
+
+const (
+	AccountStatusActive  AccountStatus = "active"
+	AccountStatusDeleted AccountStatus = "deleted"
+	AccountStatusAll     AccountStatus = "all"
+)
+
+// AccountUserRepository adds the administrator-facing lifecycle operations
+// without widening the authentication repository contract used by test fakes.
+type AccountUserRepository interface {
+	UserRepository
+	ListChildren(context.Context, AccountStatus, string, int) (Page[User], error)
+	SoftDelete(context.Context, string, time.Time) error
+	Restore(context.Context, string) error
 }
 
 type TokenRepository interface {
@@ -41,6 +59,8 @@ type ServiceTokenRepository interface {
 	GetByHash(context.Context, string) (ServiceToken, error)
 	List(context.Context, ServiceTokenFilter, string, int) (Page[ServiceToken], error)
 	Revoke(context.Context, string, time.Time) error
+	UpdateExpiration(context.Context, string, *time.Time, time.Time) error
+	UpdateScope(context.Context, string, string, time.Time) error
 	TouchLastUsed(context.Context, string, time.Time) error
 	Rotate(context.Context, string, ServiceToken, time.Time) error
 }
@@ -54,6 +74,7 @@ type ServiceTokenSecretRepository interface {
 }
 
 var ErrServiceTokenRevoked = errors.New("service token is already revoked")
+var ErrServiceTokenExpired = errors.New("service token is already expired")
 
 type AgentRepository interface {
 	Create(context.Context, Agent) error
@@ -97,6 +118,16 @@ type AgentMetadataRepository interface {
 	Touch(context.Context, string, int64, time.Time, time.Time) error
 }
 
+// AgentInstanceMetadataRepository adds instance-scoped operations while the
+// legacy repository contract remains usable by existing fakes and callers.
+type AgentInstanceMetadataRepository interface {
+	AgentMetadataRepository
+	GetInstance(context.Context, string, string) (AgentRuntimeMetadata, error)
+	ListInstances(context.Context, string) ([]AgentRuntimeMetadata, error)
+	MarkInstanceStale(context.Context, string, string, int64) error
+	TouchInstance(context.Context, string, string, int64, time.Time, time.Time) error
+}
+
 var ErrRuntimeStatsStaleEpoch = errors.New("runtime stats epoch is stale")
 
 // ErrStaleEpoch is a concise compatibility alias used by callers that share
@@ -120,11 +151,16 @@ type LeaseRepository interface {
 	Renew(context.Context, string, int64, time.Duration) error
 	Release(context.Context, string, int64) error
 	Get(context.Context, string) (AgentLease, error)
+	RegisterConnection(context.Context, AgentLease) (AgentLease, error)
+	RenewConnection(context.Context, string, string, int64, time.Duration) error
+	ReleaseConnection(context.Context, string, string, int64) error
+	ListActiveByAgent(context.Context, string) ([]AgentLease, error)
+	UpdateConnectionStats(context.Context, AgentLease) error
 }
 
 type AuditRepository interface {
 	Create(context.Context, AuditLog) error
-	List(context.Context, string, int) (Page[AuditLog], error)
+	List(context.Context, AuditFilter, string, int) (Page[AuditLog], error)
 }
 
 type IdempotencyRepository interface {
@@ -239,6 +275,16 @@ func newID(prefix string) string {
 	}
 	return prefix + "-" + base64.RawURLEncoding.EncodeToString(b)
 }
+
+// newAgentID uses lowercase hexadecimal so generated Agent IDs can be embedded
+// directly in case-insensitive DNS labels without changing their identity.
+func newAgentID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("agent-%d", time.Now().UnixNano())
+	}
+	return "agent-" + hex.EncodeToString(b)
+}
 func stamp(id string, created, updated time.Time, prefix string) (string, time.Time, time.Time) {
 	if id == "" {
 		id = newID(prefix)
@@ -299,6 +345,34 @@ func decodeCursor(cursor string) string {
 	}
 	return string(b)
 }
+
+// encodeAuditCursor keeps time as the primary pagination key and ID as the
+// deterministic tie-breaker. Audit IDs are random, so an ID-only cursor cannot
+// preserve the newest-first ordering across pages.
+func encodeAuditCursor(createdAt time.Time, id string) string {
+	return encodeCursor(tm(createdAt) + "\x00" + id)
+}
+
+// decodeAuditCursor accepts the composite cursor and remains compatible with
+// cursors issued by older versions that contained only an audit ID.
+func (r *auditRepo) decodeAuditCursor(ctx context.Context, cursor string) (string, string, error) {
+	decoded := decodeCursor(cursor)
+	if decoded == "" {
+		return "", "", nil
+	}
+	if createdAt, id, ok := strings.Cut(decoded, "\x00"); ok {
+		return createdAt, id, nil
+	}
+
+	var createdAt sql.NullString
+	if err := r.db.QueryRowContext(ctx, `SELECT created_at FROM audit_logs WHERE id=?`, decoded).Scan(&createdAt); err != nil {
+		return "", "", fmt.Errorf("invalid audit cursor: %w", err)
+	}
+	if !createdAt.Valid || createdAt.String == "" {
+		return "", "", fmt.Errorf("invalid audit cursor: missing created_at")
+	}
+	return createdAt.String, decoded, nil
+}
 func pageLimit(limit int) int {
 	if limit <= 0 || limit > 500 {
 		return 50
@@ -327,17 +401,19 @@ func (r *userRepo) Create(ctx context.Context, v User) error {
 	if v.Role == "" {
 		v.Role = "user"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), tm(v.CreatedAt), tm(v.UpdatedAt))
+	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.CreatedAt), tm(v.UpdatedAt))
 	return err
 }
 func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
 	var v User
 	var created, updated string
-	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE id=?`
+	var deleted sql.NullString
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE id=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
+	v.DeletedAt = parseTM(deleted)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
 	return v, err
@@ -345,11 +421,13 @@ func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
 func (r *userRepo) GetByUsername(ctx context.Context, n string) (User, error) {
 	var v User
 	var created, updated string
-	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE username=?`
+	var deleted sql.NullString
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE username=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
+	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
+	v.DeletedAt = parseTM(deleted)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
 	return v, err
@@ -358,7 +436,7 @@ func (r *userRepo) Update(ctx context.Context, v User) error {
 	if v.UpdatedAt.IsZero() {
 		v.UpdatedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), tm(v.UpdatedAt), v.ID)
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,deleted_at=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.UpdatedAt), v.ID)
 	return checkAffected(res, err)
 }
 func (r *userRepo) Delete(ctx context.Context, id string) error {
@@ -367,7 +445,7 @@ func (r *userRepo) Delete(ctx context.Context, id string) error {
 }
 func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[User], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users`
+	q := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users`
 	args := []any{}
 	if c := decodeCursor(cursor); c != "" {
 		q += ` WHERE id>?`
@@ -384,9 +462,11 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
 	for rows.Next() {
 		var v User
 		var c, u string
-		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &c, &u); err != nil {
+		var deleted sql.NullString
+		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &c, &u); err != nil {
 			return Page[User]{}, err
 		}
+		v.DeletedAt = parseTM(deleted)
 		v.CreatedAt = parseTime(c)
 		v.UpdatedAt = parseTime(u)
 		out = append(out, v)
@@ -401,6 +481,66 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
 		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
 	}
 	return p, nil
+}
+
+func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, cursor string, limit int) (Page[User], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	conditions := []string{`role='user'`}
+	switch status {
+	case "", AccountStatusActive:
+		conditions = append(conditions, `deleted_at IS NULL`)
+	case AccountStatusDeleted:
+		conditions = append(conditions, `deleted_at IS NOT NULL`)
+	case AccountStatusAll:
+	default:
+		return Page[User]{}, fmt.Errorf("invalid account status %q", status)
+	}
+	args := make([]any, 0, 2)
+	if decoded := decodeCursor(cursor); decoded != "" {
+		conditions = append(conditions, `id>?`)
+		args = append(args, decoded)
+	}
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[User]{}, err
+	}
+	defer rows.Close()
+	page := Page[User]{}
+	for rows.Next() {
+		var user User
+		var deleted sql.NullString
+		var created, updated string
+		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.PasswordHash, &user.Disabled, &deleted, &created, &updated); err != nil {
+			return Page[User]{}, err
+		}
+		user.DeletedAt = parseTM(deleted)
+		user.CreatedAt = parseTime(created)
+		user.UpdatedAt = parseTime(updated)
+		page.Items = append(page.Items, user)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[User]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+	}
+	return page, nil
+}
+
+func (r *userRepo) SoftDelete(ctx context.Context, id string, when time.Time) error {
+	when = timeOrNow(when)
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=CASE WHEN deleted_at IS NULL THEN ? ELSE deleted_at END,disabled=1,updated_at=? WHERE id=?`, tm(when), tm(when), id)
+	return checkAffected(res, err)
+}
+
+func (r *userRepo) Restore(ctx context.Context, id string) error {
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=NULL,disabled=0,updated_at=? WHERE id=?`, tm(now), id)
+	return checkAffected(res, err)
 }
 
 func boolInt(v bool) int {
@@ -609,6 +749,76 @@ func (r *serviceTokenRepo) Revoke(ctx context.Context, id string, when time.Time
 	return fmt.Errorf("revoke service token %q made no state transition", id)
 }
 
+// UpdateExpiration only changes the lifecycle deadline. Revoked and already
+// expired credentials are rejected so an update cannot resurrect them.
+func (r *serviceTokenRepo) UpdateExpiration(ctx context.Context, id string, expiresAt *time.Time, when time.Time) error {
+	when = timeOrNow(when)
+	if r.starter == nil {
+		return updateServiceTokenExpiration(ctx, r.db, r.driver, id, expiresAt, when)
+	}
+	tx, err := r.starter.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := updateServiceTokenExpiration(ctx, tx, r.driver, id, expiresAt, when); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updateServiceTokenExpiration(ctx context.Context, db dbExecutor, driver, id string, expiresAt *time.Time, when time.Time) error {
+	if err := ensureActiveServiceTokenForUpdate(ctx, db, driver, id); err != nil {
+		return err
+	}
+	res, err := db.ExecContext(ctx, `UPDATE service_tokens SET expires_at=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, nullableTime(expiresAt), tm(when), id)
+	return checkAffected(res, err)
+}
+
+// UpdateScope replaces the stored scope while preserving all other credential
+// facts. The service is responsible for merging and validating the new scope.
+func (r *serviceTokenRepo) UpdateScope(ctx context.Context, id string, scope string, when time.Time) error {
+	when = timeOrNow(when)
+	if r.starter == nil {
+		return updateServiceTokenScope(ctx, r.db, r.driver, id, scope, when)
+	}
+	tx, err := r.starter.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := updateServiceTokenScope(ctx, tx, r.driver, id, scope, when); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func updateServiceTokenScope(ctx context.Context, db dbExecutor, driver, id, scope string, when time.Time) error {
+	if err := ensureActiveServiceTokenForUpdate(ctx, db, driver, id); err != nil {
+		return err
+	}
+	res, err := db.ExecContext(ctx, `UPDATE service_tokens SET scope=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, scope, tm(when), id)
+	return checkAffected(res, err)
+}
+
+func ensureActiveServiceTokenForUpdate(ctx context.Context, db dbExecutor, driver, id string) error {
+	query := `SELECT expires_at,revoked_at FROM service_tokens WHERE id=?`
+	if driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+	var expires, revoked sql.NullString
+	if err := db.QueryRowContext(ctx, query, id).Scan(&expires, &revoked); err != nil {
+		return err
+	}
+	if parseTM(revoked) != nil {
+		return ErrServiceTokenRevoked
+	}
+	if current := parseTM(expires); current != nil && !current.After(time.Now().UTC()) {
+		return ErrServiceTokenExpired
+	}
+	return nil
+}
+
 func (r *serviceTokenRepo) TouchLastUsed(ctx context.Context, id string, when time.Time) error {
 	when = timeOrNow(when)
 	res, err := r.db.ExecContext(ctx, `UPDATE service_tokens SET last_used_at=?,updated_at=? WHERE id=?`, tm(when), tm(when), id)
@@ -714,6 +924,9 @@ type agentRepo struct {
 }
 
 func (r *agentRepo) Create(ctx context.Context, v Agent) error {
+	if v.ID == "" {
+		v.ID = newAgentID()
+	}
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "agent")
 	if v.Capabilities == "" {
 		v.Capabilities = "{}"
@@ -1057,12 +1270,30 @@ type agentMetadataRepo struct {
 	driver string
 }
 
+type metadataScanner interface{ Scan(dest ...any) error }
+
+func scanAgentMetadata(row metadataScanner) (AgentRuntimeMetadata, error) {
+	var v AgentRuntimeMetadata
+	var reported, seen, exp, updated sql.NullString
+	var stale int
+	err := row.Scan(&v.AgentID, &v.InstanceID, &v.NodeID, &v.Epoch, &v.Revision, &v.Metadata, &reported, &seen, &exp, &stale, &updated)
+	v.ReportedAt = parseTime(reported.String)
+	v.LastSeenAt = parseTime(seen.String)
+	v.ExpiresAt = parseTM(exp)
+	v.Stale = stale != 0
+	v.UpdatedAt = parseTime(updated.String)
+	return v, err
+}
+
 func (r *agentMetadataRepo) Upsert(ctx context.Context, v AgentRuntimeMetadata) error {
 	if v.AgentID == "" || v.NodeID == "" || v.Epoch <= 0 || v.Revision < 0 {
 		return errors.New("invalid runtime metadata identity")
 	}
 	if v.Metadata == "" {
 		v.Metadata = "{}"
+	}
+	if v.InstanceID == "" {
+		v.InstanceID = "legacy"
 	}
 	now := time.Now().UTC()
 	if v.ReportedAt.IsZero() {
@@ -1079,14 +1310,14 @@ func (r *agentMetadataRepo) Upsert(ctx context.Context, v AgentRuntimeMetadata) 
 		return err
 	}
 	defer tx.Rollback()
-	selectSQL := `SELECT epoch,revision FROM agent_runtime_metadata WHERE agent_id=?`
+	selectSQL := `SELECT epoch,revision FROM agent_instance_metadata WHERE agent_id=? AND instance_id=?`
 	if r.driver == DriverMySQL {
 		selectSQL += ` FOR UPDATE`
 	}
 	var epoch, revision int64
-	err = tx.QueryRowContext(ctx, selectSQL, v.AgentID).Scan(&epoch, &revision)
+	err = tx.QueryRowContext(ctx, selectSQL, v.AgentID, v.InstanceID).Scan(&epoch, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
-		_, err = tx.ExecContext(ctx, `INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, v.AgentID, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt))
+		_, err = tx.ExecContext(ctx, `INSERT INTO agent_instance_metadata(agent_id,instance_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, v.AgentID, v.InstanceID, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt))
 		if err != nil {
 			return err
 		}
@@ -1101,33 +1332,28 @@ func (r *agentMetadataRepo) Upsert(ctx context.Context, v AgentRuntimeMetadata) 
 	if v.Epoch == epoch && v.Revision == revision {
 		return tx.Commit()
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE agent_runtime_metadata SET node_id=?,epoch=?,revision=?,metadata=?,reported_at=?,last_seen_at=?,expires_at=?,stale=?,updated_at=? WHERE agent_id=?`, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt), v.AgentID)
+	_, err = tx.ExecContext(ctx, `UPDATE agent_instance_metadata SET node_id=?,epoch=?,revision=?,metadata=?,reported_at=?,last_seen_at=?,expires_at=?,stale=?,updated_at=? WHERE agent_id=? AND instance_id=?`, v.NodeID, v.Epoch, v.Revision, v.Metadata, tm(v.ReportedAt), tm(v.LastSeenAt), nullableTime(v.ExpiresAt), boolInt(v.Stale), tm(v.UpdatedAt), v.AgentID, v.InstanceID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 func (r *agentMetadataRepo) Get(ctx context.Context, id string) (AgentRuntimeMetadata, error) {
-	var v AgentRuntimeMetadata
-	var reported, seen, exp, updated sql.NullString
-	var stale int
-	err := r.db.QueryRowContext(ctx, `SELECT agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_runtime_metadata WHERE agent_id=?`, id).Scan(&v.AgentID, &v.NodeID, &v.Epoch, &v.Revision, &v.Metadata, &reported, &seen, &exp, &stale, &updated)
-	v.ReportedAt = parseTime(reported.String)
-	v.LastSeenAt = parseTime(seen.String)
-	v.ExpiresAt = parseTM(exp)
-	v.Stale = stale != 0
-	v.UpdatedAt = parseTime(updated.String)
-	return v, err
+	return scanAgentMetadata(r.db.QueryRowContext(ctx, `SELECT agent_id,instance_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_instance_metadata WHERE agent_id=? ORDER BY last_seen_at DESC LIMIT 1`, id))
+}
+func (r *agentMetadataRepo) GetInstance(ctx context.Context, agentID, instanceID string) (AgentRuntimeMetadata, error) {
+	return scanAgentMetadata(r.db.QueryRowContext(ctx, `SELECT agent_id,instance_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_instance_metadata WHERE agent_id=? AND instance_id=?`, agentID, instanceID))
 }
 func (r *agentMetadataRepo) List(ctx context.Context, cursor string, limit int) (Page[AgentRuntimeMetadata], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_runtime_metadata`
+	q := `SELECT agent_id,instance_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_instance_metadata`
 	args := []any{}
 	if c := decodeCursor(cursor); c != "" {
-		q += ` WHERE agent_id>?`
-		args = append(args, c)
+		agentID, instanceID := splitMetadataCursor(c)
+		q += ` WHERE agent_id>? OR (agent_id=? AND instance_id>?)`
+		args = append(args, agentID, agentID, instanceID)
 	}
-	q += ` ORDER BY agent_id LIMIT ?`
+	q += ` ORDER BY agent_id,instance_id LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1136,13 +1362,10 @@ func (r *agentMetadataRepo) List(ctx context.Context, cursor string, limit int) 
 	defer rows.Close()
 	page := Page[AgentRuntimeMetadata]{}
 	for rows.Next() {
-		var v AgentRuntimeMetadata
-		var reported, seen, exp, updated sql.NullString
-		var stale int
-		if err := rows.Scan(&v.AgentID, &v.NodeID, &v.Epoch, &v.Revision, &v.Metadata, &reported, &seen, &exp, &stale, &updated); err != nil {
+		v, err := scanAgentMetadata(rows)
+		if err != nil {
 			return Page[AgentRuntimeMetadata]{}, err
 		}
-		v.ReportedAt, v.LastSeenAt, v.ExpiresAt, v.Stale, v.UpdatedAt = parseTime(reported.String), parseTime(seen.String), parseTM(exp), stale != 0, parseTime(updated.String)
 		page.Items = append(page.Items, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -1151,12 +1374,32 @@ func (r *agentMetadataRepo) List(ctx context.Context, cursor string, limit int) 
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
 		page.HasMore = true
-		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].AgentID)
+		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].AgentID + "\x00" + page.Items[len(page.Items)-1].InstanceID)
 	}
 	return page, nil
 }
+func (r *agentMetadataRepo) ListInstances(ctx context.Context, agentID string) ([]AgentRuntimeMetadata, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT agent_id,instance_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at FROM agent_instance_metadata WHERE agent_id=? ORDER BY instance_id`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentRuntimeMetadata
+	for rows.Next() {
+		v, err := scanAgentMetadata(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
 func (r *agentMetadataRepo) MarkStale(ctx context.Context, id string, epoch int64) error {
-	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_metadata SET stale=1,updated_at=? WHERE agent_id=? AND epoch<=?`, tm(time.Now().UTC()), id, epoch)
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_instance_metadata SET stale=1,updated_at=? WHERE agent_id=? AND epoch<=?`, tm(time.Now().UTC()), id, epoch)
+	return checkAffected(res, err)
+}
+func (r *agentMetadataRepo) MarkInstanceStale(ctx context.Context, agentID, instanceID string, epoch int64) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_instance_metadata SET stale=1,updated_at=? WHERE agent_id=? AND instance_id=? AND epoch<=?`, tm(time.Now().UTC()), agentID, instanceID, epoch)
 	return checkAffected(res, err)
 }
 func (r *agentMetadataRepo) Touch(ctx context.Context, id string, epoch int64, lastSeenAt, expiresAt time.Time) error {
@@ -1166,8 +1409,21 @@ func (r *agentMetadataRepo) Touch(ctx context.Context, id string, epoch int64, l
 	if lastSeenAt.IsZero() {
 		lastSeenAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_metadata SET last_seen_at=?,expires_at=?,stale=0,updated_at=? WHERE agent_id=? AND epoch=?`, tm(lastSeenAt), tm(expiresAt), tm(time.Now().UTC()), id, epoch)
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_instance_metadata SET last_seen_at=?,expires_at=?,stale=0,updated_at=? WHERE agent_id=? AND epoch=?`, tm(lastSeenAt), tm(expiresAt), tm(time.Now().UTC()), id, epoch)
 	return checkAffected(res, err)
+}
+func (r *agentMetadataRepo) TouchInstance(ctx context.Context, agentID, instanceID string, epoch int64, lastSeenAt, expiresAt time.Time) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_instance_metadata SET last_seen_at=?,expires_at=?,stale=0,updated_at=? WHERE agent_id=? AND instance_id=? AND epoch=?`, tm(lastSeenAt), tm(expiresAt), tm(time.Now().UTC()), agentID, instanceID, epoch)
+	return checkAffected(res, err)
+}
+
+func splitMetadataCursor(cursor string) (string, string) {
+	for i := 0; i < len(cursor); i++ {
+		if cursor[i] == 0 {
+			return cursor[:i], cursor[i+1:]
+		}
+	}
+	return cursor, ""
 }
 
 type agentRuntimeStatsRepo struct{ db *sql.DB }
@@ -1191,7 +1447,7 @@ func (r *agentRuntimeStatsRepo) Append(ctx context.Context, v AgentRuntimeStats)
 	// INSERT ... SELECT makes the lease fact and history write one database
 	// statement, so a takeover cannot race between a process-side check and
 	// the insert. The statement is supported by both SQLite and MySQL.
-	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_runtime_stats(id,agent_id,node_id,epoch,window_start,window_end,connections,active_streams,bytes_in,bytes_out,heartbeat_total,heartbeat_success,heartbeat_rtt_p50_us,heartbeat_rtt_p95_us,reconnects,stream_errors,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM agent_runtime_leases WHERE agent_id=? AND node_id=? AND epoch=?`, v.ID, v.AgentID, v.NodeID, v.Epoch, tm(v.WindowStart), tm(v.WindowEnd), v.Connections, v.ActiveStreams, v.BytesIn, v.BytesOut, v.HeartbeatTotal, v.HeartbeatSuccess, v.HeartbeatRTTP50.Microseconds(), v.HeartbeatRTTP95.Microseconds(), v.Reconnects, v.StreamErrors, tm(v.CreatedAt), v.AgentID, v.NodeID, v.Epoch)
+	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_runtime_stats(id,agent_id,node_id,epoch,window_start,window_end,connections,active_streams,bytes_in,bytes_out,heartbeat_total,heartbeat_success,heartbeat_rtt_p50_us,heartbeat_rtt_p95_us,reconnects,stream_errors,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM agent_connection_leases WHERE agent_id=? AND node_id=? AND epoch=? LIMIT 1`, v.ID, v.AgentID, v.NodeID, v.Epoch, tm(v.WindowStart), tm(v.WindowEnd), v.Connections, v.ActiveStreams, v.BytesIn, v.BytesOut, v.HeartbeatTotal, v.HeartbeatSuccess, v.HeartbeatRTTP50.Microseconds(), v.HeartbeatRTTP95.Microseconds(), v.Reconnects, v.StreamErrors, tm(v.CreatedAt), v.AgentID, v.NodeID, v.Epoch)
 	if err != nil {
 		return err
 	}
@@ -1277,7 +1533,7 @@ func (r *agentProbeResultRepo) Create(ctx context.Context, v AgentProbeResult) e
 	if v.ObservedAt.IsZero() {
 		v.ObservedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_probe_results(probe_id,agent_id,node_id,epoch,kind,result,error_class,duration_us,observed_at) SELECT ?,?,?,?,?,?,?,?,? FROM agent_runtime_leases WHERE agent_id=? AND node_id=? AND epoch=?`, v.ProbeID, v.AgentID, v.NodeID, v.Epoch, v.Kind, v.Result, v.ErrorClass, v.Duration.Microseconds(), tm(v.ObservedAt), v.AgentID, v.NodeID, v.Epoch)
+	res, err := r.db.ExecContext(ctx, `INSERT INTO agent_probe_results(probe_id,agent_id,node_id,epoch,kind,result,error_class,duration_us,observed_at) SELECT ?,?,?,?,?,?,?,?,? FROM agent_connection_leases WHERE agent_id=? AND node_id=? AND epoch=? LIMIT 1`, v.ProbeID, v.AgentID, v.NodeID, v.Epoch, v.Kind, v.Result, v.ErrorClass, v.Duration.Microseconds(), tm(v.ObservedAt), v.AgentID, v.NodeID, v.Epoch)
 	if err != nil {
 		return err
 	}
@@ -1346,40 +1602,76 @@ type leaseRepo struct {
 	driver string
 }
 
+// Acquire preserves the legacy one-connection lease API by mapping it to the
+// deterministic "legacy" connection. New code must use RegisterConnection.
 func (r *leaseRepo) Acquire(ctx context.Context, v AgentLease) (AgentLease, error) {
+	v.ConnectionID = "legacy"
+	v.ConnectionEpoch = 0
+	return r.RegisterConnection(ctx, v)
+}
+
+func (r *leaseRepo) RegisterConnection(ctx context.Context, v AgentLease) (AgentLease, error) {
+	if r == nil || r.db == nil || v.AgentID == "" || v.NodeID == "" {
+		return AgentLease{}, errors.New("invalid agent connection lease")
+	}
+	if v.ConnectionID == "" {
+		v.ConnectionID = "legacy"
+	}
+	if v.ServerNodeID == "" {
+		v.ServerNodeID = v.NodeID
+	}
+	if v.HealthScore == 0 {
+		v.HealthScore = 100
+	}
 	if v.TTL <= 0 {
 		v.TTL = time.Minute
 	}
-	// MySQL locks the current lease row while deciding takeover. Other drivers
-	// use an epoch compare-and-swap below; this keeps SQLite portable while
-	// preventing two concurrent expired-lease owners from publishing one epoch.
+	// MySQL locks the current connection row while deciding replacement. The
+	// compare-and-set keeps SQLite portable and prevents two owners publishing
+	// the same connection epoch.
 	for attempt := 0; attempt < 8; attempt++ {
 		now := time.Now().UTC()
 		exp := now.Add(v.TTL)
+		autoEpoch := v.ConnectionEpoch <= 0
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return AgentLease{}, err
 		}
-		var epoch int64
-		var oldNode string
-		var oldExp sql.NullString
-		selectSQL := `SELECT epoch,node_id,expires_at FROM agent_runtime_leases WHERE agent_id=?`
+		var oldEpoch int64
+		var oldExpires string
+		selectSQL := `SELECT connection_epoch,expires_at FROM agent_connection_leases WHERE agent_id=? AND connection_id=?`
 		if r.driver == DriverMySQL {
 			selectSQL += ` FOR UPDATE`
 		}
-		queryErr := tx.QueryRowContext(ctx, selectSQL, v.AgentID).Scan(&epoch, &oldNode, &oldExp)
+		queryErr := tx.QueryRowContext(ctx, selectSQL, v.AgentID, v.ConnectionID).Scan(&oldEpoch, &oldExpires)
 		if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
 			_ = tx.Rollback()
 			return AgentLease{}, queryErr
 		}
 		if queryErr == nil {
-			active := oldExp.Valid && parseTime(oldExp.String).After(now)
-			if active && oldNode != v.NodeID {
+			if autoEpoch && parseTime(oldExpires).After(now) {
 				_ = tx.Rollback()
-				return AgentLease{}, fmt.Errorf("agent %s lease is held by %s", v.AgentID, oldNode)
+				return AgentLease{}, fmt.Errorf("agent %s connection %s lease is held by another owner", v.AgentID, v.ConnectionID)
 			}
-			newEpoch := epoch + 1
-			res, updateErr := tx.ExecContext(ctx, `UPDATE agent_runtime_leases SET node_id=?,epoch=?,acquired_at=?,expires_at=?,updated_at=? WHERE agent_id=? AND epoch=?`, v.NodeID, newEpoch, tm(now), tm(exp), tm(now), v.AgentID, epoch)
+			if v.ConnectionEpoch <= 0 {
+				v.ConnectionEpoch = oldEpoch + 1
+			}
+			if v.Epoch <= 0 {
+				v.Epoch = v.ConnectionEpoch
+			}
+			if oldEpoch >= v.ConnectionEpoch {
+				_ = tx.Rollback()
+				return AgentLease{}, ErrStaleEpoch
+			}
+			updateSQL := `UPDATE agent_connection_leases SET node_id=?,instance_id=?,server_node_id=?,epoch=?,connection_epoch=?,active_streams=?,health_score=?,acquired_at=?,expires_at=?,updated_at=? WHERE agent_id=? AND connection_id=? AND connection_epoch=?`
+			updateArgs := []any{v.NodeID, v.InstanceID, v.ServerNodeID, v.Epoch, v.ConnectionEpoch, v.ActiveStreams, v.HealthScore, tm(now), tm(exp), tm(now), v.AgentID, v.ConnectionID, oldEpoch}
+			if autoEpoch {
+				// Legacy takeover is only allowed after expiry. Explicit epochs
+				// may replace an active connection to fence a stale process.
+				updateSQL += ` AND expires_at<=?`
+				updateArgs = append(updateArgs, tm(now))
+			}
+			res, updateErr := tx.ExecContext(ctx, updateSQL, updateArgs...)
 			if updateErr != nil {
 				_ = tx.Rollback()
 				return AgentLease{}, updateErr
@@ -1397,11 +1689,17 @@ func (r *leaseRepo) Acquire(ctx context.Context, v AgentLease) (AgentLease, erro
 			if err = tx.Commit(); err != nil {
 				return AgentLease{}, err
 			}
-			v.Epoch, v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = newEpoch, now, exp, now
+			v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = now, exp, now
 			return v, nil
 		}
 
-		_, insertErr := tx.ExecContext(ctx, `INSERT INTO agent_runtime_leases(agent_id,node_id,epoch,acquired_at,expires_at,updated_at) VALUES(?,?,?,?,?,?)`, v.AgentID, v.NodeID, 1, tm(now), tm(exp), tm(now))
+		if v.ConnectionEpoch <= 0 {
+			v.ConnectionEpoch = 1
+		}
+		if v.Epoch <= 0 {
+			v.Epoch = v.ConnectionEpoch
+		}
+		_, insertErr := tx.ExecContext(ctx, `INSERT INTO agent_connection_leases(agent_id,connection_id,node_id,instance_id,server_node_id,epoch,connection_epoch,active_streams,health_score,acquired_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, v.AgentID, v.ConnectionID, v.NodeID, v.InstanceID, v.ServerNodeID, v.Epoch, v.ConnectionEpoch, v.ActiveStreams, v.HealthScore, tm(now), tm(exp), tm(now))
 		if insertErr != nil {
 			_ = tx.Rollback()
 			if isDuplicateError(insertErr) {
@@ -1413,10 +1711,10 @@ func (r *leaseRepo) Acquire(ctx context.Context, v AgentLease) (AgentLease, erro
 		if err = tx.Commit(); err != nil {
 			return AgentLease{}, err
 		}
-		v.Epoch, v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = 1, now, exp, now
+		v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = now, exp, now
 		return v, nil
 	}
-	return AgentLease{}, errors.New("lease acquisition contention exceeded retry budget")
+	return AgentLease{}, errors.New("connection lease registration contention exceeded retry budget")
 }
 
 func isDuplicateError(err error) bool {
@@ -1427,28 +1725,61 @@ func isDuplicateError(err error) bool {
 	return strings.Contains(s, "unique constraint") || strings.Contains(s, "duplicate") || strings.Contains(s, "already exists")
 }
 func (r *leaseRepo) Renew(ctx context.Context, agentID string, epoch int64, ttl time.Duration) error {
+	return r.RenewConnection(ctx, agentID, "legacy", epoch, ttl)
+}
+func (r *leaseRepo) RenewConnection(ctx context.Context, agentID, connectionID string, epoch int64, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
 	now := time.Now().UTC()
-	res, err := r.db.ExecContext(ctx, `UPDATE agent_runtime_leases SET expires_at=?,updated_at=? WHERE agent_id=? AND epoch=? AND expires_at>?`, tm(now.Add(ttl)), tm(now), agentID, epoch, tm(now))
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_connection_leases SET expires_at=?,updated_at=? WHERE agent_id=? AND connection_id=? AND connection_epoch=? AND expires_at>?`, tm(now.Add(ttl)), tm(now), agentID, connectionID, epoch, tm(now))
 	return checkAffected(res, err)
 }
 func (r *leaseRepo) Release(ctx context.Context, agentID string, epoch int64) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM agent_runtime_leases WHERE agent_id=? AND epoch=?`, agentID, epoch)
+	return r.ReleaseConnection(ctx, agentID, "legacy", epoch)
+}
+func (r *leaseRepo) ReleaseConnection(ctx context.Context, agentID, connectionID string, epoch int64) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM agent_connection_leases WHERE agent_id=? AND connection_id=? AND connection_epoch=?`, agentID, connectionID, epoch)
 	return checkAffected(res, err)
 }
 func (r *leaseRepo) Get(ctx context.Context, agentID string) (AgentLease, error) {
 	var v AgentLease
 	var acquired, exp, updated string
-	err := r.db.QueryRowContext(ctx, `SELECT agent_id,node_id,epoch,acquired_at,expires_at,updated_at FROM agent_runtime_leases WHERE agent_id=?`, agentID).Scan(&v.AgentID, &v.NodeID, &v.Epoch, &acquired, &exp, &updated)
-	v.AcquiredAt = parseTime(acquired)
-	v.ExpiresAt = parseTime(exp)
-	v.UpdatedAt = parseTime(updated)
+	err := r.db.QueryRowContext(ctx, `SELECT agent_id,connection_id,node_id,instance_id,server_node_id,epoch,connection_epoch,active_streams,health_score,acquired_at,expires_at,updated_at FROM agent_connection_leases WHERE agent_id=? ORDER BY connection_id`, agentID).Scan(&v.AgentID, &v.ConnectionID, &v.NodeID, &v.InstanceID, &v.ServerNodeID, &v.Epoch, &v.ConnectionEpoch, &v.ActiveStreams, &v.HealthScore, &acquired, &exp, &updated)
+	if err != nil {
+		return AgentLease{}, err
+	}
+	v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = parseTime(acquired), parseTime(exp), parseTime(updated)
 	if !v.ExpiresAt.IsZero() {
 		v.TTL = time.Until(v.ExpiresAt)
 	}
-	return v, err
+	return v, nil
+}
+func (r *leaseRepo) ListActiveByAgent(ctx context.Context, agentID string) ([]AgentLease, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT agent_id,connection_id,node_id,instance_id,server_node_id,epoch,connection_epoch,active_streams,health_score,acquired_at,expires_at,updated_at FROM agent_connection_leases WHERE agent_id=? AND expires_at>? ORDER BY connection_id`, agentID, tm(time.Now().UTC()))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var leases []AgentLease
+	for rows.Next() {
+		var v AgentLease
+		var acquired, exp, updated string
+		if err := rows.Scan(&v.AgentID, &v.ConnectionID, &v.NodeID, &v.InstanceID, &v.ServerNodeID, &v.Epoch, &v.ConnectionEpoch, &v.ActiveStreams, &v.HealthScore, &acquired, &exp, &updated); err != nil {
+			return nil, err
+		}
+		v.AcquiredAt, v.ExpiresAt, v.UpdatedAt = parseTime(acquired), parseTime(exp), parseTime(updated)
+		if !v.ExpiresAt.IsZero() {
+			v.TTL = time.Until(v.ExpiresAt)
+		}
+		leases = append(leases, v)
+	}
+	return leases, rows.Err()
+}
+func (r *leaseRepo) UpdateConnectionStats(ctx context.Context, v AgentLease) error {
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `UPDATE agent_connection_leases SET active_streams=?,health_score=?,updated_at=? WHERE agent_id=? AND connection_id=? AND connection_epoch=? AND expires_at>?`, v.ActiveStreams, v.HealthScore, tm(now), v.AgentID, v.ConnectionID, v.ConnectionEpoch, tm(now))
+	return checkAffected(res, err)
 }
 
 type auditRepo struct{ db dbExecutor }
@@ -1461,15 +1792,47 @@ func (r *auditRepo) Create(ctx context.Context, v AuditLog) error {
 	_, err := r.db.ExecContext(ctx, `INSERT INTO audit_logs(id,actor_user_id,action,resource_type,resource_id,details,created_at) VALUES(?,?,?,?,?,?,?)`, v.ID, nullableString(v.ActorUserID), v.Action, v.ResourceType, nullableString(v.ResourceID), v.Details, tm(v.CreatedAt))
 	return err
 }
-func (r *auditRepo) List(ctx context.Context, cursor string, limit int) (Page[AuditLog], error) {
+func (r *auditRepo) List(ctx context.Context, filter AuditFilter, cursor string, limit int) (Page[AuditLog], error) {
 	cursor, limit = pageArgs(cursor, limit)
 	q := `SELECT id,actor_user_id,action,resource_type,resource_id,details,created_at FROM audit_logs`
 	args := []any{}
-	if c := decodeCursor(cursor); c != "" {
-		q += ` WHERE id>?`
-		args = append(args, c)
+	conditions := []string{}
+	if filter.ActorUserID != "" {
+		conditions = append(conditions, "actor_user_id=?")
+		args = append(args, filter.ActorUserID)
 	}
-	q += ` ORDER BY id LIMIT ?`
+	if filter.Action != "" {
+		conditions = append(conditions, "action=?")
+		args = append(args, filter.Action)
+	}
+	if filter.ResourceType != "" {
+		conditions = append(conditions, "resource_type=?")
+		args = append(args, filter.ResourceType)
+	}
+	if filter.ResourceID != "" {
+		conditions = append(conditions, "resource_id=?")
+		args = append(args, filter.ResourceID)
+	}
+	if filter.CreatedFrom != nil {
+		conditions = append(conditions, "created_at>=?")
+		args = append(args, tm(*filter.CreatedFrom))
+	}
+	if filter.CreatedTo != nil {
+		conditions = append(conditions, "created_at<=?")
+		args = append(args, tm(*filter.CreatedTo))
+	}
+	cursorCreatedAt, cursorID, err := r.decodeAuditCursor(ctx, cursor)
+	if err != nil {
+		return Page[AuditLog]{}, err
+	}
+	if cursorID != "" {
+		conditions = append(conditions, `(created_at<? OR (created_at=? AND id<?))`)
+		args = append(args, cursorCreatedAt, cursorCreatedAt, cursorID)
+	}
+	if len(conditions) > 0 {
+		q += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	q += ` ORDER BY created_at DESC,id DESC LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1502,7 +1865,8 @@ func (r *auditRepo) List(ctx context.Context, cursor string, limit int) (Page[Au
 	if len(out) > limit {
 		p.Items = out[:limit]
 		p.HasMore = true
-		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
+		last := p.Items[len(p.Items)-1]
+		p.NextCursor = encodeAuditCursor(last.CreatedAt, last.ID)
 	}
 	return p, nil
 }

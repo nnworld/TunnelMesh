@@ -322,6 +322,13 @@ func (f *HTTPForward) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tunnel unavailable", http.StatusBadGateway)
 		return
 	}
+	forwardHTTP(w, r, stream)
+}
+
+// forwardHTTP writes one HTTP request to a logical stream and copies the
+// response back to the local client. It is shared by fixed-target forwards and
+// the standard HTTP proxy so upgrade and error behavior cannot drift.
+func forwardHTTP(w http.ResponseWriter, r *http.Request, stream io.ReadWriteCloser) {
 	defer stream.Close()
 	// The local request is serialized directly so upgrades and arbitrary HTTP
 	// headers remain transparent to the remote HTTP service.

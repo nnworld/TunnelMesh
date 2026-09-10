@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -46,12 +47,147 @@ func ParseHTTPConnect(payload []byte) (ConnectRequest, error) {
 
 type SOCKS5Command byte
 
-const SOCKS5Connect SOCKS5Command = 1
+const (
+	SOCKS5Connect SOCKS5Command = 1
+)
+
+const (
+	SOCKS5MethodNoAuth           byte = 0x00
+	SOCKS5MethodUsernamePassword byte = 0x02
+)
+
+type SOCKS5Reply byte
+
+const (
+	SOCKS5ReplySucceeded            SOCKS5Reply = 0x00
+	SOCKS5ReplyGeneralFailure       SOCKS5Reply = 0x01
+	SOCKS5ReplyConnectionNotAllowed SOCKS5Reply = 0x02
+	SOCKS5ReplyCommandUnsupported   SOCKS5Reply = 0x07
+)
+
+type SOCKS5Credentials struct {
+	Username string
+	Password string
+}
 
 type SOCKS5Request struct {
 	Command SOCKS5Command
 	Host    string
 	Port    int
+}
+
+func ReadSOCKS5Methods(r io.Reader) ([]byte, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, ErrMalformedHandshake
+	}
+	if header[0] != 5 || header[1] == 0 {
+		return nil, ErrMalformedHandshake
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(r, methods); err != nil {
+		return nil, ErrMalformedHandshake
+	}
+	return methods, nil
+}
+
+func SupportsSOCKS5NoAuth(methods []byte) bool {
+	return supportsSOCKS5Method(methods, SOCKS5MethodNoAuth)
+}
+
+func SupportsSOCKS5UsernamePassword(methods []byte) bool {
+	return supportsSOCKS5Method(methods, SOCKS5MethodUsernamePassword)
+}
+
+func supportsSOCKS5Method(methods []byte, method byte) bool {
+	for _, offered := range methods {
+		if offered == method {
+			return true
+		}
+	}
+	return false
+}
+
+func EncodeSOCKS5MethodSelection(method byte) []byte {
+	return []byte{5, method}
+}
+
+func ReadSOCKS5UsernamePassword(r io.Reader) (SOCKS5Credentials, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(r, header); err != nil || header[0] != 1 {
+		return SOCKS5Credentials{}, ErrMalformedHandshake
+	}
+	username := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(r, username); err != nil {
+		return SOCKS5Credentials{}, ErrMalformedHandshake
+	}
+	length := make([]byte, 1)
+	if _, err := io.ReadFull(r, length); err != nil {
+		return SOCKS5Credentials{}, ErrMalformedHandshake
+	}
+	password := make([]byte, int(length[0]))
+	if _, err := io.ReadFull(r, password); err != nil {
+		return SOCKS5Credentials{}, ErrMalformedHandshake
+	}
+	return SOCKS5Credentials{Username: string(username), Password: string(password)}, nil
+}
+
+func EncodeSOCKS5UsernamePasswordReply(success bool) []byte {
+	status := byte(1)
+	if success {
+		status = 0
+	}
+	return []byte{1, status}
+}
+
+func ReadSOCKS5Request(r io.Reader) (SOCKS5Request, error) {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return SOCKS5Request{}, ErrMalformedHandshake
+	}
+	if header[0] != 5 || header[2] != 0 {
+		return SOCKS5Request{}, ErrMalformedHandshake
+	}
+	var host string
+	switch header[3] {
+	case 1:
+		address := make([]byte, net.IPv4len)
+		if _, err := io.ReadFull(r, address); err != nil {
+			return SOCKS5Request{}, ErrMalformedHandshake
+		}
+		host = net.IP(address).String()
+	case 3:
+		length := make([]byte, 1)
+		if _, err := io.ReadFull(r, length); err != nil || length[0] == 0 {
+			return SOCKS5Request{}, ErrMalformedHandshake
+		}
+		address := make([]byte, int(length[0]))
+		if _, err := io.ReadFull(r, address); err != nil {
+			return SOCKS5Request{}, ErrMalformedHandshake
+		}
+		host = string(address)
+	case 4:
+		address := make([]byte, net.IPv6len)
+		if _, err := io.ReadFull(r, address); err != nil {
+			return SOCKS5Request{}, ErrMalformedHandshake
+		}
+		host = net.IP(address).String()
+	default:
+		return SOCKS5Request{}, ErrMalformedHandshake
+	}
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(r, portBytes); err != nil {
+		return SOCKS5Request{}, ErrMalformedHandshake
+	}
+	port := int(binary.BigEndian.Uint16(portBytes))
+	if port < 1 {
+		return SOCKS5Request{}, ErrMalformedHandshake
+	}
+	return SOCKS5Request{Command: SOCKS5Command(header[1]), Host: host, Port: port}, nil
+}
+
+func EncodeSOCKS5Reply(reply SOCKS5Reply) []byte {
+	return []byte{5, byte(reply), 0, 1, 0, 0, 0, 0, 0, 0}
 }
 
 func ParseSOCKS5Connect(payload []byte) (SOCKS5Request, error) {

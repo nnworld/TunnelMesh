@@ -1,2 +1,6 @@
-<template><el-container><el-header>TunnelMesh Admin <el-button v-if="auth.user" link @click="auth.logout(); router.push('/login')">Logout</el-button></el-header><el-container v-if="auth.user"><el-aside width="210px"><el-menu router><el-menu-item index="/">Dashboard</el-menu-item><el-menu-item index="/agents">Agents</el-menu-item><el-menu-item index="/routes">Routes</el-menu-item><el-menu-item index="/tunnels">Tunnels</el-menu-item><el-menu-item index="/tokens">Tokens</el-menu-item><el-menu-item v-if="auth.isAdmin" index="/audit-logs">Audit logs</el-menu-item></el-menu></el-aside><el-main><router-view/></el-main></el-container><router-view v-else/></el-container></template>
-<script setup lang="ts">import { useAuthStore } from './stores/auth'; import router from './router'; const auth=useAuthStore()</script>
+<template><el-config-provider :locale="elementLocale"><AppShell v-if="auth.user"/><router-view v-else/></el-config-provider></template>
+<script setup lang="ts">
+import { computed } from 'vue'; import zhCn from 'element-plus/es/locale/lang/zh-cn'; import en from 'element-plus/es/locale/lang/en';
+import { useAuthStore } from './stores/auth'; import { usePreferencesStore } from './stores/preferences'; import AppShell from './layouts/AppShell.vue';
+const auth=useAuthStore(); const preferences=usePreferencesStore(); const elementLocale=computed(()=>preferences.locale==='zh-CN'?zhCn:en)
+</script>

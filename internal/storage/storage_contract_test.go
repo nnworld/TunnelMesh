@@ -100,7 +100,7 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	if err := db.Audits().Create(ctx, AuditLog{ID: "audit-1", ActorUserID: user.ID, Action: "create", ResourceType: "agent", ResourceID: agent.ID, Details: `{}`}); err != nil {
 		t.Fatalf("create audit: %v", err)
 	}
-	audits, err := db.Audits().List(ctx, "", 10)
+	audits, err := db.Audits().List(ctx, AuditFilter{}, "", 10)
 	if err != nil || len(audits.Items) != 1 {
 		t.Fatalf("audits = %+v err=%v", audits, err)
 	}
@@ -122,6 +122,83 @@ func TestIdempotencyExpiredRecordsAreNotReplayed(t *testing.T) {
 	}
 	if _, err := db.Idempotency().Get(context.Background(), "expired"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("Get expired record error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestAgentConnectionLeaseRepositoryContract(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	base := AgentLease{
+		AgentID: "agent-connection-leases", NodeID: "node-a", InstanceID: "instance-a",
+		ServerNodeID: "server-a", ConnectionEpoch: 1, ActiveStreams: 0, HealthScore: 100,
+		TTL: time.Minute, AcquiredAt: now, UpdatedAt: now,
+	}
+	first := base
+	first.ConnectionID = "conn-a"
+	first, err := db.Leases().RegisterConnection(ctx, first)
+	if err != nil {
+		t.Fatalf("register first connection: %v", err)
+	}
+	second := base
+	second.ConnectionID = "conn-b"
+	second.NodeID = "node-b"
+	second.InstanceID = "instance-b"
+	second.ServerNodeID = "server-b"
+	second, err = db.Leases().RegisterConnection(ctx, second)
+	if err != nil {
+		t.Fatalf("register second connection: %v", err)
+	}
+	active, err := db.Leases().ListActiveByAgent(ctx, base.AgentID)
+	if err != nil {
+		t.Fatalf("list active connections: %v", err)
+	}
+	if len(active) != 2 || active[0].ConnectionID != "conn-a" || active[1].ConnectionID != "conn-b" {
+		t.Fatalf("active connections = %+v, want ordered conn-a and conn-b", active)
+	}
+
+	first.ConnectionEpoch = 2
+	first.ActiveStreams = 3
+	first.HealthScore = 87
+	replacement, err := db.Leases().RegisterConnection(ctx, first)
+	if err != nil {
+		t.Fatalf("replace connection: %v", err)
+	}
+	if replacement.ConnectionEpoch != 2 {
+		t.Fatalf("replacement epoch = %d, want 2", replacement.ConnectionEpoch)
+	}
+	if err := db.Leases().UpdateConnectionStats(ctx, AgentLease{AgentID: base.AgentID, ConnectionID: first.ConnectionID, ConnectionEpoch: 1, ActiveStreams: 9}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale update error = %v, want sql.ErrNoRows", err)
+	}
+	if err := db.Leases().RenewConnection(ctx, base.AgentID, first.ConnectionID, 1, time.Minute); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale renew error = %v, want sql.ErrNoRows", err)
+	}
+	if err := db.Leases().ReleaseConnection(ctx, base.AgentID, first.ConnectionID, 1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stale release error = %v, want sql.ErrNoRows", err)
+	}
+	if err := db.Leases().UpdateConnectionStats(ctx, first); err != nil {
+		t.Fatalf("update connection stats: %v", err)
+	}
+	if err := db.Leases().RenewConnection(ctx, base.AgentID, first.ConnectionID, first.ConnectionEpoch, time.Minute); err != nil {
+		t.Fatalf("renew connection: %v", err)
+	}
+
+	expired := base
+	expired.ConnectionID = "conn-expired"
+	expired.TTL = time.Millisecond
+	if _, err := db.Leases().RegisterConnection(ctx, expired); err != nil {
+		t.Fatalf("register expired connection: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	active, err = db.Leases().ListActiveByAgent(ctx, base.AgentID)
+	if err != nil {
+		t.Fatalf("list active after expiry: %v", err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("active after expiry = %+v, want conn-a and conn-b only", active)
+	}
+	if err := db.Leases().ReleaseConnection(ctx, base.AgentID, second.ConnectionID, second.ConnectionEpoch); err != nil {
+		t.Fatalf("release second connection: %v", err)
 	}
 }
 

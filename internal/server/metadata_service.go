@@ -26,6 +26,7 @@ type MetadataItem struct {
 }
 type AgentMetadataInput struct {
 	AgentID    string
+	InstanceID string
 	NodeID     string
 	Epoch      int64
 	Revision   int64
@@ -81,7 +82,11 @@ func (s *AgentMetadataService) Upsert(ctx context.Context, in AgentMetadataInput
 	if in.ReportedAt.IsZero() {
 		in.ReportedAt = now
 	}
-	v := storage.AgentRuntimeMetadata{AgentID: in.AgentID, NodeID: in.NodeID, Epoch: in.Epoch, Revision: in.Revision, Metadata: string(b), ReportedAt: in.ReportedAt, LastSeenAt: now, ExpiresAt: in.ExpiresAt, UpdatedAt: now}
+	instanceID := in.InstanceID
+	if instanceID == "" {
+		instanceID = "legacy"
+	}
+	v := storage.AgentRuntimeMetadata{AgentID: in.AgentID, InstanceID: instanceID, NodeID: in.NodeID, Epoch: in.Epoch, Revision: in.Revision, Metadata: string(b), ReportedAt: in.ReportedAt, LastSeenAt: now, ExpiresAt: in.ExpiresAt, UpdatedAt: now}
 	if err := s.repo.Upsert(ctx, v); err != nil {
 		return storage.AgentRuntimeMetadata{}, err
 	}
@@ -97,6 +102,12 @@ func (s *AgentMetadataService) Get(ctx context.Context, agentID string) (storage
 
 type AgentMetadataView struct {
 	storage.AgentRuntimeMetadata
+	Items     []MetadataItem              `json:"items"`
+	Instances []AgentMetadataInstanceView `json:"instances"`
+}
+
+type AgentMetadataInstanceView struct {
+	storage.AgentRuntimeMetadata
 	Items []MetadataItem `json:"items"`
 }
 
@@ -109,7 +120,30 @@ func (s *AgentMetadataService) GetView(ctx context.Context, agentID string) (Age
 	if err := json.Unmarshal([]byte(v.Metadata), &envelope); err != nil {
 		return AgentMetadataView{}, err
 	}
-	return AgentMetadataView{AgentRuntimeMetadata: v, Items: envelope.Items}, nil
+	view := AgentMetadataView{AgentRuntimeMetadata: v, Items: envelope.Items}
+	instances, err := s.ListInstances(ctx, agentID)
+	if err != nil {
+		return AgentMetadataView{}, err
+	}
+	for _, instance := range instances {
+		instance := instance
+		if instance.ExpiresAt != nil && time.Now().UTC().After(*instance.ExpiresAt) {
+			instance.Stale = true
+		}
+		var instanceEnvelope metadataEnvelope
+		if err := json.Unmarshal([]byte(instance.Metadata), &instanceEnvelope); err != nil {
+			return AgentMetadataView{}, err
+		}
+		view.Instances = append(view.Instances, AgentMetadataInstanceView{AgentRuntimeMetadata: instance, Items: instanceEnvelope.Items})
+		// Preserve the legacy single-object response for clients deployed
+		// before instance-scoped metadata. It must never select a stale
+		// instance when another healthy instance is still reporting.
+		if !instance.Stale {
+			view.AgentRuntimeMetadata = instance
+			view.Items = instanceEnvelope.Items
+		}
+	}
+	return view, nil
 }
 func (s *AgentMetadataService) List(ctx context.Context, cursor string, limit int) (storage.Page[storage.AgentRuntimeMetadata], error) {
 	page, err := s.repo.List(ctx, cursor, limit)
@@ -128,6 +162,30 @@ func (s *AgentMetadataService) MarkStale(ctx context.Context, agentID string, ep
 	return s.repo.MarkStale(ctx, agentID, epoch)
 }
 
+func (s *AgentMetadataService) MarkInstanceStale(ctx context.Context, agentID, instanceID string, epoch int64) error {
+	if repo, ok := s.repo.(storage.AgentInstanceMetadataRepository); ok {
+		return repo.MarkInstanceStale(ctx, agentID, instanceID, epoch)
+	}
+	return s.repo.MarkStale(ctx, agentID, epoch)
+}
+
+func (s *AgentMetadataService) ListInstances(ctx context.Context, agentID string) ([]storage.AgentRuntimeMetadata, error) {
+	if repo, ok := s.repo.(storage.AgentInstanceMetadataRepository); ok {
+		return repo.ListInstances(ctx, agentID)
+	}
+	page, err := s.repo.List(ctx, "", 500)
+	if err != nil {
+		return nil, err
+	}
+	var instances []storage.AgentRuntimeMetadata
+	for _, item := range page.Items {
+		if item.AgentID == agentID {
+			instances = append(instances, item)
+		}
+	}
+	return instances, nil
+}
+
 // Touch refreshes the runtime lease without changing the metadata revision.
 // Heartbeats use this path so unchanged metadata remains fresh while the
 // authenticated Agent WebSocket is alive.
@@ -140,6 +198,14 @@ func (s *AgentMetadataService) Touch(ctx context.Context, agentID string, epoch 
 	}
 	now := time.Now().UTC()
 	return s.repo.Touch(ctx, agentID, epoch, now, now.Add(ttl))
+}
+
+func (s *AgentMetadataService) TouchInstance(ctx context.Context, agentID, instanceID string, epoch int64, ttl time.Duration) error {
+	if repo, ok := s.repo.(storage.AgentInstanceMetadataRepository); ok {
+		now := time.Now().UTC()
+		return repo.TouchInstance(ctx, agentID, instanceID, epoch, now, now.Add(ttl))
+	}
+	return s.Touch(ctx, agentID, epoch, ttl)
 }
 
 var metadataNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)

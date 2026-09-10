@@ -108,19 +108,39 @@ func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionMana
 	if manager == nil || tr == nil {
 		return ErrSessionClosed
 	}
+	instanceID := registration.InstanceID
+	if instanceID == "" {
+		instanceID = registration.NodeID
+	}
+	connectionID := registration.ConnectionID
+	if connectionID == "" {
+		connectionID = "legacy"
+	}
 	session, err := manager.Register(ctx, registration, tr)
 	if err != nil {
 		if metrics != nil {
 			metrics.ObserveConnection("server", "agent", "failed", observability.NormalizeErrorClass(err))
+			metrics.ObserveAgentConnection(registration.AgentID, instanceID, connectionID, false)
+			metrics.ObserveAgentConnectionError(registration.AgentID, instanceID, connectionID, observability.NormalizeErrorClass(err))
 		}
 		return err
 	}
 	if metrics != nil {
 		metrics.ObserveConnection("server", "agent", "started", "")
+		metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, true)
+		metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, 64)
+	}
+	return serveRegisteredAgentSessionWithMetrics(ctx, manager, registration, session, tr, initial, onFrame, onClose, metrics)
+}
+
+func serveRegisteredAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, session *AgentSession, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
+	if manager == nil || tr == nil || session == nil {
+		return ErrSessionClosed
 	}
 	defer func() {
 		if metrics != nil {
 			metrics.ObserveConnection("server", "agent", "closed", "")
+			metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, false)
 		}
 		manager.RemoveSession(registration.AgentID, session)
 		if onClose != nil {
@@ -132,7 +152,10 @@ func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionMana
 			// Heartbeats keep both the live session timestamp and unchanged
 			// metadata snapshots fresh. A transient metadata-store failure must
 			// not tear down an otherwise healthy forwarding channel.
-			_ = manager.RefreshMetadataLease(ctx, registration.AgentID, registration.Epoch)
+			_ = manager.RefreshSessionMetadataLease(ctx, session)
+			if manager.cfg.HeartbeatCallback != nil {
+				_ = manager.cfg.HeartbeatCallback(ctx, session)
+			}
 			if frame.Type == protocol.FramePing {
 				return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload})
 			}

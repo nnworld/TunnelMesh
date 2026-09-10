@@ -5,6 +5,8 @@ package config
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +17,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 	"golang.org/x/net/http/httpguts"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -29,6 +33,13 @@ const (
 
 	RegistryDatabase = "database"
 	RegistryEtcd     = "etcd"
+	// DefaultNodeIDPath is writable by the packaged systemd service and keeps
+	// generated cluster identities outside the read-only /etc configuration.
+	DefaultNodeIDPath = "/var/lib/tunnelmesh/node-id"
+	// DefaultAgentInstanceIDPath keeps a stable physical Agent instance identity
+	// outside the read-only /etc configuration. It must stay inside the Agent
+	// systemd unit's ReadWritePaths directory.
+	DefaultAgentInstanceIDPath = "/var/lib/tunnelmesh-agent/agent-instance-id"
 )
 
 // ConfigOptions controls the sources used by Load.  CLI and Overrides are
@@ -46,6 +57,11 @@ type ConfigOptions struct {
 	Env        any
 	Set        any
 	Viper      *viper.Viper
+	// NodeIDPath persists an automatically generated cluster node identity.
+	// It is intentionally opt-in so read-only config validation has no side effects.
+	NodeIDPath string
+	// AgentInstanceIDPath persists a stable physical Agent instance identity.
+	AgentInstanceIDPath string
 }
 
 type Config struct {
@@ -98,6 +114,7 @@ type ServerConfig struct {
 	HTTPSAddr        string          `mapstructure:"https_addr" json:"https_addr" yaml:"https_addr"`
 	AgentWSAddr      string          `mapstructure:"agent_ws_addr" json:"agent_ws_addr" yaml:"agent_ws_addr"`
 	ClientWSAddr     string          `mapstructure:"client_ws_addr" json:"client_ws_addr" yaml:"client_ws_addr"`
+	DynamicSuffix    string          `mapstructure:"dynamic_suffix" json:"dynamic_suffix" yaml:"dynamic_suffix"`
 	TCPBridge        TCPBridgeConfig `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
 	TCPBridgeEnabled bool            `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
 	Relay            RelayConfig     `mapstructure:"relay" json:"relay" yaml:"relay"`
@@ -137,10 +154,21 @@ type TLSConfig struct {
 }
 
 type AgentConfig struct {
-	ServerURL string           `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
-	ID        string           `mapstructure:"id" json:"id" yaml:"id"`
-	Token     string           `mapstructure:"token" json:"-" yaml:"-"`
-	Metadata  []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+	ServerURL   string                `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	ID          string                `mapstructure:"id" json:"id" yaml:"id"`
+	InstanceID  string                `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
+	Token       string                `mapstructure:"token" json:"-" yaml:"-"`
+	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
+	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+}
+
+type AgentConnectionConfig struct {
+	Min                int           `mapstructure:"min" json:"min" yaml:"min"`
+	Max                int           `mapstructure:"max" json:"max" yaml:"max"`
+	HighWatermark      int           `mapstructure:"high_watermark" json:"high_watermark" yaml:"high_watermark"`
+	LowWatermark       int           `mapstructure:"low_watermark" json:"low_watermark" yaml:"low_watermark"`
+	EvaluationInterval time.Duration `mapstructure:"evaluation_interval" json:"evaluation_interval" yaml:"evaluation_interval"`
+	Cooldown           time.Duration `mapstructure:"cooldown" json:"cooldown" yaml:"cooldown"`
 }
 
 // MetadataSource is an explicit allowlisted host value source. File sources
@@ -225,6 +253,20 @@ func Load(ctx context.Context, opts ConfigOptions) (Config, error) {
 	cfg.Storage.MySQLTLS = cfg.Storage.MySQL.TLS
 	cfg.Registry.EtcdEndpoints = append([]string(nil), cfg.Registry.Endpoints...)
 	cfg.Node.Identity = cfg.Node.ID
+	if cfg.Mode == ModeCluster && strings.TrimSpace(cfg.Node.ID) == "" && strings.TrimSpace(opts.NodeIDPath) != "" {
+		id, err := EnsureNodeID(opts.NodeIDPath)
+		if err != nil {
+			return Config{}, fmt.Errorf("ensure cluster node identity: %w", err)
+		}
+		cfg.Node.ID, cfg.Node.Identity = id, id
+	}
+	if strings.TrimSpace(cfg.Agent.InstanceID) == "" && strings.TrimSpace(opts.AgentInstanceIDPath) != "" {
+		id, err := EnsureAgentInstanceID(opts.AgentInstanceIDPath)
+		if err != nil {
+			return Config{}, fmt.Errorf("ensure agent instance identity: %w", err)
+		}
+		cfg.Agent.InstanceID = id
+	}
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
 	}
@@ -306,6 +348,7 @@ func setDefaults(v *viper.Viper) {
 		"server.https_addr":                       ":443",
 		"server.agent_ws_addr":                    ":443",
 		"server.client_ws_addr":                   ":443",
+		"server.dynamic_suffix":                   "apps.example.com",
 		"server.tcp_bridge.enabled":               true,
 		"server.tcp_bridge.path":                  "/ws/tcp",
 		"server.tcp_bridge.max_bytes":             int64(64 << 10),
@@ -321,6 +364,12 @@ func setDefaults(v *viper.Viper) {
 		"security.allow_legacy_connection_tokens": false,
 		"tls.enabled":                             false,
 		"tls.min_version":                         "1.2",
+		"agent.connections.min":                   1,
+		"agent.connections.max":                   1,
+		"agent.connections.high_watermark":        16,
+		"agent.connections.low_watermark":         2,
+		"agent.connections.evaluation_interval":   10 * time.Second,
+		"agent.connections.cooldown":              30 * time.Second,
 	}
 	for key, value := range defaults {
 		v.SetDefault(key, value)
@@ -335,11 +384,11 @@ func bindEnvironment(v *viper.Viper) {
 		"mode", "storage.driver", "storage.sqlite.path", "storage.auto_init",
 		"storage.mysql.dsn", "storage.mysql.tls", "storage.mysql.ca", "storage.mysql.cert", "storage.mysql.key",
 		"registry.type", "registry.endpoints", "node.id", "server.http_addr", "server.https_addr",
-		"server.agent_ws_addr", "server.client_ws_addr", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
+		"server.agent_ws_addr", "server.client_ws_addr", "server.dynamic_suffix", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
 		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
-		"agent.server_url", "agent.id", "agent.token", "client.server_url", "client.token",
+		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.token",
 	}
 	for _, key := range keys {
 		_ = v.BindEnv(key)
@@ -352,8 +401,17 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateSecurity(cfg.Security)...)
 	problems = append(problems, validateTLS(cfg.TLS)...)
 	problems = append(problems, validateRelay(cfg.Mode, cfg.Node.ID, cfg.Server.Relay)...)
+	if suffix := strings.TrimSpace(cfg.Server.DynamicSuffix); suffix != "" && !validDynamicSuffix(suffix) {
+		problems = append(problems, fmt.Sprintf("dynamic route suffix %q must be a DNS domain without a wildcard", suffix))
+	}
 	if cfg.Agent.ServerURL != "" && !validWebSocketURL(cfg.Agent.ServerURL) {
 		problems = append(problems, "agent server URL must be an absolute ws:// or wss:// URL")
+	}
+	if cfg.Agent.ServerURL != "" {
+		problems = append(problems, validateAgentConnections(cfg.Agent.Connections)...)
+	}
+	if id := strings.TrimSpace(cfg.Agent.InstanceID); id != "" && strings.ContainsAny(id, " \t\r\n") {
+		problems = append(problems, "agent instance ID must not contain whitespace")
 	}
 	if cfg.Client.ServerURL != "" && !validWebSocketURL(cfg.Client.ServerURL) {
 		problems = append(problems, "client server URL must be an absolute ws:// or wss:// URL")
@@ -369,12 +427,6 @@ func Validate(cfg Config) error {
 		}
 		if strings.TrimSpace(cfg.Storage.MySQL.DSN) == "" {
 			problems = append(problems, "cluster mode requires mysql DSN")
-		}
-		if !cfg.Storage.MySQL.TLS {
-			problems = append(problems, "cluster mode requires mysql TLS")
-		}
-		if strings.TrimSpace(cfg.Node.ID) == "" {
-			problems = append(problems, "cluster mode requires node identity")
 		}
 	default:
 		problems = append(problems, fmt.Sprintf("invalid mode %q", cfg.Mode))
@@ -395,6 +447,228 @@ func Validate(cfg Config) error {
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func validateAgentConnections(c AgentConnectionConfig) []string {
+	var problems []string
+	if c.Min < 1 {
+		problems = append(problems, "agent connections min must be at least 1")
+	}
+	if c.Max < c.Min || c.Max > 64 {
+		if c.Max < c.Min {
+			problems = append(problems, "agent connections max must be greater than or equal to min")
+		}
+		if c.Max > 64 {
+			problems = append(problems, "agent connections max must be at most 64")
+		}
+	}
+	if c.LowWatermark > c.HighWatermark {
+		problems = append(problems, "agent connections low watermark must be less than or equal to high watermark")
+	}
+	if c.EvaluationInterval <= 0 {
+		problems = append(problems, "agent connections evaluation interval must be positive")
+	}
+	if c.Cooldown <= 0 {
+		problems = append(problems, "agent connections cooldown must be positive")
+	}
+	return problems
+}
+
+// EnsureNodeID returns the existing persisted node identity or creates one.
+// The exclusive create prevents concurrent server starts from acquiring
+// different identities; the generated value is opaque and contains no host data.
+func EnsureNodeID(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("node identity path is required")
+	}
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", err
+		}
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(data))
+		if id != "" {
+			return id, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", fmt.Errorf("generate node identity: %w", err)
+	}
+	id := "server-" + hex.EncodeToString(entropy[:])
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		if _, writeErr := file.WriteString(id + "\n"); writeErr != nil {
+			_ = file.Close()
+			return "", writeErr
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return "", closeErr
+		}
+		return id, nil
+	} else if !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if id = strings.TrimSpace(string(data)); id == "" {
+		return "", errors.New("persisted node identity is empty")
+	}
+	return id, nil
+}
+
+// EnsureAgentInstanceID returns or creates a stable physical Agent instance
+// identity. It is separate from node identity because a logical Agent can run
+// on many physical hosts while the Server process has its own node identity.
+func EnsureAgentInstanceID(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("agent instance identity path is required")
+	}
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return "", err
+		}
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(data))
+		if id != "" {
+			return id, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", fmt.Errorf("generate agent instance identity: %w", err)
+	}
+	id := "agent-" + hex.EncodeToString(entropy[:])
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		if _, writeErr := file.WriteString(id + "\n"); writeErr != nil {
+			_ = file.Close()
+			return "", writeErr
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return "", closeErr
+		}
+		return id, nil
+	} else if !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	if data, readErr := os.ReadFile(path); readErr != nil {
+		return "", readErr
+	} else {
+		id := strings.TrimSpace(string(data))
+		if id == "" {
+			return "", errors.New("agent instance identity file is empty")
+		}
+		return id, nil
+	}
+}
+
+// InitializeNodeID generates or reuses a node identity and writes it into the
+// YAML config's node.id field using an atomic replacement.
+func InitializeNodeID(configPath, nodeIDPath string) (string, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return "", errors.New("config path is required")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return "", fmt.Errorf("decode YAML config: %w", err)
+	}
+	root, err := yamlMappingRoot(&document)
+	if err != nil {
+		return "", err
+	}
+	node := yamlMappingValue(root, "node")
+	if node != nil && node.Kind == yaml.MappingNode {
+		if configured := yamlMappingValue(node, "id"); configured != nil && strings.TrimSpace(configured.Value) != "" {
+			return strings.TrimSpace(configured.Value), nil
+		}
+	}
+	id, err := EnsureNodeID(nodeIDPath)
+	if err != nil {
+		return "", err
+	}
+	if node == nil || node.Kind != yaml.MappingNode {
+		node = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "node"}, node,
+		)
+	}
+	node.Content = append(node.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "id"},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id},
+	)
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".tunnelmesh-config-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	encoder := yaml.NewEncoder(tmp)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&document); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := encoder.Close(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := preserveOwnership(tmpName, info); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpName, configPath); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func yamlMappingRoot(document *yaml.Node) (*yaml.Node, error) {
+	if document == nil || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return nil, errors.New("YAML config root must be a mapping")
+	}
+	return document.Content[0], nil
+}
+
+func yamlMappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
 	}
 	return nil
 }
@@ -475,6 +749,11 @@ func validDNSHost(raw string) bool {
 	return true
 }
 
+func validDynamicSuffix(raw string) bool {
+	raw = strings.TrimSuffix(strings.TrimSpace(raw), ".")
+	return raw != "" && !strings.Contains(raw, "*") && validDNSHost(raw)
+}
+
 func asciiAlphaNumeric(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
@@ -525,6 +804,9 @@ func validateRelay(mode, nodeID string, cfg RelayConfig) []string {
 	}
 	if strings.TrimSpace(cfg.Listen) == "" {
 		problems = append(problems, "server relay requires listen address")
+	}
+	if strings.TrimSpace(cfg.Endpoint) == "" {
+		problems = append(problems, "server relay requires a reachable endpoint address")
 	}
 	if strings.TrimSpace(cfg.CA) == "" || !filepath.IsAbs(cfg.CA) {
 		problems = append(problems, "server relay CA path must be absolute")

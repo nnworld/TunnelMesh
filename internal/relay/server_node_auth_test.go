@@ -77,7 +77,7 @@ func TestAuthenticatedGRPCRelayValidMTLSAndServerNodeToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", AgentID: "agent-a", Epoch: 7, StreamID: 1, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
+	stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", AgentID: "agent-a", CaseInsensitiveAgentID: true, Epoch: 7, StreamID: 1, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +97,181 @@ func TestAuthenticatedGRPCRelayValidMTLSAndServerNodeToken(t *testing.T) {
 	}
 	if principal.NodeID != "node-a" || principal.Epoch != 7 || targetRequest.NodeID != "target-node" {
 		t.Fatalf("principal=%+v target=%+v, caller and target identities were not separated", principal, targetRequest)
+	}
+	if !targetRequest.CaseInsensitiveAgentID {
+		t.Fatalf("target request = %+v, dynamic Agent ID mode was not propagated", targetRequest)
+	}
+}
+
+func TestRelayCloseAgentConnectionRequiresServerNodeAuth(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:relay-close-unauth?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "relay-close-unauth-owner", "relay-password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	credentialsService := auth.NewCredentialService(db)
+	defer credentialsService.Close()
+	if _, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
+	var handlerCalls atomic.Int32
+	server := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainUnaryInterceptor(NewServerNodeUnaryInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(server, NewRelayServerWithClose(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return nil, ErrNodeDisconnected
+	}, func(context.Context, CloseAgentConnectionRequest) error {
+		handlerCalls.Add(1)
+		return nil
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go server.Serve(ln)
+	defer server.Stop()
+
+	client, err := DialGRPCNode(ctx, ln.Addr().String(), clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.CloseAgentConnection(ctx, CloseAgentConnectionRequest{AgentID: "agent-a", ConnectionID: "conn-a", ConnectionEpoch: 9, RequestedByNodeID: "node-b"})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("CloseAgentConnection() error = %v, code=%v, want Unauthenticated", err, status.Code(err))
+	}
+	if handlerCalls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
+	}
+}
+
+func TestRelayCloseAgentConnectionUsesExactEpoch(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:relay-close-epoch?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "relay-close-epoch-owner", "relay-password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	credentialsService := auth.NewCredentialService(db)
+	defer credentialsService.Close()
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
+	var requests []CloseAgentConnectionRequest
+	var requestMu sync.Mutex
+	server := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainUnaryInterceptor(NewServerNodeUnaryInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(server, NewRelayServerWithClose(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return nil, ErrNodeDisconnected
+	}, func(_ context.Context, request CloseAgentConnectionRequest) error {
+		requestMu.Lock()
+		requests = append(requests, request)
+		requestMu.Unlock()
+		if request.ConnectionEpoch != 9 {
+			return status.Error(codes.FailedPrecondition, "relay agent connection epoch is stale")
+		}
+		return nil
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go server.Serve(ln)
+	defer server.Stop()
+
+	client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	valid := CloseAgentConnectionRequest{AgentID: "agent-a", ConnectionID: "conn-a", ConnectionEpoch: 9, RequestedByNodeID: "node-b"}
+	if err := client.CloseAgentConnection(ctx, valid); err != nil {
+		t.Fatalf("CloseAgentConnection(valid) error = %v", err)
+	}
+	stale := valid
+	stale.ConnectionEpoch = 8
+	if err := client.CloseAgentConnection(ctx, stale); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("CloseAgentConnection(stale) error = %v, code=%v, want FailedPrecondition", err, status.Code(err))
+	}
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	if len(requests) != 2 || requests[0] != valid || requests[1] != stale {
+		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestGRPCNodeTransportCloseAgentConnectionPropagatesFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:relay-close-failure?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "relay-close-failure-owner", "relay-password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	credentialsService := auth.NewCredentialService(db)
+	defer credentialsService.Close()
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
+	server := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainUnaryInterceptor(NewServerNodeUnaryInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(server, NewRelayServerWithClose(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return nil, ErrNodeDisconnected
+	}, func(context.Context, CloseAgentConnectionRequest) error {
+		return status.Error(codes.Internal, "relay close failed")
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go server.Serve(ln)
+	defer server.Stop()
+
+	client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.CloseAgentConnection(ctx, CloseAgentConnectionRequest{AgentID: "agent-a", ConnectionID: "conn-a", ConnectionEpoch: 9, RequestedByNodeID: "node-b"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("CloseAgentConnection() error = %v, code=%v, want Internal", err, status.Code(err))
 	}
 }
 

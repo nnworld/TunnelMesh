@@ -148,6 +148,155 @@ func TestTokenAPIAdminCanRevealEncryptedSecretWithConfirmation(t *testing.T) {
 	}
 }
 
+func TestTokenAPIUpdatesExpirationForActiveTokensOnly(t *testing.T) {
+	fixture := newTokenAPIFixture(t)
+	create := apiJSON(t, fixture.api, http.MethodPost, "/api/v1/tokens", fixture.ownerToken, "expiration-create", map[string]any{
+		"type": "client", "scope": map[string]any{"agentIds": []string{"agent-alice-a"}},
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	tokenID := tokenIDFromResponse(t, create.Body.Bytes())
+
+	future := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339Nano)
+	update := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{"expiresAt": future})
+	if update.Code != http.StatusOK {
+		t.Fatalf("update status = %d: %s", update.Code, update.Body.String())
+	}
+	if data := tokenResponseData(t, update.Body.Bytes()); data["id"] != tokenID || data["status"] != "active" {
+		t.Fatalf("unexpected update response: %+v", data)
+	}
+	assertNoSensitiveFields(t, tokenResponseData(t, update.Body.Bytes()))
+
+	clear := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{"expiresAt": nil})
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear status = %d: %s", clear.Code, clear.Body.String())
+	}
+	if _, present := tokenResponseData(t, clear.Body.Bytes())["expiresAt"]; present {
+		t.Fatalf("cleared expiration should be omitted: %s", clear.Body.String())
+	}
+
+	past := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	invalid := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{"expiresAt": past})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("past expiration status = %d, want 400: %s", invalid.Code, invalid.Body.String())
+	}
+	missing := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("missing expiration status = %d, want 400: %s", missing.Code, missing.Body.String())
+	}
+
+	foreign := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.otherToken, "", map[string]any{"expiresAt": future})
+	if foreign.Code != http.StatusForbidden {
+		t.Fatalf("foreign update status = %d, want 403: %s", foreign.Code, foreign.Body.String())
+	}
+
+	expired := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := fixture.api.DB.SQL().ExecContext(context.Background(), `UPDATE service_tokens SET expires_at=? WHERE id=?`, expired, tokenID); err != nil {
+		t.Fatal(err)
+	}
+	expiredUpdate := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{"expiresAt": future})
+	if expiredUpdate.Code != http.StatusConflict {
+		t.Fatalf("expired update status = %d, want 409: %s", expiredUpdate.Code, expiredUpdate.Body.String())
+	}
+
+	if err := fixture.api.DB.ServiceTokens().Revoke(context.Background(), tokenID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	revokedUpdate := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{"expiresAt": future})
+	if revokedUpdate.Code != http.StatusConflict {
+		t.Fatalf("revoked update status = %d, want 409: %s", revokedUpdate.Code, revokedUpdate.Body.String())
+	}
+	if countTokenLifecycleAudits(t, fixture.api.DB, tokenID, "token.expiration_updated") != 2 {
+		t.Fatalf("expected two expiration update audits for token %s", tokenID)
+	}
+}
+
+func TestTokenAPIUpdatesScopeForActiveTokensOnly(t *testing.T) {
+	fixture := newTokenAPIFixture(t)
+	create := apiJSON(t, fixture.api, http.MethodPost, "/api/v1/tokens", fixture.ownerToken, "scope-create", map[string]any{
+		"type":  "client",
+		"scope": map[string]any{"agentIds": []string{"agent-alice-a"}, "protocols": []string{"tcp"}, "targetCIDRs": []string{"10.0.0.0/8"}, "targetPorts": []int{22}},
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	tokenID := tokenIDFromResponse(t, create.Body.Bytes())
+
+	update := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{"tcp", "http"}, "targetPorts": []int{22, 80}},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("scope update status = %d: %s", update.Code, update.Body.String())
+	}
+	scope, _ := tokenResponseData(t, update.Body.Bytes())["scope"].(map[string]any)
+	if !reflect.DeepEqual(scope["protocols"], []any{"http", "tcp"}) {
+		t.Fatalf("updated protocols = %#v, want [http tcp]", scope["protocols"])
+	}
+	if !reflect.DeepEqual(scope["targetCIDRs"], []any{"10.0.0.0/8"}) {
+		t.Fatalf("omitted CIDRs should be preserved: %#v", scope["targetCIDRs"])
+	}
+	if !reflect.DeepEqual(scope["targetPorts"], []any{float64(22), float64(80)}) {
+		t.Fatalf("updated ports = %#v, want [22 80]", scope["targetPorts"])
+	}
+	assertNoSensitiveFields(t, tokenResponseData(t, update.Body.Bytes()))
+
+	clear := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{}, "targetCIDRs": []string{}, "targetPorts": []int{}},
+	})
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear scope status = %d: %s", clear.Code, clear.Body.String())
+	}
+	scope, _ = tokenResponseData(t, clear.Body.Bytes())["scope"].(map[string]any)
+	if (scope["protocols"] != nil && len(scope["protocols"].([]any)) != 0) ||
+		(scope["targetCIDRs"] != nil && len(scope["targetCIDRs"].([]any)) != 0) ||
+		(scope["targetPorts"] != nil && len(scope["targetPorts"].([]any)) != 0) {
+		t.Fatalf("empty arrays should remove scope restrictions: %#v", scope)
+	}
+
+	invalid := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{"icmp"}, "targetCIDRs": []string{"not-a-cidr"}, "targetPorts": []int{0}},
+	})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid scope status = %d, want 400: %s", invalid.Code, invalid.Body.String())
+	}
+	missing := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("missing update status = %d, want 400: %s", missing.Code, missing.Body.String())
+	}
+
+	foreign := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.otherToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{"tcp"}},
+	})
+	if foreign.Code != http.StatusForbidden {
+		t.Fatalf("foreign scope update status = %d, want 403: %s", foreign.Code, foreign.Body.String())
+	}
+
+	expired := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := fixture.api.DB.SQL().ExecContext(context.Background(), `UPDATE service_tokens SET expires_at=? WHERE id=?`, expired, tokenID); err != nil {
+		t.Fatal(err)
+	}
+	expiredUpdate := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{"tcp"}},
+	})
+	if expiredUpdate.Code != http.StatusConflict {
+		t.Fatalf("expired scope update status = %d, want 409: %s", expiredUpdate.Code, expiredUpdate.Body.String())
+	}
+
+	if err := fixture.api.DB.ServiceTokens().Revoke(context.Background(), tokenID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	revokedUpdate := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"protocols": []string{"tcp"}},
+	})
+	if revokedUpdate.Code != http.StatusConflict {
+		t.Fatalf("revoked scope update status = %d, want 409: %s", revokedUpdate.Code, revokedUpdate.Body.String())
+	}
+	if got := countTokenLifecycleAudits(t, fixture.api.DB, tokenID, "token.scope_updated"); got != 2 {
+		t.Fatalf("scope update audit count = %d, want 2", got)
+	}
+}
+
 func TestAgentTracerouteAPIEnforcesSensitiveBoundary(t *testing.T) {
 	fixture := newTokenAPIFixture(t)
 	request := map[string]any{"maxHops": 8}
@@ -287,7 +436,7 @@ func TestTokenAPIOwnerAuthorizationAndValidation(t *testing.T) {
 		t.Fatalf("invalid scope status = %d, want 400: %s", invalidScope.Code, invalidScope.Body.String())
 	}
 
-	audits, err := fixture.api.DB.Audits().List(context.Background(), "", 100)
+	audits, err := fixture.api.DB.Audits().List(context.Background(), storage.AuditFilter{}, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +555,7 @@ func TestTokenAPIPaginationLifecycleRedactionAndAudit(t *testing.T) {
 		t.Fatalf("expired detail = %d %s", expiredDetail.Code, expiredDetail.Body.String())
 	}
 
-	audits, err := fixture.api.DB.Audits().List(context.Background(), "", 100)
+	audits, err := fixture.api.DB.Audits().List(context.Background(), storage.AuditFilter{}, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -909,7 +1058,7 @@ func (r *selectedTokenGetBarrier) release(call int) { close(r.blocked[call].rele
 
 func countTokenLifecycleAudits(t *testing.T, db *storage.DB, tokenID, action string) int {
 	t.Helper()
-	page, err := db.Audits().List(context.Background(), "", 500)
+	page, err := db.Audits().List(context.Background(), storage.AuditFilter{}, "", 500)
 	if err != nil {
 		t.Fatal(err)
 	}

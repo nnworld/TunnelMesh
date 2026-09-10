@@ -131,7 +131,8 @@ func IsDangerousAddress(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	// 0/8, loopback, link-local, and the cloud metadata endpoint are never
-	// reachable through a public dynamic route.
-	return ip[0] == 0 || ip[0] == 127 || ip[0] >= 224 || (ip[0] == 169 && ip[1] == 254) || ip.Equal(net.IPv4(169, 254, 169, 254))
+	// Dynamic targets are dialed by the Agent, so loopback is a valid
+	// agent-local service address. Other non-routable and metadata ranges
+	// remain denied.
+	return ip[0] == 0 || ip[0] >= 224 || (ip[0] == 169 && ip[1] == 254) || ip.Equal(net.IPv4(169, 254, 169, 254))
 }

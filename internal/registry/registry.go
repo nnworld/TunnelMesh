@@ -15,11 +15,14 @@ var (
 )
 
 type NodeRegistration struct {
-	NodeID   string
-	Address  string
-	Metadata string
-	AgentID  string
-	TTL      time.Duration
+	NodeID       string
+	Address      string
+	Metadata     string
+	AgentID      string
+	InstanceID   string
+	ConnectionID string
+	ServerNodeID string
+	TTL          time.Duration
 }
 
 // Node is retained as a concise registration alias for callers that model a
@@ -36,13 +39,20 @@ type Lease struct {
 }
 
 type NodeOwner struct {
-	NodeID    string
-	Address   string
-	Metadata  string
-	AgentID   string
-	Epoch     int64
-	ExpiresAt time.Time
-	LeaseID   int64
+	NodeID          string
+	Address         string
+	Metadata        string
+	AgentID         string
+	InstanceID      string
+	ConnectionID    string
+	ServerNodeID    string
+	Epoch           int64
+	ConnectionEpoch int64
+	ServerNodeEpoch int64
+	ActiveStreams   int64
+	HealthScore     int64
+	ExpiresAt       time.Time
+	LeaseID         int64
 }
 
 type EventType string
@@ -61,7 +71,9 @@ type RegistryEvent struct {
 type NodeRegistry interface {
 	Register(context.Context, NodeRegistration) (NodeOwner, error)
 	KeepAlive(context.Context, NodeOwner, time.Duration) (NodeOwner, error)
+	UpdateConnectionStats(context.Context, NodeOwner) error
 	ResolveAgent(context.Context, string) (NodeOwner, error)
+	ListAgentConnections(context.Context, string) ([]NodeOwner, error)
 	Watch(context.Context, string) (<-chan RegistryEvent, error)
 	Revoke(context.Context, NodeOwner) error
 	Close() error

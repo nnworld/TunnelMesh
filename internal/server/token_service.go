@@ -67,6 +67,18 @@ type tokenReplayRecord struct {
 	Token       TokenView `json:"token"`
 }
 
+type tokenScopePatch struct {
+	Protocols   *[]string `json:"protocols,omitempty"`
+	TargetCIDRs *[]string `json:"targetCIDRs,omitempty"`
+	TargetPorts *[]int    `json:"targetPorts,omitempty"`
+}
+
+type tokenUpdate struct {
+	ExpiresAt    *time.Time
+	HasExpiresAt bool
+	Scope        *tokenScopePatch
+}
+
 // TokenService orchestrates credential lifecycle operations while leaving SQL
 // and transaction mechanics in storage repositories.
 type TokenService struct {
@@ -335,6 +347,98 @@ func (s *TokenService) Revoke(ctx context.Context, actorUserID, id string) (Toke
 	return s.view(ctx, result)
 }
 
+// UpdateExpiration changes only the active credential's deadline. Clearing the
+// value makes the Token non-expiring; an expired Token must be rotated instead.
+func (s *TokenService) UpdateExpiration(ctx context.Context, actorUserID, id string, expiresAt *time.Time) (TokenView, error) {
+	return s.Update(ctx, actorUserID, id, tokenUpdate{ExpiresAt: expiresAt, HasExpiresAt: true})
+}
+
+// Update applies expiration and authorization-scope changes in one transaction.
+// Scope fields not present in the patch remain unchanged; empty arrays remove
+// the corresponding restriction.
+func (s *TokenService) Update(ctx context.Context, actorUserID, id string, update tokenUpdate) (TokenView, error) {
+	id = strings.TrimSpace(id)
+	if !update.HasExpiresAt && update.Scope == nil {
+		return TokenView{}, fmt.Errorf("%w: expiresAt or scope is required", errInvalidTokenRequest)
+	}
+	if update.HasExpiresAt && update.ExpiresAt != nil && !update.ExpiresAt.After(time.Now().UTC()) {
+		return TokenView{}, fmt.Errorf("%w: expiresAt must be in the future", errInvalidTokenRequest)
+	}
+	var result storage.ServiceToken
+	err := s.db.ServiceTokenMutationTransaction(ctx, func(tokens storage.ServiceTokenRepository, audits storage.AuditRepository, _ storage.IdempotencyRepository) error {
+		current, err := tokens.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if current.RevokedAt != nil {
+			return storage.ErrServiceTokenRevoked
+		}
+		if current.ExpiresAt != nil && !current.ExpiresAt.After(time.Now().UTC()) {
+			return storage.ErrServiceTokenExpired
+		}
+		when := time.Now().UTC()
+		if update.Scope != nil {
+			scope, err := mergeTokenScope(current.Scope, *update.Scope)
+			if err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(scope)
+			if err != nil {
+				return fmt.Errorf("encode token scope: %w", err)
+			}
+			if err := tokens.UpdateScope(ctx, id, string(encoded), when); err != nil {
+				return err
+			}
+		}
+		if update.HasExpiresAt {
+			if err := tokens.UpdateExpiration(ctx, id, update.ExpiresAt, when); err != nil {
+				return err
+			}
+		}
+		updated, err := tokens.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if update.Scope != nil {
+			if err := audits.Create(ctx, tokenAudit(actorUserID, "token.scope_updated", id, updated, "", "")); err != nil {
+				return err
+			}
+		}
+		if update.HasExpiresAt {
+			if err := audits.Create(ctx, tokenAudit(actorUserID, "token.expiration_updated", id, updated, "", "")); err != nil {
+				return err
+			}
+		}
+		result = updated
+		return nil
+	})
+	if err != nil {
+		return TokenView{}, err
+	}
+	return s.view(ctx, result)
+}
+
+func mergeTokenScope(raw string, patch tokenScopePatch) (auth.TokenScope, error) {
+	var scope auth.TokenScope
+	if err := json.Unmarshal([]byte(raw), &scope); err != nil {
+		return auth.TokenScope{}, fmt.Errorf("decode token scope: %w", err)
+	}
+	if patch.Protocols != nil {
+		scope.Protocols = *patch.Protocols
+	}
+	if patch.TargetCIDRs != nil {
+		scope.TargetCIDRs = *patch.TargetCIDRs
+	}
+	if patch.TargetPorts != nil {
+		scope.TargetPorts = *patch.TargetPorts
+	}
+	normalized, err := auth.NormalizeTokenScope(scope)
+	if err != nil {
+		return auth.TokenScope{}, invalidCredentialRequest(err)
+	}
+	return normalized, nil
+}
+
 // RecordAuthorizationDenied persists only allowlisted non-secret identifiers.
 func (s *TokenService) RecordAuthorizationDenied(ctx context.Context, actorUserID string, record storage.ServiceToken, reasonCode string) error {
 	resourceID := record.ID
@@ -577,6 +681,14 @@ func (r *plannedTokenRepository) List(ctx context.Context, filter storage.Servic
 
 func (r *plannedTokenRepository) Revoke(context.Context, string, time.Time) error {
 	return errors.New("planned repository cannot revoke")
+}
+
+func (r *plannedTokenRepository) UpdateExpiration(context.Context, string, *time.Time, time.Time) error {
+	return errors.New("planned repository cannot update expiration")
+}
+
+func (r *plannedTokenRepository) UpdateScope(context.Context, string, string, time.Time) error {
+	return errors.New("planned repository cannot update scope")
 }
 
 func (r *plannedTokenRepository) TouchLastUsed(context.Context, string, time.Time) error {

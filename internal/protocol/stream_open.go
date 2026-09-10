@@ -6,11 +6,14 @@ import "encoding/json"
 // Authentication identity is deliberately absent: the server derives it from
 // the pre-upgrade bearer credential instead of trusting frame data.
 type StreamOpenPayload struct {
-	AgentID    string `json:"agent_id,omitempty"`
-	Protocol   string `json:"protocol"`
-	TargetHost string `json:"target_host"`
-	TargetPort int    `json:"target_port"`
-	Metadata   []byte `json:"metadata,omitempty"`
+	AgentID       string `json:"agent_id,omitempty"`
+	Protocol      string `json:"protocol"`
+	TargetHost    string `json:"target_host"`
+	TargetPort    int    `json:"target_port"`
+	TargetScheme  string `json:"target_scheme,omitempty"`
+	HostHeader    string `json:"host_header,omitempty"`
+	TLSServerName string `json:"tls_server_name,omitempty"`
+	Metadata      []byte `json:"metadata,omitempty"`
 }
 
 func EncodeStreamOpenPayload(payload StreamOpenPayload) ([]byte, error) {

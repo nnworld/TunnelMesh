@@ -26,6 +26,7 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/registry"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
@@ -114,6 +115,57 @@ func TestAgentWebSocketRouteIsExact(t *testing.T) {
 			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tc.path, nil))
 			if recorder.Code != tc.want {
 				t.Fatalf("GET %s status = %d, want %d", tc.path, recorder.Code, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerRuntimeRoutesManagedHostBeforeSPAFallback(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-managed-routes?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	if err := db.Tunnels().Create(ctx, storage.Tunnel{
+		ID: "tunnel-explicit", AgentID: "agent-explicit", Protocol: "http",
+		Domain: "app.example.test", TargetHost: "10.0.0.8", TargetPort: 3000,
+		Status: "active", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		DynamicSuffix: "claw.qihoo.net",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	tests := []struct {
+		name string
+		host string
+	}{
+		{name: "explicit database route", host: "app.example.test"},
+		{name: "dynamic route", host: "agent-explicit-10-0-0-8-3000.claw.qihoo.net"},
+		{name: "dynamic agent-local route", host: "agent-explicit-127-0-0-1-3000.claw.qihoo.net"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "http://"+tt.host+"/", nil)
+			recorder := httptest.NewRecorder()
+			runtime.Handler().ServeHTTP(recorder, request)
+
+			// Agent is intentionally offline in this test. Reaching the proxy
+			// proves that the request did not fall through to the admin SPA.
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d; body = %q", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+			}
+			if strings.Contains(strings.ToLower(recorder.Body.String()), "<!doctype html") {
+				t.Fatal("managed host was swallowed by the admin SPA fallback")
 			}
 		})
 	}
@@ -835,7 +887,7 @@ func TestAgentLegacyManagementTokenRequiresMigrationFlagAndAuditsWarning(t *test
 	if strings.Contains(logs.String(), login.Token) {
 		t.Fatal("warning log leaked raw management token")
 	}
-	audits, err := db.Audits().List(ctx, "", 100)
+	audits, err := db.Audits().List(ctx, storage.AuditFilter{}, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,6 +1115,54 @@ func TestRealAgentReconnectsWithNewEpochAfterServerClosesSession(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestRuntimeRejectsAgentConnectionWhenLeaseRegistrationFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-agent-lease-reject?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "lease-reject-owner", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID := "lease-reject-agent"
+	if err := db.Agents().Create(ctx, storage.Agent{ID: agentID, Name: agentID, OwnerUserID: owner.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	credentials := auth.NewCredentialService(db)
+	token, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeAgent, OwnerUserID: owner.ID, AgentID: agentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		ConnectionRegistry: &recordingConnectionRegistry{registerErr: registry.ErrLeaseHeld},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(serverCtx, listener) }()
+	defer func() {
+		cancel()
+		<-serveErr
+	}()
+	if agentWebSocketAccepted(t, listener.Addr().String(), token.Secret, agentID, 1, "", "") {
+		t.Fatal("Agent connection was accepted when lease registration failed")
+	}
+	if sessions := runtime.AgentSessions.List(agentID); len(sessions) != 0 {
+		t.Fatalf("sessions = %#v, want none", sessions)
 	}
 }
 

@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sort"
 	"strconv"
@@ -12,17 +13,20 @@ var ErrRouteNotFound = errors.New("routing: route not found")
 
 // Route is both an explicit managed route and the result of a dynamic route.
 type Route struct {
-	ID           string
-	RouteID      string // compatibility alias used by API payloads
-	Domain       string
-	PathPrefix   string
-	AgentID      string
-	TargetHost   string
-	TargetPort   int
-	Protocol     string
-	AllowedCIDRs []string
-	AllowedPorts []int
-	Dynamic      bool
+	ID            string
+	RouteID       string // compatibility alias used by API payloads
+	Domain        string
+	PathPrefix    string
+	AgentID       string
+	TargetHost    string
+	TargetPort    int
+	Protocol      string
+	HostHeader    string
+	TargetScheme  string
+	TLSServerName string
+	AllowedCIDRs  []string
+	AllowedPorts  []int
+	Dynamic       bool
 }
 
 type resolverOptions struct {
@@ -164,6 +168,9 @@ func (r *RouteResolver) ResolveHTTP(args ...string) (Route, error) {
 	}
 	if r.dynamicSuffix != "" && strings.HasSuffix(host, "."+r.dynamicSuffix) {
 		d, err := ParseDynamicHost(host)
+		if errors.Is(err, ErrDangerousAddress) {
+			return Route{}, err
+		}
 		if err == nil && strings.EqualFold(d.Domain, r.dynamicSuffix) {
 			p := r.policy
 			if err := p.Validate(d.IP, d.Port); err != nil {
@@ -213,9 +220,14 @@ func domainMatch(pattern, host string) bool {
 	if pattern == host {
 		return true
 	}
-	if strings.HasPrefix(pattern, "*.") {
-		base := strings.TrimPrefix(pattern, "*.")
-		return strings.HasSuffix(host, "."+base) && strings.Count(strings.TrimSuffix(host, "."+base), ".") == 0
+	if strings.HasPrefix(pattern, "tm-*.") {
+		base := strings.TrimPrefix(pattern, "tm-*")
+		if !strings.HasSuffix(host, base) {
+			return false
+		}
+		label := strings.TrimSuffix(host, base)
+		label = strings.TrimSuffix(label, ".")
+		return strings.HasPrefix(label, "tm-") && validDNSLabel(label)
 	}
 	return false
 }
@@ -226,10 +238,60 @@ func domainRank(pattern, host string) int {
 	if pattern == host {
 		return 3
 	}
-	if strings.HasPrefix(pattern, "*.") {
+	if strings.HasPrefix(pattern, "tm-*.") {
 		return 1
 	}
 	return 0
+}
+
+// ValidateDomainPattern accepts exact DNS names and the one supported
+// explicit wildcard form, tm-*.example.com. Generic wildcards are rejected so
+// operators cannot accidentally expose every subdomain through one route.
+func ValidateDomainPattern(raw string) error {
+	pattern := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	if pattern == "" {
+		return nil
+	}
+	if strings.Contains(pattern, "*") {
+		if !strings.HasPrefix(pattern, "tm-*.") || strings.Count(pattern, "*") != 1 {
+			return fmt.Errorf("unsupported domain wildcard %q: only tm-*.example.com is allowed", raw)
+		}
+		base := strings.TrimPrefix(pattern, "tm-*")
+		if !validDNSName(base[1:]) {
+			return fmt.Errorf("invalid wildcard domain suffix %q", raw)
+		}
+		return nil
+	}
+	if !validDNSName(pattern) {
+		return fmt.Errorf("invalid domain %q", raw)
+	}
+	return nil
+}
+
+func validDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validDNSLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validDNSLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		ch := label[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func pathMatch(prefix, path string) bool {

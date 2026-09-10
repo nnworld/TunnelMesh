@@ -1,0 +1,1347 @@
+diff --git a/internal/auth/credential_service.go b/internal/auth/credential_service.go
+index 3a09b7b..59e575e 100644
+--- a/internal/auth/credential_service.go
++++ b/internal/auth/credential_service.go
+@@ -372,7 +372,7 @@ func validTokenType(tokenType storage.TokenType) bool {
+
+ func (s *CredentialService) validateOwnerAndBinding(ctx context.Context, tokenType storage.TokenType, ownerID, agentID, nodeID string) error {
+	owner, err := s.users.Get(ctx, ownerID)
+-	if err != nil || owner.Disabled {
++	if err != nil || owner.Disabled || owner.DeletedAt != nil {
+		return ErrUnauthenticated
+	}
+	switch tokenType {
+diff --git a/internal/auth/credential_service_test.go b/internal/auth/credential_service_test.go
+index b152693..6eb4c18 100644
+--- a/internal/auth/credential_service_test.go
++++ b/internal/auth/credential_service_test.go
+@@ -103,6 +103,12 @@ func TestCredentialServiceRejectsInvalidLifecycleStateAndRepositoryErrors(t *tes
+			u.Disabled = true
+			r.users.items["owner"] = u
+		}},
++		{name: "deleted owner", mutate: func(r *credentialRepos, _ *storage.ServiceToken) {
++			u := r.users.items["owner"]
++			deletedAt := now
++			u.DeletedAt = &deletedAt
++			r.users.items["owner"] = u
++		}},
+		{name: "missing owner", mutate: func(r *credentialRepos, _ *storage.ServiceToken) { delete(r.users.items, "owner") }},
+		{name: "disabled agent", mutate: func(r *credentialRepos, _ *storage.ServiceToken) {
+			a := r.agents.items["agent-a"]
+diff --git a/internal/auth/service.go b/internal/auth/service.go
+index 05e04b6..e2c99fc 100644
+--- a/internal/auth/service.go
++++ b/internal/auth/service.go
+@@ -87,7 +87,7 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (Log
+		return LoginResult{}, errors.New("auth repositories are required")
+	}
+	u, err := s.users.GetByUsername(ctx, strings.TrimSpace(username))
+-	if err != nil || u.Disabled || !verifyPassword(password, u.PasswordHash) {
++	if err != nil || u.Disabled || u.DeletedAt != nil || !verifyPassword(password, u.PasswordHash) {
+		return LoginResult{}, ErrInvalidCredentials
+	}
+	plain, err := randomToken(32)
+@@ -109,7 +109,7 @@ func (s *AuthService) ValidateToken(ctx context.Context, plain string) (Principa
+		return Principal{}, ErrUnauthenticated
+	}
+	u, err := s.users.Get(ctx, t.UserID)
+-	if err != nil || u.Disabled {
++	if err != nil || u.Disabled || u.DeletedAt != nil {
+		return Principal{}, ErrUnauthenticated
+	}
+	return Principal{UserID: u.ID, Username: u.Username, Role: u.Role}, nil
+diff --git a/internal/storage/db.go b/internal/storage/db.go
+index f99cf18..4c756e3 100644
+--- a/internal/storage/db.go
++++ b/internal/storage/db.go
+@@ -5,6 +5,7 @@ import (
+	"database/sql"
+	"errors"
+	"fmt"
++	"net/url"
+	"strings"
+	"time"
+
+@@ -19,7 +20,7 @@ import (
+ const (
+	DriverSQLite  = "sqlite"
+	DriverMySQL   = "mysql"
+-	SchemaVersion = 5
++	SchemaVersion = 6
+ )
+
+ var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
+@@ -43,6 +44,32 @@ type DB struct {
+	metrics       *observability.Metrics
+ }
+
++// AccountRepositories are transaction-bound repositories used for account
++// lifecycle changes and their audit record.
++type AccountRepositories struct {
++	Users  AccountUserRepository
++	Audits AuditRepository
++}
++
++func (d *DB) AccountTransaction(ctx context.Context, fn func(AccountRepositories) error) error {
++	tx, err := d.sql.BeginTx(ctx, nil)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = tx.Rollback() }()
++	if _, err := tx.ExecContext(ctx, `UPDATE schema_meta SET version=version WHERE id=1`); err != nil {
++		return err
++	}
++	repos := AccountRepositories{
++		Users:  &userRepo{db: tx, driver: d.driver, lockReads: true},
++		Audits: &auditRepo{db: tx},
++	}
++	if err := fn(repos); err != nil {
++		return err
++	}
++	return tx.Commit()
++}
++
+ // ServiceTokenMutationRepositories groups every repository that participates
+ // in an authorized service-token mutation. Each repository is bound to the
+ // same transaction so authorization facts and the credential write cannot
+@@ -194,11 +221,46 @@ func OpenWithMetrics(ctx context.Context, driver, dsn string, autoInit bool, met
+ func OpenConfig(ctx context.Context, cfg config.StorageConfig) (*DB, error) {
+	dsn := cfg.SQLite.Path
+	if cfg.Driver == DriverMySQL {
+-		dsn = cfg.MySQL.DSN
++		var err error
++		dsn, err = normalizeMySQLDSNTLS(cfg.MySQL.DSN, cfg.MySQL.TLS)
++		if err != nil {
++			return nil, fmt.Errorf("normalize mysql DSN: %w", err)
++		}
+	}
+	return Open(ctx, cfg.Driver, dsn, cfg.AutoInit)
+ }
+
++// normalizeMySQLDSNTLS makes the typed configuration authoritative over a
++// stale tls query parameter in an injected DSN. This is especially important
++// for MySQL installations that do not support TLS: leaving tls=true in the
++// DSN makes the driver negotiate TLS even when storage.mysql.tls is false.
++func normalizeMySQLDSNTLS(dsn string, enabled bool) (string, error) {
++	dsn = strings.TrimSpace(dsn)
++	if dsn == "" {
++		return dsn, nil
++	}
++	base, rawQuery := dsn, ""
++	if i := strings.IndexByte(dsn, '?'); i >= 0 {
++		base, rawQuery = dsn[:i], dsn[i+1:]
++	}
++	values, err := url.ParseQuery(rawQuery)
++	if err != nil {
++		return "", err
++	}
++	if enabled {
++		// Preserve an explicitly registered custom TLS profile. If none is
++		// present (or the DSN explicitly disabled TLS), request the driver's
++		// built-in TLS configuration.
++		profile, ok := values["tls"]
++		if !ok || len(profile) == 0 || strings.EqualFold(profile[0], "false") || profile[0] == "0" {
++			values.Set("tls", "true")
++		}
++	} else {
++		values.Set("tls", "false")
++	}
++	return base + "?" + values.Encode(), nil
++}
++
+ func newDB(db *sql.DB, driver string) *DB {
+	return &DB{
+		sql:           db,
+@@ -220,25 +282,29 @@ func newDB(db *sql.DB, driver string) *DB {
+ }
+
+ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
+-	for _, stmt := range strings.Split(migrations.DDL, ";") {
+-		stmt = strings.TrimSpace(stmt)
+-		if stmt == "" {
+-			continue
+-		}
+-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+-			if isDuplicateError(err) {
+-				continue
+-			}
++	exists, err := schemaMetaExists(ctx, db, driver)
++	if err != nil {
++		return err
++	}
++	if !exists {
++		if err := applySchemaStatements(ctx, db, migrations.DDL, true); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
++		if _, err := db.ExecContext(ctx, `INSERT INTO schema_meta(id,version) VALUES(1,?)`, SchemaVersion); err != nil {
++			return fmt.Errorf("write schema version: %w", err)
++		}
++		return requireSchemaTables(ctx, db, driver)
+	}
+	var version int
+-	err := db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&version)
++	err = db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
++		if err := applySchemaStatements(ctx, db, migrations.DDL, true); err != nil {
++			return fmt.Errorf("apply schema: %w", err)
++		}
+		if _, err = db.ExecContext(ctx, `INSERT INTO schema_meta(id,version) VALUES(1,?)`, SchemaVersion); err != nil {
+			return fmt.Errorf("write schema version: %w", err)
+		}
+-		return nil
++		return requireSchemaTables(ctx, db, driver)
+	}
+	if err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+@@ -247,6 +313,18 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
+		return fmt.Errorf("%w: database has version %d, application requires version %d; run the migration tool", ErrSchemaVersionMismatch, version, SchemaVersion)
+	}
+	if version < SchemaVersion {
++		if version != 5 {
++			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
++		}
++		script := migrations.V5ToV6SQLite
++		if driver == DriverMySQL {
++			script = migrations.V5ToV6MySQL
++		}
++		// MySQL DDL commits implicitly. Tolerating an already-added column or
++		// index makes a partially applied adjacent migration safe to retry.
++		if err := applySchemaStatements(ctx, db, script, true); err != nil {
++			return fmt.Errorf("apply migration v0005_to_v0006: %w", err)
++		}
+		if _, err := db.ExecContext(ctx, `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+			return fmt.Errorf("migrate schema version: %w", err)
+		}
+@@ -256,6 +334,39 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
+	}
+	return nil
+ }
++
++func schemaMetaExists(ctx context.Context, db *sql.DB, driver string) (bool, error) {
++	var name string
++	var err error
++	if driver == DriverMySQL {
++		err = db.QueryRowContext(ctx, `SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='schema_meta'`).Scan(&name)
++	} else {
++		err = db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'`).Scan(&name)
++	}
++	if errors.Is(err, sql.ErrNoRows) {
++		return false, nil
++	}
++	if err != nil {
++		return false, fmt.Errorf("check schema metadata: %w", err)
++	}
++	return true, nil
++}
++
++func applySchemaStatements(ctx context.Context, db *sql.DB, script string, tolerateDuplicates bool) error {
++	for _, statement := range strings.Split(script, ";") {
++		statement = strings.TrimSpace(statement)
++		if statement == "" {
++			continue
++		}
++		if _, err := db.ExecContext(ctx, statement); err != nil {
++			if tolerateDuplicates && isDuplicateError(err) {
++				continue
++			}
++			return err
++		}
++	}
++	return nil
++}
+ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
+	var v int
+	err := db.QueryRowContext(ctx, `SELECT version FROM schema_meta WHERE id=1`).Scan(&v)
+diff --git a/internal/storage/models.go b/internal/storage/models.go
+index ac56b5a..ba3748a 100644
+--- a/internal/storage/models.go
++++ b/internal/storage/models.go
+@@ -10,6 +10,7 @@ type User struct {
+	Role         string
+	PasswordHash string
+	Disabled     bool
++	DeletedAt    *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+ }
+@@ -206,5 +207,6 @@ type Page[T any] struct {
+	HasMore    bool
+ }
+
+-// CursorPage is an alias retained for callers that use the longer name.
+-type CursorPage[T any] = Page[T]
++// CursorPage retains the longer compatibility name without using a generic
++// type alias, which is experimental in Go 1.23 and crashes go/types tooling.
++type CursorPage[T any] Page[T]
+diff --git a/internal/storage/mysql_test.go b/internal/storage/mysql_test.go
+index f68e3ce..7e5081e 100644
+--- a/internal/storage/mysql_test.go
++++ b/internal/storage/mysql_test.go
+@@ -25,34 +25,15 @@ func TestMySQLRepositoryContract(t *testing.T) {
+	runRepositoryContract(t, db)
+ }
+
+-func TestMySQLAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
++func TestMySQLAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
+	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
+	}
+-	raw := prepareMySQLServiceTokenSchemaTest(t, dsn, 2)
++	prepareMySQLServiceTokenSchemaTest(t, dsn, 2)
+
+-	db, err := OpenMySQL(context.Background(), dsn, true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer db.Close()
+-
+-	assertMySQLTableColumns(t, raw, "service_tokens", []string{
+-		"id", "token_type", "owner_user_id", "agent_id", "node_id",
+-		"token_prefix", "token_hash", "scope", "expires_at", "revoked_at",
+-		"last_used_at", "created_at", "updated_at",
+-	})
+-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_owner_type", []string{"owner_user_id", "token_type", "id"})
+-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_agent", []string{"agent_id", "token_type", "id"})
+-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_node", []string{"node_id", "token_type", "id"})
+-
+-	version, err := db.SchemaVersion(context.Background())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if version != SchemaVersion {
+-		t.Fatalf("schema version = %d, want %d", version, SchemaVersion)
++	if _, err := OpenMySQL(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0002_to_v0003") {
++		t.Fatalf("error=%v, want missing v2 to v3 migration", err)
+	}
+ }
+
+@@ -103,16 +84,17 @@ func prepareMySQLServiceTokenSchemaTest(t *testing.T, dsn string, version int) *
+		}
+	}
+	t.Cleanup(func() {
+-		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=2 WHERE id=1`); err != nil {
+-			t.Errorf("restore MySQL schema version: %v", err)
+-			_ = raw.Close()
+-			return
++		for _, statement := range strings.Split(migrations.DDL, ";") {
++			statement = strings.TrimSpace(statement)
++			if statement == "" {
++				continue
++			}
++			if _, err := raw.ExecContext(context.Background(), statement); err != nil && !isDuplicateError(err) {
++				t.Errorf("restore MySQL schema: %v", err)
++			}
+		}
+-		db, err := OpenMySQL(context.Background(), dsn, true)
+-		if err != nil {
+-			t.Errorf("restore MySQL service_tokens schema: %v", err)
+-		} else if err := db.Close(); err != nil {
+-			t.Errorf("close restored MySQL database: %v", err)
++		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
++			t.Errorf("restore MySQL schema version: %v", err)
+		}
+		if err := raw.Close(); err != nil {
+			t.Errorf("close MySQL schema test database: %v", err)
+diff --git a/internal/storage/repository.go b/internal/storage/repository.go
+index 0e47d9c..35a2ffc 100644
+--- a/internal/storage/repository.go
++++ b/internal/storage/repository.go
+@@ -20,6 +20,23 @@ type UserRepository interface {
+	List(context.Context, string, int) (Page[User], error)
+ }
+
++type AccountStatus string
++
++const (
++	AccountStatusActive  AccountStatus = "active"
++	AccountStatusDeleted AccountStatus = "deleted"
++	AccountStatusAll     AccountStatus = "all"
++)
++
++// AccountUserRepository adds the administrator-facing lifecycle operations
++// without widening the authentication repository contract used by test fakes.
++type AccountUserRepository interface {
++	UserRepository
++	ListChildren(context.Context, AccountStatus, string, int) (Page[User], error)
++	SoftDelete(context.Context, string, time.Time) error
++	Restore(context.Context, string) error
++}
++
+ type TokenRepository interface {
+	Create(context.Context, APIToken) error
+	Get(context.Context, string) (APIToken, error)
+@@ -327,17 +344,19 @@ func (r *userRepo) Create(ctx context.Context, v User) error {
+	if v.Role == "" {
+		v.Role = "user"
+	}
+-	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), tm(v.CreatedAt), tm(v.UpdatedAt))
++	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.CreatedAt), tm(v.UpdatedAt))
+	return err
+ }
+ func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
+	var v User
+	var created, updated string
+-	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE id=?`
++	var deleted sql.NullString
++	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE id=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+-	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
++	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
++	v.DeletedAt = parseTM(deleted)
+	v.CreatedAt = parseTime(created)
+	v.UpdatedAt = parseTime(updated)
+	return v, err
+@@ -345,11 +364,13 @@ func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
+ func (r *userRepo) GetByUsername(ctx context.Context, n string) (User, error) {
+	var v User
+	var created, updated string
+-	query := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users WHERE username=?`
++	var deleted sql.NullString
++	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE username=?`
+	if r.lockReads && r.driver == DriverMySQL {
+		query += ` FOR UPDATE`
+	}
+-	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &created, &updated)
++	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
++	v.DeletedAt = parseTM(deleted)
+	v.CreatedAt = parseTime(created)
+	v.UpdatedAt = parseTime(updated)
+	return v, err
+@@ -358,7 +379,7 @@ func (r *userRepo) Update(ctx context.Context, v User) error {
+	if v.UpdatedAt.IsZero() {
+		v.UpdatedAt = time.Now().UTC()
+	}
+-	res, err := r.db.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), tm(v.UpdatedAt), v.ID)
++	res, err := r.db.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,deleted_at=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.UpdatedAt), v.ID)
+	return checkAffected(res, err)
+ }
+ func (r *userRepo) Delete(ctx context.Context, id string) error {
+@@ -367,7 +388,7 @@ func (r *userRepo) Delete(ctx context.Context, id string) error {
+ }
+ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[User], error) {
+	cursor, limit = pageArgs(cursor, limit)
+-	q := `SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users`
++	q := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users`
+	args := []any{}
+	if c := decodeCursor(cursor); c != "" {
+		q += ` WHERE id>?`
+@@ -384,9 +405,11 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
+	for rows.Next() {
+		var v User
+		var c, u string
+-		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &c, &u); err != nil {
++		var deleted sql.NullString
++		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &c, &u); err != nil {
+			return Page[User]{}, err
+		}
++		v.DeletedAt = parseTM(deleted)
+		v.CreatedAt = parseTime(c)
+		v.UpdatedAt = parseTime(u)
+		out = append(out, v)
+@@ -403,6 +426,66 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
+	return p, nil
+ }
+
++func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, cursor string, limit int) (Page[User], error) {
++	cursor, limit = pageArgs(cursor, limit)
++	conditions := []string{`role='user'`}
++	switch status {
++	case "", AccountStatusActive:
++		conditions = append(conditions, `deleted_at IS NULL`)
++	case AccountStatusDeleted:
++		conditions = append(conditions, `deleted_at IS NOT NULL`)
++	case AccountStatusAll:
++	default:
++		return Page[User]{}, fmt.Errorf("invalid account status %q", status)
++	}
++	args := make([]any, 0, 2)
++	if decoded := decodeCursor(cursor); decoded != "" {
++		conditions = append(conditions, `id>?`)
++		args = append(args, decoded)
++	}
++	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
++	args = append(args, limit+1)
++	rows, err := r.db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return Page[User]{}, err
++	}
++	defer rows.Close()
++	page := Page[User]{}
++	for rows.Next() {
++		var user User
++		var deleted sql.NullString
++		var created, updated string
++		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.PasswordHash, &user.Disabled, &deleted, &created, &updated); err != nil {
++			return Page[User]{}, err
++		}
++		user.DeletedAt = parseTM(deleted)
++		user.CreatedAt = parseTime(created)
++		user.UpdatedAt = parseTime(updated)
++		page.Items = append(page.Items, user)
++	}
++	if err := rows.Err(); err != nil {
++		return Page[User]{}, err
++	}
++	if len(page.Items) > limit {
++		page.Items = page.Items[:limit]
++		page.HasMore = true
++		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
++	}
++	return page, nil
++}
++
++func (r *userRepo) SoftDelete(ctx context.Context, id string, when time.Time) error {
++	when = timeOrNow(when)
++	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=CASE WHEN deleted_at IS NULL THEN ? ELSE deleted_at END,disabled=1,updated_at=? WHERE id=?`, tm(when), tm(when), id)
++	return checkAffected(res, err)
++}
++
++func (r *userRepo) Restore(ctx context.Context, id string) error {
++	now := time.Now().UTC()
++	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=NULL,disabled=0,updated_at=? WHERE id=?`, tm(now), id)
++	return checkAffected(res, err)
++}
++
+ func boolInt(v bool) int {
+	if v {
+		return 1
+diff --git a/internal/storage/sqlite_test.go b/internal/storage/sqlite_test.go
+index 9b54517..f1c1ebf 100644
+--- a/internal/storage/sqlite_test.go
++++ b/internal/storage/sqlite_test.go
+@@ -41,7 +41,7 @@ func TestSQLiteAutoInitRejectsIncompatibleSchemaVersion(t *testing.T) {
+	}
+ }
+
+-func TestSQLiteAutoInitMigratesSchemaV1ToCurrent(t *testing.T) {
++func TestSQLiteAutoInitRejectsMissingV1MigrationChain(t *testing.T) {
+	dsn := "file:schema-v1-migrate?mode=memory&cache=shared"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+@@ -52,21 +52,12 @@ func TestSQLiteAutoInitMigratesSchemaV1ToCurrent(t *testing.T) {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+-	db, err := OpenSQLite(context.Background(), dsn, true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer db.Close()
+-	version, err := db.SchemaVersion(context.Background())
+-	if err != nil || version != SchemaVersion {
+-		t.Fatalf("version=%d err=%v, want %d", version, err, SchemaVersion)
+-	}
+-	if _, err := db.SQL().Exec(`INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,stale,updated_at) VALUES ('a','n',1,1,'{}','now','now',0,'now')`); err != nil {
+-		t.Fatalf("metadata table unavailable after migration: %v", err)
++	if _, err := OpenSQLite(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0001_to_v0002") {
++		t.Fatalf("error=%v, want missing v1 to v2 migration", err)
+	}
+ }
+
+-func TestSQLiteAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
++func TestSQLiteAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
+	dsn := "file:schema-v2-service-tokens?mode=memory&cache=shared"
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+@@ -82,28 +73,8 @@ func TestSQLiteAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
+	}
+	defer raw.Close()
+
+-	db, err := OpenSQLite(context.Background(), dsn, true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer db.Close()
+-
+-	assertSQLiteTableColumns(t, db.SQL(), "service_tokens", []string{
+-		"id", "token_type", "owner_user_id", "agent_id", "node_id",
+-		"token_prefix", "token_hash", "scope", "expires_at", "revoked_at",
+-		"last_used_at", "created_at", "updated_at", "secret_ciphertext",
+-		"secret_nonce", "secret_key_id", "secret_version", "secret_last_read_at",
+-	})
+-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_owner_type", []string{"owner_user_id", "token_type", "id"})
+-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_agent", []string{"agent_id", "token_type", "id"})
+-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_node", []string{"node_id", "token_type", "id"})
+-
+-	version, err := db.SchemaVersion(context.Background())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if version != SchemaVersion {
+-		t.Fatalf("schema version = %d, want %d", version, SchemaVersion)
++	if _, err := OpenSQLite(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0002_to_v0003") {
++		t.Fatalf("error=%v, want missing v2 to v3 migration", err)
+	}
+ }
+
+@@ -117,7 +88,7 @@ func TestSQLiteAutoInitDisabledRejectsMissingServiceTokensTable(t *testing.T) {
+		raw.Close()
+		t.Fatal(err)
+	}
+-	if _, err := raw.Exec(`DROP TABLE IF EXISTS service_tokens; DELETE FROM schema_meta WHERE id=1; INSERT INTO schema_meta(id,version) VALUES (1,5)`); err != nil {
++	if _, err := raw.Exec(`DROP TABLE IF EXISTS service_tokens; DELETE FROM schema_meta WHERE id=1; INSERT INTO schema_meta(id,version) VALUES (1,6)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+@@ -134,7 +105,7 @@ func TestSQLiteAutoInitDisabledRejectsMissingRuntimeMetadataTable(t *testing.T)
+	if err != nil {
+		t.Fatal(err)
+	}
+-	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,5); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`); err != nil {
++	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,6); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+diff --git a/migrations/ddl.sql b/migrations/ddl.sql
+index 33e60d1..21b37f7 100644
+--- a/migrations/ddl.sql
++++ b/migrations/ddl.sql
+@@ -4,20 +4,22 @@ CREATE TABLE IF NOT EXISTS schema_meta (
+ );
+
+ CREATE TABLE IF NOT EXISTS users (
+-    id VARCHAR(255) PRIMARY KEY,
+-    username VARCHAR(255) NOT NULL UNIQUE,
++    id VARBINARY(255) PRIMARY KEY,
++    username VARCHAR(191) NOT NULL UNIQUE,
+     role VARCHAR(32) NOT NULL,
+     password_hash VARCHAR(255) NOT NULL,
+     disabled INTEGER NOT NULL DEFAULT 0,
++    deleted_at VARCHAR(32),
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+ );
++CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);
+
+ CREATE TABLE IF NOT EXISTS api_tokens (
+-    id VARCHAR(255) PRIMARY KEY,
+-    user_id VARCHAR(255) NOT NULL,
+-    token_hash VARCHAR(255) NOT NULL UNIQUE,
+-    idempotency_key VARCHAR(255),
++    id VARBINARY(255) PRIMARY KEY,
++    user_id VARBINARY(255) NOT NULL,
++    token_hash VARBINARY(255) NOT NULL UNIQUE,
++    idempotency_key VARBINARY(255),
+     expires_at TEXT,
+     revoked_at TEXT,
+     created_at TEXT NOT NULL
+@@ -25,13 +27,13 @@ CREATE TABLE IF NOT EXISTS api_tokens (
+ CREATE INDEX idx_api_tokens_user_id ON api_tokens(user_id);
+
+ CREATE TABLE IF NOT EXISTS service_tokens (
+-    id VARCHAR(255) PRIMARY KEY,
++    id VARBINARY(255) PRIMARY KEY,
+     token_type VARCHAR(32) NOT NULL,
+-    owner_user_id VARCHAR(255),
+-    agent_id VARCHAR(255),
+-    node_id VARCHAR(255),
+-    token_prefix VARCHAR(32) NOT NULL,
+-    token_hash VARCHAR(255) NOT NULL UNIQUE,
++    owner_user_id VARBINARY(255),
++    agent_id VARBINARY(255),
++    node_id VARBINARY(255),
++    token_prefix VARBINARY(32) NOT NULL,
++    token_hash VARBINARY(255) NOT NULL UNIQUE,
+     scope TEXT NOT NULL,
+     expires_at TEXT,
+     revoked_at TEXT,
+@@ -51,9 +53,9 @@ ALTER TABLE service_tokens ADD COLUMN secret_version INTEGER;
+ ALTER TABLE service_tokens ADD COLUMN secret_last_read_at TEXT;
+
+ CREATE TABLE IF NOT EXISTS agents (
+-    id VARCHAR(255) PRIMARY KEY,
++    id VARBINARY(255) PRIMARY KEY,
+     name VARCHAR(255) NOT NULL,
+-    owner_user_id VARCHAR(255) NOT NULL,
++    owner_user_id VARBINARY(255) NOT NULL,
+     capabilities TEXT NOT NULL,
+     enabled INTEGER NOT NULL DEFAULT 1,
+     created_at TEXT NOT NULL,
+@@ -62,8 +64,8 @@ CREATE TABLE IF NOT EXISTS agents (
+ CREATE INDEX idx_agents_owner ON agents(owner_user_id);
+
+ CREATE TABLE IF NOT EXISTS agent_policies (
+-    id VARCHAR(255) PRIMARY KEY,
+-    agent_id VARCHAR(255) NOT NULL,
++    id VARBINARY(255) PRIMARY KEY,
++    agent_id VARBINARY(255) NOT NULL,
+     target_host VARCHAR(255) NOT NULL,
+     target_port INTEGER NOT NULL,
+     protocol VARCHAR(32) NOT NULL,
+@@ -75,20 +77,20 @@ CREATE TABLE IF NOT EXISTS agent_policies (
+ CREATE INDEX idx_agent_policies_agent ON agent_policies(agent_id);
+
+ CREATE TABLE IF NOT EXISTS tunnel_groups (
+-    id VARCHAR(255) PRIMARY KEY,
+-    user_id VARCHAR(255) NOT NULL,
++    id VARBINARY(255) PRIMARY KEY,
++    user_id VARBINARY(255) NOT NULL,
+     name VARCHAR(255) NOT NULL,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+ );
+
+ CREATE TABLE IF NOT EXISTS tunnels (
+-    id VARCHAR(255) PRIMARY KEY,
+-    group_id VARCHAR(255),
+-    agent_id VARCHAR(255) NOT NULL,
++    id VARBINARY(255) PRIMARY KEY,
++    group_id VARBINARY(255),
++    agent_id VARBINARY(255) NOT NULL,
+     protocol VARCHAR(32) NOT NULL,
+-    domain VARCHAR(255),
+-    path_prefix VARCHAR(255),
++    domain VARBINARY(255),
++    path_prefix VARBINARY(255),
+     target_host VARCHAR(255) NOT NULL,
+     target_port INTEGER NOT NULL,
+     public_port INTEGER,
+@@ -102,8 +104,8 @@ CREATE INDEX idx_tunnels_agent ON tunnels(agent_id);
+ CREATE INDEX idx_tunnels_domain_path ON tunnels(domain, path_prefix);
+
+ CREATE TABLE IF NOT EXISTS server_nodes (
+-    id VARCHAR(255) PRIMARY KEY,
+-    address VARCHAR(255) NOT NULL,
++    id VARBINARY(255) PRIMARY KEY,
++    address VARBINARY(255) NOT NULL,
+     epoch INTEGER NOT NULL DEFAULT 0,
+     metadata TEXT NOT NULL,
+     last_seen_at TEXT,
+@@ -113,8 +115,8 @@ CREATE TABLE IF NOT EXISTS server_nodes (
+ );
+
+ CREATE TABLE IF NOT EXISTS agent_runtime_leases (
+-    agent_id VARCHAR(255) PRIMARY KEY,
+-    node_id VARCHAR(255) NOT NULL,
++    agent_id VARBINARY(255) PRIMARY KEY,
++    node_id VARBINARY(255) NOT NULL,
+     epoch INTEGER NOT NULL,
+     acquired_at TEXT NOT NULL,
+     expires_at TEXT NOT NULL,
+@@ -123,8 +125,8 @@ CREATE TABLE IF NOT EXISTS agent_runtime_leases (
+ CREATE INDEX idx_agent_leases_node ON agent_runtime_leases(node_id);
+
+ CREATE TABLE IF NOT EXISTS agent_runtime_metadata (
+-    agent_id VARCHAR(255) PRIMARY KEY,
+-    node_id VARCHAR(255) NOT NULL,
++    agent_id VARBINARY(255) PRIMARY KEY,
++    node_id VARBINARY(255) NOT NULL,
+     epoch INTEGER NOT NULL,
+     revision INTEGER NOT NULL,
+     metadata TEXT NOT NULL,
+@@ -132,15 +134,15 @@ CREATE TABLE IF NOT EXISTS agent_runtime_metadata (
+     last_seen_at TEXT NOT NULL,
+     expires_at TEXT,
+     stale INTEGER NOT NULL DEFAULT 0,
+-    updated_at TEXT NOT NULL
++    updated_at VARCHAR(32) NOT NULL
+ );
+ CREATE INDEX idx_agent_metadata_node ON agent_runtime_metadata(node_id);
+ CREATE INDEX idx_agent_metadata_stale ON agent_runtime_metadata(stale, updated_at);
+
+ CREATE TABLE IF NOT EXISTS agent_runtime_stats (
+-    id VARCHAR(255) PRIMARY KEY,
+-    agent_id VARCHAR(255) NOT NULL,
+-    node_id VARCHAR(255) NOT NULL,
++    id VARBINARY(255) PRIMARY KEY,
++    agent_id VARBINARY(255) NOT NULL,
++    node_id VARBINARY(255) NOT NULL,
+     epoch INTEGER NOT NULL,
+     window_start VARCHAR(32) NOT NULL,
+     window_end VARCHAR(32) NOT NULL,
+@@ -159,9 +161,9 @@ CREATE TABLE IF NOT EXISTS agent_runtime_stats (
+ CREATE INDEX idx_agent_runtime_stats_range ON agent_runtime_stats(agent_id, window_start, id);
+
+ CREATE TABLE IF NOT EXISTS agent_probe_results (
+-    probe_id VARCHAR(255) PRIMARY KEY,
+-    agent_id VARCHAR(255) NOT NULL,
+-    node_id VARCHAR(255) NOT NULL,
++    probe_id VARBINARY(255) PRIMARY KEY,
++    agent_id VARBINARY(255) NOT NULL,
++    node_id VARBINARY(255) NOT NULL,
+     epoch INTEGER NOT NULL,
+     kind VARCHAR(32) NOT NULL,
+     result VARCHAR(32) NOT NULL,
+@@ -172,19 +174,19 @@ CREATE TABLE IF NOT EXISTS agent_probe_results (
+ CREATE INDEX idx_agent_probe_results_range ON agent_probe_results(agent_id, observed_at, probe_id);
+
+ CREATE TABLE IF NOT EXISTS audit_logs (
+-    id VARCHAR(255) PRIMARY KEY,
+-    actor_user_id VARCHAR(255),
++    id VARBINARY(255) PRIMARY KEY,
++    actor_user_id VARBINARY(255),
+     action VARCHAR(255) NOT NULL,
+     resource_type VARCHAR(255) NOT NULL,
+-    resource_id VARCHAR(255),
++    resource_id VARBINARY(255),
+     details TEXT NOT NULL,
+-    created_at TEXT NOT NULL
++    created_at VARCHAR(32) NOT NULL
+ );
+ CREATE INDEX idx_audit_created ON audit_logs(created_at, id);
+
+ CREATE TABLE IF NOT EXISTS idempotency_keys (
+-    idempotency_key VARCHAR(255) PRIMARY KEY,
+-    user_id VARCHAR(255),
++    idempotency_key VARBINARY(255) PRIMARY KEY,
++    user_id VARBINARY(255),
+     response TEXT NOT NULL,
+     status_code INTEGER NOT NULL DEFAULT 200,
+     created_at TEXT NOT NULL,
+diff --git a/migrations/embed.go b/migrations/embed.go
+index d8a6114..9e6a0aa 100644
+--- a/migrations/embed.go
++++ b/migrations/embed.go
+@@ -8,3 +8,9 @@ import _ "embed"
+ //
+ //go:embed ddl.sql
+ var DDL string
++
++//go:embed incremental/v0005_to_v0006/mysql.sql
++var V5ToV6MySQL string
++
++//go:embed incremental/v0005_to_v0006/sqlite.sql
++var V5ToV6SQLite string
+diff --git a/internal/auth/account_service.go b/internal/auth/account_service.go
+new file mode 100644
+index 0000000..f378100
+--- /dev/null
++++ b/internal/auth/account_service.go
+@@ -0,0 +1,250 @@
++package auth
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"regexp"
++	"strings"
++	"time"
++	"unicode/utf8"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++)
++
++var (
++	ErrUsernameInvalid         = errors.New("username_invalid")
++	ErrUsernameConflict        = errors.New("username_conflict")
++	ErrPasswordPolicyViolation = errors.New("password_policy_violation")
++	ErrCurrentPasswordInvalid  = errors.New("current_password_invalid")
++	ErrAdminAccountProtected   = errors.New("admin_account_protected")
++	ErrAccountDeleted          = errors.New("account_deleted")
++)
++
++var accountUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{3,64}$`)
++
++type AccountService struct {
++	users  storage.AccountUserRepository
++	audits storage.AuditRepository
++	tx     func(context.Context, func(storage.AccountRepositories) error) error
++}
++
++func NewAccountService(source any, repos ...any) *AccountService {
++	service := &AccountService{}
++	bindAccountRepository(service, source)
++	for _, repo := range repos {
++		bindAccountRepository(service, repo)
++	}
++	return service
++}
++
++func bindAccountRepository(service *AccountService, source any) {
++	switch value := source.(type) {
++	case *storage.DB:
++		service.users, _ = value.Users().(storage.AccountUserRepository)
++		service.audits = value.Audits()
++		service.tx = value.AccountTransaction
++	case storage.AccountUserRepository:
++		service.users = value
++	case storage.AuditRepository:
++		service.audits = value
++	}
++}
++
++func (s *AccountService) CreateChild(ctx context.Context, actorUserID, username string) (storage.User, string, error) {
++	username = strings.TrimSpace(username)
++	if !accountUsernamePattern.MatchString(username) {
++		return storage.User{}, "", ErrUsernameInvalid
++	}
++	temporaryPassword, err := randomToken(24)
++	if err != nil {
++		return storage.User{}, "", fmt.Errorf("generate temporary password: %w", err)
++	}
++	passwordHash, err := hashPassword(temporaryPassword)
++	if err != nil {
++		return storage.User{}, "", err
++	}
++	var result storage.User
++	err = s.withTransaction(ctx, func(repos storage.AccountRepositories) error {
++		if err := repos.Users.Create(ctx, storage.User{Username: username, Role: "user", PasswordHash: passwordHash}); err != nil {
++			if isUniqueConstraintError(err) {
++				return ErrUsernameConflict
++			}
++			return err
++		}
++		result, err = repos.Users.GetByUsername(ctx, username)
++		if err != nil {
++			return err
++		}
++		return createAccountAudit(ctx, repos.Audits, actorUserID, "account.created", result)
++	})
++	if err != nil {
++		return storage.User{}, "", err
++	}
++	return result, temporaryPassword, nil
++}
++
++func (s *AccountService) ListChildren(ctx context.Context, status, cursor string, limit int) (storage.Page[storage.User], error) {
++	if s == nil || s.users == nil {
++		return storage.Page[storage.User]{}, errors.New("account user repository is required")
++	}
++	return s.users.ListChildren(ctx, storage.AccountStatus(strings.ToLower(strings.TrimSpace(status))), cursor, limit)
++}
++
++func (s *AccountService) SetDisabled(ctx context.Context, actorUserID, userID string, disabled bool) (storage.User, error) {
++	return s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
++		if user.DeletedAt != nil {
++			return "", ErrAccountDeleted
++		}
++		user.Disabled = disabled
++		if err := repos.Users.Update(ctx, *user); err != nil {
++			return "", err
++		}
++		if disabled {
++			return "account.disabled", nil
++		}
++		return "account.enabled", nil
++	})
++}
++
++func (s *AccountService) ResetPassword(ctx context.Context, actorUserID, userID string) (storage.User, string, error) {
++	temporaryPassword, err := randomToken(24)
++	if err != nil {
++		return storage.User{}, "", fmt.Errorf("generate temporary password: %w", err)
++	}
++	passwordHash, err := hashPassword(temporaryPassword)
++	if err != nil {
++		return storage.User{}, "", err
++	}
++	user, err := s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
++		if user.DeletedAt != nil {
++			return "", ErrAccountDeleted
++		}
++		user.PasswordHash = passwordHash
++		if err := repos.Users.Update(ctx, *user); err != nil {
++			return "", err
++		}
++		return "account.password_reset", nil
++	})
++	if err != nil {
++		return storage.User{}, "", err
++	}
++	return user, temporaryPassword, nil
++}
++
++func (s *AccountService) ChangeOwnPassword(ctx context.Context, userID, currentPassword, newPassword string) (storage.User, error) {
++	if err := validateAccountPassword(newPassword); err != nil {
++		return storage.User{}, err
++	}
++	var result storage.User
++	err := s.withTransaction(ctx, func(repos storage.AccountRepositories) error {
++		user, err := repos.Users.Get(ctx, userID)
++		if err != nil {
++			return err
++		}
++		if user.DeletedAt != nil || user.Disabled {
++			return ErrAccountDeleted
++		}
++		if !verifyPassword(currentPassword, user.PasswordHash) {
++			return ErrCurrentPasswordInvalid
++		}
++		if verifyPassword(newPassword, user.PasswordHash) {
++			return ErrPasswordPolicyViolation
++		}
++		user.PasswordHash, err = hashPassword(newPassword)
++		if err != nil {
++			return err
++		}
++		if err := repos.Users.Update(ctx, user); err != nil {
++			return err
++		}
++		result = user
++		return createAccountAudit(ctx, repos.Audits, user.ID, "account.password_changed", user)
++	})
++	return result, err
++}
++
++func (s *AccountService) DeleteChild(ctx context.Context, actorUserID, userID string) (storage.User, error) {
++	return s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
++		if err := repos.Users.SoftDelete(ctx, user.ID, time.Now().UTC()); err != nil {
++			return "", err
++		}
++		return "account.deleted", nil
++	})
++}
++
++func (s *AccountService) RestoreChild(ctx context.Context, actorUserID, userID string) (storage.User, error) {
++	return s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
++		if err := repos.Users.Restore(ctx, user.ID); err != nil {
++			return "", err
++		}
++		return "account.restored", nil
++	})
++}
++
++func (s *AccountService) mutateChild(ctx context.Context, actorUserID, userID string, mutate func(storage.AccountRepositories, *storage.User) (string, error)) (storage.User, error) {
++	var result storage.User
++	err := s.withTransaction(ctx, func(repos storage.AccountRepositories) error {
++		user, err := repos.Users.Get(ctx, userID)
++		if err != nil {
++			return err
++		}
++		if strings.EqualFold(user.Role, "admin") {
++			return ErrAdminAccountProtected
++		}
++		action, err := mutate(repos, &user)
++		if err != nil {
++			return err
++		}
++		result, err = repos.Users.Get(ctx, userID)
++		if err != nil {
++			return err
++		}
++		return createAccountAudit(ctx, repos.Audits, actorUserID, action, result)
++	})
++	return result, err
++}
++
++func (s *AccountService) withTransaction(ctx context.Context, work func(storage.AccountRepositories) error) error {
++	if s == nil || s.users == nil || s.audits == nil {
++		return errors.New("account repositories are required")
++	}
++	if s.tx != nil {
++		return s.tx(ctx, work)
++	}
++	return work(storage.AccountRepositories{Users: s.users, Audits: s.audits})
++}
++
++func validateAccountPassword(password string) error {
++	if !utf8.ValidString(password) {
++		return ErrPasswordPolicyViolation
++	}
++	length := utf8.RuneCountInString(password)
++	if length < 12 || length > 128 {
++		return ErrPasswordPolicyViolation
++	}
++	return nil
++}
++
++func createAccountAudit(ctx context.Context, audits storage.AuditRepository, actorUserID, action string, user storage.User) error {
++	details, err := json.Marshal(struct {
++		UserID   string `json:"userId"`
++		Username string `json:"username"`
++		Disabled bool   `json:"disabled"`
++		Deleted  bool   `json:"deleted"`
++	}{UserID: user.ID, Username: user.Username, Disabled: user.Disabled, Deleted: user.DeletedAt != nil})
++	if err != nil {
++		return err
++	}
++	return audits.Create(ctx, storage.AuditLog{ActorUserID: actorUserID, Action: action, ResourceType: "user", ResourceID: user.ID, Details: string(details)})
++}
++
++func isUniqueConstraintError(err error) bool {
++	if err == nil || errors.Is(err, sql.ErrNoRows) {
++		return false
++	}
++	message := strings.ToLower(err.Error())
++	return strings.Contains(message, "unique") || strings.Contains(message, "duplicate")
++}
+diff --git a/internal/auth/account_service_test.go b/internal/auth/account_service_test.go
+new file mode 100644
+index 0000000..b6cc71d
+--- /dev/null
++++ b/internal/auth/account_service_test.go
+@@ -0,0 +1,133 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++)
++
++func TestAccountServiceCreateChildValidatesUsernameAndGeneratesPassword(t *testing.T) {
++	ctx := context.Background()
++	db := newAccountTestDB(t, "create")
++	service := NewAccountService(db)
++
++	for _, username := range []string{"ab", strings.Repeat("a", 65), "bad name", "bad/name", "用户"} {
++		if _, _, err := service.CreateChild(ctx, "admin-1", username); !errors.Is(err, ErrUsernameInvalid) {
++			t.Errorf("CreateChild(%q) error = %v, want ErrUsernameInvalid", username, err)
++		}
++	}
++	user, temporaryPassword, err := service.CreateChild(ctx, "admin-1", " operator.one ")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if user.Username != "operator.one" || user.Role != "user" || user.Disabled || user.DeletedAt != nil {
++		t.Fatalf("created user = %+v", user)
++	}
++	if len(temporaryPassword) < 32 || !VerifyPassword(temporaryPassword, user.PasswordHash) {
++		t.Fatal("temporary password is not a high-entropy credential matching the stored hash")
++	}
++	audits, err := db.Audits().List(ctx, "", 10)
++	if err != nil || len(audits.Items) != 1 || audits.Items[0].Action != "account.created" || audits.Items[0].ActorUserID != "admin-1" {
++		t.Fatalf("audits = %+v, err = %v", audits, err)
++	}
++	if strings.Contains(audits.Items[0].Details, temporaryPassword) || strings.Contains(audits.Items[0].Details, user.PasswordHash) {
++		t.Fatal("audit details contain password material")
++	}
++}
++
++func TestAccountServiceChangeOwnPasswordPreservesExistingToken(t *testing.T) {
++	ctx := context.Background()
++	db := newAccountTestDB(t, "password")
++	authService := NewAuthService(db)
++	user, err := authService.CreateUser(ctx, "member.one", "old-password-12", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	login, err := authService.Login(ctx, user.Username, "old-password-12")
++	if err != nil {
++		t.Fatal(err)
++	}
++	service := NewAccountService(db)
++	if _, err := service.ChangeOwnPassword(ctx, user.ID, "old-password-12", "new-password-12"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := authService.ValidateToken(ctx, login.Token); err != nil {
++		t.Fatalf("existing token was revoked: %v", err)
++	}
++	if _, err := authService.Login(ctx, user.Username, "old-password-12"); !errors.Is(err, ErrInvalidCredentials) {
++		t.Fatalf("old password login error = %v", err)
++	}
++	if _, err := authService.Login(ctx, user.Username, "new-password-12"); err != nil {
++		t.Fatalf("new password login: %v", err)
++	}
++	if _, err := service.ChangeOwnPassword(ctx, user.ID, "new-password-12", "new-password-12"); !errors.Is(err, ErrPasswordPolicyViolation) {
++		t.Fatalf("same password error = %v", err)
++	}
++	if _, err := service.ChangeOwnPassword(ctx, user.ID, "new-password-12", "short"); !errors.Is(err, ErrPasswordPolicyViolation) {
++		t.Fatalf("short password error = %v", err)
++	}
++}
++
++func TestAccountServiceLogicalDeleteInvalidatesAndRestoreReenablesToken(t *testing.T) {
++	ctx := context.Background()
++	db := newAccountTestDB(t, "delete-restore")
++	authService := NewAuthService(db)
++	user, err := authService.CreateUser(ctx, "member.two", "member-password-12", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	login, err := authService.Login(ctx, user.Username, "member-password-12")
++	if err != nil {
++		t.Fatal(err)
++	}
++	service := NewAccountService(db)
++	deleted, err := service.DeleteChild(ctx, "admin-1", user.ID)
++	if err != nil || deleted.DeletedAt == nil || !deleted.Disabled {
++		t.Fatalf("deleted user = %+v, err = %v", deleted, err)
++	}
++	if _, err := authService.ValidateToken(ctx, login.Token); !errors.Is(err, ErrUnauthenticated) {
++		t.Fatalf("deleted account token error = %v", err)
++	}
++	restored, err := service.RestoreChild(ctx, "admin-1", user.ID)
++	if err != nil || restored.DeletedAt != nil || restored.Disabled {
++		t.Fatalf("restored user = %+v, err = %v", restored, err)
++	}
++	if _, err := authService.ValidateToken(ctx, login.Token); err != nil {
++		t.Fatalf("preserved token did not become valid after restore: %v", err)
++	}
++}
++
++func TestAccountServiceProtectsAdministratorTargets(t *testing.T) {
++	ctx := context.Background()
++	db := newAccountTestDB(t, "protect-admin")
++	authService := NewAuthService(db)
++	admin, err := authService.CreateUser(ctx, "admin.one", "admin-password-12", "admin")
++	if err != nil {
++		t.Fatal(err)
++	}
++	service := NewAccountService(db)
++	checks := []func() error{
++		func() error { _, err := service.SetDisabled(ctx, "admin-1", admin.ID, true); return err },
++		func() error { _, _, err := service.ResetPassword(ctx, "admin-1", admin.ID); return err },
++		func() error { _, err := service.DeleteChild(ctx, "admin-1", admin.ID); return err },
++		func() error { _, err := service.RestoreChild(ctx, "admin-1", admin.ID); return err },
++	}
++	for i, check := range checks {
++		if err := check(); !errors.Is(err, ErrAdminAccountProtected) {
++			t.Errorf("check %d error = %v, want ErrAdminAccountProtected", i, err)
++		}
++	}
++}
++
++func newAccountTestDB(t *testing.T, name string) *storage.DB {
++	t.Helper()
++	db, err := storage.Open(context.Background(), storage.DriverSQLite, "file:auth-account-"+name+"?mode=memory&cache=shared", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++	return db
++}
+diff --git a/internal/storage/account_repository_test.go b/internal/storage/account_repository_test.go
+new file mode 100644
+index 0000000..2e4b44c
+--- /dev/null
++++ b/internal/storage/account_repository_test.go
+@@ -0,0 +1,123 @@
++package storage
++
++import (
++	"context"
++	"database/sql"
++	"strings"
++	"testing"
++	"time"
++
++	_ "modernc.org/sqlite"
++
++	"github.com/tunnelmesh/tunnelmesh/migrations"
++)
++
++func TestAccountMigrationV5ToV6SQLite(t *testing.T) {
++	dsn := "file:account-migration-v5-v6?mode=memory&cache=shared"
++	raw, err := sql.Open("sqlite", dsn)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer raw.Close()
++
++	legacyDDL := strings.ReplaceAll(migrations.DDL, "    deleted_at VARCHAR(32),\n", "")
++	legacyDDL = strings.ReplaceAll(legacyDDL, "CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);\n", "")
++	if _, err := raw.Exec(legacyDDL); err != nil {
++		t.Fatalf("create v5 schema: %v", err)
++	}
++	if _, err := raw.Exec(`DELETE FROM schema_meta; INSERT INTO schema_meta(id,version) VALUES(1,5)`); err != nil {
++		t.Fatalf("set v5 schema version: %v", err)
++	}
++
++	db, err := OpenSQLite(context.Background(), dsn, true)
++	if err != nil {
++		t.Fatalf("migrate v5 to v6: %v", err)
++	}
++	defer db.Close()
++	if version, err := db.SchemaVersion(context.Background()); err != nil || version != 6 {
++		t.Fatalf("schema version = %d, err = %v, want 6", version, err)
++	}
++	assertSQLiteTableColumnsContains(t, db.SQL(), "users", "deleted_at")
++	assertSQLiteIndexColumns(t, db.SQL(), "idx_users_role_deleted", []string{"role", "deleted_at", "id"})
++}
++
++func TestAccountRepositoryListsAndRestoresLogicalDeletes(t *testing.T) {
++	db := newTestDB(t)
++	ctx := context.Background()
++	repo, ok := db.Users().(AccountUserRepository)
++	if !ok {
++		t.Fatal("user repository does not implement AccountUserRepository")
++	}
++	for _, user := range []User{
++		{ID: "admin-a", Username: "admin-a", Role: "admin", PasswordHash: "hash"},
++		{ID: "user-a", Username: "user-a", Role: "user", PasswordHash: "hash"},
++		{ID: "user-b", Username: "user-b", Role: "user", PasswordHash: "hash"},
++	} {
++		if err := repo.Create(ctx, user); err != nil {
++			t.Fatalf("create %s: %v", user.ID, err)
++		}
++	}
++	if err := db.Tokens().Create(ctx, APIToken{ID: "token-user-b", UserID: "user-b", TokenHash: "hash-user-b"}); err != nil {
++		t.Fatal(err)
++	}
++	deletedAt := time.Date(2026, 9, 8, 7, 0, 0, 0, time.UTC)
++	if err := repo.SoftDelete(ctx, "user-b", deletedAt); err != nil {
++		t.Fatalf("soft delete: %v", err)
++	}
++
++	active, err := repo.ListChildren(ctx, AccountStatusActive, "", 10)
++	if err != nil || len(active.Items) != 1 || active.Items[0].ID != "user-a" {
++		t.Fatalf("active page = %+v, err = %v", active, err)
++	}
++	deleted, err := repo.ListChildren(ctx, AccountStatusDeleted, "", 10)
++	if err != nil || len(deleted.Items) != 1 || deleted.Items[0].ID != "user-b" || deleted.Items[0].DeletedAt == nil || !deleted.Items[0].Disabled {
++		t.Fatalf("deleted page = %+v, err = %v", deleted, err)
++	}
++	all, err := repo.ListChildren(ctx, AccountStatusAll, "", 10)
++	if err != nil || len(all.Items) != 2 {
++		t.Fatalf("all page = %+v, err = %v", all, err)
++	}
++	if _, err := db.Tokens().Get(ctx, "token-user-b"); err != nil {
++		t.Fatalf("related token was removed: %v", err)
++	}
++
++	if err := repo.Restore(ctx, "user-b"); err != nil {
++		t.Fatalf("restore: %v", err)
++	}
++	restored, err := repo.Get(ctx, "user-b")
++	if err != nil || restored.DeletedAt != nil || restored.Disabled {
++		t.Fatalf("restored user = %+v, err = %v", restored, err)
++	}
++}
++
++func TestMySQLV5ToV6MigrationUsesCompatibleDDL(t *testing.T) {
++	if strings.Contains(strings.ToUpper(migrations.V5ToV6MySQL), "IF NOT EXISTS") {
++		t.Fatal("MySQL 5.6 migration must not use ADD COLUMN IF NOT EXISTS")
++	}
++	for _, fragment := range []string{"ALTER TABLE users ADD COLUMN deleted_at VARCHAR(32)", "CREATE INDEX idx_users_role_deleted"} {
++		if !strings.Contains(migrations.V5ToV6MySQL, fragment) {
++			t.Fatalf("MySQL migration missing %q", fragment)
++		}
++	}
++}
++
++func assertSQLiteTableColumnsContains(t *testing.T, db *sql.DB, table, want string) {
++	t.Helper()
++	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer rows.Close()
++	for rows.Next() {
++		var cid, notNull, primaryKey int
++		var name, columnType string
++		var defaultValue any
++		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
++			t.Fatal(err)
++		}
++		if name == want {
++			return
++		}
++	}
++	t.Fatalf("table %s does not contain column %s", table, want)
++}
+diff --git a/migrations/incremental/v0005_to_v0006/mysql.sql b/migrations/incremental/v0005_to_v0006/mysql.sql
+new file mode 100644
+index 0000000..478b71d
+--- /dev/null
++++ b/migrations/incremental/v0005_to_v0006/mysql.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE users ADD COLUMN deleted_at VARCHAR(32) NULL AFTER disabled;
++CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);
+diff --git a/migrations/incremental/v0005_to_v0006/sqlite.sql b/migrations/incremental/v0005_to_v0006/sqlite.sql
+new file mode 100644
+index 0000000..835a911
+--- /dev/null
++++ b/migrations/incremental/v0005_to_v0006/sqlite.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE users ADD COLUMN deleted_at TEXT;
++CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);

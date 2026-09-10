@@ -1,13 +1,23 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"golang.org/x/net/websocket"
 	"io"
+	"math/big"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -555,5 +565,207 @@ func TestDialWebSocketDoesNotSkipServerCertificateVerification(t *testing.T) {
 	if transport, err := DialWebSocket(context.Background(), serverURL, "agent-token"); err == nil {
 		_ = transport.Close()
 		t.Fatal("DialWebSocket accepted an untrusted server certificate")
+	}
+}
+
+func TestStreamDispatcherHTTPSUsesConfiguredHostAndSNI(t *testing.T) {
+	certificate, roots := testAgentTLSCertificate(t, "service.internal.example.com", nil)
+	serverName := make(chan string, 1)
+	responses := make(chan string, 1)
+	address := startAgentTLSServer(t, certificate, serverName, responses, tls.VersionTLS12)
+
+	dataFrames := make(chan []byte, 4)
+	d := NewStreamDispatcherWithSender(Dialer{Timeout: 2 * time.Second, TLSRootCAs: roots}, nil, func(frame protocol.Frame) error {
+		if frame.Type == protocol.FrameData {
+			dataFrames <- frame.Payload
+		}
+		return nil
+	})
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{
+		Protocol: "http", TargetHost: "127.0.0.1", TargetPort: address.Port,
+		TargetScheme: "https", HostHeader: "service.internal.example.com",
+		TLSServerName: "service.internal.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 31, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	request := "GET / HTTP/1.1\r\nHost: service.internal.example.com\r\n\r\n"
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 31, Payload: []byte(request)}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case name := <-serverName:
+		if name != "service.internal.example.com" {
+			t.Fatalf("TLS SNI = %q", name)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLS server did not receive SNI")
+	}
+	if response := waitAgentResponse(dataFrames); !strings.Contains(response, "tls12:ok") {
+		t.Fatalf("TLS response = %q", response)
+	}
+}
+
+func TestStreamDispatcherHTTPSDefaultsSNIToTargetHost(t *testing.T) {
+	certificate, roots := testAgentTLSCertificate(t, "localhost", nil)
+	serverName := make(chan string, 1)
+	responses := make(chan string, 1)
+	address := startAgentTLSServer(t, certificate, serverName, responses, 0)
+
+	d := NewStreamDispatcher(Dialer{Timeout: 2 * time.Second, TLSRootCAs: roots}, nil)
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{
+		Protocol: "http", TargetHost: "localhost", TargetPort: address.Port, TargetScheme: "https",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 32, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case name := <-serverName:
+		if name != "localhost" {
+			t.Fatalf("default TLS SNI = %q", name)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLS server did not receive default SNI")
+	}
+}
+
+func TestStreamDispatcherHTTPSRejectsUntrustedCertificate(t *testing.T) {
+	certificate, _ := testAgentTLSCertificate(t, "service.internal.example.com", nil)
+	serverName := make(chan string, 1)
+	responses := make(chan string, 1)
+	address := startAgentTLSServer(t, certificate, serverName, responses, 0)
+
+	d := NewStreamDispatcher(Dialer{Timeout: 2 * time.Second}, nil)
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{
+		Protocol: "http", TargetHost: "127.0.0.1", TargetPort: address.Port,
+		TargetScheme: "https", TLSServerName: "service.internal.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 33, Payload: payload}); err == nil {
+		t.Fatal("HTTPS stream accepted an untrusted certificate")
+	}
+}
+
+func testAgentTLSCertificate(t *testing.T, dnsName string, ip net.IP) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkixName("TunnelMesh Test CA"),
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkixName(dnsName),
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{dnsName},
+	}
+	if ip != nil {
+		leafTemplate.IPAddresses = []net.IP{ip}
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := tls.Certificate{
+		Certificate: [][]byte{leafDER, caDER},
+		PrivateKey:  leafKey,
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+	return certificate, roots
+}
+
+func pkixName(commonName string) pkix.Name {
+	return pkix.Name{CommonName: commonName}
+}
+
+func startAgentTLSServer(t *testing.T, certificate tls.Certificate, serverName chan<- string, responses chan<- string, maxVersion uint16) *net.TCPAddr {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		config := &tls.Config{
+			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12,
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+				serverName <- info.ServerName
+				return nil, nil
+			},
+		}
+		if maxVersion != 0 {
+			config.MaxVersion = maxVersion
+		}
+		tlsConn := tls.Server(conn, config)
+		_ = tlsConn.SetDeadline(time.Now().Add(2 * time.Second))
+		if err := tlsConn.Handshake(); err != nil {
+			_ = tlsConn.Close()
+			return
+		}
+		request, err := bufio.NewReader(tlsConn).ReadString('\n')
+		if err == nil {
+			version := "tls-other"
+			if tlsConn.ConnectionState().Version == tls.VersionTLS12 {
+				version = "tls12"
+			}
+			_, _ = fmt.Fprintf(tlsConn, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n%s:ok", version)
+		}
+		_ = tlsConn.Close()
+		responses <- request
+	}()
+	return listener.Addr().(*net.TCPAddr)
+}
+
+func waitAgentResponse(frames <-chan []byte) string {
+	var response string
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case payload := <-frames:
+			response += string(payload)
+			if strings.Contains(response, ":ok") {
+				return response
+			}
+		case <-deadline:
+			return response
+		}
 	}
 }

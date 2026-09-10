@@ -99,7 +99,7 @@ func TestAgentRunCommandForwardsTCPUDPAndHTTPThroughRealDispatcher(t *testing.T)
 	go func() { runtimeDone <- runtime.ServeListener(runtimeCtx, runtimeListener) }()
 
 	configPath := filepath.Join(t.TempDir(), "agent.yaml")
-	configBody := fmt.Sprintf("mode: local\nnode:\n  id: agent-cli-node\nagent:\n  server_url: ws://%s/ws/agent\n  id: agent-cli\n  token: %s\n", runtimeListener.Addr().String(), agentToken.Secret)
+	configBody := fmt.Sprintf("mode: local\nnode:\n  id: agent-cli-node\nagent:\n  instance_id: agent-cli-instance\n  server_url: ws://%s/ws/agent\n  id: agent-cli\n  token: %s\n", runtimeListener.Addr().String(), agentToken.Secret)
 	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
 	}

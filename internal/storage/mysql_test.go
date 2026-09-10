@@ -25,34 +25,32 @@ func TestMySQLRepositoryContract(t *testing.T) {
 	runRepositoryContract(t, db)
 }
 
-func TestMySQLAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
+func TestMySQLV6ToV7ConnectionLeaseMigrationUsesCompatibleDDL(t *testing.T) {
+	script := migrations.V6ToV7MySQL
+	if strings.Contains(strings.ToUpper(script), "DROP TABLE") || strings.Contains(strings.ToUpper(script), "ON DUPLICATE KEY") {
+		t.Fatalf("migration must not rewrite or upsert the legacy lease table: %s", script)
+	}
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS agent_connection_leases",
+		"PRIMARY KEY (agent_id, connection_id)",
+		"INSERT INTO agent_connection_leases",
+		"FROM agent_runtime_leases old",
+	} {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("migration missing required fragment %q", fragment)
+		}
+	}
+}
+
+func TestMySQLAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {
 		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
 	}
-	raw := prepareMySQLServiceTokenSchemaTest(t, dsn, 2)
+	prepareMySQLServiceTokenSchemaTest(t, dsn, 2)
 
-	db, err := OpenMySQL(context.Background(), dsn, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	assertMySQLTableColumns(t, raw, "service_tokens", []string{
-		"id", "token_type", "owner_user_id", "agent_id", "node_id",
-		"token_prefix", "token_hash", "scope", "expires_at", "revoked_at",
-		"last_used_at", "created_at", "updated_at",
-	})
-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_owner_type", []string{"owner_user_id", "token_type", "id"})
-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_agent", []string{"agent_id", "token_type", "id"})
-	assertMySQLIndexColumns(t, raw, "idx_service_tokens_node", []string{"node_id", "token_type", "id"})
-
-	version, err := db.SchemaVersion(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != SchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, SchemaVersion)
+	if _, err := OpenMySQL(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0002_to_v0003") {
+		t.Fatalf("error=%v, want missing v2 to v3 migration", err)
 	}
 }
 
@@ -103,16 +101,17 @@ func prepareMySQLServiceTokenSchemaTest(t *testing.T, dsn string, version int) *
 		}
 	}
 	t.Cleanup(func() {
-		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=2 WHERE id=1`); err != nil {
-			t.Errorf("restore MySQL schema version: %v", err)
-			_ = raw.Close()
-			return
+		for _, statement := range strings.Split(migrations.DDL, ";") {
+			statement = strings.TrimSpace(statement)
+			if statement == "" {
+				continue
+			}
+			if _, err := raw.ExecContext(context.Background(), statement); err != nil && !isDuplicateError(err) {
+				t.Errorf("restore MySQL schema: %v", err)
+			}
 		}
-		db, err := OpenMySQL(context.Background(), dsn, true)
-		if err != nil {
-			t.Errorf("restore MySQL service_tokens schema: %v", err)
-		} else if err := db.Close(); err != nil {
-			t.Errorf("close restored MySQL database: %v", err)
+		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+			t.Errorf("restore MySQL schema version: %v", err)
 		}
 		if err := raw.Close(); err != nil {
 			t.Errorf("close MySQL schema test database: %v", err)

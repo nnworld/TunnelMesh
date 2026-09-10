@@ -9,6 +9,11 @@ import (
 
 type registryFactory func(t *testing.T) NodeRegistry
 
+type connectionRegistry interface {
+	NodeRegistry
+	ListAgentConnections(context.Context, string) ([]NodeOwner, error)
+}
+
 func runRegistryContract(t *testing.T, factory registryFactory) {
 	t.Helper()
 	ctx := context.Background()
@@ -98,5 +103,68 @@ func runRegistryContract(t *testing.T, factory registryFactory) {
 	}
 	if _, err := r.KeepAlive(ctx, owner, time.Second); !errors.Is(err, ErrFencing) {
 		t.Fatalf("stale owner accepted: %v", err)
+	}
+}
+
+func runConnectionRegistryContract(t *testing.T, factory func(*testing.T) connectionRegistry) {
+	t.Helper()
+	ctx := context.Background()
+	r := factory(t)
+	defer r.Close()
+
+	first, err := r.Register(ctx, NodeRegistration{
+		NodeID: "server-1", Address: "10.0.0.1", AgentID: "agent-connections",
+		InstanceID: "instance-a", ConnectionID: "conn-a", ServerNodeID: "server-1", TTL: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := r.Register(ctx, NodeRegistration{
+		NodeID: "server-1", Address: "10.0.0.1", AgentID: "agent-connections",
+		InstanceID: "instance-b", ConnectionID: "conn-b", ServerNodeID: "server-1", TTL: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections, err := r.ListAgentConnections(ctx, "agent-connections")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(connections) != 2 {
+		t.Fatalf("connections=%d, want 2", len(connections))
+	}
+	for _, connection := range connections {
+		if connection.ServerNodeID != "server-1" {
+			t.Fatalf("connection=%+v, want server node identity", connection)
+		}
+	}
+
+	first, err = r.KeepAlive(ctx, first, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections, err = r.ListAgentConnections(ctx, "agent-connections")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(connections) != 2 || !connections[0].ExpiresAt.After(second.ExpiresAt) {
+		t.Fatalf("connection-scoped renewal changed pool: %+v", connections)
+	}
+	if err := r.Revoke(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	connections, err = r.ListAgentConnections(ctx, "agent-connections")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(connections) != 1 || connections[0].ConnectionID != "conn-a" {
+		t.Fatalf("connections after revoke=%+v, want only conn-a", connections)
+	}
+	resolved, err := r.ResolveAgent(ctx, "agent-connections")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ConnectionID != "conn-a" || resolved.InstanceID != "instance-a" {
+		t.Fatalf("resolved=%+v, want conn-a instance-a", resolved)
 	}
 }

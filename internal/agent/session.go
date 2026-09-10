@@ -22,6 +22,7 @@ const agentStreamResetMessage = "stream rejected"
 
 type StreamOpenPayload = protocol.StreamOpenPayload
 type StreamDialFunc func(context.Context, string, string, int) (io.ReadWriteCloser, error)
+type streamPayloadDialFunc func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error)
 type FrameSender func(protocol.Frame) error
 type streamEntry struct {
 	conn       io.ReadWriteCloser
@@ -31,16 +32,17 @@ type streamEntry struct {
 	remoteHalf bool
 }
 type StreamDispatcher struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	dial       StreamDialFunc
-	streams    map[uint32]*streamEntry
-	generation uint64
-	mu         sync.Mutex
-	send       FrameSender
-	metrics    *observability.Metrics
-	readers    sync.WaitGroup
-	closed     bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	dial        StreamDialFunc
+	dialPayload streamPayloadDialFunc
+	streams     map[uint32]*streamEntry
+	generation  uint64
+	mu          sync.Mutex
+	send        FrameSender
+	metrics     *observability.Metrics
+	readers     sync.WaitGroup
+	closed      bool
 }
 
 func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
@@ -57,25 +59,27 @@ func NewStreamDispatcherWithCallback(d Dialer, override StreamDialFunc, cb func(
 	return NewStreamDispatcherWithSender(d, override, sender)
 }
 func NewStreamDispatcherWithSender(d Dialer, override StreamDialFunc, sender FrameSender) *StreamDispatcher {
-	if override == nil {
-		override = func(ctx context.Context, proto, host string, port int) (io.ReadWriteCloser, error) {
-			switch proto {
+	var dial StreamDialFunc
+	var dialPayload streamPayloadDialFunc
+	if override != nil {
+		dial = override
+	} else {
+		dialPayload = func(ctx context.Context, payload protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+			if payload.Protocol == "http" {
+				return d.dialHTTPStreamPayload(ctx, payload)
+			}
+			switch payload.Protocol {
 			case "tcp":
-				return d.DialTCP(ctx, host, port)
+				return d.DialTCP(ctx, payload.TargetHost, payload.TargetPort)
 			case "udp":
-				return d.DialUDP(ctx, host, port)
-			case "http":
-				if d.HTTPStream != nil {
-					return d.HTTPStream(ctx, host, port)
-				}
-				return d.DialHTTPStream(ctx, host, port)
+				return d.DialUDP(ctx, payload.TargetHost, payload.TargetPort)
 			default:
 				return nil, errors.New("agent: unsupported stream protocol")
 			}
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &StreamDispatcher{ctx: ctx, cancel: cancel, dial: override, streams: make(map[uint32]*streamEntry), send: sender}
+	return &StreamDispatcher{ctx: ctx, cancel: cancel, dial: dial, dialPayload: dialPayload, streams: make(map[uint32]*streamEntry), send: sender}
 }
 
 // SetMetrics attaches the process-scoped observer without changing the
@@ -99,12 +103,18 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if f.StreamID == 0 || p.TargetHost == "" || p.TargetPort < 1 || p.TargetPort > 65535 {
 			return errors.New("agent: invalid stream target")
 		}
-		c, err := d.dial(d.ctx, p.Protocol, p.TargetHost, p.TargetPort)
-		if err != nil {
+		var c io.ReadWriteCloser
+		var dialErr error
+		if d.dialPayload != nil {
+			c, dialErr = d.dialPayload(d.ctx, p)
+		} else {
+			c, dialErr = d.dial(d.ctx, p.Protocol, p.TargetHost, p.TargetPort)
+		}
+		if dialErr != nil {
 			if d.metrics != nil {
-				d.metrics.ObserveStream(p.Protocol, "failed", observability.NormalizeErrorClass(err))
+				d.metrics.ObserveStream(p.Protocol, "failed", observability.NormalizeErrorClass(dialErr))
 			}
-			return err
+			return dialErr
 		}
 		d.mu.Lock()
 		if d.closed {
@@ -193,6 +203,17 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 	default:
 		return nil
 	}
+}
+
+// ActiveStreams returns the number of streams currently owned by this
+// connection. It is used by the connection-pool controller for scaling.
+func (d *StreamDispatcher) ActiveStreams() int {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.streams)
 }
 
 func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
@@ -303,6 +324,8 @@ type Session struct {
 	metadataCollector       *MetadataCollector
 	metadataAgentID         string
 	metadataNodeID          string
+	metadataInstanceID      string
+	metadataConnectionID    string
 	metadataEpoch           int64
 	metadataRevision        uint64
 	metadataReported        bool
@@ -312,7 +335,9 @@ type Session struct {
 	HeartbeatInterval       time.Duration
 	Rand                    *rand.Rand
 	Metrics                 *observability.Metrics
+	OnHeartbeatRTT          func(time.Duration)
 	heartbeatSentNanos      atomic.Int64
+	heartbeatRTTNanos       atomic.Int64
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -337,6 +362,19 @@ func (s *Session) SetMetadataIdentity(agentID, nodeID string, epoch int64) {
 	defer s.metadataMu.Unlock()
 	s.metadataAgentID = agentID
 	s.metadataNodeID = nodeID
+	s.metadataEpoch = epoch
+}
+
+// SetMetadataConnectionIdentity attaches logical and physical connection
+// identity to metadata reports while retaining the legacy helper above.
+func (s *Session) SetMetadataConnectionIdentity(agentID, nodeID, instanceID, connectionID string, epoch int64) {
+	if s == nil {
+		return
+	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	s.metadataAgentID, s.metadataNodeID = agentID, nodeID
+	s.metadataInstanceID, s.metadataConnectionID = instanceID, connectionID
 	s.metadataEpoch = epoch
 }
 
@@ -377,7 +415,8 @@ func (s *Session) ReportMetadata(ctx context.Context) error {
 	}
 	s.metadataRevision++
 	payload := protocol.AgentMetadataPayload{
-		AgentID: s.metadataAgentID, NodeID: s.metadataNodeID, Epoch: s.metadataEpoch,
+		AgentID: s.metadataAgentID, NodeID: s.metadataNodeID, InstanceID: s.metadataInstanceID,
+		ConnectionID: s.metadataConnectionID, Epoch: s.metadataEpoch,
 		Revision: s.metadataRevision, ReportedAt: time.Now().UTC(),
 		Items:  make([]protocol.AgentMetadataItem, 0, len(snapshot.Fields)),
 		Errors: make([]protocol.AgentMetadataError, 0, len(snapshot.Errors)),
@@ -485,6 +524,13 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 			continue
 		}
 		if f.Type == protocol.FramePong {
+			if sent := s.heartbeatSentNanos.Load(); sent > 0 {
+				rtt := time.Since(time.Unix(0, sent))
+				s.heartbeatRTTNanos.Store(rtt.Nanoseconds())
+				if s.OnHeartbeatRTT != nil {
+					s.OnHeartbeatRTT(rtt)
+				}
+			}
 			if s.Metrics != nil {
 				rtt := time.Duration(0)
 				if sent := s.heartbeatSentNanos.Load(); sent > 0 {
@@ -500,6 +546,14 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 			}
 		}
 	}
+}
+
+// LastHeartbeatRTT returns the most recent PING/PONG round-trip time.
+func (s *Session) LastHeartbeatRTT() time.Duration {
+	if s == nil {
+		return 0
+	}
+	return time.Duration(s.heartbeatRTTNanos.Load())
 }
 func (s *Session) Close() error {
 	if s.closed.Swap(true) {

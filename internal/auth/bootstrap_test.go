@@ -54,6 +54,21 @@ func TestEnsureAdminConcurrentCreatesOneAndPrintsOnce(t *testing.T) {
 	}
 }
 
+func TestBootstrapAdminRejectsExistingAdmin(t *testing.T) {
+	db := testDB(t)
+	svc := NewBootstrapService(db)
+	created, err := svc.BootstrapAdmin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Username == "" || created.Password == "" {
+		t.Fatalf("bootstrap credentials = %+v", created)
+	}
+	if _, err := svc.BootstrapAdmin(context.Background()); err != ErrAdminAlreadyExists {
+		t.Fatalf("second bootstrap error = %v, want %v", err, ErrAdminAlreadyExists)
+	}
+}
+
 func TestRegenerateRevokesAllAdminSessionsBeyondFirstPage(t *testing.T) {
 	db := testDB(t)
 	svc := NewBootstrapService(db)
@@ -121,7 +136,7 @@ func TestRegenerateCredentialsRequiresConfirmAndRevokesSessions(t *testing.T) {
 	if _, err := auth.ValidateToken(context.Background(), login.Token); err == nil {
 		t.Fatal("old token remains valid")
 	}
-	logs, err := db.Audits().List(context.Background(), "", 10)
+	logs, err := db.Audits().List(context.Background(), storage.AuditFilter{}, "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

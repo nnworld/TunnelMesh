@@ -18,7 +18,7 @@ TunnelMesh 是一个 Go 实现的内网穿透与服务代理平台，包含三�
 - Agent/Client 与 Server：TLS WebSocket。
 - Server 节点间：mTLS gRPC/HTTP2 relay。
 - 管理后台：Vue 3、TypeScript、Vite、Pinia、Vue Router、Element Plus。
-- 数据库 DDL：唯一权威文件为 `migrations/ddl.sql`。
+- 数据库 DDL：`migrations/ddl.sql` 是当前版本全量建库脚本；`migrations/incremental/` 保存不可变的版本间增量升级脚本。
 
 ## 目录职责
 
@@ -26,7 +26,9 @@ TunnelMesh 是一个 Go 实现的内网穿透与服务代理平台，包含三�
 - `internal/cli/`：命令行参数、配置加载和子命令。
 - `internal/config/`：配置模型、默认值和配置优先级。
 - `internal/auth/`：用户、Token、Argon2id、RBAC 和管理员恢复。
-- `internal/storage/`：数据库连接、DDL 初始化和 Repository 实现。
+- `internal/storage/`：数据库连接、DDL 初始化、版本迁移和 Repository 实现。
+- `migrations/ddl.sql`：当前版本的全量 DDL，用于空库初始化和最终 Schema 校验。
+- `migrations/incremental/`：已发布 Schema 版本之间的增量 DDL，按版本目录分别维护 MySQL 与 SQLite 脚本。
 - `internal/registry/`：MySQL lease、etcd 注册发现和 epoch fencing。
 - `internal/protocol/`：WebSocket frame、能力协商、稳定错误码、stream 状态机、UDP association 和逻辑 traceroute 协议。
 - `internal/session/`、`internal/relay/`：会话管理、跨节点 relay 和流生命周期。
@@ -45,10 +47,28 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 
 ### 数据库
 
-- 所有 schema 变更只修改 `migrations/ddl.sql`，禁止另建第二份 DDL。
+- `migrations/ddl.sql` 是“当前 Schema 状态”的唯一权威全量脚本；`migrations/incremental/` 是“版本升级路径”的唯一权威历史。二者职责不同，不得维护其他影子 DDL。
+- 每次 Schema 变更必须同时更新全量 DDL、对应增量 DDL、`SchemaVersion`、迁移测试和升级文档；禁止只修改 `migrations/ddl.sql` 或只提升版本号。
+- 增量脚本目录命名为 `migrations/incremental/vNNNN_to_vNNNN/`，其中必须包含 `mysql.sql` 和 `sqlite.sql`；`NNNN` 与 `schema_meta.version` 一一对应并单调递增。
+- 已发布的增量脚本禁止修改、重排或删除；修复已发布迁移必须新增下一个 Schema 版本，保证审计与升级结果可复现。
+- 只要求维护相邻 Schema 版本的增量脚本；跨多个版本升级必须按版本号顺序逐个执行，不允许跳过中间迁移。
 - 必须同时考虑 SQLite 和 MySQL 语法兼容性；涉及索引、租约和事务时补充两种驱动的测试或验证。
-- `auto-init` 开启时自动执行 DDL；关闭时缺表或版本不匹配必须快速失败。
+- `auto-init` 开启时：空库执行全量 DDL，旧库按 `schema_meta.version` 顺序执行增量 DDL；禁止使用 `CREATE TABLE IF NOT EXISTS` 代替真实的存量表迁移。
+- `auto-init` 关闭时，缺表、版本不匹配或增量链不完整必须快速失败，并给出当前版本、目标版本和缺失迁移信息。
+- 增量迁移必须可安全重试：执行前校验源版本和必要前置条件，执行成功后再推进 `schema_meta.version`。MySQL DDL 可能隐式提交，脚本必须避免依赖整体事务回滚，并提供失败后的恢复步骤。
+- 破坏性变更不得与依赖它的代码在同一步发布；采用 expand → migrate/backfill → contract，先新增兼容结构，再迁移数据和代码，最后在允许的版本窗口删除旧结构。
 - 管理数据以数据库为权威来源；缓存、租约和运行时状态不得替代持久化事实。
+
+### 版本升级与迭代
+
+- 应用版本遵循 `MAJOR.MINOR.PATCH`；应用版本与整数 Schema 版本分别管理，但发布说明必须明确二者映射、最低可升级版本和是否包含数据库迁移。
+- **补丁版本（PATCH）**：原则上不得改变 Schema 结构；只允许代码修复和不改变数据库契约的数据修正。确需 DDL 时必须升级为 MINOR，不得把结构迁移隐藏在 PATCH 中。
+- **小版本（MINOR）**：只允许向后兼容的 Schema 扩展，例如新增可空列、新表或不影响旧查询的索引；必须保证滚动升级期间新旧 Server 可同时访问数据库。
+- **大版本（MAJOR）**：允许经过批准的不兼容 Schema 或数据语义变更，但必须有 ADR、升级前备份、停机或兼容窗口、数据迁移、回滚方案和明确的最低源版本。能分阶段完成的破坏性变更仍必须跨版本执行 expand/contract。
+- 升级前必须检查当前应用版本、`schema_meta.version`、数据库类型、备份可恢复性、账号 DDL 权限和增量链完整性；不满足前置条件时拒绝升级。
+- 升级后必须校验目标 Schema 版本、关键表/列/索引、数据回填结果、健康检查和关键链路；升级日志不得包含 DSN、密码、Token 或业务敏感数据。
+- 回滚优先回退应用且保留向后兼容 Schema；涉及不可逆 DDL 或数据转换时必须通过备份恢复或经验证的补偿迁移处理，禁止自动猜测反向 SQL。
+- 每个包含 Schema 变更的版本必须在 `docs/operations/` 更新升级与回滚步骤，说明预计锁表时间、容量影响、灰度顺序和 5 分钟止损方案。
 
 ### 一致性与并发
 
@@ -102,6 +122,21 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 5. 运行完整验证后再提交。
 
 核心模块禁止只靠手工验证；跨层行为必须有集成测试，关键用户链路必须有 E2E 冒烟测试。
+
+## Plan 与 PR 要求
+
+- 非平凡功能、缺陷修复、接口行为变更、Schema 变更和跨模块重构，必须在实现前编写实施计划；紧急修复可以在止损后 24 小时内补记，但必须明确标注“补记计划”并只记录已验证事实。
+- 实施计划保存在 `docs/superpowers/plans/YYYY-MM-DD-<feature-name>.md`，文件名使用英文短横线命名。
+- 创建实施计划后必须暂停并等待用户确认；未获得用户明确确认前，不得开始实现、修改生产代码或执行计划中的任务。
+- 计划必须包含：目标、架构决策、技术栈、规格引用、全局约束、精确文件清单、任务间接口、TDD 步骤、预期失败结果、最小实现、预期通过结果、验证命令、回滚注意事项。
+- 计划不得包含 `TBD`、`TODO`、“后续补充”等占位内容，不得引用不存在的类型、函数或文档；每个任务必须能独立测试和评审。
+- 补记计划必须说明原始实现已完成，并记录实际验证结果；不得虚构当时的红灯测试输出。
+- PR 面向的变更必须同步编写 PR 描述文档，保存在 `docs/pull-requests/YYYY-MM-DD-<feature-name>.md`。
+- PR 描述必须包含：标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全与授权影响、测试证据、发布步骤、回滚步骤、Reviewer 关注点和集成状态。
+- PR 默认基于 `main`；如果因发布或长期迭代需要其他基线，必须由用户明确确认。
+- 创建 PR 前必须完成对应范围的 `go test ./... -count=1`、`go test -race ./...`、`go vet ./...`、前端 `npm test -- --run` 和 `npm run build`、`git diff --check`；涉及 Web 产物时还必须执行嵌入资源验证。
+- PR 描述、计划、提交信息和评论中不得包含密码、Token、私钥、生产 DSN、完整凭据或未脱敏日志。
+- 未经用户明确授权，不得执行 commit、push、merge、创建远端 PR 或删除远端数据。
 
 ### 安全功能边界
 

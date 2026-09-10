@@ -14,6 +14,7 @@ import (
 var (
 	ErrConfirmRequired    = errors.New("credential regeneration requires --confirm")
 	ErrRecoveryInProgress = errors.New("credential recovery is already in progress")
+	ErrAdminAlreadyExists = errors.New("admin account already exists")
 )
 
 type Credentials struct {
@@ -93,6 +94,20 @@ func (s *BootstrapService) EnsureAdmin(ctx context.Context) (Credentials, error)
 		return result, nil
 	}
 	return result, work(s.users, s.tokens, s.audits)
+}
+
+// BootstrapAdmin creates the first administrator and returns its one-time
+// credentials. It refuses to act when an administrator already exists so a
+// mistakenly selected database cannot silently create or replace credentials.
+func (s *BootstrapService) BootstrapAdmin(ctx context.Context) (Credentials, error) {
+	creds, err := s.EnsureAdmin(ctx)
+	if err != nil {
+		return Credentials{}, err
+	}
+	if creds.Username == "" {
+		return Credentials{}, ErrAdminAlreadyExists
+	}
+	return creds, nil
 }
 
 func (s *BootstrapService) RegenerateCredentials(ctx context.Context, confirm bool) (Credentials, error) {

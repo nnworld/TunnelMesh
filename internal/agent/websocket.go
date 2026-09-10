@@ -43,6 +43,7 @@ type SessionFrameHandler interface {
 }
 
 type SessionFrameHandlerFactory func(*Session) SessionFrameHandler
+type ConnectionSessionFactory func(*Session, string) SessionFrameHandler
 
 // RunWebSocket dials the configured Server, authenticates with a bearer token,
 // reports metadata through the existing Session, and reconnects with bounded
@@ -60,6 +61,10 @@ func RunWebSocketWithHandlerFactory(ctx context.Context, serverURL, token, agent
 }
 
 func runWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string, epoch int64, collector *MetadataCollector, onFrame func(protocol.Frame) error, factory SessionFrameHandlerFactory, options WebSocketRunOptions) error {
+	return runWebSocketConnection(ctx, serverURL, token, agentID, nodeID, "", "", epoch, collector, onFrame, factory, options)
+}
+
+func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, nodeID, instanceID, connectionID string, epoch int64, collector *MetadataCollector, onFrame func(protocol.Frame) error, factory SessionFrameHandlerFactory, options WebSocketRunOptions) error {
 	if strings.TrimSpace(serverURL) == "" {
 		return ErrAgentServerURLRequired
 	}
@@ -104,7 +109,11 @@ func runWebSocket(ctx context.Context, serverURL, token, agentID, nodeID string,
 			session.Metrics = options.Metrics
 			session.BaseBackoff, session.MaxBackoff, session.Rand = base, max, rng
 			session.HeartbeatInterval = heartbeat
-			session.SetMetadataIdentity(agentID, nodeID, currentEpoch)
+			if instanceID == "" && connectionID == "" {
+				session.SetMetadataIdentity(agentID, nodeID, currentEpoch)
+			} else {
+				session.SetMetadataConnectionIdentity(agentID, nodeID, instanceID, connectionID, currentEpoch)
+			}
 			if factory == nil {
 				err = session.Run(ctx, onFrame)
 			} else {

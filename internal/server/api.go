@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,19 +24,26 @@ import (
 // storage interfaces so the handler remains usable with SQLite, MySQL, and
 // small in-memory fakes in tests.
 type API struct {
-	DB           *storage.DB
-	Auth         *auth.AuthService
-	users        storage.UserRepository
-	agents       storage.AgentRepository
-	policies     storage.PolicyRepository
-	tunnels      storage.TunnelRepository
-	audits       storage.AuditRepository
-	idem         storage.IdempotencyRepository
-	routeMu      sync.Mutex
-	service      *apiService
-	tokenService *TokenService
-	traceroute   *TracerouteService
-	probeService *ProbeService
+	DB                 *storage.DB
+	Auth               *auth.AuthService
+	users              storage.UserRepository
+	agents             storage.AgentRepository
+	policies           storage.PolicyRepository
+	tunnels            storage.TunnelRepository
+	audits             storage.AuditRepository
+	idem               storage.IdempotencyRepository
+	dashboard          storage.DashboardRepository
+	routeMu            sync.Mutex
+	service            *apiService
+	tokenService       *TokenService
+	accounts           *auth.AccountService
+	traceroute         *TracerouteService
+	probeService       *ProbeService
+	agentSessions      *AgentSessionManager
+	localAgentRelay    *AgentRelayTransport
+	clusterConnections AgentConnectionLister
+	connectionCloser   AgentConnectionCloseService
+	localNodeID        string
 }
 
 // apiService is the application layer between HTTP handlers and storage. It
@@ -59,13 +67,25 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 	}
 	a := &API{DB: db, Auth: authService}
 	if db != nil {
-		a.users, a.agents, a.policies, a.tunnels, a.audits, a.idem = db.Users(), db.Agents(), db.Policies(), db.Tunnels(), db.Audits(), db.Idempotency()
+		a.users, a.agents, a.policies, a.tunnels, a.audits, a.idem, a.dashboard = db.Users(), db.Agents(), db.Policies(), db.Tunnels(), db.Audits(), db.Idempotency(), db.Dashboard()
 		a.service = &apiService{agents: a.agents, metadata: NewAgentMetadataService(db.Metadata()), policies: a.policies, tunnels: a.tunnels, audits: a.audits}
 		a.tokenService = NewTokenService(db)
+		a.accounts = auth.NewAccountService(db)
 		a.traceroute = NewTracerouteService(db)
 		a.probeService = NewProbeService(db)
 	}
 	return a
+}
+
+// SetAgentConnections lets the runtime expose process-local connection state
+// alongside durable metadata. API tests and embedders may omit it; the
+// metadata endpoint then reports only persisted Agent instances.
+func (a *API) SetAgentConnections(sessions *AgentSessionManager, relay *AgentRelayTransport) {
+	if a == nil {
+		return
+	}
+	a.agentSessions = sessions
+	a.localAgentRelay = relay
 }
 
 func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentRequest) (storage.Agent, error) {
@@ -98,6 +118,9 @@ func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentReq
 func (s *apiService) CreateTunnel(ctx context.Context, v storage.Tunnel) (storage.Tunnel, error) {
 	if v.AgentID == "" || v.TargetHost == "" || v.TargetPort < 1 || v.TargetPort > 65535 {
 		return storage.Tunnel{}, errors.New("agentId, targetHost and valid targetPort are required")
+	}
+	if err := routing.ValidateDomainPattern(v.Domain); err != nil {
+		return storage.Tunnel{}, err
 	}
 	if err := s.tunnels.Create(ctx, v); err != nil {
 		return storage.Tunnel{}, err
@@ -157,13 +180,16 @@ func (s *apiService) ListTunnels(ctx context.Context, cursor string, limit int) 
 	return s.tunnels.List(ctx, cursor, limit)
 }
 func (s *apiService) UpdateTunnel(ctx context.Context, v storage.Tunnel) error {
+	if err := routing.ValidateDomainPattern(v.Domain); err != nil {
+		return err
+	}
 	return s.tunnels.Update(ctx, v)
 }
 func (s *apiService) DeleteTunnel(ctx context.Context, id string) error {
 	return s.tunnels.Delete(ctx, id)
 }
-func (s *apiService) ListAudits(ctx context.Context, cursor string, limit int) (storage.Page[storage.AuditLog], error) {
-	return s.audits.List(ctx, cursor, limit)
+func (s *apiService) ListAudits(ctx context.Context, filter storage.AuditFilter, cursor string, limit int) (storage.Page[storage.AuditLog], error) {
+	return s.audits.List(ctx, filter, cursor, limit)
 }
 func (s *apiService) CreateAudit(ctx context.Context, v storage.AuditLog) error {
 	return s.audits.Create(ctx, v)
@@ -230,7 +256,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if parts[0] == "auth" && len(parts) == 2 && parts[1] == "me" {
-		writeJSON(w, http.StatusOK, p)
+		writeJSON(w, http.StatusOK, map[string]any{"id": p.UserID, "username": p.Username, "role": p.Role})
+		return
+	}
+	if parts[0] == "auth" && len(parts) == 2 && parts[1] == "password" {
+		a.changeOwnPassword(w, r, p)
 		return
 	}
 	switch parts[0] {
@@ -242,6 +272,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleAudits(w, r, p)
 	case "tokens":
 		a.handleTokens(w, r, p, parts[1:])
+	case "users":
+		a.handleUsers(w, r, p, parts[1:])
+	case "dashboard":
+		a.handleDashboard(w, r, p, parts[1:])
 	case "traces":
 		a.handleTraces(w, r, p, parts[1:])
 	default:
@@ -311,6 +345,10 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 	}
 	if len(parts) >= 2 && parts[1] == "metadata" {
 		a.handleAgentMetadata(w, r, p, id)
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "connections" {
+		a.handleAgentConnections(w, r, p, id, parts[2:])
 		return
 	}
 	if len(parts) >= 2 && parts[1] == "policies" {
@@ -492,14 +530,42 @@ func (a *API) handleTraces(w http.ResponseWriter, r *http.Request, p auth.Princi
 }
 
 type agentMetadataResponse struct {
-	AgentID    string         `json:"agentId"`
-	NodeID     string         `json:"nodeId"`
-	Epoch      int64          `json:"epoch"`
-	Revision   int64          `json:"revision"`
-	Stale      bool           `json:"stale"`
-	ReportedAt time.Time      `json:"reportedAt"`
-	UpdatedAt  time.Time      `json:"updatedAt"`
-	Items      []MetadataItem `json:"items"`
+	AgentID     string                          `json:"agentId"`
+	InstanceID  string                          `json:"instanceId"`
+	NodeID      string                          `json:"nodeId"`
+	Epoch       int64                           `json:"epoch"`
+	Revision    int64                           `json:"revision"`
+	Stale       bool                            `json:"stale"`
+	ReportedAt  time.Time                       `json:"reportedAt"`
+	UpdatedAt   time.Time                       `json:"updatedAt"`
+	Items       []MetadataItem                  `json:"items"`
+	Instances   []agentMetadataInstanceResponse `json:"instances"`
+	Connections []agentConnectionResponse       `json:"connections"`
+}
+
+type agentMetadataInstanceResponse struct {
+	InstanceID      string         `json:"instanceId"`
+	NodeID          string         `json:"nodeId"`
+	Epoch           int64          `json:"epoch"`
+	Revision        int64          `json:"revision"`
+	Stale           bool           `json:"stale"`
+	ReportedAt      time.Time      `json:"reportedAt"`
+	UpdatedAt       time.Time      `json:"updatedAt"`
+	Items           []MetadataItem `json:"items"`
+	ConnectionCount int            `json:"connectionCount"`
+}
+
+type agentConnectionResponse struct {
+	AgentID         string    `json:"agentId"`
+	InstanceID      string    `json:"instanceId"`
+	NodeID          string    `json:"nodeId"`
+	ConnectionID    string    `json:"connectionId"`
+	Epoch           int64     `json:"epoch"`
+	ConnectionEpoch int64     `json:"connectionEpoch"`
+	ServerNodeID    string    `json:"serverNodeId"`
+	Healthy         bool      `json:"healthy"`
+	ActiveStreams   int       `json:"activeStreams"`
+	LastHeartbeatAt time.Time `json:"lastHeartbeatAt"`
 }
 
 func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth.Principal, agentID string) {
@@ -528,11 +594,46 @@ func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth
 		return
 	}
 	data := agentMetadataResponse{
-		AgentID: view.AgentID, NodeID: view.NodeID, Epoch: view.Epoch, Revision: view.Revision,
+		AgentID: view.AgentID, InstanceID: view.InstanceID, NodeID: view.NodeID, Epoch: view.Epoch, Revision: view.Revision,
 		Stale: view.Stale, ReportedAt: view.ReportedAt, UpdatedAt: view.UpdatedAt, Items: view.Items,
 	}
+	for _, instance := range view.Instances {
+		connectionCount := 0
+		for _, connection := range a.agentConnections(agentID) {
+			if connection.InstanceID == instance.InstanceID {
+				connectionCount++
+			}
+		}
+		data.Instances = append(data.Instances, agentMetadataInstanceResponse{
+			InstanceID: instance.InstanceID, NodeID: instance.NodeID, Epoch: instance.Epoch, Revision: instance.Revision,
+			Stale: instance.Stale, ReportedAt: instance.ReportedAt, UpdatedAt: instance.UpdatedAt, Items: instance.Items,
+			ConnectionCount: connectionCount,
+		})
+	}
+	data.Connections = a.agentConnections(agentID)
 	a.audit(r.Context(), p, "agent.metadata.read", "agent_runtime_metadata", agentID)
 	writeJSON(w, http.StatusOK, data)
+}
+
+func (a *API) agentConnections(agentID string) []agentConnectionResponse {
+	if a == nil || a.agentSessions == nil {
+		return nil
+	}
+	sessions := a.agentSessions.List(agentID)
+	out := make([]agentConnectionResponse, 0, len(sessions))
+	for _, session := range sessions {
+		activeStreams := 0
+		if a.localAgentRelay != nil {
+			activeStreams = a.localAgentRelay.ActiveStreams(agentID, session.ConnectionID)
+		}
+		out = append(out, agentConnectionResponse{
+			AgentID: session.AgentID, InstanceID: session.InstanceID, NodeID: session.NodeID,
+			ConnectionID: session.ConnectionID, Epoch: session.Epoch, ConnectionEpoch: session.ConnectionEpoch,
+			ServerNodeID: a.agentSessions.ServerNodeID(), Healthy: session.Healthy(),
+			ActiveStreams: activeStreams, LastHeartbeatAt: session.LastHeartbeat(),
+		})
+	}
+	return out
 }
 
 type agentRequest struct {
@@ -751,29 +852,10 @@ func (a *API) handleTunnels(w http.ResponseWriter, r *http.Request, p auth.Princ
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "route.deleted", "tunnel", v.ID)
+		a.auditRoute(r.Context(), p, "route.deleted", v)
 		writeJSON(w, http.StatusOK, map[string]string{"id": v.ID})
 	case http.MethodPut, http.MethodPatch:
-		var req tunnelRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid JSON")
-			return
-		}
-		if req.Domain != "" {
-			v.Domain = req.Domain
-		}
-		if req.PathPrefix != "" {
-			v.PathPrefix = req.PathPrefix
-		}
-		if req.Status != "" {
-			v.Status = req.Status
-		}
-		v.UpdatedAt = time.Now().UTC()
-		if err := a.service.UpdateTunnel(r.Context(), v); err != nil {
-			writeStorageError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, publicTunnel(v))
+		a.updateTunnel(w, r, p, v, r.Method == http.MethodPut)
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -793,15 +875,247 @@ func (a *API) listTunnels(w http.ResponseWriter, r *http.Request, p auth.Princip
 }
 
 type tunnelRequest struct {
-	AgentID    string         `json:"agentId"`
-	Protocol   string         `json:"protocol"`
-	Domain     string         `json:"domain"`
-	PathPrefix string         `json:"pathPrefix"`
-	TargetHost string         `json:"targetHost"`
-	TargetPort int            `json:"targetPort"`
-	PublicPort int            `json:"publicPort"`
-	Status     string         `json:"status"`
-	Config     map[string]any `json:"config"`
+	AgentID       string         `json:"agentId"`
+	Protocol      string         `json:"protocol"`
+	Domain        string         `json:"domain"`
+	PathPrefix    string         `json:"pathPrefix"`
+	TargetHost    string         `json:"targetHost"`
+	TargetPort    int            `json:"targetPort"`
+	PublicPort    int            `json:"publicPort"`
+	Status        string         `json:"status"`
+	HostHeader    string         `json:"hostHeader"`
+	TargetScheme  string         `json:"targetScheme"`
+	TLSServerName string         `json:"tlsServerName"`
+	Config        map[string]any `json:"config"`
+}
+
+// tunnelUpdateRequest uses pointers so PATCH can distinguish an omitted field
+// from an explicitly supplied empty or invalid value.
+type tunnelUpdateRequest struct {
+	AgentID       *string         `json:"agentId"`
+	Protocol      *string         `json:"protocol"`
+	Domain        *string         `json:"domain"`
+	PathPrefix    *string         `json:"pathPrefix"`
+	TargetHost    *string         `json:"targetHost"`
+	TargetPort    *int            `json:"targetPort"`
+	PublicPort    *int            `json:"publicPort"`
+	Status        *string         `json:"status"`
+	HostHeader    *string         `json:"hostHeader"`
+	TargetScheme  *string         `json:"targetScheme"`
+	TLSServerName *string         `json:"tlsServerName"`
+	Config        *map[string]any `json:"config"`
+}
+
+type upstreamRouteConfig struct {
+	HostHeader    string `json:"hostHeader,omitempty"`
+	TargetScheme  string `json:"targetScheme,omitempty"`
+	TLSServerName string `json:"tlsServerName,omitempty"`
+}
+
+// normalizeUpstreamRouteConfig validates and serializes upstream options while
+// allowing callers to clear optional values. Empty means "use the documented
+// default" rather than storing a redundant copy of targetHost.
+func normalizeUpstreamRouteConfig(config map[string]any) (string, string) {
+	hostHeader := strings.TrimSpace(stringValue(config["hostHeader"]))
+	targetScheme := strings.ToLower(strings.TrimSpace(stringValue(config["targetScheme"])))
+	tlsServerName := strings.TrimSpace(stringValue(config["tlsServerName"]))
+	if targetScheme == "" {
+		targetScheme = "http"
+	}
+	if targetScheme != "http" && targetScheme != "https" {
+		return "", "targetScheme must be http or https"
+	}
+	if hostHeader != "" && !validAuthorityHost(hostHeader) {
+		return "", "hostHeader must be a valid host or host:port"
+	}
+	if tlsServerName != "" && !validAuthorityHost(tlsServerName) {
+		return "", "tlsServerName must be a valid host"
+	}
+	if targetScheme == "http" && tlsServerName != "" {
+		return "", "tlsServerName requires targetScheme https"
+	}
+	if config == nil {
+		config = map[string]any{}
+	}
+	config["hostHeader"] = hostHeader
+	config["targetScheme"] = targetScheme
+	config["tlsServerName"] = tlsServerName
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return "", "invalid config"
+	}
+	return string(encoded), ""
+}
+
+func stringValue(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return ""
+}
+
+// validAuthorityHost accepts a host name, IPv4/IPv6 literal, or host:port. It
+// intentionally rejects values containing schemes, user info, paths, or spaces.
+func validAuthorityHost(value string) bool {
+	if value == "" || strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	parsed, err := url.Parse("//" + value)
+	return err == nil && parsed.Host == value
+}
+
+func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Principal, current storage.Tunnel, full bool) {
+	var req tunnelUpdateRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if full && (req.AgentID == nil || req.TargetHost == nil || req.TargetPort == nil) {
+		writeAPIError(w, http.StatusBadRequest, "agentId, targetHost and targetPort are required")
+		return
+	}
+
+	next := current
+	if req.AgentID != nil {
+		agentID := strings.TrimSpace(*req.AgentID)
+		if agentID == "" {
+			writeAPIError(w, http.StatusBadRequest, "agentId is required")
+			return
+		}
+		agent, err := a.service.GetAgent(r.Context(), agentID)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		if !isAdmin(p) && agent.OwnerUserID != p.UserID {
+			writeAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		next.AgentID = agentID
+	}
+	if req.Protocol != nil {
+		protocol := strings.ToLower(strings.TrimSpace(*req.Protocol))
+		if protocol == "ws" {
+			protocol = "websocket"
+		}
+		if protocol != "http" && protocol != "websocket" {
+			writeAPIError(w, http.StatusBadRequest, "protocol must be http or websocket")
+			return
+		}
+		next.Protocol = protocol
+	}
+	if req.Domain != nil {
+		domain := strings.ToLower(strings.TrimSpace(*req.Domain))
+		if domain == "" {
+			writeAPIError(w, http.StatusBadRequest, "domain is required")
+			return
+		}
+		if err := routing.ValidateDomainPattern(domain); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		next.Domain = domain
+	}
+	if req.PathPrefix != nil {
+		next.PathPrefix = strings.TrimSpace(*req.PathPrefix)
+		if next.PathPrefix == "" {
+			next.PathPrefix = "/"
+		}
+	}
+	if req.TargetHost != nil {
+		next.TargetHost = strings.TrimSpace(*req.TargetHost)
+		if next.TargetHost == "" {
+			writeAPIError(w, http.StatusBadRequest, "targetHost is required")
+			return
+		}
+	}
+	if req.TargetPort != nil && (*req.TargetPort < 1 || *req.TargetPort > 65535) {
+		writeAPIError(w, http.StatusBadRequest, "targetPort must be between 1 and 65535")
+		return
+	} else if req.TargetPort != nil {
+		next.TargetPort = *req.TargetPort
+	}
+	if req.PublicPort != nil {
+		if *req.PublicPort < 0 || *req.PublicPort > 65535 {
+			writeAPIError(w, http.StatusBadRequest, "publicPort must be between 0 and 65535")
+			return
+		}
+		next.PublicPort = *req.PublicPort
+	}
+	if req.Status != nil {
+		status := strings.ToLower(strings.TrimSpace(*req.Status))
+		if status != "active" && status != "disabled" {
+			writeAPIError(w, http.StatusBadRequest, "status must be active or disabled")
+			return
+		}
+		next.Status = status
+	}
+
+	if req.Config != nil || req.HostHeader != nil || req.TargetScheme != nil || req.TLSServerName != nil {
+		config := map[string]any{}
+		if next.Config != "" && next.Config != "{}" {
+			if err := json.Unmarshal([]byte(next.Config), &config); err != nil {
+				writeAPIError(w, http.StatusBadRequest, "invalid config")
+				return
+			}
+		}
+		if req.Config != nil {
+			config = map[string]any{}
+			for key, value := range *req.Config {
+				config[key] = value
+			}
+		}
+		if req.HostHeader != nil {
+			config["hostHeader"] = strings.TrimSpace(*req.HostHeader)
+		}
+		if req.TargetScheme != nil {
+			config["targetScheme"] = strings.ToLower(strings.TrimSpace(*req.TargetScheme))
+		}
+		if req.TLSServerName != nil {
+			config["tlsServerName"] = strings.TrimSpace(*req.TLSServerName)
+		}
+		configBytes, message := normalizeUpstreamRouteConfig(config)
+		if message != "" {
+			writeAPIError(w, http.StatusBadRequest, message)
+			return
+		}
+		next.Config = configBytes
+	}
+
+	a.routeMu.Lock()
+	defer a.routeMu.Unlock()
+	conflict, err := a.tunnelRouteConflict(r.Context(), next.ID, next.Domain, next.PathPrefix)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if conflict {
+		writeAPIError(w, http.StatusConflict, "route already exists")
+		return
+	}
+	next.UpdatedAt = time.Now().UTC()
+	if err := a.service.UpdateTunnel(r.Context(), next); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	a.auditRoute(r.Context(), p, "route.updated", next)
+	writeJSON(w, http.StatusOK, publicTunnel(next))
+}
+
+func (a *API) tunnelRouteConflict(ctx context.Context, id, domain, pathPrefix string) (bool, error) {
+	if domain == "" {
+		return false, nil
+	}
+	routes, err := a.listAllTunnels(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, route := range routes {
+		if route.ID != id && strings.EqualFold(route.Domain, domain) && route.PathPrefix == pathPrefix {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Principal) {
@@ -814,37 +1128,40 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeAPIError(w, http.StatusBadRequest, "agentId, targetHost and valid targetPort are required")
 		return
 	}
+	if err := routing.ValidateDomainPattern(req.Domain); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if _, err := a.service.GetAgent(r.Context(), req.AgentID); err != nil {
 		writeStorageError(w, err)
 		return
 	}
 	a.routeMu.Lock()
 	defer a.routeMu.Unlock()
-	page, err := a.service.ListTunnels(r.Context(), "", 500)
+	routes, err := a.listAllTunnels(r.Context())
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
-	for page.HasMore && page.NextCursor != "" {
-		next, e := a.service.ListTunnels(r.Context(), page.NextCursor, 500)
-		if e != nil {
-			writeStorageError(w, e)
-			return
-		}
-		page.Items = append(page.Items, next.Items...)
-		page.HasMore, page.NextCursor = next.HasMore, next.NextCursor
-	}
-	for _, existing := range page.Items {
+	for _, existing := range routes {
 		if strings.EqualFold(existing.Domain, req.Domain) && existing.PathPrefix == req.PathPrefix && existing.Domain != "" {
 			writeAPIError(w, http.StatusConflict, "route already exists")
 			return
 		}
 	}
-	configBytes, _ := json.Marshal(req.Config)
-	if len(configBytes) == 0 {
-		configBytes = []byte(`{}`)
+	config := req.Config
+	if config == nil {
+		config = map[string]any{}
 	}
-	v := storage.Tunnel{AgentID: req.AgentID, Protocol: strings.ToLower(req.Protocol), Domain: strings.ToLower(strings.TrimSpace(req.Domain)), PathPrefix: req.PathPrefix, TargetHost: req.TargetHost, TargetPort: req.TargetPort, PublicPort: req.PublicPort, Status: req.Status, Config: string(configBytes)}
+	config["hostHeader"] = strings.TrimSpace(req.HostHeader)
+	config["targetScheme"] = strings.ToLower(strings.TrimSpace(req.TargetScheme))
+	config["tlsServerName"] = strings.TrimSpace(req.TLSServerName)
+	configBytes, message := normalizeUpstreamRouteConfig(config)
+	if message != "" {
+		writeAPIError(w, http.StatusBadRequest, message)
+		return
+	}
+	v := storage.Tunnel{AgentID: req.AgentID, Protocol: strings.ToLower(req.Protocol), Domain: strings.ToLower(strings.TrimSpace(req.Domain)), PathPrefix: req.PathPrefix, TargetHost: req.TargetHost, TargetPort: req.TargetPort, PublicPort: req.PublicPort, Status: req.Status, Config: configBytes}
 	if v.Status == "" {
 		v.Status = "active"
 	}
@@ -856,7 +1173,7 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		if err != nil {
 			return 0, nil, err
 		}
-		a.audit(r.Context(), p, "route.created", "tunnel", created.ID)
+		a.auditRoute(r.Context(), p, "route.created", created)
 		return http.StatusCreated, publicTunnel(created), nil
 	})
 	if err != nil {
@@ -864,6 +1181,22 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		return
 	}
 	writeStored(w, status, data)
+}
+
+func (a *API) listAllTunnels(ctx context.Context) ([]storage.Tunnel, error) {
+	page, err := a.service.ListTunnels(ctx, "", 500)
+	if err != nil {
+		return nil, err
+	}
+	for page.HasMore && page.NextCursor != "" {
+		next, err := a.service.ListTunnels(ctx, page.NextCursor, 500)
+		if err != nil {
+			return nil, err
+		}
+		page.Items = append(page.Items, next.Items...)
+		page.HasMore, page.NextCursor = next.HasMore, next.NextCursor
+	}
+	return page.Items, nil
 }
 
 func (a *API) handleAudits(w http.ResponseWriter, r *http.Request, p auth.Principal) {
@@ -875,16 +1208,57 @@ func (a *API) handleAudits(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	page, err := a.service.ListAudits(r.Context(), r.URL.Query().Get("cursor"), queryLimit(r))
+	filter, err := auditFilterFromQuery(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, err := a.service.ListAudits(r.Context(), filter, r.URL.Query().Get("cursor"), queryLimit(r))
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 	items := make([]any, len(page.Items))
 	for i := range page.Items {
-		items[i] = page.Items[i]
+		items[i] = publicAudit(page.Items[i])
 	}
 	writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
+}
+
+func auditFilterFromQuery(r *http.Request) (storage.AuditFilter, error) {
+	query := r.URL.Query()
+	filter := storage.AuditFilter{
+		ActorUserID:  strings.TrimSpace(query.Get("actorUserId")),
+		Action:       strings.TrimSpace(query.Get("action")),
+		ResourceType: strings.TrimSpace(query.Get("resourceType")),
+		ResourceID:   strings.TrimSpace(query.Get("resourceId")),
+	}
+	for name, target := range map[string]**time.Time{
+		"createdFrom": &filter.CreatedFrom,
+		"createdTo":   &filter.CreatedTo,
+	} {
+		value := strings.TrimSpace(query.Get(name))
+		if value == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return storage.AuditFilter{}, fmt.Errorf("%s must be RFC3339 date-time", name)
+		}
+		*target = &parsed
+	}
+	if filter.CreatedFrom != nil && filter.CreatedTo != nil && filter.CreatedFrom.After(*filter.CreatedTo) {
+		return storage.AuditFilter{}, fmt.Errorf("createdFrom must not be later than createdTo")
+	}
+	return filter, nil
+}
+
+func publicAudit(v storage.AuditLog) map[string]any {
+	return map[string]any{
+		"id": v.ID, "actorUserId": v.ActorUserID, "action": v.Action,
+		"resourceType": v.ResourceType, "resourceId": v.ResourceID,
+		"details": json.RawMessage(defaultJSON(v.Details)), "createdAt": v.CreatedAt,
+	}
 }
 
 func (a *API) mutate(r *http.Request, p auth.Principal, fn func() (int, any, error)) (int, []byte, error) {
@@ -984,7 +1358,7 @@ func decodeInts(s string) []int {
 	return out
 }
 func publicUser(v storage.User) map[string]any {
-	return map[string]any{"id": v.ID, "username": v.Username, "role": v.Role, "disabled": v.Disabled, "createdAt": v.CreatedAt}
+	return map[string]any{"id": v.ID, "username": v.Username, "role": v.Role, "disabled": v.Disabled, "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
 }
 func publicAgent(v storage.Agent) map[string]any {
 	return map[string]any{"id": v.ID, "name": v.Name, "ownerUserId": v.OwnerUserID, "capabilities": decodeStrings(v.Capabilities), "enabled": v.Enabled, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
@@ -993,7 +1367,23 @@ func publicPolicy(v storage.AgentPolicy) map[string]any {
 	return map[string]any{"id": v.ID, "agentId": v.AgentID, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "protocol": v.Protocol, "allowedCIDRs": nonemptySplit(v.AllowedCIDRs), "allowedPorts": decodeInts(v.AllowedPorts), "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
 }
 func publicTunnel(v storage.Tunnel) map[string]any {
-	return map[string]any{"id": v.ID, "agentId": v.AgentID, "protocol": v.Protocol, "domain": v.Domain, "pathPrefix": v.PathPrefix, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "publicPort": v.PublicPort, "status": v.Status, "config": json.RawMessage(defaultJSON(v.Config)), "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+	upstream := publicUpstreamRouteConfig(v)
+	return map[string]any{"id": v.ID, "agentId": v.AgentID, "protocol": v.Protocol, "domain": v.Domain, "pathPrefix": v.PathPrefix, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "publicPort": v.PublicPort, "status": v.Status, "hostHeader": upstream.HostHeader, "targetScheme": upstream.TargetScheme, "tlsServerName": upstream.TLSServerName, "config": json.RawMessage(defaultJSON(v.Config)), "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+}
+
+func publicUpstreamRouteConfig(v storage.Tunnel) upstreamRouteConfig {
+	var config upstreamRouteConfig
+	_ = json.Unmarshal([]byte(v.Config), &config)
+	if config.HostHeader == "" {
+		config.HostHeader = v.TargetHost
+	}
+	if config.TargetScheme == "" {
+		config.TargetScheme = "http"
+	}
+	if config.TLSServerName == "" {
+		config.TLSServerName = v.TargetHost
+	}
+	return config
 }
 func nonemptySplit(s string) []string {
 	if strings.TrimSpace(s) == "" {
@@ -1011,6 +1401,26 @@ func (a *API) audit(ctx context.Context, p auth.Principal, action, typ, id strin
 	if a.service != nil {
 		_ = a.service.CreateAudit(ctx, storage.AuditLog{ActorUserID: p.UserID, Action: action, ResourceType: typ, ResourceID: id, Details: "{}"})
 	}
+}
+
+// auditRoute records the non-secret routing facts administrators need while
+// investigating changes; credentials and free-form config are never included.
+func (a *API) auditRoute(ctx context.Context, p auth.Principal, action string, route storage.Tunnel) {
+	if a.service == nil {
+		return
+	}
+	details := map[string]any{
+		"agentId": route.AgentID, "domain": route.Domain, "pathPrefix": route.PathPrefix,
+		"targetHost": route.TargetHost, "targetPort": route.TargetPort, "status": route.Status,
+	}
+	encoded, err := json.Marshal(details)
+	if err != nil {
+		encoded = []byte("{}")
+	}
+	_ = a.service.CreateAudit(ctx, storage.AuditLog{
+		ActorUserID: p.UserID, Action: action, ResourceType: "tunnel",
+		ResourceID: route.ID, Details: string(encoded),
+	})
 }
 func writeStorageError(w http.ResponseWriter, err error) {
 	if errors.Is(err, sql.ErrNoRows) {

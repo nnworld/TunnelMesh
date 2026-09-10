@@ -15,16 +15,25 @@ import (
 var webDist embed.FS
 
 func NewWebHandler(api http.Handler, ws http.Handler, handlers ...http.Handler) http.Handler {
-	root, _ := fs.Sub(webDist, "web_dist")
-	static := http.FileServer(http.FS(root))
-	var healthHandler http.Handler
-	var clientWS http.Handler
+	var clientWS, healthHandler http.Handler
 	if len(handlers) > 0 {
 		clientWS = handlers[0]
 	}
 	if len(handlers) > 1 {
 		healthHandler = handlers[1]
 	}
+	return NewWebHandlerWithManagedRoutes(api, ws, clientWS, healthHandler, nil)
+}
+
+// ManagedRouteDispatcher is tried only after reserved API, health, and
+// WebSocket paths, and before the SPA history fallback.
+type ManagedRouteDispatcher interface {
+	TryServeHTTP(http.ResponseWriter, *http.Request) bool
+}
+
+func NewWebHandlerWithManagedRoutes(api, ws, clientWS, health http.Handler, managed ManagedRouteDispatcher) http.Handler {
+	root, _ := fs.Sub(webDist, "web_dist")
+	static := http.FileServer(http.FS(root))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			if api == nil {
@@ -35,10 +44,10 @@ func NewWebHandler(api http.Handler, ws http.Handler, handlers ...http.Handler) 
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/health/") || r.URL.Path == "/metrics" {
-			if healthHandler == nil {
+			if health == nil {
 				http.NotFound(w, r)
 			} else {
-				healthHandler.ServeHTTP(w, r)
+				health.ServeHTTP(w, r)
 			}
 			return
 		}
@@ -60,6 +69,9 @@ func NewWebHandler(api http.Handler, ws http.Handler, handlers ...http.Handler) 
 		}
 		if strings.HasPrefix(r.URL.Path, "/ws/") {
 			http.NotFound(w, r)
+			return
+		}
+		if managed != nil && managed.TryServeHTTP(w, r) {
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/")

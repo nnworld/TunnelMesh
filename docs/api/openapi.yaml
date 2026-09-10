@@ -20,6 +20,54 @@ paths:
     get:
       security: [{ bearerAuth: [] }]
       responses: { '200': { description: Current principal } }
+  /api/v1/auth/password:
+    put:
+      summary: Change the current user's password without revoking existing login tokens
+      security: [{ bearerAuth: [] }]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordChangeRequest'}}}}
+      responses: {'200': {description: Password changed}, '400': {description: Password policy violation}, '401': {description: Unauthenticated}, '403': {description: Current password is invalid}}
+  /api/v1/users:
+    get:
+      summary: List ordinary child accounts
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}}
+      responses: {'200': {description: Cursor page}, '401': {description: Unauthenticated}, '403': {description: Administrator required}}
+    post:
+      summary: Create an ordinary child account and return its temporary password once
+      security: [{ bearerAuth: [] }]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UserCreateRequest'}}}}
+      responses: {'201': {description: Created; response uses Cache-Control no-store}, '400': {description: Invalid username}, '401': {description: Unauthenticated}, '403': {description: Administrator required}, '409': {description: Username conflict}}
+  /api/v1/users/{userId}:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    patch:
+      summary: Enable or disable an ordinary account
+      security: [{ bearerAuth: [] }]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UserStatusRequest'}}}}
+      responses: {'200': {description: Updated}, '400': {description: Invalid request}, '403': {description: Administrator account is protected}, '404': {description: Not found}, '409': {description: Account is deleted}}
+    delete:
+      summary: Logically delete an ordinary account while retaining all related resources
+      security: [{ bearerAuth: [] }]
+      responses: {'200': {description: Logically deleted}, '403': {description: Administrator account is protected}, '404': {description: Not found}}
+  /api/v1/users/{userId}/reset-password:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Reset an ordinary account password and return the temporary password once
+      security: [{ bearerAuth: [] }]
+      responses: {'200': {description: Reset; response uses Cache-Control no-store}, '403': {description: Administrator account is protected}, '404': {description: Not found}, '409': {description: Account is deleted}}
+  /api/v1/users/{userId}/restore:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Restore a logically deleted ordinary account
+      security: [{ bearerAuth: [] }]
+      responses: {'200': {description: Restored}, '403': {description: Administrator account is protected}, '404': {description: Not found}}
+  /api/v1/dashboard/summary:
+    get:
+      summary: Read resource counts and recent events within the current principal's scope
+      security: [{ bearerAuth: [] }]
+      responses: {'200': {description: Dashboard summary}, '401': {description: Unauthenticated}}
   /api/v1/agents:
     get:
       security: [{ bearerAuth: [] }]
@@ -54,6 +102,44 @@ paths:
         '401': {description: Unauthenticated}
         '403': {description: Agent is not owned by the caller}
         '404': {description: Agent or metadata snapshot not found, or snapshot is stale without includeStale=true}
+  /api/v1/agents/{agentId}/connections:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: List live physical Agent connections across Server nodes
+      description: Returns durable registry leases for one Agent and overlays fresher process-local state for connections owned by the responding Server. Only the Agent owner or an administrator may read this list.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Cluster connection list
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentConnectionClusterEnvelope'}
+        '401': {description: Unauthenticated}
+        '403': {description: Agent is not owned by the caller}
+        '404': {description: Agent not found}
+        '503': {description: Cluster connection registry is unavailable}
+  /api/v1/agents/{agentId}/connections/{connectionId}:
+    parameters:
+      - {name: agentId, in: path, required: true, schema: {type: string}}
+      - {name: connectionId, in: path, required: true, schema: {type: string}}
+      - {name: connectionEpoch, in: query, required: true, schema: {type: integer, format: int64, minimum: 1}, description: Registry lease epoch returned by the connection list}
+    delete:
+      summary: Close one exact physical Agent connection
+      description: Local connections are closed through the exact-fenced local controller. Remote connections are closed through authenticated Server-node mTLS relay control. If the exact lease has already disappeared, the request succeeds idempotently. If the owning Server is unreachable, the lease remains intact and the API returns 503.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Connection closed or already absent
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentConnectionCloseEnvelope'}
+        '400': {description: connectionEpoch is missing or invalid}
+        '401': {description: Unauthenticated}
+        '403': {description: Agent is not owned by the caller}
+        '404': {description: Agent not found}
+        '409': {description: Connection epoch is stale; a replacement connection was not closed}
+        '500': {description: Connection close failed}
+        '503': {description: Owning Server node or cluster registry is unavailable; the lease is preserved}
   /api/v1/agents/{agentId}/trace:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     post:
@@ -92,8 +178,19 @@ paths:
   /api/v1/routes/{routeId}:
     parameters: [{name: routeId, in: path, required: true, schema: {type: string}}]
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Route}}}
-    put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
-    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'200': {description: Updated}}}
+    put:
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}
+      responses: {'200': {description: Updated route}, '400': {description: Invalid route fields}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: Duplicate domain and path}}
+    patch:
+      security: [{bearerAuth: []}]
+      description: Updates only supplied route fields. Agent, protocol, domain, path, target, public port, status, and config are supported.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TunnelUpdateRequest'}}}
+      responses: {'200': {description: Updated route}, '400': {description: Invalid route fields}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: Duplicate domain and path}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
   /api/v1/tunnels:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnels}}}
@@ -149,6 +246,22 @@ paths:
         '401': {description: Missing or invalid management bearer Token}
         '403': {description: Token is not owned by the non-admin caller}
         '404': {description: Token not found}
+    patch:
+      summary: Update an active service Token
+      description: 'Updates `expiresAt` and/or authorization scope fields. Send `expiresAt: null` to make the Token non-expiring. Scope fields that are omitted remain unchanged; empty arrays remove that restriction. Token type, owner, and Agent/Node binding cannot be changed. Revoked and already expired Tokens must be rotated instead.'
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TokenUpdateRequest'}
+      responses:
+        '200': {description: Updated redacted Token metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenMetadataEnvelope'}}}}
+        '400': {description: Missing update field, invalid or non-future expiresAt, or invalid scope}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Token is not owned by the non-admin caller}
+        '404': {description: Token not found}
+        '409': {description: Token is revoked or already expired}
   /api/v1/tokens/{tokenId}/rotate:
     parameters:
       - {name: tokenId, in: path, required: true, schema: {type: string}}
@@ -194,7 +307,23 @@ paths:
       security: [{bearerAuth: []}]
       responses: {'200': {description: Trace result, content: {application/json: {schema: {$ref: '#/components/schemas/TraceEnvelope'}}}}, '404': {description: Trace not found}}
   /api/v1/audit-logs:
-    get: {security: [{bearerAuth: []}], responses: {'200': {description: Audit records}}}
+    get:
+      security: [{bearerAuth: []}]
+      summary: List audit logs newest first
+      description: Returns a filtered cursor page ordered by createdAt descending and ID descending as a deterministic tie-breaker. Text filters are exact matches; createdFrom and createdTo are inclusive. Cursors are opaque; cursors issued by older versions are accepted.
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: actorUserId, in: query, schema: {type: string, maxLength: 255}, description: Exact actor user ID}
+        - {name: action, in: query, schema: {type: string, maxLength: 255}, description: Exact audit action}
+        - {name: resourceType, in: query, schema: {type: string, maxLength: 255}, description: Exact resource type}
+        - {name: resourceId, in: query, schema: {type: string, maxLength: 255}, description: Exact resource ID}
+        - {name: createdFrom, in: query, schema: {type: string, format: date-time}, description: Inclusive start time}
+        - {name: createdTo, in: query, schema: {type: string, format: date-time}, description: Inclusive end time}
+      responses:
+        '200': {description: Cursor page of audit records, content: {application/json: {schema: {$ref: '#/components/schemas/AuditLogPageEnvelope'}}}}
+        '400': {description: Invalid time filter}
+        '403': {description: Admin permission required}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
@@ -208,6 +337,9 @@ components:
   schemas:
     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
     LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
+    PasswordChangeRequest: {type: object, additionalProperties: false, required: [currentPassword, newPassword], properties: {currentPassword: {type: string, format: password}, newPassword: {type: string, format: password, minLength: 12, maxLength: 128}}}
+    UserCreateRequest: {type: object, additionalProperties: false, required: [username], properties: {username: {type: string, minLength: 3, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$'}}}
+    UserStatusRequest: {type: object, additionalProperties: false, required: [disabled], properties: {disabled: {type: boolean}}}
     AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
     AgentMetadataEnvelope:
       allOf:
@@ -217,9 +349,10 @@ components:
             data: {$ref: '#/components/schemas/AgentMetadata'}
     AgentMetadata:
       type: object
-      required: [agentId, nodeId, epoch, revision, stale, reportedAt, updatedAt, items]
+      required: [agentId, instanceId, nodeId, epoch, revision, stale, reportedAt, updatedAt, items, instances]
       properties:
         agentId: {type: string}
+        instanceId: {type: string, description: Instance ID of the freshest healthy metadata row}
         nodeId: {type: string}
         epoch: {type: integer, format: int64}
         revision: {type: integer, format: int64}
@@ -227,6 +360,84 @@ components:
         reportedAt: {type: string, format: date-time}
         updatedAt: {type: string, format: date-time}
         items: {type: array, items: {$ref: '#/components/schemas/AgentMetadataItem'}}
+        instances:
+          type: array
+          description: Metadata for every reporting Agent instance
+          items: {$ref: '#/components/schemas/AgentMetadataInstance'}
+        connections:
+          type: array
+          description: Live local connections; empty when the API process cannot see local state
+          items: {$ref: '#/components/schemas/AgentConnection'}
+    AgentMetadataInstance:
+      type: object
+      required: [instanceId, nodeId, epoch, revision, stale, reportedAt, updatedAt, items]
+      properties:
+        instanceId: {type: string}
+        nodeId: {type: string}
+        epoch: {type: integer, format: int64}
+        revision: {type: integer, format: int64}
+        stale: {type: boolean}
+        reportedAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        items: {type: array, items: {$ref: '#/components/schemas/AgentMetadataItem'}}
+        connectionCount: {type: integer, minimum: 0}
+    AgentConnection:
+      type: object
+      required: [agentId, instanceId, nodeId, connectionId, epoch, connectionEpoch, healthy, activeStreams, lastHeartbeatAt]
+      properties:
+        agentId: {type: string}
+        instanceId: {type: string}
+        nodeId: {type: string}
+        connectionId: {type: string}
+        epoch: {type: integer, format: int64}
+        connectionEpoch: {type: integer, format: int64}
+        serverNodeId: {type: string}
+        healthy: {type: boolean}
+        activeStreams: {type: integer, minimum: 0}
+        lastHeartbeatAt: {type: string, format: date-time}
+    AgentConnectionClusterEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [connections]
+              properties:
+                connections: {type: array, items: {$ref: '#/components/schemas/ClusterAgentConnection'}}
+    ClusterAgentConnection:
+      type: object
+      additionalProperties: false
+      required: [agentId, instanceId, connectionId, connectionEpoch, serverNodeId, serverNodeEpoch, serverNodeAddress, healthy, activeStreams, healthScore, leaseExpiresAt, local]
+      properties:
+        agentId: {type: string}
+        instanceId: {type: string}
+        connectionId: {type: string}
+        connectionEpoch: {type: integer, format: int64, description: Registry lease epoch used for cross-node close fencing}
+        serverNodeId: {type: string}
+        serverNodeEpoch: {type: integer, format: int64}
+        serverNodeAddress: {type: string, description: Authenticated relay endpoint of the owning Server node}
+        healthy: {type: boolean}
+        activeStreams: {type: integer, minimum: 0}
+        healthScore: {type: integer, format: int64, minimum: 0}
+        lastHeartbeatAt: {type: string, format: date-time}
+        leaseExpiresAt: {type: string, format: date-time}
+        local: {type: boolean, description: True when the responding Server owns the physical WebSocket}
+    AgentConnectionCloseEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/AgentConnectionCloseResult'}
+    AgentConnectionCloseResult:
+      type: object
+      additionalProperties: false
+      required: [agentId, connectionId, connectionEpoch, closed]
+      properties:
+        agentId: {type: string}
+        connectionId: {type: string}
+        connectionEpoch: {type: integer, format: int64}
+        closed: {type: boolean}
     AgentMetadataItem:
       type: object
       required: [name, source, redacted]
@@ -236,7 +447,62 @@ components:
         value: {type: string, description: Omitted for redacted sensitive fields}
         redacted: {type: boolean}
     PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
-    TunnelRequest: {type: object, required: [agentId, targetHost, targetPort], properties: {agentId: {type: string}, protocol: {type: string}, domain: {type: string}, pathPrefix: {type: string}, targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, publicPort: {type: integer}, status: {type: string}, config: {type: object}}}
+    TunnelRequest:
+      type: object
+      required: [agentId, targetHost, targetPort]
+      properties:
+        agentId: {type: string}
+        protocol: {type: string, enum: [http, websocket], description: Public application protocol}
+        domain: {type: string, description: Exact domain or single-level tm-* wildcard}
+        pathPrefix: {type: string, default: /}
+        targetHost: {type: string, description: IP or hostname that the Agent dials}
+        targetPort: {type: integer, minimum: 1, maximum: 65535}
+        publicPort: {type: integer}
+        status: {type: string}
+        hostHeader: {type: string, description: Host sent to the upstream service; defaults to targetHost}
+        targetScheme: {type: string, enum: [http, https], default: http, description: Upstream transport scheme used by the Agent}
+        tlsServerName: {type: string, description: TLS SNI and certificate name; requires targetScheme https and defaults to targetHost}
+        config: {type: object, description: Backward-compatible route configuration; new route fields are also persisted here}
+    TunnelUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        agentId: {type: string, description: Omitted preserves the current Agent}
+        protocol: {type: string, enum: [http, websocket], description: Omitted preserves the current protocol}
+        domain: {type: string, description: Exact domain or single-level tm-* wildcard}
+        pathPrefix: {type: string, default: /}
+        targetHost: {type: string}
+        targetPort: {type: integer, minimum: 1, maximum: 65535}
+        hostHeader: {type: string, description: Omitted preserves the current Host header; empty uses targetHost}
+        targetScheme: {type: string, enum: [http, https], description: Omitted preserves the current upstream scheme; empty defaults to http}
+        tlsServerName: {type: string, description: Omitted preserves the current TLS name; empty uses targetHost}
+        publicPort: {type: integer, minimum: 0, maximum: 65535}
+        status: {type: string, enum: [active, disabled]}
+        config: {type: object}
+    AuditLog:
+      type: object
+      additionalProperties: false
+      required: [id, action, resourceType, createdAt]
+      properties:
+        id: {type: string}
+        actorUserId: {type: string}
+        action: {type: string}
+        resourceType: {type: string}
+        resourceId: {type: string}
+        details: {type: object, additionalProperties: true, description: Action-specific non-secret facts}
+        createdAt: {type: string, format: date-time}
+    AuditLogPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items]
+              properties:
+                items: {type: array, items: {$ref: '#/components/schemas/AuditLog'}}
+                nextCursor: {type: string}
+                hasMore: {type: boolean}
     TokenScope:
       type: object
       additionalProperties: false
@@ -245,6 +511,13 @@ components:
         protocols: {type: array, maxItems: 4, uniqueItems: true, items: {type: string, enum: [tcp, udp, http, ws, websocket]}}
         targetCIDRs: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, description: IPv4 or IPv6 CIDR}}
         targetPorts: {type: array, maxItems: 1024, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}}
+    TokenScopeUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        protocols: {type: array, maxItems: 4, uniqueItems: true, items: {type: string, enum: [tcp, udp, http, ws, websocket]}, description: Empty array allows every protocol; omitted preserves the current value}
+        targetCIDRs: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, description: IPv4 or IPv6 CIDR}, description: Empty array allows every target address; omitted preserves the current value}
+        targetPorts: {type: array, maxItems: 1024, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}, description: Empty array allows every port; omitted preserves the current value}
     TokenCreateRequest:
       type: object
       additionalProperties: false
@@ -258,6 +531,18 @@ components:
           allOf: [{$ref: '#/components/schemas/TokenScope'}]
           description: Optional narrowing scope; omission is equivalent to an empty scope
         expiresAt: {type: string, format: date-time, description: Optional future expiration time}
+    TokenUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Future expiration time, or null for a non-expiring Token; omitted preserves the current value
+        scope:
+          allOf: [{$ref: '#/components/schemas/TokenScopeUpdate'}]
+          description: Optional authorization-scope update
     TokenMetadata:
       type: object
       additionalProperties: false

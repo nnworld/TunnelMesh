@@ -15,13 +15,20 @@ import (
 const defaultEtcdPrefix = "/tunnelmesh"
 
 type etcdOwnerValue struct {
-	NodeID    string    `json:"node_id"`
-	Address   string    `json:"address"`
-	Metadata  string    `json:"metadata,omitempty"`
-	AgentID   string    `json:"agent_id"`
-	Epoch     int64     `json:"epoch"`
-	ExpiresAt time.Time `json:"expires_at"`
-	LeaseID   int64     `json:"lease_id"`
+	NodeID          string    `json:"node_id"`
+	Address         string    `json:"address"`
+	Metadata        string    `json:"metadata,omitempty"`
+	AgentID         string    `json:"agent_id"`
+	InstanceID      string    `json:"instance_id,omitempty"`
+	ConnectionID    string    `json:"connection_id"`
+	ServerNodeID    string    `json:"server_node_id"`
+	Epoch           int64     `json:"epoch"`
+	ConnectionEpoch int64     `json:"connection_epoch"`
+	ServerNodeEpoch int64     `json:"server_node_epoch"`
+	ActiveStreams   int64     `json:"active_streams,omitempty"`
+	HealthScore     int64     `json:"health_score,omitempty"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	LeaseID         int64     `json:"lease_id"`
 }
 
 type EtcdRegistry struct {
@@ -50,9 +57,16 @@ func NewEtcdRegistryFromEndpoints(ctx context.Context, endpoints []string, prefi
 	return r, nil
 }
 
-func (r *EtcdRegistry) nodeKey(id string) string       { return r.prefix + "/nodes/" + id }
-func (r *EtcdRegistry) agentKey(id string) string      { return r.prefix + "/agents/" + id }
-func (r *EtcdRegistry) agentEpochKey(id string) string { return r.prefix + "/agents/" + id + "/epoch" }
+func (r *EtcdRegistry) nodeKey(id string) string { return r.prefix + "/nodes/" + id }
+func (r *EtcdRegistry) agentConnectionsPrefix(id string) string {
+	return r.prefix + "/agents/" + id + "/connections/"
+}
+func (r *EtcdRegistry) agentConnectionKey(id, connectionID string) string {
+	return r.agentConnectionsPrefix(id) + connectionID
+}
+func (r *EtcdRegistry) agentConnectionEpochKey(id, connectionID string) string {
+	return r.prefix + "/agents/" + id + "/connection-epochs/" + connectionID
+}
 
 func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (NodeOwner, error) {
 	if r == nil || r.client == nil {
@@ -60,6 +74,14 @@ func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (Node
 	}
 	if strings.TrimSpace(req.NodeID) == "" || strings.TrimSpace(req.AgentID) == "" {
 		return NodeOwner{}, errors.New("node_id and agent_id are required")
+	}
+	connectionID := strings.TrimSpace(req.ConnectionID)
+	if connectionID == "" {
+		connectionID = "legacy"
+	}
+	serverNodeID := strings.TrimSpace(req.ServerNodeID)
+	if serverNodeID == "" {
+		serverNodeID = req.NodeID
 	}
 	ttl := req.TTL
 	if ttl <= 0 {
@@ -73,56 +95,60 @@ func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (Node
 	if err != nil {
 		return NodeOwner{}, err
 	}
+	connectionKey := r.agentConnectionKey(req.AgentID, connectionID)
+	epochKey := r.agentConnectionEpochKey(req.AgentID, connectionID)
 	var existingKV *mvccpb.KeyValue
-	if resp, e := r.client.Get(ctx, r.agentKey(req.AgentID)); e == nil && len(resp.Kvs) > 0 {
+	if resp, e := r.client.Get(ctx, connectionKey); e == nil && len(resp.Kvs) > 0 {
 		existingKV = resp.Kvs[0]
 		var current etcdOwnerValue
-		if json.Unmarshal(existingKV.Value, &current) == nil && !current.ExpiresAt.After(time.Now().UTC()) {
-			// The lease server may take a short while to deliver its delete
-			// event. Treat an expired value as reclaimable, guarded by modrev.
-		} else {
+		if json.Unmarshal(existingKV.Value, &current) == nil && current.ExpiresAt.After(time.Now().UTC()) {
 			_, _ = r.client.Revoke(ctx, leaseResp.ID)
 			return NodeOwner{}, ErrLeaseHeld
 		}
+	} else if e != nil {
+		_, _ = r.client.Revoke(ctx, leaseResp.ID)
+		return NodeOwner{}, e
 	}
+
 	var oldEpoch int64
 	var epochKV *mvccpb.KeyValue
-	if resp, e := r.client.Get(ctx, r.agentEpochKey(req.AgentID)); e == nil && len(resp.Kvs) > 0 {
+	if resp, e := r.client.Get(ctx, epochKey); e == nil && len(resp.Kvs) > 0 {
 		epochKV = resp.Kvs[0]
 		_, _ = fmt.Sscanf(string(epochKV.Value), "%d", &oldEpoch)
-	}
-	if oldEpoch == 0 {
-		if resp, e := r.client.Get(ctx, r.nodeKey(req.NodeID)); e == nil && len(resp.Kvs) > 0 {
-			var old etcdOwnerValue
-			_ = json.Unmarshal(resp.Kvs[0].Value, &old)
-			oldEpoch = old.Epoch
-		}
+	} else if e != nil {
+		_, _ = r.client.Revoke(ctx, leaseResp.ID)
+		return NodeOwner{}, e
 	}
 	epoch := oldEpoch + 1
 	now := time.Now().UTC()
-	owner := NodeOwner{NodeID: req.NodeID, Address: req.Address, Metadata: req.Metadata, AgentID: req.AgentID, Epoch: epoch, ExpiresAt: now.Add(ttl), LeaseID: int64(leaseResp.ID)}
-	b, _ := json.Marshal(etcdOwnerValue{NodeID: owner.NodeID, Address: owner.Address, Metadata: owner.Metadata, AgentID: owner.AgentID, Epoch: owner.Epoch, ExpiresAt: owner.ExpiresAt, LeaseID: owner.LeaseID})
-	// Keep the node record persistent so its epoch survives an expired agent
-	// lease; the agent key itself is the ephemeral ownership marker.
-	// The marker comparison closes the read/CAS gap: a contender that read an
-	// older epoch cannot overwrite a newer marker after the previous lease
-	// expires and is replaced.
+	owner := NodeOwner{
+		NodeID: req.NodeID, Address: req.Address, Metadata: req.Metadata, AgentID: req.AgentID,
+		InstanceID: req.InstanceID, ConnectionID: connectionID, ServerNodeID: serverNodeID,
+		Epoch: epoch, ConnectionEpoch: epoch, ServerNodeEpoch: epoch, ExpiresAt: now.Add(ttl), LeaseID: int64(leaseResp.ID),
+	}
+	value, _ := json.Marshal(etcdOwnerValue{
+		NodeID: owner.NodeID, Address: owner.Address, Metadata: owner.Metadata, AgentID: owner.AgentID,
+		InstanceID: owner.InstanceID, ConnectionID: owner.ConnectionID, ServerNodeID: owner.ServerNodeID,
+		Epoch: owner.Epoch, ConnectionEpoch: owner.ConnectionEpoch, ServerNodeEpoch: owner.ServerNodeEpoch, ExpiresAt: owner.ExpiresAt, LeaseID: owner.LeaseID,
+	})
 	compares := []clientv3.Cmp{}
 	thenOps := []clientv3.Op{}
 	if existingKV == nil {
-		compares = append(compares, clientv3.Compare(clientv3.Version(r.agentKey(req.AgentID)), "=", 0))
+		compares = append(compares, clientv3.Compare(clientv3.Version(connectionKey), "=", 0))
 	} else {
-		compares = append(compares, clientv3.Compare(clientv3.ModRevision(r.agentKey(req.AgentID)), "=", existingKV.ModRevision))
-		thenOps = append(thenOps, clientv3.OpDelete(r.agentKey(req.AgentID)))
+		compares = append(compares, clientv3.Compare(clientv3.ModRevision(connectionKey), "=", existingKV.ModRevision))
 	}
 	if epochKV == nil {
-		compares = append(compares, clientv3.Compare(clientv3.Version(r.agentEpochKey(req.AgentID)), "=", 0))
+		compares = append(compares, clientv3.Compare(clientv3.Version(epochKey), "=", 0))
 	} else {
-		compares = append(compares, clientv3.Compare(clientv3.ModRevision(r.agentEpochKey(req.AgentID)), "=", epochKV.ModRevision))
+		compares = append(compares, clientv3.Compare(clientv3.ModRevision(epochKey), "=", epochKV.ModRevision))
 	}
-	thenOps = append(thenOps, clientv3.OpPut(r.agentEpochKey(req.AgentID), fmt.Sprintf("%d", epoch)), clientv3.OpPut(r.nodeKey(req.NodeID), string(b)), clientv3.OpPut(r.agentKey(req.AgentID), string(b), clientv3.WithLease(leaseResp.ID)))
-	txn := r.client.Txn(ctx).If(compares...).Then(thenOps...)
-	resp, err := txn.Commit()
+	thenOps = append(thenOps,
+		clientv3.OpPut(epochKey, fmt.Sprintf("%d", epoch)),
+		clientv3.OpPut(r.nodeKey(serverNodeID), string(value)),
+		clientv3.OpPut(connectionKey, string(value), clientv3.WithLease(leaseResp.ID)),
+	)
+	resp, err := r.client.Txn(ctx).If(compares...).Then(thenOps...).Commit()
 	if err != nil {
 		_, _ = r.client.Revoke(ctx, leaseResp.ID)
 		return NodeOwner{}, err
@@ -135,12 +161,14 @@ func (r *EtcdRegistry) Register(ctx context.Context, req NodeRegistration) (Node
 }
 
 func (r *EtcdRegistry) KeepAlive(ctx context.Context, owner NodeOwner, ttl time.Duration) (NodeOwner, error) {
-	currentResp, err := r.client.Get(ctx, r.agentKey(owner.AgentID))
+	key := r.agentConnectionKey(owner.AgentID, owner.ConnectionID)
+	currentResp, err := r.client.Get(ctx, key)
 	if err != nil || len(currentResp.Kvs) == 0 {
 		return NodeOwner{}, ErrFencing
 	}
 	var current etcdOwnerValue
-	if json.Unmarshal(currentResp.Kvs[0].Value, &current) != nil || current.Epoch != owner.Epoch || current.NodeID != owner.NodeID {
+	if json.Unmarshal(currentResp.Kvs[0].Value, &current) != nil ||
+		current.Epoch != owner.Epoch || current.NodeID != owner.NodeID || current.ConnectionID != owner.ConnectionID {
 		return NodeOwner{}, ErrFencing
 	}
 	if owner.LeaseID == 0 {
@@ -150,40 +178,93 @@ func (r *EtcdRegistry) KeepAlive(ctx context.Context, owner NodeOwner, ttl time.
 		return NodeOwner{}, ErrFencing
 	}
 	resp, err := r.client.KeepAliveOnce(ctx, clientv3.LeaseID(owner.LeaseID))
-	if err != nil || resp == nil {
-		return NodeOwner{}, ErrFencing
-	}
-	if resp.TTL <= 0 {
+	if err != nil || resp == nil || resp.TTL <= 0 {
 		return NodeOwner{}, ErrLeaseExpired
 	}
 	owner.ExpiresAt = time.Now().UTC().Add(time.Duration(resp.TTL) * time.Second)
-	// Keep the value's expiry in sync with the etcd lease. ResolveAgent reads
-	// the value, while the lease controls key liveness; updating both avoids a
-	// renewed owner being mistaken for an expired one after its first TTL.
-	b, _ := json.Marshal(etcdOwnerValue{NodeID: owner.NodeID, Address: owner.Address, Metadata: owner.Metadata, AgentID: owner.AgentID, Epoch: owner.Epoch, ExpiresAt: owner.ExpiresAt, LeaseID: owner.LeaseID})
-	updated, err := r.client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(r.agentKey(owner.AgentID)), "=", currentResp.Kvs[0].ModRevision)).Then(clientv3.OpPut(r.agentEpochKey(owner.AgentID), fmt.Sprintf("%d", owner.Epoch)), clientv3.OpPut(r.agentKey(owner.AgentID), string(b), clientv3.WithLease(clientv3.LeaseID(owner.LeaseID))), clientv3.OpPut(r.nodeKey(owner.NodeID), string(b))).Commit()
+	value, _ := json.Marshal(etcdOwnerValue{
+		NodeID: owner.NodeID, Address: owner.Address, Metadata: owner.Metadata, AgentID: owner.AgentID,
+		InstanceID: owner.InstanceID, ConnectionID: owner.ConnectionID, ServerNodeID: owner.ServerNodeID,
+		Epoch: owner.Epoch, ConnectionEpoch: owner.ConnectionEpoch, ServerNodeEpoch: owner.ServerNodeEpoch, ActiveStreams: owner.ActiveStreams, HealthScore: owner.HealthScore,
+		ExpiresAt: owner.ExpiresAt, LeaseID: owner.LeaseID,
+	})
+	updated, err := r.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", currentResp.Kvs[0].ModRevision)).
+		Then(
+			clientv3.OpPut(key, string(value), clientv3.WithLease(clientv3.LeaseID(owner.LeaseID))),
+			clientv3.OpPut(r.nodeKey(owner.ServerNodeID), string(value)),
+		).Commit()
 	if err != nil || !updated.Succeeded {
 		return NodeOwner{}, ErrFencing
 	}
 	return owner, nil
 }
 
+// UpdateConnectionStats writes local relay load without changing ownership.
+// The transaction fences the update on the current ModRevision.
+func (r *EtcdRegistry) UpdateConnectionStats(ctx context.Context, owner NodeOwner) error {
+	key := r.agentConnectionKey(owner.AgentID, owner.ConnectionID)
+	currentResp, err := r.client.Get(ctx, key)
+	if err != nil || len(currentResp.Kvs) == 0 {
+		return ErrFencing
+	}
+	var current etcdOwnerValue
+	if json.Unmarshal(currentResp.Kvs[0].Value, &current) != nil ||
+		current.Epoch != owner.Epoch || current.NodeID != owner.NodeID || current.ConnectionID != owner.ConnectionID {
+		return ErrFencing
+	}
+	current.ActiveStreams = owner.ActiveStreams
+	current.HealthScore = owner.HealthScore
+	value, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	updated, err := r.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", currentResp.Kvs[0].ModRevision)).
+		Then(
+			clientv3.OpPut(key, string(value), clientv3.WithLease(clientv3.LeaseID(current.LeaseID))),
+			clientv3.OpPut(r.nodeKey(current.ServerNodeID), string(value)),
+		).Commit()
+	if err != nil {
+		return err
+	}
+	if !updated.Succeeded {
+		return ErrFencing
+	}
+	return nil
+}
+
 func (r *EtcdRegistry) ResolveAgent(ctx context.Context, agentID string) (NodeOwner, error) {
-	resp, err := r.client.Get(ctx, r.agentKey(agentID))
+	owners, err := r.ListAgentConnections(ctx, agentID)
 	if err != nil {
 		return NodeOwner{}, err
 	}
-	if len(resp.Kvs) == 0 {
+	if len(owners) == 0 {
 		return NodeOwner{}, ErrNotFound
 	}
-	var v etcdOwnerValue
-	if err := json.Unmarshal(resp.Kvs[0].Value, &v); err != nil {
-		return NodeOwner{}, fmt.Errorf("decode owner: %w", err)
+	return owners[0], nil
+}
+
+func (r *EtcdRegistry) ListAgentConnections(ctx context.Context, agentID string) ([]NodeOwner, error) {
+	resp, err := r.client.Get(ctx, r.agentConnectionsPrefix(agentID), clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
 	}
-	if v.ExpiresAt.Before(time.Now().UTC()) {
-		return NodeOwner{}, ErrLeaseExpired
+	owners := make([]NodeOwner, 0, len(resp.Kvs))
+	now := time.Now().UTC()
+	for _, kv := range resp.Kvs {
+		var v etcdOwnerValue
+		if json.Unmarshal(kv.Value, &v) != nil || v.AgentID != agentID || !v.ExpiresAt.After(now) {
+			continue
+		}
+		owners = append(owners, NodeOwner{
+			NodeID: v.NodeID, Address: v.Address, Metadata: v.Metadata, AgentID: v.AgentID,
+			InstanceID: v.InstanceID, ConnectionID: v.ConnectionID, ServerNodeID: v.ServerNodeID,
+			Epoch: v.Epoch, ConnectionEpoch: v.ConnectionEpoch, ServerNodeEpoch: v.ServerNodeEpoch, ActiveStreams: v.ActiveStreams, HealthScore: v.HealthScore,
+			ExpiresAt: v.ExpiresAt, LeaseID: v.LeaseID,
+		})
 	}
-	return NodeOwner{NodeID: v.NodeID, Address: v.Address, Metadata: v.Metadata, AgentID: v.AgentID, Epoch: v.Epoch, ExpiresAt: v.ExpiresAt, LeaseID: v.LeaseID}, nil
+	return owners, nil
 }
 
 func (r *EtcdRegistry) Watch(ctx context.Context, agentID string) (<-chan RegistryEvent, error) {
@@ -191,7 +272,7 @@ func (r *EtcdRegistry) Watch(ctx context.Context, agentID string) (<-chan Regist
 		return nil, errors.New("agent_id is required")
 	}
 	out := make(chan RegistryEvent, 16)
-	wch := r.client.Watch(ctx, r.agentKey(agentID), clientv3.WithPrevKV())
+	wch := r.client.Watch(ctx, r.agentConnectionsPrefix(agentID), clientv3.WithPrevKV())
 	go func() {
 		defer close(out)
 		for resp := range wch {
@@ -208,7 +289,7 @@ func (r *EtcdRegistry) Watch(ctx context.Context, agentID string) (<-chan Regist
 					continue
 				}
 				var v etcdOwnerValue
-				if json.Unmarshal(raw, &v) != nil {
+				if json.Unmarshal(raw, &v) != nil || v.AgentID != agentID {
 					continue
 				}
 				typ := EventUpdated
@@ -217,7 +298,12 @@ func (r *EtcdRegistry) Watch(ctx context.Context, agentID string) (<-chan Regist
 				} else if ev.IsCreate() {
 					typ = EventRegistered
 				}
-				owner := NodeOwner{NodeID: v.NodeID, Address: v.Address, Metadata: v.Metadata, AgentID: v.AgentID, Epoch: v.Epoch, ExpiresAt: v.ExpiresAt, LeaseID: v.LeaseID}
+				owner := NodeOwner{
+					NodeID: v.NodeID, Address: v.Address, Metadata: v.Metadata, AgentID: v.AgentID,
+					InstanceID: v.InstanceID, ConnectionID: v.ConnectionID, ServerNodeID: v.ServerNodeID,
+					Epoch: v.Epoch, ConnectionEpoch: v.ConnectionEpoch, ServerNodeEpoch: v.ServerNodeEpoch, ActiveStreams: v.ActiveStreams, HealthScore: v.HealthScore,
+					ExpiresAt: v.ExpiresAt, LeaseID: v.LeaseID,
+				}
 				select {
 				case out <- RegistryEvent{Type: typ, Owner: owner}:
 				case <-ctx.Done():
@@ -230,7 +316,8 @@ func (r *EtcdRegistry) Watch(ctx context.Context, agentID string) (<-chan Regist
 }
 
 func (r *EtcdRegistry) Revoke(ctx context.Context, owner NodeOwner) error {
-	resp, err := r.client.Get(ctx, r.agentKey(owner.AgentID))
+	key := r.agentConnectionKey(owner.AgentID, owner.ConnectionID)
+	resp, err := r.client.Get(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -238,13 +325,13 @@ func (r *EtcdRegistry) Revoke(ctx context.Context, owner NodeOwner) error {
 		return ErrNotFound
 	}
 	var current etcdOwnerValue
-	if json.Unmarshal(resp.Kvs[0].Value, &current) != nil {
+	if json.Unmarshal(resp.Kvs[0].Value, &current) != nil ||
+		current.Epoch != owner.Epoch || current.NodeID != owner.NodeID || current.ConnectionID != owner.ConnectionID {
 		return ErrFencing
 	}
-	if current.Epoch != owner.Epoch || current.NodeID != owner.NodeID {
-		return ErrFencing
-	}
-	deleted, err := r.client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(r.agentKey(owner.AgentID)), "=", resp.Kvs[0].ModRevision)).Then(clientv3.OpDelete(r.agentKey(owner.AgentID))).Commit()
+	deleted, err := r.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", resp.Kvs[0].ModRevision)).
+		Then(clientv3.OpDelete(key)).Commit()
 	if err != nil {
 		return err
 	}

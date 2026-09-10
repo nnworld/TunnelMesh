@@ -1,0 +1,139 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/registry"
+	"github.com/tunnelmesh/tunnelmesh/internal/relay"
+)
+
+type fixedConnectionRegistry struct {
+	connections []registry.NodeOwner
+	err         error
+}
+
+func (r *fixedConnectionRegistry) Register(context.Context, registry.NodeRegistration) (registry.NodeOwner, error) {
+	return registry.NodeOwner{}, errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) KeepAlive(context.Context, registry.NodeOwner, time.Duration) (registry.NodeOwner, error) {
+	return registry.NodeOwner{}, errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) UpdateConnectionStats(context.Context, registry.NodeOwner) error {
+	return errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) ResolveAgent(context.Context, string) (registry.NodeOwner, error) {
+	return registry.NodeOwner{}, errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) ListAgentConnections(context.Context, string) ([]registry.NodeOwner, error) {
+	return r.connections, r.err
+}
+func (r *fixedConnectionRegistry) Watch(context.Context, string) (<-chan registry.RegistryEvent, error) {
+	return nil, errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) Revoke(context.Context, registry.NodeOwner) error {
+	return errors.New("not implemented")
+}
+func (r *fixedConnectionRegistry) Close() error { return nil }
+
+func TestAgentConnectionSelectorPrefersHealthyLeastLoadedLocalConnection(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	var err error
+	_, err = manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-select", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-select", NodeID: "node-b", ConnectionID: "conn-b", ConnectionEpoch: 1, Epoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-select", TargetConnectionID: "conn-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	selector := NewAgentConnectionSelector(manager, mux, &fixedConnectionRegistry{}, "server-local")
+	target, err := selector.Select(context.Background(), "agent-select", "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !target.Local || target.ConnectionID != "conn-b" {
+		t.Fatalf("target=%+v, want healthy least-loaded local conn-b", target)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target, err = selector.Select(context.Background(), "agent-select", "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !target.Local || target.ConnectionID != "conn-a" {
+		t.Fatalf("target=%+v, want only healthy local conn-a", target)
+	}
+}
+
+func TestAgentConnectionSelectorFallsBackToRemote(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	closed, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-remote", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+	remote := &fixedConnectionRegistry{connections: []registry.NodeOwner{{
+		AgentID: "agent-remote", ConnectionID: "conn-remote", ServerNodeID: "server-remote",
+		ServerNodeEpoch: 8, ConnectionEpoch: 2, ActiveStreams: 1, HealthScore: 90,
+	}}}
+	selector := NewAgentConnectionSelector(manager, mux, remote, "server-local")
+	target, err := selector.Select(context.Background(), "agent-remote", "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Local || target.ConnectionID != "conn-remote" || target.ServerNodeID != "server-remote" || target.ServerNodeEpoch != 8 {
+		t.Fatalf("target=%+v, want remote connection", target)
+	}
+}
+
+func TestAgentConnectionSelectorObservesSelection(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(registry)
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-selection", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1}, newFakeTransport()); err != nil {
+		t.Fatal(err)
+	}
+	selector := NewAgentConnectionSelector(manager, NewAgentRelayTransport(manager), &fixedConnectionRegistry{}, "server-local")
+	selector.SetMetrics(metrics)
+	if _, err := selector.Select(context.Background(), "agent-selection", "tcp"); err != nil {
+		t.Fatal(err)
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exposition strings.Builder
+	for _, family := range families {
+		exposition.WriteString(family.GetName())
+	}
+	if !strings.Contains(exposition.String(), "tunnelmesh_agent_selection_total") {
+		t.Fatalf("selection metric not published: %s", exposition.String())
+	}
+}

@@ -1,14 +1,16 @@
 <template>
-  <el-dialog :model-value="Boolean(secret)" title="Copy this secret now" width="520px" @close="$emit('close')">
-    <el-alert type="warning" :closable="false" title="The secret is shown once. It is not stored in the browser or returned by later requests." />
+  <el-dialog :model-value="Boolean(secret)" :title="t('tokens.secretTitle')" width="520px" @close="$emit('close')">
+    <el-alert type="warning" :closable="false" :title="t('tokens.secretWarning')" />
     <el-input class="secret" :model-value="secret" readonly>
-      <template #append><el-button @click="copy">Copy</el-button></template>
+      <template #append><el-button @click="copy">{{t('tokens.copy')}}</el-button></template>
     </el-input>
-    <template #footer><el-button type="primary" @click="$emit('close')">I saved it</el-button></template>
+    <template #footer><el-button type="primary" @click="$emit('close')">{{t('tokens.saved')}}</el-button></template>
   </el-dialog>
 </template>
 
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
+const {t}=useI18n()
 const props = defineProps<{ secret: string }>()
 const emit = defineEmits<{ close: [] }>()
 async function copy() {

@@ -131,3 +131,41 @@ func TestMetricsClusterFamilies(t *testing.T) {
 		}
 	}
 }
+
+func TestMetricsAgentConnectionPoolFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewMetrics(reg)
+	metrics.ObserveAgentConnection("agent", "instance", "connection", false)
+	metrics.ObserveAgentConnection("agent", "instance", "connection", true)
+	metrics.ObserveAgentConnectionError("agent", "instance", "connection", "timeout")
+	metrics.ObserveAgentActiveStreams("agent", "instance", "connection", 3)
+	metrics.ObserveAgentConnectionRTT("agent", "instance", "connection", 20*time.Millisecond)
+	metrics.SetAgentConnectionCapacity("agent", "instance", 8)
+	metrics.ObserveAgentScaleDecision("agent", "instance", "scale-up", "high-active-streams")
+	metrics.ObserveAgentSelection("agent", "connection", "server", "local")
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, family := range families {
+		names[family.GetName()] = true
+	}
+	for _, name := range []string{
+		"tunnelmesh_agent_connections",
+		"tunnelmesh_agent_connection_capacity",
+		"tunnelmesh_agent_active_streams",
+		"tunnelmesh_agent_connection_rtt_seconds",
+		"tunnelmesh_agent_connection_errors_total",
+		"tunnelmesh_agent_connection_scale_decisions_total",
+		"tunnelmesh_agent_selection_total",
+	} {
+		if !names[name] {
+			t.Fatalf("missing metric family %s", name)
+		}
+	}
+	if got := testutil.ToFloat64(metrics.agentConnectionErrors.WithLabelValues("agent", "instance", "connection", "timeout")); got != 1 {
+		t.Fatalf("connection error count = %v", got)
+	}
+}

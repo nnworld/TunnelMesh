@@ -59,6 +59,61 @@ func TestMetadataPayloadRejectsUnknownControlAndOversizedBeforeJSON(t *testing.T
 	}
 }
 
+func TestAgentMetadataPayloadCarriesConnectionIdentity(t *testing.T) {
+	payload := AgentMetadataPayload{
+		AgentID: "agent-a", InstanceID: "agent-node-a",
+		ConnectionID: "conn-1", NodeID: "legacy-node", Epoch: 3,
+		Revision: 7, ReportedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	encoded, err := EncodeAgentMetadataPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeAgentMetadataPayload(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InstanceID != "agent-node-a" || got.ConnectionID != "conn-1" {
+		t.Fatalf("connection identity = %+v", got)
+	}
+}
+
+func TestAgentMetadataAckAdvertisesConnectionPool(t *testing.T) {
+	payload := AgentMetadataAckPayload{
+		AgentID: "agent-a", Epoch: 3, Revision: 7, Accepted: true,
+		ConnectionPoolSupported: true, MaxConnectionsPerAgent: 8,
+	}
+	encoded, err := EncodeAgentMetadataAckPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeAgentMetadataAckPayload(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ConnectionPoolSupported || got.MaxConnectionsPerAgent != 8 {
+		t.Fatalf("connection pool ack = %+v", got)
+	}
+}
+
+func TestAgentMetadataConnectionFieldsRemainOptionalForLegacyAgents(t *testing.T) {
+	got, err := DecodeAgentMetadataPayload([]byte(`{"agent_id":"agent-a","node_id":"node-a","epoch":1,"revision":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InstanceID != "" || got.ConnectionID != "" {
+		t.Fatalf("legacy payload gained identity = %+v", got)
+	}
+
+	ack, err := DecodeAgentMetadataAckPayload([]byte(`{"agent_id":"agent-a","epoch":1,"revision":1,"accepted":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.ConnectionPoolSupported || ack.MaxConnectionsPerAgent != 0 {
+		t.Fatalf("legacy ack gained capability = %+v", ack)
+	}
+}
+
 func TestFrameRoundTrip(t *testing.T) {
 	in := Frame{Version: CurrentVersion, Type: FrameData, Flags: FlagFin, StreamID: 42, Window: 8192, Payload: []byte("hello")}
 	var b bytes.Buffer

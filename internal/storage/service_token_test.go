@@ -98,6 +98,62 @@ func runServiceTokenRepositoryContract(t *testing.T, db *DB) {
 		t.Fatalf("last used at = %v, want %v", got.LastUsedAt, lastUsedAt)
 	}
 
+	activeExpiresAt := time.Now().UTC().Add(time.Hour)
+	active := ServiceToken{
+		ID: "contract-service-token-15-expiration", OwnerUserID: "owner-main", Prefix: "p15",
+		TokenHash: "contract-service-token-hash-15", Scope: `[]`, Type: TokenTypeClient,
+		ExpiresAt: &activeExpiresAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := repo.Create(ctx, active); err != nil {
+		t.Fatalf("create active service token: %v", err)
+	}
+	newExpiresAt := time.Now().UTC().Add(72 * time.Hour)
+	updatedAt := time.Now().UTC().Add(time.Minute)
+	if err := repo.UpdateExpiration(ctx, active.ID, &newExpiresAt, updatedAt); err != nil {
+		t.Fatalf("update service token expiration: %v", err)
+	}
+	got, err = repo.Get(ctx, active.ID)
+	if err != nil {
+		t.Fatalf("get updated service token: %v", err)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(newExpiresAt) || !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("updated expiration = %+v, want expires %v updated %v", got, newExpiresAt, updatedAt)
+	}
+	if err := repo.UpdateExpiration(ctx, active.ID, nil, updatedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("clear service token expiration: %v", err)
+	}
+	got, err = repo.Get(ctx, active.ID)
+	if err != nil {
+		t.Fatalf("get cleared service token: %v", err)
+	}
+	if got.ExpiresAt != nil {
+		t.Fatalf("cleared expiration = %v, want nil", got.ExpiresAt)
+	}
+
+	scopeUpdatedAt := updatedAt.Add(2 * time.Minute)
+	scopeJSON := `{"agentIds":["agent-a"],"protocols":["tcp","http"],"targetCIDRs":["10.0.0.0/8"],"targetPorts":[22,80]}`
+	if err := repo.UpdateScope(ctx, active.ID, scopeJSON, scopeUpdatedAt); err != nil {
+		t.Fatalf("update service token scope: %v", err)
+	}
+	got, err = repo.Get(ctx, active.ID)
+	if err != nil {
+		t.Fatalf("get scope-updated service token: %v", err)
+	}
+	if got.Scope != scopeJSON || !got.UpdatedAt.Equal(scopeUpdatedAt) {
+		t.Fatalf("updated scope = %q updated=%v, want scope %q updated=%v", got.Scope, got.UpdatedAt, scopeJSON, scopeUpdatedAt)
+	}
+	clearScopeJSON := `{"agentIds":["agent-a"],"protocols":[],"targetCIDRs":[],"targetPorts":[]}`
+	if err := repo.UpdateScope(ctx, active.ID, clearScopeJSON, scopeUpdatedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("clear service token scope: %v", err)
+	}
+	got, err = repo.Get(ctx, active.ID)
+	if err != nil {
+		t.Fatalf("get cleared-scope service token: %v", err)
+	}
+	if got.Scope != clearScopeJSON {
+		t.Fatalf("cleared scope = %q, want %q", got.Scope, clearScopeJSON)
+	}
+
 	revokedAt := createdAt.Add(2 * time.Hour)
 	if err := repo.Revoke(ctx, base.ID, revokedAt); err != nil {
 		t.Fatalf("revoke service token: %v", err)
@@ -108,6 +164,16 @@ func runServiceTokenRepositoryContract(t *testing.T, db *DB) {
 	}
 	if got.RevokedAt == nil || !got.RevokedAt.Equal(revokedAt) {
 		t.Fatalf("revoked at = %v, want %v", got.RevokedAt, revokedAt)
+	}
+	activeRevokedAt := time.Now().UTC()
+	if err := repo.Revoke(ctx, active.ID, activeRevokedAt); err != nil {
+		t.Fatalf("revoke active service token: %v", err)
+	}
+	if err := repo.UpdateExpiration(ctx, active.ID, &newExpiresAt, revokedAt.Add(time.Minute)); !errors.Is(err, ErrServiceTokenRevoked) {
+		t.Fatalf("revoked expiration update error = %v, want ErrServiceTokenRevoked", err)
+	}
+	if err := repo.UpdateScope(ctx, active.ID, scopeJSON, revokedAt.Add(2*time.Minute)); !errors.Is(err, ErrServiceTokenRevoked) {
+		t.Fatalf("revoked scope update error = %v, want ErrServiceTokenRevoked", err)
 	}
 
 	old := ServiceToken{ID: "contract-service-token-30-rotate-old", OwnerUserID: "owner-rotate", Prefix: "old", TokenHash: "contract-service-token-hash-30", Scope: `[]`, Type: TokenTypeClient}
@@ -343,7 +409,7 @@ func assertServiceToken(t *testing.T, got, want ServiceToken) {
 
 func assertAuditExists(t *testing.T, repo AuditRepository, id string, want bool) {
 	t.Helper()
-	page, err := repo.List(context.Background(), "", 100)
+	page, err := repo.List(context.Background(), AuditFilter{}, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}

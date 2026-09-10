@@ -20,12 +20,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/websocket"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/registry"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -43,27 +46,35 @@ type RuntimeConfig struct {
 	TLS             config.TLSConfig
 	Relay           config.RelayConfig
 	NodeID          string
+	DynamicSuffix   string
 	MetricsRegistry *prometheus.Registry
+	// ConnectionSelector and RemoteRelay allow deployments to provide their
+	// authenticated Server-node transport pool. Defaults are local-only.
+	ConnectionSelector relay.ConnectionSelector
+	ConnectionRegistry registry.NodeRegistry
+	RemoteRelay        *relay.RelayService
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
 // and authenticated Agent WebSocket handlers. The caller owns DB lifecycle.
 type ServerRuntime struct {
-	DB               *storage.DB
-	AgentSessions    *AgentSessionManager
-	ClientSessions   *ClientSessionManager
-	API              *API
-	Auth             *auth.AuthService
-	Credentials      *auth.CredentialService
-	ClientAuthorizer StreamAuthorizer
-	ClientTransport  relay.NodeTransport
-	LocalAgentRelay  *AgentRelayTransport
-	relayServer      *grpc.Server
-	relayListener    net.Listener
-	config           RuntimeConfig
-	metricsRegistry  *prometheus.Registry
-	metrics          *observability.Metrics
-	closed           atomic.Bool
+	DB                    *storage.DB
+	AgentSessions         *AgentSessionManager
+	AgentConnectionLeases *AgentConnectionLeaseController
+	ClientSessions        *ClientSessionManager
+	API                   *API
+	Auth                  *auth.AuthService
+	Credentials           *auth.CredentialService
+	ClientAuthorizer      StreamAuthorizer
+	ClientTransport       relay.NodeTransport
+	LocalAgentRelay       *AgentRelayTransport
+	managedRoutes         *ManagedRouteHandler
+	relayServer           *grpc.Server
+	relayListener         net.Listener
+	config                RuntimeConfig
+	metricsRegistry       *prometheus.Registry
+	metrics               *observability.Metrics
+	closed                atomic.Bool
 }
 
 // NewServerRuntime creates the server runtime with durable Agent metadata
@@ -81,15 +92,49 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		runtimeConfig.Security.AllowedHosts = append([]string(nil), runtimeConfig.Security.AllowedHosts...)
 		runtimeConfig.Security.AllowedOrigins = append([]string(nil), runtimeConfig.Security.AllowedOrigins...)
 	}
+	cfg.ServerNodeID = runtimeConfig.NodeID
 	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
 	localAgentRelay := NewAgentRelayTransport(agentSessions)
-	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: localAgentRelay, LocalAgentRelay: localAgentRelay, config: runtimeConfig}
+	serverNodeID := runtimeConfig.NodeID
+	if strings.TrimSpace(serverNodeID) == "" {
+		serverNodeID = "local"
+	}
+	connectionRegistry := runtimeConfig.ConnectionRegistry
+	if connectionRegistry == nil {
+		connectionRegistry = registry.NewDatabaseRegistry(db)
+	}
+	connectionSelector := runtimeConfig.ConnectionSelector
+	if connectionSelector == nil {
+		connectionSelector = NewAgentConnectionSelector(agentSessions, localAgentRelay, connectionRegistry, serverNodeID)
+	}
+	agentConnectionLeases := NewAgentConnectionLeaseController(connectionRegistry, agentSessions, localAgentRelay, serverNodeID, runtimeConfig.Relay.Endpoint, defaultAgentConnectionLeaseTTL)
+	agentSessions.SetHeartbeatCallback(agentConnectionLeases.HeartbeatForSession)
+	clientTransport := relay.NodeTransport(localAgentRelay)
+	if _, ok := connectionSelector.(*AgentConnectionSelector); !ok || runtimeConfig.RemoteRelay != nil {
+		clientTransport = relay.NewSelectedTransport(connectionSelector, localAgentRelay, runtimeConfig.RemoteRelay)
+	}
+	routeTable := NewManagedRouteTable(db, runtimeConfig.DynamicSuffix, managedRouteCacheTTL)
+	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
+	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
+	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	dialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (AgentConnectionRelayClient, error) {
+		client, err := runtime.DialRelayNode(ctx, endpoint, epoch)
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+	connectionCloser := NewClusterAgentConnectionCloseService(connectionRegistry, agentConnectionLeases, serverNodeID, dialRelayNode)
+	runtime.API.SetClusterAgentConnections(connectionRegistry, connectionCloser, serverNodeID)
 	registry := runtimeConfig.MetricsRegistry
 	if registry == nil {
 		registry = prometheus.NewRegistry()
 	}
 	runtime.metricsRegistry = registry
 	runtime.metrics = observability.NewMetrics(registry)
+	if selector, ok := connectionSelector.(*AgentConnectionSelector); ok {
+		selector.SetMetrics(runtime.metrics)
+	}
 	if runtimeConfig.Relay.Enabled {
 		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
 			_ = credentialService.Close()
@@ -106,8 +151,12 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 			return nil, fmt.Errorf("server runtime: listen relay: %w", err)
 		}
 		runtime.relayListener = listener
-		runtime.relayServer = grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)), grpc.ChainStreamInterceptor(relay.NewServerNodeStreamInterceptorWithMetrics(credentialService, db.Nodes(), runtime.metrics)))
-		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServer(localAgentRelay.OpenStream))
+		runtime.relayServer = grpc.NewServer(
+			grpc.Creds(credentials.NewTLS(tlsConfig)),
+			grpc.ChainStreamInterceptor(relay.NewServerNodeStreamInterceptorWithMetrics(credentialService, db.Nodes(), runtime.metrics)),
+			grpc.ChainUnaryInterceptor(relay.NewServerNodeUnaryInterceptor(credentialService, db.Nodes())),
+		)
+		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithClose(localAgentRelay.OpenStream, runtime.closeAgentConnection))
 	}
 	runtime.Credentials = credentialService
 	return runtime, nil
@@ -134,6 +183,33 @@ func (r *ServerRuntime) Close() error {
 		credentialErr = r.Credentials.Close()
 	}
 	return errors.Join(relayErr, credentialErr)
+}
+
+// closeAgentConnection is the authenticated inter-Server control handler. The
+// unary interceptor supplies the caller identity; the request's caller field
+// is only a correlation ID and must match that authenticated identity.
+func (r *ServerRuntime) closeAgentConnection(ctx context.Context, req relay.CloseAgentConnectionRequest) error {
+	if r == nil || r.AgentConnectionLeases == nil {
+		return status.Error(codes.Unimplemented, "agent connection close control is not configured")
+	}
+	principal, ok := relay.ServerNodePrincipalFromContext(ctx)
+	if !ok {
+		return status.Error(codes.PermissionDenied, "relay server-node identity is required")
+	}
+	if principal.NodeID != req.RequestedByNodeID {
+		return status.Error(codes.PermissionDenied, "relay close caller identity is denied")
+	}
+	err := r.AgentConnectionLeases.CloseConnection(ctx, req.AgentID, req.ConnectionID, req.ConnectionEpoch)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrEpoch):
+		return status.Error(codes.FailedPrecondition, "agent connection epoch is stale")
+	case errors.Is(err, ErrSessionClosed):
+		return status.Error(codes.NotFound, "agent connection is not found")
+	default:
+		return status.Error(codes.Internal, "agent connection close failed")
+	}
 }
 
 // DialRelayNode is the authenticated production client path for a cluster
@@ -166,7 +242,7 @@ func (r *ServerRuntime) Handler() http.Handler {
 		return http.NotFoundHandler()
 	}
 	health := NewHealthHandler(r, promhttp.HandlerFor(r.metricsRegistry, promhttp.HandlerOpts{}))
-	return NewWebHandler(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health)
+	return NewWebHandlerWithManagedRoutes(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, r.managedRoutes)
 }
 
 // Live reports process responsiveness and intentionally performs no I/O.
@@ -319,12 +395,69 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 		_ = transport.Close()
 		return
 	}
-	registration := AgentRegistration{AgentID: payload.AgentID, NodeID: payload.NodeID, Epoch: payload.Epoch, TokenID: tokenID}
+	registration := AgentRegistration{
+		AgentID: payload.AgentID, NodeID: payload.NodeID, Epoch: payload.Epoch,
+		InstanceID: payload.InstanceID, ConnectionID: payload.ConnectionID,
+		ConnectionEpoch: payload.Epoch, TokenID: tokenID,
+	}
 	if r.LocalAgentRelay == nil {
 		_ = transport.Close()
 		return
 	}
-	_ = serveAgentSessionWithMetrics(ctx, r.AgentSessions, registration, transport, &initial, func(session *AgentSession, frame protocol.Frame) error {
+	if registration.InstanceID == "" {
+		registration.InstanceID = registration.NodeID
+	}
+	if registration.ConnectionID == "" {
+		registration.ConnectionID = "legacy"
+	}
+	action := agentConnectionAuditAction(r.AgentSessions, registration)
+	session, err := r.AgentSessions.Register(ctx, registration, transport)
+	actorUserID := authentication.Identity.OwnerUserID
+	if authentication.Legacy {
+		actorUserID = authentication.Principal.UserID
+	}
+	if err != nil {
+		if r.metrics != nil {
+			r.metrics.ObserveConnection("server", "agent", "failed", observability.NormalizeErrorClass(err))
+			r.metrics.ObserveAgentConnection(registration.AgentID, registration.InstanceID, registration.ConnectionID, false)
+			r.metrics.ObserveAgentConnectionError(registration.AgentID, registration.InstanceID, registration.ConnectionID, observability.NormalizeErrorClass(err))
+		}
+		_ = writeAgentConnectionAudit(ctx, r.DB.Audits(), actorUserID, agentConnectionRejectedAudit, registration, err)
+		_ = transport.Close()
+		return
+	}
+	leaseOwner, err := r.AgentConnectionLeases.Register(ctx, session)
+	if err != nil {
+		if r.metrics != nil {
+			r.metrics.ObserveConnection("server", "agent", "failed", observability.NormalizeErrorClass(err))
+			r.metrics.ObserveAgentConnection(registration.AgentID, registration.InstanceID, registration.ConnectionID, false)
+			r.metrics.ObserveAgentConnectionError(registration.AgentID, registration.InstanceID, registration.ConnectionID, observability.NormalizeErrorClass(err))
+		}
+		_ = writeAgentConnectionAudit(ctx, r.DB.Audits(), actorUserID, agentConnectionRejectedAudit, registration, err)
+		_ = session.Close()
+		r.AgentSessions.RemoveSession(registration.AgentID, session)
+		_ = transport.Close()
+		return
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), agentConnectionLeaseTimeout)
+		defer cancel()
+		if err := r.AgentConnectionLeases.Release(releaseCtx, leaseOwner); err != nil {
+			if r.metrics != nil {
+				r.metrics.ObserveAgentConnectionError(registration.AgentID, registration.InstanceID, registration.ConnectionID, observability.NormalizeErrorClass(err))
+			}
+		}
+	}()
+	if r.metrics != nil {
+		r.metrics.ObserveConnection("server", "agent", "started", "")
+		r.metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, true)
+		r.metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, 64)
+	}
+	_ = writeAgentConnectionAudit(ctx, r.DB.Audits(), actorUserID, action, registration, nil)
+	defer func() {
+		_ = writeAgentConnectionAudit(context.Background(), r.DB.Audits(), actorUserID, agentConnectionClosedAudit, registration, nil)
+	}()
+	_ = serveRegisteredAgentSessionWithMetrics(ctx, r.AgentSessions, registration, session, transport, &initial, func(session *AgentSession, frame protocol.Frame) error {
 		return r.LocalAgentRelay.handleAgentFrameGeneration(registration.AgentID, session.serverGeneration, frame)
 	}, func(session *AgentSession) {
 		r.LocalAgentRelay.failAgentGeneration(registration.AgentID, session.serverGeneration)

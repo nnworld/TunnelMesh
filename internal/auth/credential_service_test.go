@@ -103,6 +103,12 @@ func TestCredentialServiceRejectsInvalidLifecycleStateAndRepositoryErrors(t *tes
 			u.Disabled = true
 			r.users.items["owner"] = u
 		}},
+		{name: "deleted owner", mutate: func(r *credentialRepos, _ *storage.ServiceToken) {
+			u := r.users.items["owner"]
+			deletedAt := now
+			u.DeletedAt = &deletedAt
+			r.users.items["owner"] = u
+		}},
 		{name: "missing owner", mutate: func(r *credentialRepos, _ *storage.ServiceToken) { delete(r.users.items, "owner") }},
 		{name: "disabled agent", mutate: func(r *credentialRepos, _ *storage.ServiceToken) {
 			a := r.agents.items["agent-a"]
@@ -628,6 +634,36 @@ func (r *memoryServiceTokens) Revoke(_ context.Context, id string, when time.Tim
 		return sql.ErrNoRows
 	}
 	token.RevokedAt = &when
+	r.items[id] = token
+	return nil
+}
+func (r *memoryServiceTokens) UpdateExpiration(_ context.Context, id string, expiresAt *time.Time, when time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	token, ok := r.items[id]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	if token.RevokedAt != nil {
+		return storage.ErrServiceTokenRevoked
+	}
+	token.ExpiresAt = expiresAt
+	token.UpdatedAt = when
+	r.items[id] = token
+	return nil
+}
+func (r *memoryServiceTokens) UpdateScope(_ context.Context, id string, scope string, when time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	token, ok := r.items[id]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	if token.RevokedAt != nil {
+		return storage.ErrServiceTokenRevoked
+	}
+	token.Scope = scope
+	token.UpdatedAt = when
 	r.items[id] = token
 	return nil
 }

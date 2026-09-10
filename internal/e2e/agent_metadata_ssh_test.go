@@ -229,8 +229,11 @@ func TestAgentMetadataSSHBridgeDisconnectCleanup(t *testing.T) {
 	}
 }
 
-func TestAgentMetadataSSHPolicyRejectsLoopbackTarget(t *testing.T) {
-	if err := (&routing.Policy{}).Validate(net.ParseIP("127.0.0.1"), 22); !errors.Is(err, routing.ErrDangerousAddress) {
-		t.Fatalf("expected loopback policy denial, got %v", err)
+func TestAgentMetadataSSHPolicyAllowsAgentLocalLoopbackTarget(t *testing.T) {
+	if err := (&routing.Policy{}).Validate(net.ParseIP("127.0.0.1"), 22); err != nil {
+		t.Fatalf("expected agent-local loopback target, got %v", err)
+	}
+	if err := (&routing.Policy{}).Validate(net.ParseIP("169.254.169.254"), 80); !errors.Is(err, routing.ErrDangerousAddress) {
+		t.Fatalf("expected metadata address denial, got %v", err)
 	}
 }

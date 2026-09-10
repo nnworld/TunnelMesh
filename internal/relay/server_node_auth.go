@@ -70,6 +70,18 @@ func NewServerNodeStreamInterceptorWithMetrics(credentialsService *auth.Credenti
 	}
 }
 
+// NewServerNodeUnaryInterceptor applies the same authenticated server-node
+// identity checks to unary relay control RPCs.
+func NewServerNodeUnaryInterceptor(credentialsService *auth.CredentialService, nodes storage.NodeRepository) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		principal, err := authenticateServerNode(ctx, credentialsService, nodes)
+		if err != nil {
+			return nil, err
+		}
+		return handler(context.WithValue(ctx, serverNodePrincipalContextKey{}, principal), req)
+	}
+}
+
 type serverNodeContextStream struct {
 	grpc.ServerStream
 	ctx context.Context
@@ -200,6 +212,18 @@ func NewServerNodeStreamClientInterceptor(nodeID string, epoch int64, rawToken s
 		}
 		ctx = metadata.AppendToOutgoingContext(ctx, serverNodeAuthorizationMetadata, "Bearer "+rawToken, serverNodeIDMetadata, nodeID, serverNodeEpochMetadata, strconv.FormatInt(epoch, 10))
 		return streamer(ctx, desc, cc, method, opts...)
+	}
+}
+
+// NewServerNodeUnaryClientInterceptor injects the caller identity on unary
+// control RPCs. Raw tokens remain in metadata only.
+func NewServerNodeUnaryClientInterceptor(nodeID string, epoch int64, rawToken string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if strings.TrimSpace(nodeID) == "" || epoch <= 0 || strings.TrimSpace(rawToken) == "" || strings.ContainsAny(rawToken, " \t\r\n") {
+			return status.Error(codes.Unauthenticated, "relay client identity is invalid")
+		}
+		ctx = metadata.AppendToOutgoingContext(ctx, serverNodeAuthorizationMetadata, "Bearer "+rawToken, serverNodeIDMetadata, nodeID, serverNodeEpochMetadata, strconv.FormatInt(epoch, 10))
+		return invoker(ctx, method, req, reply, cc, opts...)
 	}
 }
 

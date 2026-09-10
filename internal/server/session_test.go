@@ -213,6 +213,145 @@ func TestRegisterRejectsStaleEpoch(t *testing.T) {
 	}
 }
 
+func TestAgentSessionManagerKeepsConnectionsForSameAgent(t *testing.T) {
+	m := NewAgentSessionManager(AgentSessionConfig{})
+	first, err := m.Register(context.Background(), AgentRegistration{
+		AgentID: "pool-agent", NodeID: "node-a", InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Register(context.Background(), AgentRegistration{
+		AgentID: "pool-agent", NodeID: "node-b", InstanceID: "instance-b", ConnectionID: "conn-b", ConnectionEpoch: 1, Epoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := m.List("pool-agent")
+	if len(sessions) != 2 {
+		t.Fatalf("connections=%d, want 2", len(sessions))
+	}
+	if sessions[0] != first || sessions[1] != second {
+		t.Fatalf("connections=%v, want registration order [first second]", sessions)
+	}
+	if got, ok := m.GetConnection("pool-agent", "conn-a"); !ok || got != first {
+		t.Fatalf("GetConnection(conn-a) = (%v, %v), want first", got, ok)
+	}
+	if got, ok := m.GetConnection("pool-agent", "conn-b"); !ok || got != second {
+		t.Fatalf("GetConnection(conn-b) = (%v, %v), want second", got, ok)
+	}
+}
+
+func TestAgentSessionManagerReplacesOnlyMatchingConnection(t *testing.T) {
+	m := NewAgentSessionManager(AgentSessionConfig{})
+	first, err := m.Register(context.Background(), AgentRegistration{AgentID: "replace-agent", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Register(context.Background(), AgentRegistration{AgentID: "replace-agent", NodeID: "node-b", ConnectionID: "conn-b", ConnectionEpoch: 1, Epoch: 1}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := m.Register(context.Background(), AgentRegistration{AgentID: "replace-agent", NodeID: "node-c", ConnectionID: "conn-a", ConnectionEpoch: 2, Epoch: 2}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Register(context.Background(), AgentRegistration{AgentID: "replace-agent", NodeID: "node-d", ConnectionID: "conn-a", ConnectionEpoch: 2, Epoch: 2}, newFakeTransport()); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("equal epoch err=%v, want ErrEpoch", err)
+	}
+	if got, ok := m.GetConnection("replace-agent", "conn-a"); !ok || got != replacement {
+		t.Fatalf("replacement=%v,%v, want registered replacement", got, ok)
+	}
+	if got, ok := m.GetConnection("replace-agent", "conn-b"); !ok || got != second {
+		t.Fatalf("other connection=%v,%v, want unchanged", got, ok)
+	}
+	m.RemoveSession("replace-agent", replacement)
+	if _, ok := m.GetConnection("replace-agent", "conn-a"); ok {
+		t.Fatal("replacement remained registered")
+	}
+	if _, ok := m.GetConnection("replace-agent", "conn-b"); !ok {
+		t.Fatal("other connection was removed")
+	}
+	if first == replacement {
+		t.Fatal("replacement unexpectedly reused session object")
+	}
+}
+
+func TestAgentSessionManagerCloseConnectionSendsGoAway(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	transport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "close-agent", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 7, Epoch: 7,
+	}, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.CloseConnection(session.AgentID, session.ConnectionID, session.ConnectionEpoch); err != nil {
+		t.Fatalf("CloseConnection() error = %v", err)
+	}
+	select {
+	case frame := <-transport.sent:
+		if frame.Type != protocol.FrameGoAway {
+			t.Fatalf("frame type = %v, want GOAWAY", frame.Type)
+		}
+	default:
+		t.Fatal("GOAWAY was not sent")
+	}
+	select {
+	case <-transport.closed:
+	default:
+		t.Fatal("transport was not closed")
+	}
+}
+
+func TestAgentSessionManagerCloseConnectionRejectsStaleEpoch(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	transport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "stale-close-agent", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 7, Epoch: 7,
+	}, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.CloseConnection(session.AgentID, session.ConnectionID, session.ConnectionEpoch-1); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("CloseConnection() error = %v, want %v", err, ErrEpoch)
+	}
+	select {
+	case <-transport.closed:
+		t.Fatal("stale close closed the live transport")
+	default:
+	}
+}
+
+func TestAgentSessionManagerCloseConnectionDoesNotAffectSiblingConnection(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	firstTransport := newFakeTransport()
+	secondTransport := newFakeTransport()
+	first, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "sibling-agent", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 7, Epoch: 7,
+	}, firstTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "sibling-agent", NodeID: "node-b", ConnectionID: "conn-b", ConnectionEpoch: 8, Epoch: 8,
+	}, secondTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.CloseConnection(first.AgentID, first.ConnectionID, first.ConnectionEpoch); err != nil {
+		t.Fatalf("CloseConnection() error = %v", err)
+	}
+	if _, ok := manager.GetConnection(second.AgentID, second.ConnectionID); !ok {
+		t.Fatal("sibling connection was removed")
+	}
+	select {
+	case <-secondTransport.closed:
+		t.Fatal("sibling transport was closed")
+	default:
+	}
+}
+
 func TestAgentSessionManagerAllocatesMonotonicServerGenerationsAndFailsClosedAtOverflow(t *testing.T) {
 	manager := NewAgentSessionManager(AgentSessionConfig{})
 	first, err := manager.Register(context.Background(), AgentRegistration{AgentID: "generation-agent", NodeID: "node-a", Epoch: 1}, newFakeTransport())

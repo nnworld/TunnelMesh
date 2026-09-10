@@ -1,0 +1,635 @@
+diff --git a/internal/registry/database.go b/internal/registry/database.go
+index 10c48b1..5ff6d81 100644
+--- a/internal/registry/database.go
++++ b/internal/registry/database.go
+@@ -127,6 +127,19 @@ func (r *DatabaseRegistry) KeepAlive(ctx context.Context, owner NodeOwner, ttl t
+	return updated, nil
+ }
+
++// UpdateConnectionStats persists local relay load for one fenced connection
++// lease. Ownership fields are not modified.
++func (r *DatabaseRegistry) UpdateConnectionStats(ctx context.Context, owner NodeOwner) error {
++	if r == nil || r.leases == nil {
++		return errors.New("registry is not configured")
++	}
++	return r.leases.UpdateConnectionStats(ctx, storage.AgentLease{
++		AgentID: owner.AgentID, ConnectionID: owner.ConnectionID,
++		ConnectionEpoch: owner.ConnectionEpoch,
++		ActiveStreams:   owner.ActiveStreams, HealthScore: owner.HealthScore,
++	})
++}
++
+ func (r *DatabaseRegistry) ResolveAgent(ctx context.Context, agentID string) (NodeOwner, error) {
+	lease, err := r.leases.Get(ctx, agentID)
+	if errors.Is(err, sql.ErrNoRows) {
+diff --git a/internal/registry/etcd.go b/internal/registry/etcd.go
+index 6747b60..3c8c21a 100644
+--- a/internal/registry/etcd.go
++++ b/internal/registry/etcd.go
+@@ -15,20 +15,20 @@ import (
+ const defaultEtcdPrefix = "/tunnelmesh"
+
+ type etcdOwnerValue struct {
+-	NodeID           string    `json:"node_id"`
+-	Address          string    `json:"address"`
+-	Metadata         string    `json:"metadata,omitempty"`
+-	AgentID          string    `json:"agent_id"`
+-	InstanceID       string    `json:"instance_id,omitempty"`
+-	ConnectionID     string    `json:"connection_id"`
+-	ServerNodeID     string    `json:"server_node_id"`
+-	Epoch            int64     `json:"epoch"`
+-	ConnectionEpoch  int64     `json:"connection_epoch"`
+-	ServerNodeEpoch  int64     `json:"server_node_epoch"`
+-	ActiveStreams    int64     `json:"active_streams,omitempty"`
+-	HealthScore      int64     `json:"health_score,omitempty"`
+-	ExpiresAt        time.Time `json:"expires_at"`
+-	LeaseID          int64     `json:"lease_id"`
++	NodeID          string    `json:"node_id"`
++	Address         string    `json:"address"`
++	Metadata        string    `json:"metadata,omitempty"`
++	AgentID         string    `json:"agent_id"`
++	InstanceID      string    `json:"instance_id,omitempty"`
++	ConnectionID    string    `json:"connection_id"`
++	ServerNodeID    string    `json:"server_node_id"`
++	Epoch           int64     `json:"epoch"`
++	ConnectionEpoch int64     `json:"connection_epoch"`
++	ServerNodeEpoch int64     `json:"server_node_epoch"`
++	ActiveStreams   int64     `json:"active_streams,omitempty"`
++	HealthScore     int64     `json:"health_score,omitempty"`
++	ExpiresAt       time.Time `json:"expires_at"`
++	LeaseID         int64     `json:"lease_id"`
+ }
+
+ type EtcdRegistry struct {
+@@ -200,6 +200,40 @@ func (r *EtcdRegistry) KeepAlive(ctx context.Context, owner NodeOwner, ttl time.
+	return owner, nil
+ }
+
++// UpdateConnectionStats writes local relay load without changing ownership.
++// The transaction fences the update on the current ModRevision.
++func (r *EtcdRegistry) UpdateConnectionStats(ctx context.Context, owner NodeOwner) error {
++	key := r.agentConnectionKey(owner.AgentID, owner.ConnectionID)
++	currentResp, err := r.client.Get(ctx, key)
++	if err != nil || len(currentResp.Kvs) == 0 {
++		return ErrFencing
++	}
++	var current etcdOwnerValue
++	if json.Unmarshal(currentResp.Kvs[0].Value, &current) != nil ||
++		current.Epoch != owner.Epoch || current.NodeID != owner.NodeID || current.ConnectionID != owner.ConnectionID {
++		return ErrFencing
++	}
++	current.ActiveStreams = owner.ActiveStreams
++	current.HealthScore = owner.HealthScore
++	value, err := json.Marshal(current)
++	if err != nil {
++		return err
++	}
++	updated, err := r.client.Txn(ctx).
++		If(clientv3.Compare(clientv3.ModRevision(key), "=", currentResp.Kvs[0].ModRevision)).
++		Then(
++			clientv3.OpPut(key, string(value), clientv3.WithLease(clientv3.LeaseID(current.LeaseID))),
++			clientv3.OpPut(r.nodeKey(current.ServerNodeID), string(value)),
++		).Commit()
++	if err != nil {
++		return err
++	}
++	if !updated.Succeeded {
++		return ErrFencing
++	}
++	return nil
++}
++
+ func (r *EtcdRegistry) ResolveAgent(ctx context.Context, agentID string) (NodeOwner, error) {
+	owners, err := r.ListAgentConnections(ctx, agentID)
+	if err != nil {
+diff --git a/internal/registry/registry.go b/internal/registry/registry.go
+index 0a0a237..2c15e64 100644
+--- a/internal/registry/registry.go
++++ b/internal/registry/registry.go
+@@ -39,20 +39,20 @@ type Lease struct {
+ }
+
+ type NodeOwner struct {
+-	NodeID           string
+-	Address          string
+-	Metadata         string
+-	AgentID          string
+-	InstanceID       string
+-	ConnectionID     string
+-	ServerNodeID     string
+-	Epoch            int64
+-	ConnectionEpoch  int64
+-	ServerNodeEpoch  int64
+-	ActiveStreams    int64
+-	HealthScore      int64
+-	ExpiresAt        time.Time
+-	LeaseID          int64
++	NodeID          string
++	Address         string
++	Metadata        string
++	AgentID         string
++	InstanceID      string
++	ConnectionID    string
++	ServerNodeID    string
++	Epoch           int64
++	ConnectionEpoch int64
++	ServerNodeEpoch int64
++	ActiveStreams   int64
++	HealthScore     int64
++	ExpiresAt       time.Time
++	LeaseID         int64
+ }
+
+ type EventType string
+@@ -71,6 +71,7 @@ type RegistryEvent struct {
+ type NodeRegistry interface {
+	Register(context.Context, NodeRegistration) (NodeOwner, error)
+	KeepAlive(context.Context, NodeOwner, time.Duration) (NodeOwner, error)
++	UpdateConnectionStats(context.Context, NodeOwner) error
+	ResolveAgent(context.Context, string) (NodeOwner, error)
+	ListAgentConnections(context.Context, string) ([]NodeOwner, error)
+	Watch(context.Context, string) (<-chan RegistryEvent, error)
+diff --git a/internal/server/agent_connection_registry.go b/internal/server/agent_connection_registry.go
+new file mode 100644
+index 0000000..1922338
+--- /dev/null
++++ b/internal/server/agent_connection_registry.go
+@@ -0,0 +1,107 @@
++package server
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/registry"
++)
++
++const (
++	defaultAgentConnectionLeaseTTL = 90 * time.Second
++	agentConnectionLeaseTimeout    = time.Second
++)
++
++// AgentConnectionLeaseController owns the durable lifecycle for one Server
++// node's process-local Agent connections. The registry remains the authority
++// for cross-node ownership while the session manager remains the execution
++// authority for the WebSocket itself.
++type AgentConnectionLeaseController struct {
++	reg          registry.NodeRegistry
++	manager      *AgentSessionManager
++	localRelay   *AgentRelayTransport
++	serverNodeID string
++	ttl          time.Duration
++
++	mu     sync.Mutex
++	owners map[*AgentSession]registry.NodeOwner
++}
++
++func NewAgentConnectionLeaseController(reg registry.NodeRegistry, manager *AgentSessionManager, localRelay *AgentRelayTransport, serverNodeID string, ttl time.Duration) *AgentConnectionLeaseController {
++	if ttl <= 0 {
++		ttl = defaultAgentConnectionLeaseTTL
++	}
++	return &AgentConnectionLeaseController{
++		reg: reg, manager: manager, localRelay: localRelay,
++		serverNodeID: serverNodeID, ttl: ttl,
++		owners: make(map[*AgentSession]registry.NodeOwner),
++	}
++}
++
++func (c *AgentConnectionLeaseController) Register(ctx context.Context, session *AgentSession) (registry.NodeOwner, error) {
++	if c == nil || c.reg == nil || session == nil {
++		return registry.NodeOwner{}, errors.New("agent connection lease controller is not configured")
++	}
++	owner, err := c.reg.Register(ctx, registry.NodeRegistration{
++		NodeID: c.serverNodeID, AgentID: session.AgentID,
++		InstanceID: session.InstanceID, ConnectionID: session.ConnectionID,
++		ServerNodeID: c.serverNodeID, TTL: c.ttl,
++	})
++	if err != nil {
++		return registry.NodeOwner{}, err
++	}
++	c.mu.Lock()
++	c.owners[session] = owner
++	c.mu.Unlock()
++	return owner, nil
++}
++
++func (c *AgentConnectionLeaseController) Heartbeat(ctx context.Context, owner registry.NodeOwner, session *AgentSession) error {
++	if c == nil || c.reg == nil || session == nil {
++		return errors.New("agent connection lease controller is not configured")
++	}
++	leaseCtx, cancel := context.WithTimeout(ctx, agentConnectionLeaseTimeout)
++	defer cancel()
++	updated, err := c.reg.KeepAlive(leaseCtx, owner, c.ttl)
++	if err != nil {
++		return err
++	}
++	owner.ExpiresAt = updated.ExpiresAt
++	if c.localRelay != nil {
++		owner.ActiveStreams = int64(c.localRelay.ActiveStreams(session.AgentID, session.ConnectionID))
++	}
++	owner.HealthScore = 100
++	return c.reg.UpdateConnectionStats(leaseCtx, owner)
++}
++
++func (c *AgentConnectionLeaseController) HeartbeatForSession(ctx context.Context, session *AgentSession) error {
++	if c == nil || session == nil {
++		return errors.New("agent connection lease controller is not configured")
++	}
++	c.mu.Lock()
++	owner, ok := c.owners[session]
++	c.mu.Unlock()
++	if !ok {
++		return registry.ErrNotFound
++	}
++	return c.Heartbeat(ctx, owner, session)
++}
++
++func (c *AgentConnectionLeaseController) Release(ctx context.Context, owner registry.NodeOwner) error {
++	if c == nil || c.reg == nil {
++		return errors.New("agent connection lease controller is not configured")
++	}
++	releaseCtx, cancel := context.WithTimeout(ctx, agentConnectionLeaseTimeout)
++	defer cancel()
++	err := c.reg.Revoke(releaseCtx, owner)
++	c.mu.Lock()
++	for session, current := range c.owners {
++		if current.AgentID == owner.AgentID && current.ConnectionID == owner.ConnectionID && current.Epoch == owner.Epoch {
++			delete(c.owners, session)
++		}
++	}
++	c.mu.Unlock()
++	return err
++}
+diff --git a/internal/server/agent_connection_registry_test.go b/internal/server/agent_connection_registry_test.go
+new file mode 100644
+index 0000000..c1bf199
+--- /dev/null
++++ b/internal/server/agent_connection_registry_test.go
+@@ -0,0 +1,132 @@
++package server
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/tunnelmesh/tunnelmesh/internal/registry"
++	"github.com/tunnelmesh/tunnelmesh/internal/storage"
++)
++
++func newAgentConnectionLeaseFixture(t *testing.T) (*AgentSessionManager, *AgentRelayTransport, *AgentSession, *AgentConnectionLeaseController) {
++	t.Helper()
++	manager := NewAgentSessionManager(AgentSessionConfig{})
++	localRelay := NewAgentRelayTransport(manager)
++	session, err := manager.Register(context.Background(), AgentRegistration{
++		AgentID: "agent-lease", NodeID: "node-agent", Epoch: 12,
++		InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 12,
++	}, newFakeTransport())
++	if err != nil {
++		t.Fatal(err)
++	}
++	controller := NewAgentConnectionLeaseController(nil, manager, localRelay, "server-local", time.Minute)
++	return manager, localRelay, session, controller
++}
++
++func TestAgentConnectionLeaseControllerRegistersRenewsAndReleases(t *testing.T) {
++	db, err := storage.Open(context.Background(), storage.DriverSQLite, "file:agent-lease-lifecycle?mode=memory&cache=shared", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++	reg := registry.NewDatabaseRegistry(db)
++	manager := NewAgentSessionManager(AgentSessionConfig{})
++	localRelay := NewAgentRelayTransport(manager)
++	session, err := manager.Register(context.Background(), AgentRegistration{
++		AgentID: "agent-lease", NodeID: "node-agent", Epoch: 12,
++		InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 12,
++	}, newFakeTransport())
++	if err != nil {
++		t.Fatal(err)
++	}
++	controller := NewAgentConnectionLeaseController(reg, manager, localRelay, "server-local", time.Minute)
++
++	owner, err := controller.Register(context.Background(), session)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if owner.AgentID != session.AgentID || owner.ConnectionID != session.ConnectionID || owner.ConnectionEpoch <= 0 || owner.ServerNodeID != "server-local" {
++		t.Fatalf("owner = %#v", owner)
++	}
++	active, err := db.Leases().ListActiveByAgent(context.Background(), session.AgentID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(active) != 1 || active[0].ServerNodeID != "server-local" {
++		t.Fatalf("active leases = %#v", active)
++	}
++
++	if err := controller.Heartbeat(context.Background(), owner, session); err != nil {
++		t.Fatal(err)
++	}
++	if err := controller.Release(context.Background(), owner); err != nil {
++		t.Fatal(err)
++	}
++	remaining, err := db.Leases().ListActiveByAgent(context.Background(), session.AgentID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(remaining) != 0 {
++		t.Fatalf("remaining leases = %#v", remaining)
++	}
++}
++
++func TestAgentConnectionLeaseControllerHeartbeatUpdatesActiveStreams(t *testing.T) {
++	_, localRelay, session, controller := newAgentConnectionLeaseFixture(t)
++	controller.reg = &recordingConnectionRegistry{owner: registry.NodeOwner{
++		AgentID: session.AgentID, ConnectionID: session.ConnectionID, ConnectionEpoch: session.ConnectionEpoch, ServerNodeID: "server-local",
++	}}
++	owner := registry.NodeOwner{AgentID: session.AgentID, ConnectionID: session.ConnectionID, ConnectionEpoch: session.ConnectionEpoch}
++
++	if err := controller.Heartbeat(context.Background(), owner, session); err != nil {
++		t.Fatal(err)
++	}
++	if int(controller.reg.(*recordingConnectionRegistry).stats.ActiveStreams) != localRelay.ActiveStreams(session.AgentID, session.ConnectionID) {
++		t.Fatalf("active streams = %d", controller.reg.(*recordingConnectionRegistry).stats.ActiveStreams)
++	}
++}
++
++func TestAgentConnectionLeaseControllerReleaseIsFenced(t *testing.T) {
++	_, _, session, controller := newAgentConnectionLeaseFixture(t)
++	controller.reg = &recordingConnectionRegistry{releaseErr: registry.ErrFencing}
++	err := controller.Release(context.Background(), registry.NodeOwner{AgentID: session.AgentID, ConnectionID: session.ConnectionID, ConnectionEpoch: session.ConnectionEpoch - 1})
++	if !errors.Is(err, registry.ErrFencing) {
++		t.Fatalf("Release() error = %v, want %v", err, registry.ErrFencing)
++	}
++}
++
++type recordingConnectionRegistry struct {
++	owner       registry.NodeOwner
++	stats       registry.NodeOwner
++	registerErr error
++	releaseErr  error
++}
++
++func (r *recordingConnectionRegistry) Register(context.Context, registry.NodeRegistration) (registry.NodeOwner, error) {
++	if r.registerErr != nil {
++		return registry.NodeOwner{}, r.registerErr
++	}
++	return r.owner, nil
++}
++func (r *recordingConnectionRegistry) KeepAlive(context.Context, registry.NodeOwner, time.Duration) (registry.NodeOwner, error) {
++	return r.owner, nil
++}
++func (r *recordingConnectionRegistry) UpdateConnectionStats(_ context.Context, owner registry.NodeOwner) error {
++	r.stats = owner
++	return nil
++}
++func (r *recordingConnectionRegistry) ResolveAgent(context.Context, string) (registry.NodeOwner, error) {
++	return r.owner, nil
++}
++func (r *recordingConnectionRegistry) ListAgentConnections(context.Context, string) ([]registry.NodeOwner, error) {
++	return []registry.NodeOwner{r.owner}, nil
++}
++func (r *recordingConnectionRegistry) Watch(context.Context, string) (<-chan registry.RegistryEvent, error) {
++	return nil, nil
++}
++func (r *recordingConnectionRegistry) Revoke(context.Context, registry.NodeOwner) error {
++	return r.releaseErr
++}
++func (r *recordingConnectionRegistry) Close() error { return nil }
+diff --git a/internal/server/connection_selector_test.go b/internal/server/connection_selector_test.go
+index 6d25e90..fd7771b 100644
+--- a/internal/server/connection_selector_test.go
++++ b/internal/server/connection_selector_test.go
+@@ -24,6 +24,9 @@ func (r *fixedConnectionRegistry) Register(context.Context, registry.NodeRegistr
+ func (r *fixedConnectionRegistry) KeepAlive(context.Context, registry.NodeOwner, time.Duration) (registry.NodeOwner, error) {
+	return registry.NodeOwner{}, errors.New("not implemented")
+ }
++func (r *fixedConnectionRegistry) UpdateConnectionStats(context.Context, registry.NodeOwner) error {
++	return errors.New("not implemented")
++}
+ func (r *fixedConnectionRegistry) ResolveAgent(context.Context, string) (registry.NodeOwner, error) {
+	return registry.NodeOwner{}, errors.New("not implemented")
+ }
+diff --git a/internal/server/runtime.go b/internal/server/runtime.go
+index 399bf0b..233f7cc 100644
+--- a/internal/server/runtime.go
++++ b/internal/server/runtime.go
+@@ -49,28 +49,30 @@ type RuntimeConfig struct {
+	// ConnectionSelector and RemoteRelay allow deployments to provide their
+	// authenticated Server-node transport pool. Defaults are local-only.
+	ConnectionSelector relay.ConnectionSelector
++	ConnectionRegistry registry.NodeRegistry
+	RemoteRelay        *relay.RelayService
+ }
+
+ // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
+ // and authenticated Agent WebSocket handlers. The caller owns DB lifecycle.
+ type ServerRuntime struct {
+-	DB               *storage.DB
+-	AgentSessions    *AgentSessionManager
+-	ClientSessions   *ClientSessionManager
+-	API              *API
+-	Auth             *auth.AuthService
+-	Credentials      *auth.CredentialService
+-	ClientAuthorizer StreamAuthorizer
+-	ClientTransport  relay.NodeTransport
+-	LocalAgentRelay  *AgentRelayTransport
+-	managedRoutes    *ManagedRouteHandler
+-	relayServer      *grpc.Server
+-	relayListener    net.Listener
+-	config           RuntimeConfig
+-	metricsRegistry  *prometheus.Registry
+-	metrics          *observability.Metrics
+-	closed           atomic.Bool
++	DB                    *storage.DB
++	AgentSessions         *AgentSessionManager
++	AgentConnectionLeases *AgentConnectionLeaseController
++	ClientSessions        *ClientSessionManager
++	API                   *API
++	Auth                  *auth.AuthService
++	Credentials           *auth.CredentialService
++	ClientAuthorizer      StreamAuthorizer
++	ClientTransport       relay.NodeTransport
++	LocalAgentRelay       *AgentRelayTransport
++	managedRoutes         *ManagedRouteHandler
++	relayServer           *grpc.Server
++	relayListener         net.Listener
++	config                RuntimeConfig
++	metricsRegistry       *prometheus.Registry
++	metrics               *observability.Metrics
++	closed                atomic.Bool
+ }
+
+ // NewServerRuntime creates the server runtime with durable Agent metadata
+@@ -91,17 +93,27 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
+	cfg.ServerNodeID = runtimeConfig.NodeID
+	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
+	localAgentRelay := NewAgentRelayTransport(agentSessions)
++	serverNodeID := runtimeConfig.NodeID
++	if strings.TrimSpace(serverNodeID) == "" {
++		serverNodeID = "local"
++	}
++	connectionRegistry := runtimeConfig.ConnectionRegistry
++	if connectionRegistry == nil {
++		connectionRegistry = registry.NewDatabaseRegistry(db)
++	}
+	connectionSelector := runtimeConfig.ConnectionSelector
+	if connectionSelector == nil {
+-		connectionSelector = NewAgentConnectionSelector(agentSessions, localAgentRelay, registry.NewDatabaseRegistry(db), runtimeConfig.NodeID)
++		connectionSelector = NewAgentConnectionSelector(agentSessions, localAgentRelay, connectionRegistry, serverNodeID)
+	}
++	agentConnectionLeases := NewAgentConnectionLeaseController(connectionRegistry, agentSessions, localAgentRelay, serverNodeID, defaultAgentConnectionLeaseTTL)
++	agentSessions.SetHeartbeatCallback(agentConnectionLeases.HeartbeatForSession)
+	clientTransport := relay.NodeTransport(localAgentRelay)
+	if _, ok := connectionSelector.(*AgentConnectionSelector); !ok || runtimeConfig.RemoteRelay != nil {
+		clientTransport = relay.NewSelectedTransport(connectionSelector, localAgentRelay, runtimeConfig.RemoteRelay)
+	}
+	routeTable := NewManagedRouteTable(db, runtimeConfig.DynamicSuffix, managedRouteCacheTTL)
+	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
+-	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
++	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
+	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	registry := runtimeConfig.MetricsRegistry
+	if registry == nil {
+@@ -372,6 +384,28 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
+		_ = transport.Close()
+		return
+	}
++	leaseOwner, err := r.AgentConnectionLeases.Register(ctx, session)
++	if err != nil {
++		if r.metrics != nil {
++			r.metrics.ObserveConnection("server", "agent", "failed", observability.NormalizeErrorClass(err))
++			r.metrics.ObserveAgentConnection(registration.AgentID, registration.InstanceID, registration.ConnectionID, false)
++			r.metrics.ObserveAgentConnectionError(registration.AgentID, registration.InstanceID, registration.ConnectionID, observability.NormalizeErrorClass(err))
++		}
++		_ = writeAgentConnectionAudit(ctx, r.DB.Audits(), actorUserID, agentConnectionRejectedAudit, registration, err)
++		_ = session.Close()
++		r.AgentSessions.RemoveSession(registration.AgentID, session)
++		_ = transport.Close()
++		return
++	}
++	defer func() {
++		releaseCtx, cancel := context.WithTimeout(context.Background(), agentConnectionLeaseTimeout)
++		defer cancel()
++		if err := r.AgentConnectionLeases.Release(releaseCtx, leaseOwner); err != nil {
++			if r.metrics != nil {
++				r.metrics.ObserveAgentConnectionError(registration.AgentID, registration.InstanceID, registration.ConnectionID, observability.NormalizeErrorClass(err))
++			}
++		}
++	}()
+	if r.metrics != nil {
+		r.metrics.ObserveConnection("server", "agent", "started", "")
+		r.metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, true)
+diff --git a/internal/server/runtime_test.go b/internal/server/runtime_test.go
+index 88f2311..3cef77a 100644
+--- a/internal/server/runtime_test.go
++++ b/internal/server/runtime_test.go
+@@ -26,6 +26,7 @@ import (
+	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
++	"github.com/tunnelmesh/tunnelmesh/internal/registry"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
+ )
+
+@@ -1117,6 +1118,54 @@ func TestRealAgentReconnectsWithNewEpochAfterServerClosesSession(t *testing.T) {
+	}
+ }
+
++func TestRuntimeRejectsAgentConnectionWhenLeaseRegistrationFails(t *testing.T) {
++	ctx := context.Background()
++	db, err := storage.OpenSQLite(ctx, "file:runtime-agent-lease-reject?mode=memory&cache=shared")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	authService := auth.NewAuthService(db)
++	owner, err := authService.CreateUser(ctx, "lease-reject-owner", "owner-pass", "user")
++	if err != nil {
++		t.Fatal(err)
++	}
++	agentID := "lease-reject-agent"
++	if err := db.Agents().Create(ctx, storage.Agent{ID: agentID, Name: agentID, OwnerUserID: owner.ID, Enabled: true}); err != nil {
++		t.Fatal(err)
++	}
++	credentials := auth.NewCredentialService(db)
++	token, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeAgent, OwnerUserID: owner.ID, AgentID: agentID})
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
++		ConnectionRegistry: &recordingConnectionRegistry{registerErr: registry.ErrLeaseHeld},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer runtime.Close()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	serverCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	serveErr := make(chan error, 1)
++	go func() { serveErr <- runtime.ServeListener(serverCtx, listener) }()
++	defer func() {
++		cancel()
++		<-serveErr
++	}()
++	if agentWebSocketAccepted(t, listener.Addr().String(), token.Secret, agentID, 1, "", "") {
++		t.Fatal("Agent connection was accepted when lease registration failed")
++	}
++	if sessions := runtime.AgentSessions.List(agentID); len(sessions) != 0 {
++		t.Fatalf("sessions = %#v, want none", sessions)
++	}
++}
++
+ func frameBytes(t *testing.T, typ protocol.FrameType, payload []byte) []byte {
+	t.Helper()
+	var frame bytes.Buffer
+diff --git a/internal/server/session_manager.go b/internal/server/session_manager.go
+index 04202f7..ef28852 100644
+--- a/internal/server/session_manager.go
++++ b/internal/server/session_manager.go
+@@ -54,6 +54,7 @@ type AgentSessionConfig struct {
+	ServerNodeID          string
+	QueueSize             int
+	MetadataTTL           time.Duration
++	HeartbeatCallback     func(context.Context, *AgentSession) error
+	Authenticate          func(context.Context, AgentRegistration) error
+	MetadataCallback      MetadataCallback
+	MetadataService       *AgentMetadataService
+@@ -426,6 +427,15 @@ func (m *AgentSessionManager) ServerNodeID() string {
+	return m.cfg.ServerNodeID
+ }
+
++// SetHeartbeatCallback lets the runtime attach a cluster lease refresher
++// after both the manager and lease controller have been constructed.
++func (m *AgentSessionManager) SetHeartbeatCallback(callback func(context.Context, *AgentSession) error) {
++	if m == nil {
++		return
++	}
++	m.cfg.HeartbeatCallback = callback
++}
++
+ func (m *AgentSessionManager) GetConnection(agentID, connectionID string) (*AgentSession, bool) {
+	if m == nil || connectionID == "" {
+		return nil, false
+diff --git a/internal/server/ws_agent.go b/internal/server/ws_agent.go
+index 9f19ade..e653d6d 100644
+--- a/internal/server/ws_agent.go
++++ b/internal/server/ws_agent.go
+@@ -153,6 +153,9 @@ func serveRegisteredAgentSessionWithMetrics(ctx context.Context, manager *AgentS
+			// metadata snapshots fresh. A transient metadata-store failure must
+			// not tear down an otherwise healthy forwarding channel.
+			_ = manager.RefreshSessionMetadataLease(ctx, session)
++			if manager.cfg.HeartbeatCallback != nil {
++				_ = manager.cfg.HeartbeatCallback(ctx, session)
++			}
+			if frame.Type == protocol.FramePing {
+				return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload})
+			}

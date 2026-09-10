@@ -173,7 +173,7 @@ func TestScopedTokenConnectionsAndRotation(t *testing.T) {
 		t.Fatalf("rotated token frame = %+v", frame)
 	}
 
-	page, err := db.Audits().List(ctx, "", 200)
+	page, err := db.Audits().List(ctx, storage.AuditFilter{}, "", 200)
 	if err != nil {
 		t.Fatal(err)
 	}

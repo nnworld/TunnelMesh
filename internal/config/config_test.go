@@ -4,11 +4,41 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 )
+
+func TestDefaultAgentInstanceIDPathMatchesSystemdWritableStateDirectory(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not locate test source file")
+	}
+	unitPath := filepath.Join(filepath.Dir(file), "..", "..", "deploy", "systemd", "tunnelmesh-agent.service")
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read agent systemd unit: %v", err)
+	}
+
+	var writableDirectory string
+	for _, line := range strings.Split(string(unit), "\n") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), "ReadWritePaths="); found {
+			writableDirectory = value
+			break
+		}
+	}
+	if writableDirectory == "" {
+		t.Fatal("agent systemd unit has no ReadWritePaths")
+	}
+
+	got := filepath.Dir(config.DefaultAgentInstanceIDPath)
+	if got != writableDirectory {
+		t.Fatalf("DefaultAgentInstanceIDPath directory = %q, want systemd writable directory %q", got, writableDirectory)
+	}
+}
 
 func TestLoadDefaultsToLocalSQLiteDatabaseRegistryAndTCPBridge(t *testing.T) {
 	t.Setenv("TUNNELMESH_MODE", "")
@@ -34,6 +64,79 @@ func TestLoadDefaultsToLocalSQLiteDatabaseRegistryAndTCPBridge(t *testing.T) {
 	}
 	if !cfg.Server.TCPBridge.Enabled {
 		t.Fatal("Server.TCPBridge.Enabled = false, want true")
+	}
+}
+
+func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := config.AgentConnectionConfig{
+		Min: 1, Max: 1, HighWatermark: 16, LowWatermark: 2,
+		EvaluationInterval: 10 * time.Second, Cooldown: 30 * time.Second,
+	}
+	if cfg.Agent.Connections != want {
+		t.Fatalf("Agent.Connections = %+v, want %+v", cfg.Agent.Connections, want)
+	}
+	base := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
+	base.Agent.ServerURL = "wss://tunnel.example.com/ws/agent"
+	base.Agent.Connections = want
+	cases := []struct {
+		name string
+		edit func(*config.AgentConnectionConfig)
+		want string
+	}{
+		{name: "min below one", edit: func(c *config.AgentConnectionConfig) { c.Min = 0 }, want: "agent connections min must be at least 1"},
+		{name: "max below min", edit: func(c *config.AgentConnectionConfig) { c.Min, c.Max = 2, 1 }, want: "agent connections max must be greater than or equal to min"},
+		{name: "max above limit", edit: func(c *config.AgentConnectionConfig) { c.Max = 65 }, want: "agent connections max must be at most 64"},
+		{name: "low above high", edit: func(c *config.AgentConnectionConfig) { c.Max, c.LowWatermark = 8, 17 }, want: "agent connections low watermark must be less than or equal to high watermark"},
+		{name: "invalid evaluation interval", edit: func(c *config.AgentConnectionConfig) { c.EvaluationInterval = 0 }, want: "agent connections evaluation interval must be positive"},
+		{name: "invalid cooldown", edit: func(c *config.AgentConnectionConfig) { c.Cooldown = 0 }, want: "agent connections cooldown must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg.Agent.Connections)
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadGeneratesStableAgentInstanceID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent-instance-id")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{AgentInstanceIDPath: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !strings.HasPrefix(cfg.Agent.InstanceID, "agent-") {
+		t.Fatalf("generated Agent.InstanceID = %q, want agent- prefix", cfg.Agent.InstanceID)
+	}
+	again, err := config.Load(context.Background(), config.ConfigOptions{AgentInstanceIDPath: path})
+	if err != nil {
+		t.Fatalf("Load(again) error = %v", err)
+	}
+	if again.Agent.InstanceID != cfg.Agent.InstanceID {
+		t.Fatalf("generated Agent.InstanceID changed: %q -> %q", cfg.Agent.InstanceID, again.Agent.InstanceID)
+	}
+
+	explicitPath := filepath.Join(dir, "unused-agent-instance-id")
+	explicit, err := config.Load(context.Background(), config.ConfigOptions{
+		AgentInstanceIDPath: explicitPath,
+		CLI:                 map[string]any{"agent.instance_id": "agent-node-a"},
+	})
+	if err != nil {
+		t.Fatalf("Load(explicit) error = %v", err)
+	}
+	if explicit.Agent.InstanceID != "agent-node-a" {
+		t.Fatalf("explicit Agent.InstanceID = %q", explicit.Agent.InstanceID)
+	}
+	if _, err := os.Stat(explicitPath); !os.IsNotExist(err) {
+		t.Fatalf("explicit instance ID unexpectedly wrote persistence file: %v", err)
 	}
 }
 
@@ -73,12 +176,45 @@ func TestLoadPrecedenceIsCLIThenEnvironmentThenFileThenDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAndValidateDynamicRouteSuffix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tunnelmesh.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  dynamic_suffix: claw.qihoo.net\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.DynamicSuffix != "claw.qihoo.net" {
+		t.Fatalf("Server.DynamicSuffix = %q, want %q", cfg.Server.DynamicSuffix, "claw.qihoo.net")
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	t.Setenv("TUNNELMESH_SERVER_DYNAMIC_SUFFIX", "apps.example.com")
+	cfg, err = config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load(environment) error = %v", err)
+	}
+	if cfg.Server.DynamicSuffix != "apps.example.com" {
+		t.Fatalf("environment suffix = %q, want %q", cfg.Server.DynamicSuffix, "apps.example.com")
+	}
+
+	cfg.Server.DynamicSuffix = "*.example.com"
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "dynamic route suffix") {
+		t.Fatalf("Validate(wildcard) error = %v, want dynamic route suffix error", err)
+	}
+}
+
 func TestValidateRejectsIncompleteClusterAndUnknownRegistry(t *testing.T) {
 	base := config.Config{Mode: config.ModeCluster}
 	if err := config.Validate(base); err == nil {
 		t.Fatal("Validate() error = nil for incomplete cluster config")
 	} else {
-		for _, want := range []string{"mysql dsn", "tls", "node"} {
+		for _, want := range []string{"mysql dsn"} {
 			if !strings.Contains(strings.ToLower(err.Error()), want) {
 				t.Errorf("Validate() error %q does not mention %q", err, want)
 			}
@@ -89,6 +225,125 @@ func TestValidateRejectsIncompleteClusterAndUnknownRegistry(t *testing.T) {
 	bad.Registry.Type = "consul"
 	if err := config.Validate(bad); err == nil || !strings.Contains(strings.ToLower(err.Error()), "registry") {
 		t.Fatalf("Validate() error = %v, want invalid registry error", err)
+	}
+}
+
+func TestValidateAllowsClusterWithoutExplicitNodeID(t *testing.T) {
+	cfg := config.Config{
+		Mode:     config.ModeCluster,
+		Storage:  config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "user:pass@tcp(db:3306)/tunnelmesh"}},
+		Registry: config.RegistryConfig{Type: config.RegistryDatabase},
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want generated node identity to be allowed", err)
+	}
+}
+
+func TestLoadGeneratesNodeIDOnlyWhenClusterIdentityIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node-id")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{
+		NodeIDPath: path,
+		CLI: map[string]any{
+			"mode":              config.ModeCluster,
+			"storage.driver":    config.StorageMySQL,
+			"storage.mysql.dsn": "db",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !strings.HasPrefix(cfg.Node.ID, "server-") {
+		t.Fatalf("generated node ID = %q, want server- prefix", cfg.Node.ID)
+	}
+	explicit, err := config.Load(context.Background(), config.ConfigOptions{
+		NodeIDPath: filepath.Join(dir, "unused-node-id"),
+		CLI: map[string]any{
+			"mode":              config.ModeCluster,
+			"storage.driver":    config.StorageMySQL,
+			"storage.mysql.dsn": "db",
+			"node.id":           "server-explicit",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load(explicit node) error = %v", err)
+	}
+	if explicit.Node.ID != "server-explicit" {
+		t.Fatalf("explicit node ID = %q, want server-explicit", explicit.Node.ID)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "unused-node-id")); !os.IsNotExist(err) {
+		t.Fatalf("explicit node ID unexpectedly wrote persistence file: %v", err)
+	}
+}
+
+func TestValidateAllowsClusterWithoutMySQLTLS(t *testing.T) {
+	cfg := config.Config{
+		Mode:     config.ModeCluster,
+		Storage:  config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "user:pass@tcp(db:3306)/tunnelmesh", TLS: false}},
+		Registry: config.RegistryConfig{Type: config.RegistryDatabase},
+		Node:     config.NodeConfig{ID: "server-1"},
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want nil when MySQL TLS is disabled", err)
+	}
+}
+
+func TestEnsureNodeIDPersistsAndReusesGeneratedID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node-id")
+	first, err := config.EnsureNodeID(path)
+	if err != nil {
+		t.Fatalf("EnsureNodeID() error = %v", err)
+	}
+	if first == "" {
+		t.Fatal("EnsureNodeID() returned an empty ID")
+	}
+	second, err := config.EnsureNodeID(path)
+	if err != nil {
+		t.Fatalf("EnsureNodeID() second call error = %v", err)
+	}
+	if second != first {
+		t.Fatalf("EnsureNodeID() changed identity from %q to %q", first, second)
+	}
+}
+
+func TestInitializeNodeIDWritesGeneratedIDToYAML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "server.yaml")
+	if err := os.WriteFile(configPath, []byte("# keep this comment\nmode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: db\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	id, err := config.InitializeNodeID(configPath, filepath.Join(dir, "node-id"))
+	if err != nil {
+		t.Fatalf("InitializeNodeID() error = %v", err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: configPath, NodeIDPath: filepath.Join(dir, "node-id")})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Node.ID != id {
+		t.Fatalf("config node.id = %q, want %q", cfg.Node.ID, id)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "# keep this comment") {
+		t.Fatalf("InitializeNodeID() discarded YAML comments: %s", data)
+	}
+}
+
+func TestInitializeNodeIDKeepsExplicitConfigIdentity(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "server.yaml")
+	if err := os.WriteFile(configPath, []byte("mode: cluster\nnode:\n  id: server-explicit\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	id, err := config.InitializeNodeID(configPath, filepath.Join(dir, "node-id"))
+	if err != nil {
+		t.Fatalf("InitializeNodeID() error = %v", err)
+	}
+	if id != "server-explicit" {
+		t.Fatalf("InitializeNodeID() = %q, want explicit identity", id)
 	}
 }
 
@@ -317,7 +572,7 @@ func TestLoadRelayConfigPrecedenceAndRedaction(t *testing.T) {
 }
 
 func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *testing.T) {
-	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", CA: "ca.pem", Cert: "cert.pem", Key: "key.pem", ServerName: "relay.local"}}}
+	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", Endpoint: "relay.example:9443", CA: "ca.pem", Cert: "cert.pem", Key: "key.pem", ServerName: "relay.local"}}}
 	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "absolute") || !strings.Contains(err.Error(), "node token") {
 		t.Fatalf("Validate() error = %v, want absolute paths and node token failures", err)
 	}
@@ -329,5 +584,17 @@ func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *test
 	cfg.Server.Relay.Endpoint = "relay.example:9443"
 	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("Validate(endpoint-only relay) error = %v, want listen requirement", err)
+	}
+}
+
+func TestValidateRelayRequiresAdvertisedEndpoint(t *testing.T) {
+	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", Endpoint: "relay.example:9443", CA: "/ca.pem", Cert: "/cert.pem", Key: "/key.pem", ServerName: "relay.local", NodeToken: "secret"}}}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate(valid relay) error = %v", err)
+	}
+	cfg.Server.Relay.Endpoint = ""
+	err := config.Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("Validate(missing endpoint) error = %v, want endpoint requirement", err)
 	}
 }

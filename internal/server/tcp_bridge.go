@@ -73,7 +73,7 @@ func (h *TCPBridgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
 		defer cancel()
 	}
-	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, CaseInsensitiveAgentID: route.Dynamic, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
 	if err != nil {
 		h.emitAudit(ctx, "tcp_proxy.open", route, err)
 		http.Error(w, "target refused", http.StatusBadGateway)
@@ -106,7 +106,7 @@ func (h *TCPBridgeHandler) Handle(ctx context.Context, ws WSConn, host string) e
 	if err != nil {
 		return err
 	}
-	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, CaseInsensitiveAgentID: route.Dynamic, Protocol: "tcp", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
 	if err != nil {
 		h.emitAudit(ctx, "tcp_proxy.open", route, err)
 		return ErrBridgeRefused

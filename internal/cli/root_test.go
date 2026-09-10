@@ -15,7 +15,7 @@ import (
 
 func TestServerRootExposesConfigurationCommands(t *testing.T) {
 	root := cli.NewServerRoot()
-	for _, name := range []string{"run", "check-config", "init-db", "print-config", "admin"} {
+	for _, name := range []string{"run", "check-config", "init-db", "init-node-id", "print-config", "admin"} {
 		if root.CommandPath() == "" {
 			t.Fatal("root command has no path")
 		}
@@ -37,6 +37,44 @@ func TestServerAdminExposesCredentialRegeneration(t *testing.T) {
 	}
 }
 
+func TestServerAdminExposesBootstrap(t *testing.T) {
+	root := cli.NewServerRoot()
+	admin := findCommand(root, "admin")
+	if admin == nil || findCommand(admin, "bootstrap") == nil {
+		t.Fatal("admin bootstrap command missing")
+	}
+}
+
+func TestServerAdminBootstrapCreatesCredentialsOnlyForEmptyDatabase(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "server.yaml")
+	contents := "mode: local\nstorage:\n  driver: sqlite\n  auto_init: true\n  sqlite:\n    path: " + filepath.Join(dir, "runtime.db") + "\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := cli.NewServerRoot()
+	root.SetArgs([]string{"admin", "bootstrap", "--config", configFile})
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("bootstrap Execute() error = %v", err)
+	}
+	printed := out.String()
+	if !strings.Contains(printed, "admin username: ") || !strings.Contains(printed, "admin password: ") {
+		t.Fatalf("bootstrap output = %q", printed)
+	}
+
+	second := cli.NewServerRoot()
+	second.SetArgs([]string{"admin", "bootstrap", "--config", configFile})
+	second.SetOut(&out)
+	second.SetErr(&out)
+	err := second.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "admin account already exists") {
+		t.Fatalf("second bootstrap error = %v, want existing-admin error", err)
+	}
+}
+
 func TestAgentAndClientRootsExposeCommandShells(t *testing.T) {
 	agent := cli.NewAgentRoot()
 	for _, name := range []string{"run", "register", "check-config", "id"} {
@@ -52,6 +90,46 @@ func TestAgentAndClientRootsExposeCommandShells(t *testing.T) {
 		if findCommand(client, name) == nil {
 			t.Fatalf("client root missing %q command", name)
 		}
+	}
+}
+
+func TestClientRootExposesSOCKS5Forward(t *testing.T) {
+	client := cli.NewClientRoot()
+	forward := findCommand(client, "forward")
+	if forward == nil {
+		t.Fatal("client root missing forward command")
+	}
+	socks5 := findCommand(forward, "socks5")
+	if socks5 == nil {
+		t.Fatal("client forward command missing socks5")
+	}
+	for _, flag := range []string{"listen", "agent", "auth", "allow-remote"} {
+		if socks5.Flag(flag) == nil {
+			t.Fatalf("socks5 command missing --%s", flag)
+		}
+	}
+	if socks5.Flag("auth-url") == nil {
+		t.Fatal("socks5 command missing --auth-url")
+	}
+}
+
+func TestClientRootExposesHTTPProxyForward(t *testing.T) {
+	client := cli.NewClientRoot()
+	forward := findCommand(client, "forward")
+	if forward == nil {
+		t.Fatal("client root missing forward command")
+	}
+	httpProxy := findCommand(forward, "http-proxy")
+	if httpProxy == nil {
+		t.Fatal("client forward command missing http-proxy")
+	}
+	for _, flag := range []string{"listen", "agent", "auth", "allow-remote"} {
+		if httpProxy.Flag(flag) == nil {
+			t.Fatalf("http-proxy command missing --%s", flag)
+		}
+	}
+	if httpProxy.Flag("auth-url") == nil {
+		t.Fatal("http-proxy command missing --auth-url")
 	}
 }
 

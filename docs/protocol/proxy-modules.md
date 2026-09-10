@@ -7,7 +7,8 @@ TunnelMesh 的公网入口继续只监听 HTTP/HTTPS/WebSocket。内部会话通
 - TCP stream：面向连接的双向字节流。
 - UDP association：保留 datagram 边界，单个 datagram 受大小上限限制。
 - HTTP CONNECT：解析 `CONNECT host:port HTTP/1.1`，拒绝非法 Host、端口和 CR/LF 注入。
-- SOCKS5 CONNECT：支持 IPv4、IPv6 和域名地址；UDP ASSOCIATE 使用相同 association 生命周期并受 UDP 配额约束。
+- 标准 HTTP 代理：Client 本地入口支持 absolute-form HTTP、`CONNECT` 隧道、WebSocket upgrade 和可选 Basic 认证；仅支持 HTTP/1.1。
+- SOCKS5 CONNECT：Client 本地入口支持 IPv4、IPv6 和域名地址，可选 RFC 1929 用户名密码认证；`BIND` 和 `UDP ASSOCIATE` 不支持。
 - PROXY protocol v2：当前安全解析 TCP/IPv4 地址头，后续地址族由能力协商显式启用。
 - TLS SNI passthrough：只转发经过路由策略允许的 SNI，不终止端到端 TLS。
 - Unix socket / Windows named pipe：仅在 Agent 本机目标策略明确允许时使用。

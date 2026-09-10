@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -41,11 +43,14 @@ func (a *API) handleTokens(w http.ResponseWriter, r *http.Request, principal aut
 		return
 	}
 	if len(parts) == 1 {
-		if r.Method != http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, view)
+		case http.MethodPatch:
+			a.updateToken(w, r, principal, record)
+		default:
 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
 		}
-		writeJSON(w, http.StatusOK, view)
 		return
 	}
 	if len(parts) != 2 || r.Method != http.MethodPost {
@@ -104,6 +109,34 @@ func (a *API) handleTokens(w http.ResponseWriter, r *http.Request, principal aut
 	default:
 		writeAPIError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (a *API) updateToken(w http.ResponseWriter, r *http.Request, principal auth.Principal, record storage.ServiceToken) {
+	var request struct {
+		ExpiresAt json.RawMessage  `json:"expiresAt"`
+		Scope     *tokenScopePatch `json:"scope"`
+	}
+	if err := decodeJSON(r, &request); err != nil || (len(request.ExpiresAt) == 0 && request.Scope == nil) {
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON or missing update field")
+		return
+	}
+	var expiresAt *time.Time
+	if len(request.ExpiresAt) != 0 && !bytes.Equal(bytes.TrimSpace(request.ExpiresAt), []byte("null")) {
+		var value time.Time
+		if err := json.Unmarshal(request.ExpiresAt, &value); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid expiresAt")
+			return
+		}
+		expiresAt = &value
+	}
+	updated, err := a.tokenService.Update(r.Context(), principal.UserID, record.ID, tokenUpdate{
+		ExpiresAt: expiresAt, HasExpiresAt: len(request.ExpiresAt) != 0, Scope: request.Scope,
+	})
+	if err != nil {
+		writeTokenError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // listTokens fixes non-admin filtering to the caller before repository paging.
@@ -251,6 +284,8 @@ func writeTokenError(w http.ResponseWriter, err error) {
 	case errors.Is(err, errInvalidTokenRequest):
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, errTokenConflict), errors.Is(err, errIdempotencyConflict), errors.Is(err, errIdempotencyInProgress), errors.Is(err, storage.ErrServiceTokenRevoked):
+		writeAPIError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, storage.ErrServiceTokenExpired):
 		writeAPIError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, errTokenSecretNotRecoverable):
 		writeAPIError(w, http.StatusConflict, err.Error())

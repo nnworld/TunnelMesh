@@ -33,6 +33,8 @@ func NewAgentRelayTransport(manager *AgentSessionManager) *AgentRelayTransport {
 
 type agentRelayGeneration struct {
 	agentID          string
+	connectionID     string
+	connectionEpoch  int64
 	serverGeneration uint64
 }
 
@@ -53,11 +55,41 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	session, ok := t.manager.Get(request.AgentID)
-	if !ok {
+	agentID := request.AgentID
+	var session *AgentSession
+	var err error
+	if request.CaseInsensitiveAgentID {
+		session, err = t.manager.GetCaseInsensitive(agentID)
+		if err != nil {
+			return nil, err
+		}
+		agentID = session.AgentID
+	} else {
+		var ok bool
+		session, ok = t.manager.Get(agentID)
+		if !ok {
+			return nil, relay.ErrNodeDisconnected
+		}
+	}
+	if request.TargetConnectionID != "" {
+		target, ok := t.manager.GetConnection(agentID, request.TargetConnectionID)
+		if !ok {
+			return nil, relay.ErrNodeDisconnected
+		}
+		if request.TargetConnectionEpoch != 0 && target.ConnectionEpoch != request.TargetConnectionEpoch {
+			return nil, relay.ErrEpoch
+		}
+		session = target
+	}
+	if session == nil {
 		return nil, relay.ErrNodeDisconnected
 	}
-	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{AgentID: request.AgentID, Protocol: request.Protocol, TargetHost: request.TargetHost, TargetPort: request.TargetPort, Metadata: append([]byte(nil), request.Metadata...)})
+	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{
+		AgentID: agentID, Protocol: request.Protocol, TargetHost: request.TargetHost,
+		TargetPort: request.TargetPort, TargetScheme: request.TargetScheme,
+		HostHeader: request.HostHeader, TLSServerName: request.TLSServerName,
+		Metadata: append([]byte(nil), request.Metadata...),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +98,7 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 		t.mu.Unlock()
 		return nil, errAgentRelayClosed
 	}
-	generation := agentRelayGeneration{agentID: request.AgentID, serverGeneration: session.serverGeneration}
+	generation := agentRelayGeneration{agentID: agentID, connectionID: session.ConnectionID, connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration}
 	allocator := t.allocators[generation]
 	if allocator == nil {
 		allocator = &agentRelayIDAllocator{}
@@ -77,7 +109,7 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 		return nil, errAgentRelayWireIDsExhausted
 	}
 	allocator.next++
-	stream := &agentRelayStream{transport: t, agentID: request.AgentID, serverGeneration: session.serverGeneration, wireID: uint32(allocator.next), readCh: make(chan []byte, 16), done: make(chan struct{})}
+	stream := &agentRelayStream{transport: t, agentID: agentID, connectionID: session.ConnectionID, connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration, wireID: uint32(allocator.next), readCh: make(chan []byte, 16), done: make(chan struct{})}
 	t.streams[stream.key()] = stream
 	t.mu.Unlock()
 	if err := t.manager.sendServerGeneration(stream.agentID, stream.serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: stream.wireID, Payload: payload}); err != nil {
@@ -101,25 +133,21 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 	// Hold the current Agent generation stable through frame admission. Without
 	// this fence, an old WebSocket callback could deliver a frame after its
 	// replacement was registered but before the old session cleanup ran.
-	t.manager.mu.RLock()
-	session := t.manager.sessions[agentID]
+	session := t.manager.getServerGeneration(serverGeneration)
 	if session == nil || session.serverGeneration != serverGeneration {
-		t.manager.mu.RUnlock()
 		return nil
 	}
 	session.mu.RLock()
 	if session.closed || session.closing {
 		session.mu.RUnlock()
-		t.manager.mu.RUnlock()
 		return nil
 	}
-	key := agentRelayStreamKey{agentRelayGeneration: agentRelayGeneration{agentID: agentID, serverGeneration: serverGeneration}, wireID: frame.StreamID}
+	key := agentRelayStreamKey{agentRelayGeneration: agentRelayGeneration{agentID: agentID, connectionID: session.ConnectionID, connectionEpoch: session.ConnectionEpoch, serverGeneration: serverGeneration}, wireID: frame.StreamID}
 	t.mu.Lock()
 	stream := t.streams[key]
-	if stream == nil || stream.agentID != agentID || stream.serverGeneration != serverGeneration {
+	if stream == nil || stream.agentID != agentID || stream.connectionID != session.ConnectionID || stream.connectionEpoch != session.ConnectionEpoch || stream.serverGeneration != serverGeneration {
 		t.mu.Unlock()
 		session.mu.RUnlock()
-		t.manager.mu.RUnlock()
 		return nil
 	}
 	var resetStream bool
@@ -140,7 +168,6 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 	}
 	t.mu.Unlock()
 	session.mu.RUnlock()
-	t.manager.mu.RUnlock()
 	if resetStream {
 		_ = t.manager.sendServerGeneration(agentID, serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: frame.StreamID})
 	}
@@ -166,14 +193,17 @@ func (t *AgentRelayTransport) failAgentGeneration(agentID string, serverGenerati
 	}
 	t.mu.Lock()
 	var failed []*agentRelayStream
-	generation := agentRelayGeneration{agentID: agentID, serverGeneration: serverGeneration}
+	var generation agentRelayGeneration
 	for key, stream := range t.streams {
 		if stream.agentID == agentID && stream.serverGeneration == serverGeneration {
 			delete(t.streams, key)
 			failed = append(failed, stream)
+			generation = key.agentRelayGeneration
 		}
 	}
-	delete(t.allocators, generation)
+	if len(failed) > 0 {
+		delete(t.allocators, generation)
+	}
 	t.mu.Unlock()
 	for _, stream := range failed {
 		stream.fail(relay.ErrNodeDisconnected)
@@ -217,6 +247,23 @@ func (t *AgentRelayTransport) Close() error {
 	return nil
 }
 
+// ActiveStreams returns the number of currently open local streams for one
+// Agent connection. It is a process-local input to least-connections routing.
+func (t *AgentRelayTransport) ActiveStreams(agentID, connectionID string) int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := 0
+	for _, stream := range t.streams {
+		if stream.agentID == agentID && stream.connectionID == connectionID {
+			count++
+		}
+	}
+	return count
+}
+
 func (t *AgentRelayTransport) detach(stream *agentRelayStream) {
 	if t == nil || stream == nil {
 		return
@@ -231,6 +278,8 @@ func (t *AgentRelayTransport) detach(stream *agentRelayStream) {
 type agentRelayStream struct {
 	transport        *AgentRelayTransport
 	agentID          string
+	connectionID     string
+	connectionEpoch  int64
 	serverGeneration uint64
 	wireID           uint32
 	readCh           chan []byte
@@ -245,7 +294,7 @@ type agentRelayStream struct {
 }
 
 func (s *agentRelayStream) key() agentRelayStreamKey {
-	return agentRelayStreamKey{agentRelayGeneration: agentRelayGeneration{agentID: s.agentID, serverGeneration: s.serverGeneration}, wireID: s.wireID}
+	return agentRelayStreamKey{agentRelayGeneration: agentRelayGeneration{agentID: s.agentID, connectionID: s.connectionID, connectionEpoch: s.connectionEpoch, serverGeneration: s.serverGeneration}, wireID: s.wireID}
 }
 
 func (s *agentRelayStream) Read(buffer []byte) (int, error) {

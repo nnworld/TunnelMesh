@@ -10,6 +10,7 @@ type User struct {
 	Role         string
 	PasswordHash string
 	Disabled     bool
+	DeletedAt    *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -120,6 +121,7 @@ type ServerNode struct {
 
 type AgentRuntimeMetadata struct {
 	AgentID    string
+	InstanceID string
 	NodeID     string
 	Epoch      int64
 	Revision   int64
@@ -169,13 +171,19 @@ type AgentProbeResult struct {
 }
 
 type AgentLease struct {
-	AgentID    string
-	NodeID     string
-	Epoch      int64
-	TTL        time.Duration
-	AcquiredAt time.Time
-	ExpiresAt  time.Time
-	UpdatedAt  time.Time
+	AgentID         string
+	NodeID          string
+	InstanceID      string
+	ConnectionID    string
+	ServerNodeID    string
+	Epoch           int64
+	ConnectionEpoch int64
+	ActiveStreams   int64
+	HealthScore     int64
+	TTL             time.Duration
+	AcquiredAt      time.Time
+	ExpiresAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // Lease is a compatibility alias used by registry adapters.
@@ -189,6 +197,17 @@ type AuditLog struct {
 	ResourceID   string
 	Details      string
 	CreatedAt    time.Time
+}
+
+// AuditFilter describes exact management-facing audit search criteria. Time is
+// inclusive so administrators can query a complete day or event window.
+type AuditFilter struct {
+	ActorUserID  string
+	Action       string
+	ResourceType string
+	ResourceID   string
+	CreatedFrom  *time.Time
+	CreatedTo    *time.Time
 }
 
 type IdempotencyRecord struct {
@@ -206,5 +225,6 @@ type Page[T any] struct {
 	HasMore    bool
 }
 
-// CursorPage is an alias retained for callers that use the longer name.
-type CursorPage[T any] = Page[T]
+// CursorPage retains the longer compatibility name without using a generic
+// type alias, which is experimental in Go 1.23 and crashes go/types tooling.
+type CursorPage[T any] Page[T]

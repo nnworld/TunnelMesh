@@ -37,7 +37,7 @@ tunnelmesh-agent --config agent.yaml id
 tunnelmesh-agent --config agent.yaml check-config
 ```
 
-Agent ID 是路由和客户端命令引用 Agent 的稳定标识。生产环境不要在多台主机上复用同一个 ID；若 ID 由设备信息生成，应在设备生命周期内保持不变。
+Agent ID 是路由和客户端命令引用 Agent 的稳定标识。普通单机部署应保持 Agent ID 与主机一一对应；只有刻意部署为同一个逻辑 Agent 的连接池时，才允许多个物理 Agent 使用同一个 Agent ID。此时每个 Agent 进程必须有稳定的 `instance_id`，token owner 也必须一致。
 
 ## 3. 注册和运行
 
@@ -47,6 +47,35 @@ tunnelmesh-agent --config agent.yaml run
 ```
 
 `register` 用于显式检查/登记 Agent；长期运行使用 `run`。Agent 启动后会主动连接 Server，并通过心跳维护在线状态。网络短暂中断时，客户端应重连并重新建立会话，不应依赖固定的 Server 入站连接。
+
+## 连接池运行
+
+默认配置只建立一条 WebSocket 连接：
+
+```yaml
+agent:
+  server_url: wss://tunnel.example.com/ws/agent/v1
+  id: agent-devbox
+  instance_id: agent-devbox-host-a
+  connections:
+    min: 1
+    max: 1
+```
+
+Server 支持连接池并完成滚动升级后，可以提高 `max`：
+
+```yaml
+agent:
+  connections:
+    min: 1
+    max: 8
+    high_watermark: 16
+    low_watermark: 2
+    evaluation_interval: 10s
+    cooldown: 30s
+```
+
+同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；已建立的流固定在原连接上，不会在线迁移。`instance_id` 用于区分多个物理 Agent 进程；未配置时进程会生成并持久化一个稳定值，Linux 打包部署默认保存到 `/var/lib/tunnelmesh-agent/agent-instance-id`。运维细节见[逻辑 Agent 连接池运维指南](../operations/connection-pool.md)。
 
 ## 4. Agent 提供的能力
 

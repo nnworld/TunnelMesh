@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,15 @@ import (
 )
 
 func TestSQLiteRepositoryContract(t *testing.T) { runRepositoryContract(t, newTestDB(t)) }
+
+func TestGeneratedAgentIDIsLowercase(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		id := newAgentID()
+		if !strings.HasPrefix(id, "agent-") || id != strings.ToLower(id) {
+			t.Fatalf("generated Agent ID = %q, want lowercase agent- prefixed ID", id)
+		}
+	}
+}
 
 func TestSQLiteAutoInitDisabledFailsWithoutSchema(t *testing.T) {
 	if _, err := Open(context.Background(), DriverSQLite, "file:no-schema?mode=memory&cache=shared", false); err == nil {
@@ -41,7 +51,7 @@ func TestSQLiteAutoInitRejectsIncompatibleSchemaVersion(t *testing.T) {
 	}
 }
 
-func TestSQLiteAutoInitMigratesSchemaV1ToCurrent(t *testing.T) {
+func TestSQLiteAutoInitRejectsMissingV1MigrationChain(t *testing.T) {
 	dsn := "file:schema-v1-migrate?mode=memory&cache=shared"
 	raw, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -52,21 +62,12 @@ func TestSQLiteAutoInitMigratesSchemaV1ToCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	db, err := OpenSQLite(context.Background(), dsn, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	version, err := db.SchemaVersion(context.Background())
-	if err != nil || version != SchemaVersion {
-		t.Fatalf("version=%d err=%v, want %d", version, err, SchemaVersion)
-	}
-	if _, err := db.SQL().Exec(`INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,stale,updated_at) VALUES ('a','n',1,1,'{}','now','now',0,'now')`); err != nil {
-		t.Fatalf("metadata table unavailable after migration: %v", err)
+	if _, err := OpenSQLite(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0001_to_v0002") {
+		t.Fatalf("error=%v, want missing v1 to v2 migration", err)
 	}
 }
 
-func TestSQLiteAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
+func TestSQLiteAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
 	dsn := "file:schema-v2-service-tokens?mode=memory&cache=shared"
 	raw, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -82,28 +83,8 @@ func TestSQLiteAutoInitMigratesSchemaV2ToServiceTokens(t *testing.T) {
 	}
 	defer raw.Close()
 
-	db, err := OpenSQLite(context.Background(), dsn, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	assertSQLiteTableColumns(t, db.SQL(), "service_tokens", []string{
-		"id", "token_type", "owner_user_id", "agent_id", "node_id",
-		"token_prefix", "token_hash", "scope", "expires_at", "revoked_at",
-		"last_used_at", "created_at", "updated_at", "secret_ciphertext",
-		"secret_nonce", "secret_key_id", "secret_version", "secret_last_read_at",
-	})
-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_owner_type", []string{"owner_user_id", "token_type", "id"})
-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_agent", []string{"agent_id", "token_type", "id"})
-	assertSQLiteIndexColumns(t, db.SQL(), "idx_service_tokens_node", []string{"node_id", "token_type", "id"})
-
-	version, err := db.SchemaVersion(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != SchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, SchemaVersion)
+	if _, err := OpenSQLite(context.Background(), dsn, true); err == nil || !strings.Contains(err.Error(), "missing adjacent migration v0002_to_v0003") {
+		t.Fatalf("error=%v, want missing v2 to v3 migration", err)
 	}
 }
 
@@ -117,7 +98,7 @@ func TestSQLiteAutoInitDisabledRejectsMissingServiceTokensTable(t *testing.T) {
 		raw.Close()
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`DROP TABLE IF EXISTS service_tokens; DELETE FROM schema_meta WHERE id=1; INSERT INTO schema_meta(id,version) VALUES (1,5)`); err != nil {
+	if _, err := raw.Exec(`DROP TABLE IF EXISTS service_tokens; DELETE FROM schema_meta WHERE id=1; INSERT INTO schema_meta(id,version) VALUES (1,?)`, SchemaVersion); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -134,12 +115,12 @@ func TestSQLiteAutoInitDisabledRejectsMissingRuntimeMetadataTable(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,5); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,?); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`, SchemaVersion); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if _, err := OpenSQLite(context.Background(), dsn, false); err == nil || !strings.Contains(err.Error(), "agent_runtime_metadata") {
+	if _, err := OpenSQLite(context.Background(), dsn, false); err == nil || !strings.Contains(err.Error(), "agent_instance_metadata") {
 		t.Fatalf("error=%v, want missing runtime metadata table", err)
 	}
 }
@@ -243,6 +224,79 @@ func TestSQLiteConcurrentExpiredLeaseTakeoverHasSingleOwner(t *testing.T) {
 	}
 	if _, err := db.Leases().Get(ctx, first.AgentID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSQLiteV6ToV7ConnectionLeaseMigrationPreservesLegacyRows(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v6-to-v7.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	expires := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	prepareStatements := []string{
+		`DROP TABLE agent_connection_leases`,
+		`CREATE TABLE agent_runtime_leases (agent_id VARBINARY(255) PRIMARY KEY,node_id VARBINARY(255) NOT NULL,epoch INTEGER NOT NULL,acquired_at TEXT NOT NULL,expires_at TEXT NOT NULL,updated_at TEXT NOT NULL)`,
+		`DROP TABLE agent_instance_metadata`,
+		`CREATE TABLE agent_runtime_metadata (agent_id VARBINARY(255) PRIMARY KEY,node_id VARBINARY(255) NOT NULL,epoch INTEGER NOT NULL,revision INTEGER NOT NULL,metadata TEXT NOT NULL,reported_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,expires_at TEXT,stale INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL)`,
+		`DELETE FROM schema_meta WHERE id=1`,
+	}
+	for _, statement := range prepareStatements {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v6 schema: %v", err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO agent_runtime_leases(agent_id,node_id,epoch,acquired_at,expires_at,updated_at) VALUES('legacy-agent','legacy-node',7,?,?,?)`, now, expires, now); err != nil {
+		raw.Close()
+		t.Fatalf("insert legacy lease: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO agent_runtime_metadata(agent_id,node_id,epoch,revision,metadata,reported_at,last_seen_at,expires_at,stale,updated_at) VALUES('legacy-agent','legacy-node',7,3,'{"items":[]}',?,?,?,0,?)`, now, now, expires, now); err != nil {
+		raw.Close()
+		t.Fatalf("insert legacy metadata: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_meta(id,version) VALUES(1,6)`); err != nil {
+		raw.Close()
+		t.Fatalf("set v6 schema version: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v6 to v7: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	leases, err := db.Leases().ListActiveByAgent(context.Background(), "legacy-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("migrated leases = %+v, want one legacy connection", leases)
+	}
+	lease := leases[0]
+	if lease.ConnectionID != "legacy" || lease.NodeID != "legacy-node" || lease.ServerNodeID != "legacy-node" || lease.Epoch != 7 || lease.ConnectionEpoch != 7 {
+		t.Fatalf("migrated lease = %+v, want preserved legacy identity", lease)
+	}
+	metadataRepo, ok := db.Metadata().(AgentInstanceMetadataRepository)
+	if !ok {
+		t.Fatal("metadata repository does not implement instance operations")
+	}
+	metadata, err := metadataRepo.GetInstance(context.Background(), "legacy-agent", "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.InstanceID != "legacy" || metadata.NodeID != "legacy-node" || metadata.Epoch != 7 || metadata.Revision != 3 {
+		t.Fatalf("migrated metadata = %+v, want preserved legacy metadata", metadata)
 	}
 }
 

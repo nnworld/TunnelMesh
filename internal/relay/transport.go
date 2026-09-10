@@ -7,9 +7,13 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -142,6 +146,7 @@ type GRPCNodeTransport struct {
 
 type RelayServer interface {
 	OpenStream(RelayOpenStreamServer) error
+	CloseAgentConnection(context.Context, CloseAgentConnectionRequest) error
 }
 type RelayOpenStreamServer interface {
 	Send(*wrapperspb.BytesValue) error
@@ -149,17 +154,42 @@ type RelayOpenStreamServer interface {
 	grpc.ServerStream
 }
 type relayServer struct {
-	handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+	handler      func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+	closeHandler CloseAgentConnectionFunc
 }
 
 func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)) RelayServer {
 	return &relayServer{handler: handler}
 }
+
+func NewRelayServerWithClose(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeHandler CloseAgentConnectionFunc) RelayServer {
+	return &relayServer{handler: handler, closeHandler: closeHandler}
+}
 func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
-	s.RegisterService(&grpc.ServiceDesc{ServiceName: "tunnelmesh.relay.v1.Relay", HandlerType: (*RelayServer)(nil), Streams: []grpc.StreamDesc{{StreamName: "OpenStream", Handler: relayOpenStreamHandler, ServerStreams: true, ClientStreams: true}}}, srv)
+	s.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "tunnelmesh.relay.v1.Relay", HandlerType: (*RelayServer)(nil),
+		Methods: []grpc.MethodDesc{{MethodName: "CloseAgentConnection", Handler: relayCloseAgentConnectionHandler}},
+		Streams: []grpc.StreamDesc{{StreamName: "OpenStream", Handler: relayOpenStreamHandler, ServerStreams: true, ClientStreams: true}},
+	}, srv)
 }
 func relayOpenStreamHandler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(RelayServer).OpenStream(&relayOpenStreamServer{ServerStream: stream})
+}
+
+func relayCloseAgentConnectionHandler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(structpb.Struct)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	req := closeAgentConnectionRequestFromMetadata(in.GetFields())
+	if interceptor == nil {
+		return nil, srv.(RelayServer).CloseAgentConnection(ctx, req)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tunnelmesh.relay.v1.Relay/CloseAgentConnection"}
+	handler := func(ctx context.Context, request interface{}) (interface{}, error) {
+		return nil, srv.(RelayServer).CloseAgentConnection(ctx, request.(CloseAgentConnectionRequest))
+	}
+	return interceptor(ctx, req, info, handler)
 }
 
 type relayOpenStreamServer struct{ grpc.ServerStream }
@@ -179,7 +209,7 @@ func (r *relayServer) OpenStream(stream RelayOpenStreamServer) error {
 	if err := stream.RecvMsg(&first); err != nil {
 		return err
 	}
-	req := StreamRequest{Protocol: first.GetFields()["protocol"].GetStringValue(), TargetHost: first.GetFields()["target_host"].GetStringValue(), TargetPort: int(first.GetFields()["target_port"].GetNumberValue()), StreamID: uint32(first.GetFields()["stream_id"].GetNumberValue()), AgentID: first.GetFields()["agent_id"].GetStringValue(), NodeID: first.GetFields()["node_id"].GetStringValue(), Epoch: int64(first.GetFields()["epoch"].GetNumberValue())}
+	req := streamRequestFromRelayMetadata(first.GetFields())
 	conn, err := r.handler(stream.Context(), req)
 	if err != nil {
 		return err
@@ -206,6 +236,18 @@ func (r *relayServer) OpenStream(stream RelayOpenStreamServer) error {
 			return e
 		}
 	}
+}
+
+func (r *relayServer) CloseAgentConnection(ctx context.Context, req CloseAgentConnectionRequest) error {
+	if r.closeHandler == nil {
+		return status.Error(codes.Unimplemented, "relay close control is not configured")
+	}
+	if req.AgentID == "" || req.ConnectionID == "" || req.ConnectionEpoch <= 0 || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay close request is invalid")
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return r.closeHandler(closeCtx, req)
 }
 
 var relayStreamDesc = &grpc.StreamDesc{StreamName: "OpenStream", ServerStreams: true, ClientStreams: true}
@@ -236,6 +278,7 @@ func DialAuthenticatedGRPCNode(ctx context.Context, endpoint, nodeID string, epo
 	conn, err := grpc.DialContext(ctx, endpoint,
 		grpc.WithTransportCredentials(credentials.NewTLS(cfg)),
 		grpc.WithChainStreamInterceptor(NewServerNodeStreamClientInterceptor(nodeID, epoch, rawToken)),
+		grpc.WithChainUnaryInterceptor(NewServerNodeUnaryClientInterceptor(nodeID, epoch, rawToken)),
 		grpc.WithBlock(),
 	)
 	if err != nil {
@@ -257,7 +300,7 @@ func (n *GRPCNodeTransport) OpenStream(ctx context.Context, req StreamRequest) (
 	if err != nil {
 		return nil, err
 	}
-	meta := map[string]any{"node_id": req.NodeID, "agent_id": req.AgentID, "epoch": req.Epoch, "stream_id": req.StreamID, "protocol": req.Protocol, "target_host": req.TargetHost, "target_port": req.TargetPort}
+	meta := map[string]any(relayStreamMetadata(req))
 	msg, err := structpb.NewStruct(meta)
 	if err != nil {
 		_ = s.CloseSend()
@@ -268,6 +311,68 @@ func (n *GRPCNodeTransport) OpenStream(ctx context.Context, req StreamRequest) (
 		return nil, err
 	}
 	return &grpcStreamConn{stream: s}, nil
+}
+
+func (n *GRPCNodeTransport) CloseAgentConnection(ctx context.Context, req CloseAgentConnectionRequest) error {
+	if n == nil || n.conn == nil {
+		return ErrNodeDisconnected
+	}
+	if req.AgentID == "" || req.ConnectionID == "" || req.ConnectionEpoch <= 0 || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay close request is invalid")
+	}
+	msg, err := structpb.NewStruct(closeAgentConnectionMetadata(req))
+	if err != nil {
+		return err
+	}
+	return n.conn.Invoke(ctx, "/tunnelmesh.relay.v1.Relay/CloseAgentConnection", msg, &emptypb.Empty{})
+}
+
+func relayStreamMetadata(req StreamRequest) map[string]any {
+	return map[string]any{
+		"node_id": req.NodeID, "agent_id": req.AgentID,
+		"case_insensitive_agent_id": req.CaseInsensitiveAgentID,
+		"epoch":                     req.Epoch, "stream_id": req.StreamID,
+		"target_connection_id":    req.TargetConnectionID,
+		"target_connection_epoch": req.TargetConnectionEpoch,
+		"protocol":                req.Protocol, "target_host": req.TargetHost,
+		"target_port": req.TargetPort, "target_scheme": req.TargetScheme,
+		"host_header": req.HostHeader, "tls_server_name": req.TLSServerName,
+	}
+}
+
+func streamRequestFromRelayMetadata(fields map[string]*structpb.Value) StreamRequest {
+	return StreamRequest{
+		NodeID: fields["node_id"].GetStringValue(), AgentID: fields["agent_id"].GetStringValue(),
+		CaseInsensitiveAgentID: fields["case_insensitive_agent_id"].GetBoolValue(),
+		Epoch:                  int64(fields["epoch"].GetNumberValue()),
+		TargetConnectionID:     fields["target_connection_id"].GetStringValue(),
+		TargetConnectionEpoch:  int64(fields["target_connection_epoch"].GetNumberValue()),
+		StreamID:               uint32(fields["stream_id"].GetNumberValue()),
+		Protocol:               fields["protocol"].GetStringValue(),
+		TargetHost:             fields["target_host"].GetStringValue(),
+		TargetPort:             int(fields["target_port"].GetNumberValue()),
+		TargetScheme:           fields["target_scheme"].GetStringValue(),
+		HostHeader:             fields["host_header"].GetStringValue(),
+		TLSServerName:          fields["tls_server_name"].GetStringValue(),
+	}
+}
+
+func closeAgentConnectionMetadata(req CloseAgentConnectionRequest) map[string]any {
+	return map[string]any{
+		"agent_id":             req.AgentID,
+		"connection_id":        req.ConnectionID,
+		"connection_epoch":     req.ConnectionEpoch,
+		"requested_by_node_id": req.RequestedByNodeID,
+	}
+}
+
+func closeAgentConnectionRequestFromMetadata(fields map[string]*structpb.Value) CloseAgentConnectionRequest {
+	return CloseAgentConnectionRequest{
+		AgentID:           fields["agent_id"].GetStringValue(),
+		ConnectionID:      fields["connection_id"].GetStringValue(),
+		ConnectionEpoch:   int64(fields["connection_epoch"].GetNumberValue()),
+		RequestedByNodeID: fields["requested_by_node_id"].GetStringValue(),
+	}
 }
 func (n *GRPCNodeTransport) Close() error {
 	if n == nil || n.conn == nil {

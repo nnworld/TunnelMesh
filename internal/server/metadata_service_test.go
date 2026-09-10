@@ -49,6 +49,46 @@ func TestAgentMetadataServiceListComputesExpiryStale(t *testing.T) {
 	}
 }
 
+func TestAgentMetadataServiceStoresInstancesIndependently(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:metadata-instances?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewAgentMetadataService(db.Metadata())
+	ctx := context.Background()
+	base := AgentMetadataInput{AgentID: "agent-instance", NodeID: "node-a", Epoch: 1, Revision: 1, Items: []MetadataItem{{Name: "region", Source: "env", Value: "a"}}}
+	first := base
+	first.InstanceID = "instance-a"
+	if _, err := service.Upsert(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := base
+	second.InstanceID = "instance-b"
+	second.NodeID = "node-b"
+	second.Items = []MetadataItem{{Name: "region", Source: "env", Value: "b"}}
+	if _, err := service.Upsert(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.GetView(ctx, "agent-instance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Instances) != 2 || view.Instances[0].InstanceID != "instance-a" || view.Instances[1].InstanceID != "instance-b" {
+		t.Fatalf("instances=%+v, want two independent instances", view.Instances)
+	}
+	if err := service.MarkInstanceStale(ctx, "agent-instance", "instance-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	instances, err := service.ListInstances(ctx, "agent-instance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instances) != 2 || !instances[0].Stale || instances[1].Stale {
+		t.Fatalf("instances after stale=%+v, want only instance-a stale", instances)
+	}
+}
+
 type fakeMetadataRepo struct {
 	value storage.AgentRuntimeMetadata
 	list  storage.Page[storage.AgentRuntimeMetadata]

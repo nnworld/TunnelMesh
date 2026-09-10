@@ -43,6 +43,16 @@ func (h *HTTPProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	h.ServeRoute(w, r, route)
+}
+
+// ServeRoute forwards an already-resolved route. Runtime composition uses it
+// to avoid resolving the Host once for dispatch and again inside the proxy.
+func (h *HTTPProxyHandler) ServeRoute(w http.ResponseWriter, r *http.Request, route routing.Route) {
+	if h == nil || h.Opener == nil {
+		http.Error(w, "http proxy unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if isWebSocketUpgrade(r) {
 		h.handleUpgrade(w, r, route)
 		return
@@ -53,7 +63,7 @@ func (h *HTTPProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
 		defer cancel()
 	}
-	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "http", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+	stream, err := h.Opener.OpenStream(ctx, newHTTPStreamRequest(route))
 	if err != nil {
 		http.Error(w, "target unavailable", http.StatusBadGateway)
 		return
@@ -61,9 +71,9 @@ func (h *HTTPProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer stream.Close()
 	upstreamReq := r.Clone(ctx)
 	upstreamReq.RequestURI = ""
-	if route.TargetHost != "" {
-		upstreamReq.Host = route.TargetHost
-		upstreamReq.URL.Host = route.TargetHost
+	if host := upstreamHost(route); host != "" {
+		upstreamReq.Host = host
+		upstreamReq.URL.Host = host
 	}
 	// Route metadata must not leak to the target service.
 	upstreamReq.Header.Del("X-TunnelMesh-Agent")
@@ -92,7 +102,7 @@ func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request,
 		ctx, cancel = context.WithTimeout(ctx, h.Timeout)
 		defer cancel()
 	}
-	stream, err := h.Opener.OpenStream(ctx, relay.StreamRequest{AgentID: route.AgentID, Protocol: "http", TargetHost: route.TargetHost, TargetPort: route.TargetPort})
+	stream, err := h.Opener.OpenStream(ctx, newHTTPStreamRequest(route))
 	if err != nil {
 		http.Error(w, "target unavailable", http.StatusBadGateway)
 		return
@@ -103,7 +113,13 @@ func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	defer clientConn.Close()
-	if err := r.Write(stream); err != nil {
+	upstreamReq := r.Clone(ctx)
+	upstreamReq.RequestURI = ""
+	if host := upstreamHost(route); host != "" {
+		upstreamReq.Host = host
+		upstreamReq.URL.Host = host
+	}
+	if err := upstreamReq.Write(stream); err != nil {
 		return
 	}
 	streamReader := bufio.NewReader(stream)
@@ -129,6 +145,22 @@ func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request,
 	// Once the 101 response has been sent the stream is an opaque byte pipe.
 	go io.Copy(stream, clientConn)
 	_, _ = io.Copy(clientConn, streamReader)
+}
+
+func newHTTPStreamRequest(route routing.Route) relay.StreamRequest {
+	return relay.StreamRequest{
+		AgentID: route.AgentID, CaseInsensitiveAgentID: route.Dynamic, Protocol: "http",
+		TargetHost: route.TargetHost, TargetPort: route.TargetPort,
+		TargetScheme: route.TargetScheme, HostHeader: upstreamHost(route),
+		TLSServerName: route.TLSServerName,
+	}
+}
+
+func upstreamHost(route routing.Route) string {
+	if route.HostHeader != "" {
+		return route.HostHeader
+	}
+	return route.TargetHost
 }
 
 func isWebSocketUpgrade(r *http.Request) bool {

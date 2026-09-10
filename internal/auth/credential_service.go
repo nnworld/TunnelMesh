@@ -372,7 +372,7 @@ func validTokenType(tokenType storage.TokenType) bool {
 
 func (s *CredentialService) validateOwnerAndBinding(ctx context.Context, tokenType storage.TokenType, ownerID, agentID, nodeID string) error {
 	owner, err := s.users.Get(ctx, ownerID)
-	if err != nil || owner.Disabled {
+	if err != nil || owner.Disabled || owner.DeletedAt != nil {
 		return ErrUnauthenticated
 	}
 	switch tokenType {
@@ -437,6 +437,12 @@ func (s *CredentialService) identityAndScopeFromRecord(ctx context.Context, reco
 func normalizeTokenScope(scope TokenScope) (TokenScope, error) {
 	compiled, err := compileTokenScope(scope)
 	return compiled.scope, err
+}
+
+// NormalizeTokenScope is the single authorization-scope validator shared by
+// creation and mutation paths so updates cannot bypass creation-time rules.
+func NormalizeTokenScope(scope TokenScope) (TokenScope, error) {
+	return normalizeTokenScope(scope)
 }
 
 func compileTokenScope(scope TokenScope) (compiledTokenScope, error) {

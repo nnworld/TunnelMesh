@@ -126,24 +126,28 @@ type AgentMetadataError struct {
 
 // AgentMetadataPayload is used by both AGENT_HELLO and AGENT_METADATA_UPDATE.
 type AgentMetadataPayload struct {
-	AgentID    string               `json:"agent_id"`
-	NodeID     string               `json:"node_id,omitempty"`
-	Epoch      int64                `json:"epoch"`
-	Revision   uint64               `json:"revision"`
-	ReportedAt time.Time            `json:"reported_at"`
-	Items      []AgentMetadataItem  `json:"items"`
-	Errors     []AgentMetadataError `json:"errors,omitempty"`
+	AgentID      string               `json:"agent_id"`
+	InstanceID   string               `json:"instance_id,omitempty"`
+	ConnectionID string               `json:"connection_id,omitempty"`
+	NodeID       string               `json:"node_id,omitempty"`
+	Epoch        int64                `json:"epoch"`
+	Revision     uint64               `json:"revision"`
+	ReportedAt   time.Time            `json:"reported_at"`
+	Items        []AgentMetadataItem  `json:"items"`
+	Errors       []AgentMetadataError `json:"errors,omitempty"`
 }
 
 // AgentMetadataAckPayload is returned by the server after fencing and
 // validating a metadata snapshot.
 type AgentMetadataAckPayload struct {
-	AgentID    string               `json:"agent_id"`
-	Epoch      int64                `json:"epoch"`
-	Revision   uint64               `json:"revision"`
-	Accepted   bool                 `json:"accepted"`
-	Idempotent bool                 `json:"idempotent,omitempty"`
-	Errors     []AgentMetadataError `json:"errors,omitempty"`
+	AgentID                 string               `json:"agent_id"`
+	Epoch                   int64                `json:"epoch"`
+	Revision                uint64               `json:"revision"`
+	Accepted                bool                 `json:"accepted"`
+	Idempotent              bool                 `json:"idempotent,omitempty"`
+	ConnectionPoolSupported bool                 `json:"connection_pool_supported,omitempty"`
+	MaxConnectionsPerAgent  int                  `json:"max_connections_per_agent,omitempty"`
+	Errors                  []AgentMetadataError `json:"errors,omitempty"`
 }
 
 func EncodeAgentMetadataPayload(payload AgentMetadataPayload) ([]byte, error) {

@@ -2,12 +2,16 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 type PolicyHook func(context.Context, string, string, int) error
@@ -19,6 +23,9 @@ type Dialer struct {
 	// managed HTTP and WebSocket routes. When nil, HTTP falls back to TCP so
 	// request bytes remain transparent to the server-side proxy.
 	HTTPStream func(context.Context, string, int) (io.ReadWriteCloser, error)
+	// TLSRootCAs is optional for tests and deployments with a private trust
+	// bundle. Nil uses the process system roots.
+	TLSRootCAs *x509.CertPool
 }
 
 func (d Dialer) check(ctx context.Context, proto, host string, port int) error {
@@ -48,6 +55,39 @@ func (d Dialer) DialHTTPStream(ctx context.Context, host string, port int) (net.
 		return nil, err
 	}
 	return (&net.Dialer{Timeout: d.timeout()}).DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprint(port)))
+}
+
+// dialHTTPStreamPayload applies upstream HTTP/TLS options from OPEN_STREAM. It
+// remains unexported because the wire payload is the only supported source of
+// these security-sensitive options.
+func (d Dialer) dialHTTPStreamPayload(ctx context.Context, payload protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+	if payload.TargetScheme != "https" {
+		if d.HTTPStream != nil {
+			return d.HTTPStream(ctx, payload.TargetHost, payload.TargetPort)
+		}
+		return d.DialHTTPStream(ctx, payload.TargetHost, payload.TargetPort)
+	}
+
+	// A custom logical HTTP stream cannot be wrapped as TLS because tls.Client
+	// requires a net.Conn; HTTPS therefore always uses the real TCP dialer.
+	conn, err := d.DialHTTPStream(ctx, payload.TargetHost, payload.TargetPort)
+	if err != nil {
+		return nil, err
+	}
+	serverName := payload.TLSServerName
+	if serverName == "" {
+		serverName = payload.TargetHost
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: serverName,
+		RootCAs:    d.TLSRootCAs,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
 }
 func (d Dialer) DialUDP(ctx context.Context, host string, port int) (net.Conn, error) {
 	if err := d.check(ctx, "udp", host, port); err != nil {

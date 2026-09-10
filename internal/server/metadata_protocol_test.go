@@ -98,6 +98,69 @@ func TestMetadataManagerRejectsStorageOverflowWithAckError(t *testing.T) {
 	}
 }
 
+func TestMetadataManagerScopesLeasesToAgentInstances(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:metadata-instance-leases?mode=memory&cache=shared", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewAgentMetadataService(db.Metadata())
+	manager := NewAgentSessionManager(AgentSessionConfig{MetadataService: service, MetadataTTL: time.Minute})
+
+	first, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-instance-lease", NodeID: "node-a", Epoch: 1,
+		InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-instance-lease", NodeID: "node-b", Epoch: 1,
+		InstanceID: "instance-b", ConnectionID: "conn-b", ConnectionEpoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range []*AgentSession{first, second} {
+		payload := protocol.AgentMetadataPayload{
+			AgentID: session.AgentID, InstanceID: session.InstanceID, NodeID: session.NodeID,
+			Epoch: session.Epoch, Revision: 1,
+			Items: []protocol.AgentMetadataItem{{Name: "region", Source: "env", Value: session.InstanceID}},
+		}
+		if ack, err := session.HandleMetadata(context.Background(), payload); err != nil || !ack.Accepted {
+			t.Fatalf("metadata ack=%+v err=%v", ack, err)
+		}
+	}
+
+	view, err := service.GetView(context.Background(), "agent-instance-lease")
+	if err != nil || len(view.Instances) != 2 {
+		t.Fatalf("instances=%+v err=%v", view.Instances, err)
+	}
+	manager.RemoveSession("agent-instance-lease", first)
+	if _, err := service.Get(context.Background(), "agent-instance-lease"); err != nil || len(view.Instances) != 2 {
+		t.Fatalf("healthy view after disconnect=%+v err=%v", view, err)
+	}
+	metadataRepo, ok := db.Metadata().(storage.AgentInstanceMetadataRepository)
+	if !ok {
+		t.Fatal("metadata repository does not implement instance operations")
+	}
+	firstMetadata, err := metadataRepo.GetInstance(context.Background(), "agent-instance-lease", "instance-a")
+	if err != nil || !firstMetadata.Stale {
+		t.Fatalf("closed instance metadata=%+v err=%v", firstMetadata, err)
+	}
+	secondMetadata, err := metadataRepo.GetInstance(context.Background(), "agent-instance-lease", "instance-b")
+	if err != nil || secondMetadata.Stale {
+		t.Fatalf("live instance metadata=%+v err=%v", secondMetadata, err)
+	}
+	if err := manager.RefreshSessionMetadataLease(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	secondMetadata, err = metadataRepo.GetInstance(context.Background(), "agent-instance-lease", "instance-b")
+	if err != nil || secondMetadata.Stale || secondMetadata.ExpiresAt == nil || !secondMetadata.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("refreshed instance metadata=%+v err=%v", secondMetadata, err)
+	}
+}
+
 type metadataSessionWSConn struct {
 	mu         sync.Mutex
 	reads      [][]byte

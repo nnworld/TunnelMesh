@@ -78,6 +78,129 @@ func TestAgentRelayTransportAllocatesIndependentWireIDsAndFencesReconnectGenerat
 	_ = current.Close()
 }
 
+func TestAgentRelayTransportResolvesDynamicAgentIDCaseInsensitively(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-TFJXVxtPivP8KnXb", NodeID: "node-a", Epoch: 1,
+	}, agentTransport); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID:                "agent-tfjxvxtpivp8knxb",
+		CaseInsensitiveAgentID: true,
+		Protocol:               "http",
+		TargetHost:             "127.0.0.1",
+		TargetPort:             3000,
+		TargetScheme:           "https",
+		HostHeader:             "service.internal.example.com",
+		TLSServerName:          "service.internal.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	open := receiveAgentRelayFrame(t, agentTransport)
+	payload, err := protocol.DecodeStreamOpenPayload(open.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.AgentID != "agent-TFJXVxtPivP8KnXb" || payload.TargetHost != "127.0.0.1" || payload.TargetPort != 3000 ||
+		payload.TargetScheme != "https" || payload.HostHeader != "service.internal.example.com" ||
+		payload.TLSServerName != "service.internal.example.com" {
+		t.Fatalf("open payload = %#v", payload)
+	}
+}
+
+func TestAgentRelayTransportKeysStreamsByAgentConnection(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	firstTransport := newFakeTransport()
+	first, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-pool", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1,
+	}, firstTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTransport := newFakeTransport()
+	second, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-pool", NodeID: "node-b", ConnectionID: "conn-b", ConnectionEpoch: 1, Epoch: 1,
+	}, secondTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	firstStream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-pool", TargetConnectionID: "conn-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 80,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStream.Close()
+	secondStream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-pool", TargetConnectionID: "conn-b", Protocol: "tcp", TargetHost: "10.0.0.2", TargetPort: 80,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStream.Close()
+	firstOpen := receiveAgentRelayFrame(t, firstTransport)
+	secondOpen := receiveAgentRelayFrame(t, secondTransport)
+	if firstOpen.StreamID != 1 || secondOpen.StreamID != 1 {
+		t.Fatalf("wire IDs = %d, %d; want both 1", firstOpen.StreamID, secondOpen.StreamID)
+	}
+
+	if err := mux.handleAgentFrameGeneration("agent-pool", first.serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: firstOpen.StreamID, Payload: []byte("first")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.handleAgentFrameGeneration("agent-pool", second.serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: secondOpen.StreamID, Payload: []byte("second")}); err != nil {
+		t.Fatal(err)
+	}
+	assertAgentRelayData(t, firstStream, "first")
+	assertAgentRelayData(t, secondStream, "second")
+
+	mux.failAgentGeneration("agent-pool", first.serverGeneration)
+	if _, err := firstStream.Read(make([]byte, 1)); !errors.Is(err, relay.ErrNodeDisconnected) {
+		t.Fatalf("closed connection Read() error = %v, want ErrNodeDisconnected", err)
+	}
+	if _, err := secondStream.Write([]byte("still-alive")); err != nil {
+		t.Fatalf("other connection Write() error = %v", err)
+	}
+}
+
+func TestAgentRelayTransportRejectsAmbiguousCaseInsensitiveAgentID(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	for _, id := range []string{"agent-Abc", "agent-abc"} {
+		if _, err := manager.Register(context.Background(), AgentRegistration{
+			AgentID: id, NodeID: "node-" + id, Epoch: 1,
+		}, newFakeTransport()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	if _, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-abc", CaseInsensitiveAgentID: true,
+		Protocol: "http", TargetHost: "127.0.0.1", TargetPort: 3000,
+	}); !errors.Is(err, ErrAmbiguousAgentID) {
+		t.Fatalf("OpenStream() error = %v, want ErrAmbiguousAgentID", err)
+	}
+}
+
+func assertAgentRelayData(t *testing.T, stream io.ReadWriteCloser, want string) {
+	t.Helper()
+	buffer := make([]byte, len(want))
+	if _, err := io.ReadFull(stream, buffer); err != nil || string(buffer) != want {
+		t.Fatalf("data = %q, err = %v; want %q", buffer, err, want)
+	}
+}
+
 func TestAgentRelayTransportSameEpochReplacementFencesDelayedOldCallbacksAndTeardown(t *testing.T) {
 	manager := NewAgentSessionManager(AgentSessionConfig{})
 	oldTransport := newFakeTransport()
@@ -296,7 +419,9 @@ func TestAgentRelayTransportRejectsWireIDWrapAndResetsForNewEpoch(t *testing.T) 
 	}
 	mux := NewAgentRelayTransport(manager)
 	defer mux.Close()
-	mux.allocators[agentRelayGeneration{agentID: "agent-exhaust", serverGeneration: firstSession.serverGeneration}] = &agentRelayIDAllocator{next: math.MaxUint32 - 1}
+	mux.allocators[agentRelayGeneration{
+		agentID: "agent-exhaust", connectionID: firstSession.ConnectionID, connectionEpoch: firstSession.ConnectionEpoch, serverGeneration: firstSession.serverGeneration,
+	}] = &agentRelayIDAllocator{next: math.MaxUint32 - 1}
 	last, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-exhaust", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
 		t.Fatal(err)

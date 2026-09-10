@@ -1,0 +1,19 @@
+:root {
+  --tm-primary: #1677ff;
+  --tm-bg: #f5f7fa;
+  --tm-surface: #ffffff;
+  --tm-text: #1f2329;
+  --tm-muted: #667085;
+  --tm-border: #d9e2f2;
+  --tm-sidebar: 208px;
+  --tm-header: 56px;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--tm-text);
+  background: var(--tm-bg);
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; background: var(--tm-bg); }
+button, input { font: inherit; }
+.tm-page { display: grid; gap: 16px; }
+.tm-card { background: var(--tm-surface); border: 1px solid var(--tm-border); border-radius: 8px; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }

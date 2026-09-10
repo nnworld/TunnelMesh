@@ -24,6 +24,13 @@ type Metrics struct {
 	probeDuration            *prometheus.HistogramVec
 	registryLeaseTotal       *prometheus.CounterVec
 	relayTotal               *prometheus.CounterVec
+	agentConnections         *prometheus.GaugeVec
+	agentConnectionCapacity  *prometheus.GaugeVec
+	agentActiveStreams       *prometheus.GaugeVec
+	agentConnectionRTT       *prometheus.HistogramVec
+	agentConnectionErrors    *prometheus.CounterVec
+	agentScaleDecisions      *prometheus.CounterVec
+	agentSelection           *prometheus.CounterVec
 	storageOperationDuration *prometheus.HistogramVec
 	storageErrorsTotal       *prometheus.CounterVec
 	configReloadTotal        *prometheus.CounterVec
@@ -52,6 +59,13 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		probeDuration:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_probe_duration_seconds", Help: "Probe duration in seconds."}, []string{"probe_kind", "result", "error_class"}),
 		registryLeaseTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_registry_lease_total", Help: "Registry lease outcomes."}, []string{"operation", "result", "error_class"}),
 		relayTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_relay_total", Help: "Relay outcomes."}, []string{"result", "error_class"}),
+		agentConnections:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connections", Help: "Current Agent connections, by identity."}, []string{"agent_id", "instance_id", "connection_id"}),
+		agentConnectionCapacity:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connection_capacity", Help: "Maximum Agent connections allowed by policy."}, []string{"agent_id", "instance_id"}),
+		agentActiveStreams:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_active_streams", Help: "Active streams per Agent connection."}, []string{"agent_id", "instance_id", "connection_id"}),
+		agentConnectionRTT:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_agent_connection_rtt_seconds", Help: "Agent connection heartbeat RTT in seconds."}, []string{"agent_id", "instance_id", "connection_id"}),
+		agentConnectionErrors:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_errors_total", Help: "Agent connection errors."}, []string{"agent_id", "instance_id", "connection_id", "error_class"}),
+		agentScaleDecisions:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_scale_decisions_total", Help: "Agent connection pool scale decisions."}, []string{"agent_id", "instance_id", "decision", "reason"}),
+		agentSelection:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_selection_total", Help: "Agent connection selection decisions."}, []string{"agent_id", "connection_id", "server_node_id", "scope"}),
 		storageOperationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_storage_operation_duration_seconds", Help: "Storage operation duration in seconds."}, []string{"operation", "result"}),
 		storageErrorsTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_storage_errors_total", Help: "Storage errors."}, []string{"operation", "error_class"}),
 		configReloadTotal:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_config_reload_total", Help: "Configuration reload outcomes."}, []string{"result", "error_class"}),
@@ -59,7 +73,7 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		activeConnections:        make(map[string]int),
 		activeStreams:            make(map[string]int),
 	}
-	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready)
+	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready)
 	return m
 }
 
@@ -163,6 +177,47 @@ func (m *Metrics) ObserveRegistryLease(operation, result, errorClass string) {
 
 func (m *Metrics) ObserveRelay(result, errorClass string) {
 	m.relayTotal.WithLabelValues(label(result), label(errorClass)).Inc()
+}
+
+func (m *Metrics) ObserveAgentConnection(agentID, instanceID, connectionID string, active bool) {
+	value := 0.0
+	if active {
+		value = 1
+	}
+	m.agentConnections.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Set(value)
+}
+
+func (m *Metrics) ObserveAgentConnectionError(agentID, instanceID, connectionID, errorClass string) {
+	m.agentConnectionErrors.WithLabelValues(label(agentID), label(instanceID), label(connectionID), label(errorClass)).Inc()
+}
+
+func (m *Metrics) ObserveAgentActiveStreams(agentID, instanceID, connectionID string, active int) {
+	if active < 0 {
+		active = 0
+	}
+	m.agentActiveStreams.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Set(float64(active))
+}
+
+func (m *Metrics) ObserveAgentConnectionRTT(agentID, instanceID, connectionID string, rtt time.Duration) {
+	if rtt < 0 {
+		rtt = 0
+	}
+	m.agentConnectionRTT.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Observe(rtt.Seconds())
+}
+
+func (m *Metrics) SetAgentConnectionCapacity(agentID, instanceID string, capacity int) {
+	if capacity < 0 {
+		capacity = 0
+	}
+	m.agentConnectionCapacity.WithLabelValues(label(agentID), label(instanceID)).Set(float64(capacity))
+}
+
+func (m *Metrics) ObserveAgentScaleDecision(agentID, instanceID, decision, reason string) {
+	m.agentScaleDecisions.WithLabelValues(label(agentID), label(instanceID), label(decision), label(reason)).Inc()
+}
+
+func (m *Metrics) ObserveAgentSelection(agentID, connectionID, serverNodeID, scope string) {
+	m.agentSelection.WithLabelValues(label(agentID), label(connectionID), label(serverNodeID), label(scope)).Inc()
 }
 
 func (m *Metrics) ObserveStorage(operation, result, errorClass string, duration time.Duration) {

@@ -2,6 +2,11 @@
 
 本文适用于 Nginx 作为公网 HTTPS/WSS 入口，TunnelMesh Server 运行在本机 `127.0.0.1:8080`。公网只开放 80/443；Agent、Client 和 SSH over WebSocket 都通过 HTTPS/WSS 复用入口。
 
+管理后台前端有两种部署方式：默认由 Server 内嵌 `internal/server/web_dist` 提供，
+或由 Nginx 独立托管 `web/dist`。独立静态文件的构建、发布和 `try_files` 配置见
+[管理后台前端构建与部署](frontend.md)；下面的配置适用于 Server 内嵌模式，
+也可作为独立静态模式的 API/WSS 反代部分。
+
 ## 推荐配置
 
 ```nginx
@@ -20,13 +25,17 @@ upstream tunnelmesh_server {
 
 server {
     listen 80;
-    server_name tunnel.example.com *.tunnel.example.com;
+    server_name tunnel.example.com
+        "~^tm-[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?\.tunnel\.example\.com$"
+        "~^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-(?:[0-9]{1,3}-){4}[0-9]{1,5}\.apps\.example\.com$";
     return 308 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl http2;
-    server_name tunnel.example.com *.tunnel.example.com;
+    server_name tunnel.example.com
+        "~^tm-[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?\.tunnel\.example\.com$"
+        "~^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-(?:[0-9]{1,3}-){4}[0-9]{1,5}\.apps\.example\.com$";
 
     ssl_certificate     /etc/letsencrypt/live/tunnel.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/tunnel.example.com/privkey.pem;
@@ -135,6 +144,7 @@ server {
 - 必须透传 `Authorization` 和 `Origin`；不要把 token 放到 URL query 或 Cookie。
 - `/api/`、`/ws/agent`、`/ws/client`、`/ws/tcp` 使用精确或 `^~` location，优先于 SPA fallback。
 - `/metrics` 不建议暴露公网；优先让 Prometheus 访问 Server 内网管理地址。
+- 显式泛域名只允许单层 `tm-<name>.tunnel.example.com`；动态域名使用 `<agent>-<a>-<b>-<c>-<d>-<port>.<server.dynamic_suffix>`。Nginx 正则中的后缀必须与 `server.dynamic_suffix`、wildcard DNS 和证书一致；正则只做域名形状筛选，IP 八位组范围、端口范围、危险地址和 Agent 策略由 Server 再次校验。
 - 泛域名只解决 HTTP/HTTPS/WSS 路由，不提供公网 UDP 监听。
 - 修改配置后先执行 `nginx -t`，再 reload；证书轮换必须验证 WSS 和 API 登录。
 
@@ -144,7 +154,7 @@ server {
 nginx -t
 curl -fsS https://tunnel.example.com/health/live
 curl -fsS https://tunnel.example.com/health/ready
-curl -fsS --resolve metrics.tunnel.example.com:443:127.0.0.1 https://metrics.tunnel.example.com/metrics
+curl -fsS https://tunnel.example.com/metrics
 websocat --binary -H='Authorization: Bearer <client-service-token>' \
   wss://tunnel.example.com/ws/client
 ```
