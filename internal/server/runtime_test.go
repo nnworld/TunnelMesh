@@ -67,6 +67,98 @@ func TestServeListenerReportsRelayServeFailure(t *testing.T) {
 	}
 }
 
+func TestNewServerRuntimeStartsPlaintextRelayWhenCertificatesOmitted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-plaintext-relay?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		NodeID: "server-plaintext",
+		Relay: config.RelayConfig{
+			Enabled: true, Listen: "127.0.0.1:0", Endpoint: "127.0.0.1:9443", NodeToken: "secret",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if runtime.relayListener == nil || runtime.relayServer == nil {
+		t.Fatalf("plaintext relay was not initialized: listener=%v server=%v", runtime.relayListener, runtime.relayServer)
+	}
+
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpListener.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(ctx, httpListener) }()
+	node, err := db.Nodes().Get(ctx, "server-plaintext")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := runtime.DialRelayNode(ctx, runtime.relayListener.Addr().String(), node.Epoch)
+	if err != nil {
+		t.Fatalf("DialRelayNode(plaintext) error = %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not stop after context cancellation")
+	}
+}
+
+func TestNewServerRuntimeRejectsPartialRelayTLSMaterial(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-partial-relay-tls?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		NodeID: "server-partial-tls",
+		Relay: config.RelayConfig{
+			Enabled: true, Listen: "127.0.0.1:0", Endpoint: "127.0.0.1:9443",
+			CA: "/etc/tunnelmesh/certs/relay-ca.pem", NodeToken: "secret",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "all CA, certificate, and key") {
+		t.Fatalf("NewServerRuntime(partial TLS) error = %v, want complete TLS material error", err)
+	}
+}
+
+func TestNewServerRuntimeLoadsCompleteRelayTLSMaterial(t *testing.T) {
+	certFile, keyFile, _ := writeNativeTLSCertificate(t)
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-complete-relay-tls?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		NodeID: "server-complete-tls",
+		Relay: config.RelayConfig{
+			Enabled: true, Listen: "127.0.0.1:0", Endpoint: "127.0.0.1:9443",
+			CA: certFile, Cert: certFile, Key: keyFile, ServerName: "localhost", NodeToken: "secret",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if runtime.relayListener == nil || runtime.relayServer == nil {
+		t.Fatalf("mTLS relay was not initialized: listener=%v server=%v", runtime.relayListener, runtime.relayServer)
+	}
+}
+
 func TestNewServerRuntimeWiresAgentMetadataPersistence(t *testing.T) {
 	db, err := storage.OpenSQLite(context.Background(), "file:server-runtime?mode=memory&cache=shared")
 	if err != nil {

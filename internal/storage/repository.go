@@ -102,10 +102,13 @@ type TunnelRepository interface {
 
 type NodeRepository interface {
 	Create(context.Context, ServerNode) error
+	Ensure(context.Context, ServerNode) error
 	Get(context.Context, string) (ServerNode, error)
 	Update(context.Context, ServerNode) error
 	Delete(context.Context, string) error
 	List(context.Context, string, int) (Page[ServerNode], error)
+	Touch(context.Context, string, time.Time, time.Time) error
+	StatsByNodeIDs(context.Context, []string) (map[string]ServerNodeStats, error)
 }
 
 var ErrMetadataStale = errors.New("runtime metadata is stale")
@@ -1188,34 +1191,70 @@ type nodeRepo struct {
 
 func (r *nodeRepo) Create(ctx context.Context, v ServerNode) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "node")
+	if strings.TrimSpace(v.Name) == "" {
+		v.Name = v.ID
+	}
+	v.Enabled = true
 	if v.Metadata == "" {
 		v.Metadata = "{}"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO server_nodes(id,address,epoch,metadata,last_seen_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, v.ID, v.Address, v.Epoch, v.Metadata, nullableTime(v.LastSeenAt), nullableTime(v.ExpiresAt), tm(v.CreatedAt), tm(v.UpdatedAt))
+	_, err := r.db.ExecContext(ctx, `INSERT INTO server_nodes(id,name,address,epoch,metadata,enabled,deleted_at,last_seen_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.Name, v.Address, v.Epoch, v.Metadata, boolInt(v.Enabled), nullableTime(v.DeletedAt), nullableTime(v.LastSeenAt), nullableTime(v.ExpiresAt), tm(v.CreatedAt), tm(v.UpdatedAt))
 	return err
+}
+
+// Ensure creates a self-registered Server node or refreshes runtime fields.
+// It deliberately preserves enabled and deleted_at: startup must never undo an
+// administrator's lifecycle decision.
+func (r *nodeRepo) Ensure(ctx context.Context, v ServerNode) error {
+	existing, err := r.Get(ctx, v.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r.Create(ctx, v)
+	}
+	if err != nil {
+		return err
+	}
+	// Epoch is owned by lease/relay fencing. A process restart must not reset
+	// it merely because the self-registration payload uses a bootstrap value.
+	existing.Address, existing.Metadata = v.Address, v.Metadata
+	if v.LastSeenAt != nil {
+		existing.LastSeenAt = v.LastSeenAt
+	}
+	if v.ExpiresAt != nil {
+		existing.ExpiresAt = v.ExpiresAt
+	}
+	return r.Update(ctx, existing)
 }
 func (r *nodeRepo) Get(ctx context.Context, id string) (ServerNode, error) {
 	var v ServerNode
-	var meta, seen, exp, created, updated sql.NullString
-	query := `SELECT id,address,epoch,metadata,last_seen_at,expires_at,created_at,updated_at FROM server_nodes WHERE id=?`
+	var meta, seen, exp, deleted, created, updated sql.NullString
+	query := `SELECT id,name,address,epoch,metadata,enabled,deleted_at,last_seen_at,expires_at,created_at,updated_at FROM server_nodes WHERE id=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Address, &v.Epoch, &meta, &seen, &exp, &created, &updated)
+	var enabled int
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Name, &v.Address, &v.Epoch, &meta, &enabled, &deleted, &seen, &exp, &created, &updated)
+	if err != nil {
+		return ServerNode{}, err
+	}
+	v.Enabled = enabled != 0
 	if meta.Valid {
 		v.Metadata = meta.String
 	}
 	v.LastSeenAt = parseTM(seen)
 	v.ExpiresAt = parseTM(exp)
+	v.DeletedAt = parseTM(deleted)
 	v.CreatedAt = parseTime(created.String)
 	v.UpdatedAt = parseTime(updated.String)
-	return v, err
+	return v, nil
 }
 func (r *nodeRepo) Update(ctx context.Context, v ServerNode) error {
+	if strings.TrimSpace(v.Name) == "" {
+		v.Name = v.ID
+	}
 	if v.UpdatedAt.IsZero() {
 		v.UpdatedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE server_nodes SET address=?,epoch=?,metadata=?,last_seen_at=?,expires_at=?,updated_at=? WHERE id=?`, v.Address, v.Epoch, v.Metadata, nullableTime(v.LastSeenAt), nullableTime(v.ExpiresAt), tm(v.UpdatedAt), v.ID)
+	res, err := r.db.ExecContext(ctx, `UPDATE server_nodes SET name=?,address=?,epoch=?,metadata=?,enabled=?,deleted_at=?,last_seen_at=?,expires_at=?,updated_at=? WHERE id=?`, v.Name, v.Address, v.Epoch, v.Metadata, boolInt(v.Enabled), nullableTime(v.DeletedAt), nullableTime(v.LastSeenAt), nullableTime(v.ExpiresAt), tm(v.UpdatedAt), v.ID)
 	return checkAffected(res, err)
 }
 func (r *nodeRepo) Delete(ctx context.Context, id string) error {
@@ -1224,7 +1263,7 @@ func (r *nodeRepo) Delete(ctx context.Context, id string) error {
 }
 func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[ServerNode], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT id,address,epoch,metadata,last_seen_at,expires_at,created_at,updated_at FROM server_nodes`
+	q := `SELECT id,name,address,epoch,metadata,enabled,deleted_at,last_seen_at,expires_at,created_at,updated_at FROM server_nodes`
 	args := []any{}
 	if c := decodeCursor(cursor); c != "" {
 		q += ` WHERE id>?`
@@ -1240,15 +1279,18 @@ func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[Ser
 	var out []ServerNode
 	for rows.Next() {
 		var v ServerNode
-		var meta, seen, exp, created, updated sql.NullString
-		if err := rows.Scan(&v.ID, &v.Address, &v.Epoch, &meta, &seen, &exp, &created, &updated); err != nil {
+		var meta, seen, exp, deleted, created, updated sql.NullString
+		var enabled int
+		if err := rows.Scan(&v.ID, &v.Name, &v.Address, &v.Epoch, &meta, &enabled, &deleted, &seen, &exp, &created, &updated); err != nil {
 			return Page[ServerNode]{}, err
 		}
+		v.Enabled = enabled != 0
 		if meta.Valid {
 			v.Metadata = meta.String
 		}
 		v.LastSeenAt = parseTM(seen)
 		v.ExpiresAt = parseTM(exp)
+		v.DeletedAt = parseTM(deleted)
 		v.CreatedAt = parseTime(created.String)
 		v.UpdatedAt = parseTime(updated.String)
 		out = append(out, v)
@@ -1263,6 +1305,38 @@ func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[Ser
 		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
 	}
 	return p, nil
+}
+
+func (r *nodeRepo) Touch(ctx context.Context, id string, lastSeen, expires time.Time) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE server_nodes SET last_seen_at=?,expires_at=?,updated_at=? WHERE id=?`, tm(lastSeen), tm(expires), tm(time.Now().UTC()), id)
+	return checkAffected(res, err)
+}
+
+func (r *nodeRepo) StatsByNodeIDs(ctx context.Context, ids []string) (map[string]ServerNodeStats, error) {
+	out := make(map[string]ServerNodeStats, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, tm(time.Now().UTC()))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `SELECT server_node_id,COUNT(*),COALESCE(SUM(active_streams),0),COALESCE(MIN(health_score),0) FROM agent_connection_leases WHERE expires_at>? AND server_node_id IN (` + placeholders + `) GROUP BY server_node_id`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var stats ServerNodeStats
+		if err := rows.Scan(&stats.NodeID, &stats.ActiveConnections, &stats.ActiveStreams, &stats.HealthScore); err != nil {
+			return nil, err
+		}
+		out[stats.NodeID] = stats
+	}
+	return out, rows.Err()
 }
 
 type agentMetadataRepo struct {

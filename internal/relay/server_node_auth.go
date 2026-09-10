@@ -51,12 +51,19 @@ func ServerNodePrincipalFromContext(ctx context.Context) (ServerNodePrincipal, b
 // is performed by grpc credentials; this interceptor additionally checks that
 // the verified leaf certificate contains the exact caller node SAN.
 func NewServerNodeStreamInterceptor(credentialsService *auth.CredentialService, nodes storage.NodeRepository) grpc.StreamServerInterceptor {
-	return NewServerNodeStreamInterceptorWithMetrics(credentialsService, nodes, nil)
+	return NewServerNodeStreamInterceptorWithMode(credentialsService, nodes, nil, true)
 }
 
 func NewServerNodeStreamInterceptorWithMetrics(credentialsService *auth.CredentialService, nodes storage.NodeRepository, metrics *observability.Metrics) grpc.StreamServerInterceptor {
+	return NewServerNodeStreamInterceptorWithMode(credentialsService, nodes, metrics, true)
+}
+
+// NewServerNodeStreamInterceptorWithMode keeps mTLS as the default and allows
+// an explicitly plaintext deployment to retain token, node lifecycle, and
+// epoch authorization without transport-layer certificate identity.
+func NewServerNodeStreamInterceptorWithMode(credentialsService *auth.CredentialService, nodes storage.NodeRepository, metrics *observability.Metrics, requireMTLS bool) grpc.StreamServerInterceptor {
 	return func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		principal, err := authenticateServerNode(stream.Context(), credentialsService, nodes)
+		principal, err := authenticateServerNode(stream.Context(), credentialsService, nodes, requireMTLS)
 		if err != nil {
 			if metrics != nil {
 				metrics.ObserveConnection("relay", "server_node", "failed", observability.NormalizeErrorClass(err))
@@ -73,8 +80,14 @@ func NewServerNodeStreamInterceptorWithMetrics(credentialsService *auth.Credenti
 // NewServerNodeUnaryInterceptor applies the same authenticated server-node
 // identity checks to unary relay control RPCs.
 func NewServerNodeUnaryInterceptor(credentialsService *auth.CredentialService, nodes storage.NodeRepository) grpc.UnaryServerInterceptor {
+	return NewServerNodeUnaryInterceptorWithMode(credentialsService, nodes, true)
+}
+
+// NewServerNodeUnaryInterceptorWithMode mirrors the stream interceptor's
+// explicit transport security mode for unary relay control RPCs.
+func NewServerNodeUnaryInterceptorWithMode(credentialsService *auth.CredentialService, nodes storage.NodeRepository, requireMTLS bool) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		principal, err := authenticateServerNode(ctx, credentialsService, nodes)
+		principal, err := authenticateServerNode(ctx, credentialsService, nodes, requireMTLS)
 		if err != nil {
 			return nil, err
 		}
@@ -89,23 +102,25 @@ type serverNodeContextStream struct {
 
 func (s *serverNodeContextStream) Context() context.Context { return s.ctx }
 
-func authenticateServerNode(ctx context.Context, credentialsService *auth.CredentialService, nodes storage.NodeRepository) (ServerNodePrincipal, error) {
+func authenticateServerNode(ctx context.Context, credentialsService *auth.CredentialService, nodes storage.NodeRepository, requireMTLS bool) (ServerNodePrincipal, error) {
 	callerNodeID, callerEpoch, rawToken, err := parseServerNodeMetadata(ctx)
 	if err != nil {
 		return ServerNodePrincipal{}, err
 	}
-	cert, err := verifiedPeerCertificate(ctx)
-	if err != nil {
-		return ServerNodePrincipal{}, err
-	}
-	if !certificateHasExactSAN(cert, callerNodeID) {
-		return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay peer identity denied")
+	if requireMTLS {
+		cert, err := verifiedPeerCertificate(ctx)
+		if err != nil {
+			return ServerNodePrincipal{}, err
+		}
+		if !certificateHasExactSAN(cert, callerNodeID) {
+			return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay peer identity denied")
+		}
 	}
 	identity, err := credentialsService.ValidateAs(ctx, rawToken, storage.TokenTypeServerNode)
 	if err != nil {
 		return ServerNodePrincipal{}, status.Error(codes.Unauthenticated, "relay authentication failed")
 	}
-	if identity.NodeID != callerNodeID {
+	if len(identity.ServerNodeIDs) > 0 && !containsNodeID(identity.ServerNodeIDs, callerNodeID) {
 		return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay credential denied")
 	}
 	if nodes == nil {
@@ -115,6 +130,11 @@ func authenticateServerNode(ctx context.Context, credentialsService *auth.Creden
 	if err != nil {
 		return ServerNodePrincipal{}, status.Error(codes.Unauthenticated, "relay authentication failed")
 	}
+	// Lifecycle is authoritative in server_nodes. A disabled or deleted node
+	// must lose relay access even when its token and mTLS material remain valid.
+	if !node.Enabled || node.DeletedAt != nil {
+		return ServerNodePrincipal{}, status.Error(codes.PermissionDenied, "relay credential denied")
+	}
 	if node.ExpiresAt != nil && !node.ExpiresAt.After(nowUTC()) {
 		return ServerNodePrincipal{}, status.Error(codes.FailedPrecondition, "relay node is expired")
 	}
@@ -122,6 +142,15 @@ func authenticateServerNode(ctx context.Context, credentialsService *auth.Creden
 		return ServerNodePrincipal{}, status.Error(codes.FailedPrecondition, "relay node epoch is stale")
 	}
 	return ServerNodePrincipal{NodeID: callerNodeID, Epoch: callerEpoch, TokenID: identity.TokenID}, nil
+}
+
+func containsNodeID(nodeIDs []string, callerNodeID string) bool {
+	for _, nodeID := range nodeIDs {
+		if nodeID == callerNodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // nowUTC is a variable to keep expiration checks deterministic in focused

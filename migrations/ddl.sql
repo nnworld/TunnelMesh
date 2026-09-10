@@ -105,9 +105,12 @@ CREATE INDEX idx_tunnels_domain_path ON tunnels(domain, path_prefix);
 
 CREATE TABLE IF NOT EXISTS server_nodes (
     id VARBINARY(255) PRIMARY KEY,
+    name VARBINARY(255) NOT NULL,
     address VARBINARY(255) NOT NULL,
     epoch INTEGER NOT NULL DEFAULT 0,
     metadata TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    deleted_at TEXT,
     last_seen_at TEXT,
     expires_at TEXT,
     created_at TEXT NOT NULL,

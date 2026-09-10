@@ -39,60 +39,130 @@ tls:
   min_version: "1.2"
 ```
 
-## Server：集群 MySQL
+## Server：集群 MySQL 明文 Relay
 
-`node.id` 可省略。`run` 首次启动时会生成稳定 ID 并保存到 `/var/lib/tunnelmesh/node-id`。需要将 ID 明确写入 YAML 时，以有权限修改配置文件的用户执行：
+`node.id` 可省略。`run` 首次启动时会生成稳定 ID，复用 `/var/lib/tunnelmesh/node-id`，并把最终值回写到 YAML 的 `node.id`。需要提前初始化时，以有权限修改配置文件的用户执行：
 
 ```bash
 tunnelmesh-server --config /etc/tunnelmesh/server.yaml init-node-id
 ```
 
-以下示例使用不支持 TLS 的 MySQL 端口；内网明文连接必须由网络 ACL 隔离，生产环境优先启用 TLS。
+systemd 单元会在服务用户运行前以 root 执行一次初始化，因此配置文件可以保持只读。
+
+受控内网可以运行明文 relay：`endpoint` 留空时自动使用本机可用 IP 和 `listen` 端口；`ca/cert/key/server_name` 全部省略。明文模式仍要求 server-node token，并继续校验节点状态和 epoch，但不提供传输加密或证书级节点身份，只适合受控内网。
 
 ```yaml
+# /etc/tunnelmesh/server.yaml
 mode: cluster
 
 storage:
   driver: mysql
   auto_init: true
   mysql:
-    # DSN 由 TUNNELMESH_STORAGE_MYSQL_DSN 注入。
     dsn: ""
     tls: false
 
 registry:
   type: database
 
-# node:
-#   id: server-1
+node:
+  id: ""
 
 server:
   http_addr: 127.0.0.1:8080
-  # 必须与 DNS、证书和 Nginx server_name 的动态域名后缀一致。
+  dynamic_suffix: apps.example.com
+  relay:
+    enabled: true
+    listen: 0.0.0.0:9443
+    # 可省略；自动推导结果不回写 YAML。多网卡环境建议显式配置。
+    endpoint: ""
+    # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入。
+    node_token: ""
+```
+
+## Server：集群 MySQL mTLS Relay
+
+以下模板面向“Nginx 终止公网 HTTPS、Server 监听本机 HTTP、relay 使用独立 mTLS”的生产部署。MySQL DSN 和 server-node token 不写入 YAML，由环境变量注入。证书生成、安装、校验和轮换步骤见 [Relay mTLS 证书生成与配置](relay-mtls.md)。
+
+```yaml
+# /etc/tunnelmesh/server.yaml
+mode: cluster
+
+storage:
+  driver: mysql
+  # 首次启动自动初始化空库，或按 schema_meta.version 执行增量迁移。
+  auto_init: true
+  mysql:
+    # 由 TUNNELMESH_STORAGE_MYSQL_DSN 注入；不要把密码提交到配置文件。
+    dsn: ""
+    # MySQL 5.6 不支持 TLS 时保持 false，并确保数据库端口仅在内网可达。
+    tls: false
+
+registry:
+  # 集群默认使用 MySQL lease；不需要额外配置 endpoints。
+  type: database
+
+# 可省略。systemd 会在非特权启动前执行 init-node-id；
+# 生成后会回写为 node.id: server-<32位小写十六进制>。
+# relay 证书 SAN 必须包含最终 node.id。
+node:
+  id: ""
+
+server:
+  # 仅监听本机，由 Nginx/Caddy 转发；Agent/Client WebSocket 也走该监听器。
+  http_addr: 127.0.0.1:8080
+  # 必须与 DNS、证书和 Nginx server_name 的动态域名后缀一致，不要写 *。
   dynamic_suffix: apps.example.com
   tcp_bridge:
     enabled: true
     path: /ws/tcp
     max_bytes: 65536
+
+  # Server 节点间 relay。每个节点使用独立证书和私钥；
+  # 所有节点使用同一 relay CA，并复用同一个 fleet token。
   relay:
-    enabled: false
+    enabled: true
+    # 本节点 relay gRPC 监听地址。
+    listen: 0.0.0.0:9443
+    # 其他 Server 节点可访问的本节点地址；不要填 127.0.0.1。
+    endpoint: server-1.internal.example.com:9443
+    ca: /etc/tunnelmesh/certs/relay-ca.pem
+    cert: /etc/tunnelmesh/certs/server-1-relay.pem
+    key: /etc/tunnelmesh/certs/server-1-relay-key.pem
+    # 出站 relay 连接校验对端证书使用的 TLS ServerName。
+    # 对端证书需要同时包含该名称和该节点最终 node.id SAN。
+    server_name: relay.internal.example.com
+    # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入；留空会导致 check-config 失败。
+    node_token: ""
 
 security:
+  # 管理 API 和 WebSocket Host 白名单；动态 HTTP 路由由路由表匹配。
   allowed_hosts:
     - tunnel.example.com
+  # Agent/Client 连接 wss://tunnel.example.com 时发送该 Origin。
   allowed_origins:
     - https://tunnel.example.com
 
+# 公网 TLS 已由 Nginx 终止，这里保持关闭。
+# 若 Server 直接暴露 HTTPS，需同时提供 cert_file 和 key_file。
 tls:
   enabled: false
+  cert_file: ""
+  key_file: ""
   min_version: "1.2"
 ```
 
 配套的 systemd 环境文件示例：
 
 ```bash
-TUNNELMESH_STORAGE_MYSQL_DSN='db_user:db_password@tcp(10.0.0.10:3306)/tunnelmesh?parseTime=true'
+TUNNELMESH_STORAGE_MYSQL_DSN='db_user:db_password@tcp(mysql.internal.example.com:3306)/tunnelmesh?parseTime=true'
 TUNNELMESH_STORAGE_MYSQL_TLS=false
+TUNNELMESH_SERVER_RELAY_NODE_TOKEN='replace-with-server-node-service-token'
+
+# 管理台 token reveal 使用；长度为 16/24/32 字节，base64 或 hex。
+TUNNELMESH_TOKEN_ENCRYPTION_KEY='replace-with-aes-256-gcm-key'
+# 多 Server 集群所有节点必须一致，用于跨节点 traceroute 签名。
+TUNNELMESH_TRACE_SIGNING_KEY='replace-with-high-entropy-signing-key'
 ```
 
 MySQL 支持 TLS 时改为：
@@ -104,7 +174,6 @@ storage:
   mysql:
     dsn: ""
     tls: true
-    ca: /etc/tunnelmesh/certs/mysql-ca.pem
 ```
 
 并在 DSN 中追加 `tls=true`：

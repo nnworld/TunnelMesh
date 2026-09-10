@@ -110,13 +110,26 @@ type Tunnel struct {
 
 type ServerNode struct {
 	ID         string
+	Name       string
 	Address    string
 	Epoch      int64
 	Metadata   string
+	Enabled    bool
+	DeletedAt  *time.Time
 	LastSeenAt *time.Time
 	ExpiresAt  *time.Time
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+// ServerNodeStats aggregates active Agent connections owned by one Server
+// node. HealthScore is the minimum connection score so the UI exposes the
+// least healthy active path rather than hiding degradation behind an average.
+type ServerNodeStats struct {
+	NodeID            string
+	ActiveConnections int64
+	ActiveStreams     int64
+	HealthScore       int64
 }
 
 type AgentRuntimeMetadata struct {

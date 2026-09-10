@@ -55,10 +55,11 @@ describe('agent creation and token workflow', () => {
       agentId: 'agent-1',
       nodeId: '',
       expiresAt: '2027-09-08T10:20:30+00:00',
-      agentIdsText: '',
+      agentIds: [],
       cidrsText: '',
       portsText: '',
       selectedAgent,
+      selectedAgents: [],
       scope: { protocols: ['tcp'] },
     })).toEqual({
       type: 'agent',
@@ -71,6 +72,71 @@ describe('agent creation and token workflow', () => {
     vi.useRealTimers()
   })
 
+  it('builds fleet and explicit server-node token scopes', () => {
+    const baseInput = {
+      type: 'server_node' as const,
+      agentId: '',
+      nodeId: '',
+      expiresAt: '',
+      agentIds: [],
+      cidrsText: '',
+      portsText: '',
+      selectedAgent: undefined,
+      selectedAgents: [],
+      scope: { protocols: ['tcp'] },
+    }
+    expect(tokenPayloadFromForm({ ...baseInput, serverNodeIds: [] })).toMatchObject({
+      type: 'server_node',
+      scope: { serverNodeIds: [] },
+    })
+    expect(tokenPayloadFromForm({ ...baseInput, serverNodeIds: ['server-a', 'server-b'] })).toMatchObject({
+      type: 'server_node',
+      scope: { serverNodeIds: ['server-a', 'server-b'] },
+    })
+  })
+
+  it('builds client token scope from a multi-select Agent list', () => {
+    const selectedAgents = [
+      { id: 'agent-1', name: 'devbox', enabled: true, ownerUserId: 'user-1' },
+      { id: 'agent-2', name: 'build runner', enabled: true, ownerUserId: 'user-1' },
+    ]
+    const baseInput = {
+      type: 'client' as const,
+      agentId: '',
+      nodeId: '',
+      expiresAt: '',
+      cidrsText: '',
+      portsText: '',
+      selectedAgent: undefined,
+      scope: { protocols: ['tcp'] },
+    }
+
+    expect(tokenPayloadFromForm({
+      ...baseInput,
+      agentIds: ['agent-1', 'agent-2'],
+      selectedAgents,
+    })).toEqual({
+      type: 'client',
+      ownerUserId: 'user-1',
+      scope: { protocols: ['tcp'], agentIds: ['agent-1', 'agent-2'], targetCIDRs: [], targetPorts: [] },
+    })
+
+    expect(tokenPayloadFromForm({
+      ...baseInput,
+      agentIds: [],
+      selectedAgents: [],
+    })).toEqual({
+      type: 'client',
+      scope: { protocols: ['tcp'], agentIds: [], targetCIDRs: [], targetPorts: [] },
+    })
+
+    expect(() => tokenPayloadFromForm({
+      ...baseInput,
+      agentIds: ['agent-1', 'agent-other-owner'],
+      selectedAgents: [...selectedAgents, { id: 'agent-other-owner', name: 'other', enabled: true, ownerUserId: 'user-2' }],
+    })).toThrow('selected agents must have the same owner')
+  })
+
   it('wires the workflow into management views', () => {
     const agents = readFileSync('src/views/Agents.vue', 'utf8')
     const tokens = readFileSync('src/views/Tokens.vue', 'utf8')
@@ -80,6 +146,10 @@ describe('agent creation and token workflow', () => {
     expect(tokens).toContain('filterAgents')
     expect(tokens).toContain('defaultTokenExpiration()')
     expect(tokens).toContain('ownerUserId')
+    expect(tokens).toContain('v-model="form.agentIds"')
+    expect(tokens).toContain('multiple filterable clearable')
+    expect(tokens).toContain("t('tokens.allAgents')")
+    expect(tokens).not.toContain('agentIdsText')
   })
 
   it('reads token details and updates expiration through the resource API', async () => {
@@ -94,14 +164,42 @@ describe('agent creation and token workflow', () => {
 
   it('updates token scope and preserves the current expiration contract', async () => {
     await updateTokenScope('token-1', tokenScopePatchFromForm({
+      type: 'client',
+      agentIds: ['agent-1', 'agent-2'],
       protocols: ['tcp', 'http'],
       cidrsText: '10.0.0.0/8',
       portsText: '22, 80',
     }))
     const calls = vi.mocked(fetch).mock.calls.map(([url, init]) => [url, init?.method, init?.body ? JSON.parse(String(init.body)) : undefined])
     expect(calls).toEqual([
-      ['/api/v1/tokens/token-1', 'PATCH', { scope: { protocols: ['tcp', 'http'], targetCIDRs: ['10.0.0.0/8'], targetPorts: [22, 80] } }],
+      ['/api/v1/tokens/token-1', 'PATCH', { scope: { agentIds: ['agent-1', 'agent-2'], protocols: ['tcp', 'http'], targetCIDRs: ['10.0.0.0/8'], targetPorts: [22, 80] } }],
     ])
+  })
+
+  it('builds type-specific token scope patches', () => {
+    expect(tokenScopePatchFromForm({
+      type: 'server_node',
+      serverNodeIds: ['server-a', 'server-b'],
+      protocols: ['ws'],
+      cidrsText: '',
+      portsText: '',
+    })).toEqual({
+      serverNodeIds: ['server-a', 'server-b'],
+      protocols: ['ws'],
+      targetCIDRs: [],
+      targetPorts: [],
+    })
+
+    expect(tokenScopePatchFromForm({
+      type: 'agent',
+      protocols: ['tcp'],
+      cidrsText: '',
+      portsText: '',
+    })).toEqual({
+      protocols: ['tcp'],
+      targetCIDRs: [],
+      targetPorts: [],
+    })
   })
 
   it('rejects invalid port text instead of silently allowing all ports', () => {
@@ -110,14 +208,15 @@ describe('agent creation and token workflow', () => {
       agentId: '',
       nodeId: '',
       expiresAt: '',
-      agentIdsText: '',
+      agentIds: [],
       cidrsText: '',
       selectedAgent: undefined,
+      selectedAgents: [],
       scope: { protocols: ['tcp'] },
     }
     expect(() => tokenPayloadFromForm({ ...baseInput, portsText: 'abc' })).toThrow('invalid target port')
     expect(() => tokenPayloadFromForm({ ...baseInput, portsText: '65536' })).toThrow('invalid target port')
-    expect(() => tokenScopePatchFromForm({ protocols: ['tcp'], cidrsText: '', portsText: 'abc' })).toThrow('invalid target port')
+    expect(() => tokenScopePatchFromForm({ type: 'client', protocols: ['tcp'], cidrsText: '', portsText: 'abc' })).toThrow('invalid target port')
   })
 
   it('shows complete token details and an expiration action', () => {
@@ -131,5 +230,10 @@ describe('agent creation and token workflow', () => {
     expect(source).toContain('openScope')
     expect(source).toContain('scopeVisible')
     expect(source).toContain('updateTokenScope')
+    expect(source).toContain('label="ws"')
+    expect(source).toContain('scopeForm.agentIds')
+    expect(source).toContain('scopeForm.serverNodeIds')
+    expect(source).toContain('formatAgentScope')
+    expect(source).toContain('scopeToken.value?.ownerUserId')
   })
 })

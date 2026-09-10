@@ -37,6 +37,7 @@ type API struct {
 	service            *apiService
 	tokenService       *TokenService
 	accounts           *auth.AccountService
+	serverNodes        *ServerNodeService
 	traceroute         *TracerouteService
 	probeService       *ProbeService
 	agentSessions      *AgentSessionManager
@@ -71,6 +72,7 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 		a.service = &apiService{agents: a.agents, metadata: NewAgentMetadataService(db.Metadata()), policies: a.policies, tunnels: a.tunnels, audits: a.audits}
 		a.tokenService = NewTokenService(db)
 		a.accounts = auth.NewAccountService(db)
+		a.serverNodes = NewServerNodeService(db)
 		a.traceroute = NewTracerouteService(db)
 		a.probeService = NewProbeService(db)
 	}
@@ -272,6 +274,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleAudits(w, r, p)
 	case "tokens":
 		a.handleTokens(w, r, p, parts[1:])
+	case "server-nodes":
+		a.handleServerNodes(w, r, p, parts[1:])
 	case "users":
 		a.handleUsers(w, r, p, parts[1:])
 	case "dashboard":

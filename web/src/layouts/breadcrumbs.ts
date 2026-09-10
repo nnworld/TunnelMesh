@@ -13,6 +13,7 @@ export function breadcrumbsFor(path: string): Breadcrumb[] {
     : path === '/routes' ? 'routes.title'
     : path === '/tunnels' ? 'tunnels.title'
     : path === '/tokens' ? 'tokens.title'
+    : path === '/servers' ? 'servers.title'
     : path === '/users' ? 'users.title'
     : path === '/audit-logs' ? 'audits.title'
     : path === '/account/security' ? 'navigation.security'

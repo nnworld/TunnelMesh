@@ -347,6 +347,116 @@ func TestInitializeNodeIDKeepsExplicitConfigIdentity(t *testing.T) {
 	}
 }
 
+func TestLoadPersistsGeneratedNodeIDOnlyWhenRequested(t *testing.T) {
+	writeConfig := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "server.yaml")
+		contents := "# keep this comment\nmode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: db\nregistry:\n  type: database\n"
+		if err := os.WriteFile(path, []byte(contents), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("persists generated identity", func(t *testing.T) {
+		path := writeConfig(t)
+		cfg, err := config.Load(context.Background(), config.ConfigOptions{
+			ConfigFile:                     path,
+			NodeIDPath:                     filepath.Join(t.TempDir(), "node-id"),
+			PersistGeneratedNodeIDToConfig: true,
+		})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !strings.HasPrefix(cfg.Node.ID, "server-") {
+			t.Fatalf("generated node ID = %q, want server- prefix", cfg.Node.ID)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "# keep this comment") || !strings.Contains(string(data), "node:\n  id: server-") {
+			t.Fatalf("generated node ID was not written with comments: %s", data)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o640 {
+			t.Fatalf("config mode = %o, want 0640", info.Mode().Perm())
+		}
+	})
+
+	t.Run("does not persist by default", func(t *testing.T) {
+		path := writeConfig(t)
+		if _, err := config.Load(context.Background(), config.ConfigOptions{
+			ConfigFile: path,
+			NodeIDPath: filepath.Join(t.TempDir(), "node-id"),
+		}); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "node:") {
+			t.Fatalf("default Load unexpectedly rewrote config: %s", data)
+		}
+	})
+
+	t.Run("keeps explicit config identity", func(t *testing.T) {
+		path := writeConfig(t)
+		if err := os.WriteFile(path, []byte("# keep this comment\nmode: cluster\nnode:\n  id: server-explicit\nstorage:\n  driver: mysql\n  mysql:\n    dsn: db\nregistry:\n  type: database\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(context.Background(), config.ConfigOptions{
+			ConfigFile:                     path,
+			NodeIDPath:                     filepath.Join(t.TempDir(), "node-id"),
+			PersistGeneratedNodeIDToConfig: true,
+		})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Node.ID != "server-explicit" {
+			t.Fatalf("node ID = %q, want explicit identity", cfg.Node.ID)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "id: server-explicit") || !strings.Contains(string(data), "# keep this comment") {
+			t.Fatalf("explicit identity was rewritten: %s", data)
+		}
+	})
+
+	t.Run("keeps CLI identity and does not rewrite config", func(t *testing.T) {
+		path := writeConfig(t)
+		nodeIDPath := filepath.Join(t.TempDir(), "node-id")
+		cfg, err := config.Load(context.Background(), config.ConfigOptions{
+			ConfigFile:                     path,
+			NodeIDPath:                     nodeIDPath,
+			PersistGeneratedNodeIDToConfig: true,
+			CLI:                            map[string]any{"node.id": "server-cli"},
+		})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Node.ID != "server-cli" {
+			t.Fatalf("node ID = %q, want CLI identity", cfg.Node.ID)
+		}
+		if _, err := os.Stat(nodeIDPath); !os.IsNotExist(err) {
+			t.Fatalf("CLI identity unexpectedly wrote persistence file: %v", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "node:") {
+			t.Fatalf("CLI identity unexpectedly rewrote config: %s", data)
+		}
+	})
+}
+
 func TestLoadHonorsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -596,5 +706,71 @@ func TestValidateRelayRequiresAdvertisedEndpoint(t *testing.T) {
 	err := config.Validate(cfg)
 	if err == nil || !strings.Contains(err.Error(), "endpoint") {
 		t.Fatalf("Validate(missing endpoint) error = %v, want endpoint requirement", err)
+	}
+}
+
+func TestInferRelayEndpointUsesListenHostAndPort(t *testing.T) {
+	endpoint, err := config.InferRelayEndpoint("10.1.2.3:9443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "10.1.2.3:9443" {
+		t.Fatalf("InferRelayEndpoint() = %q, want 10.1.2.3:9443", endpoint)
+	}
+}
+
+func TestLoadInfersRelayEndpointAndAcceptsPlaintext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.yaml")
+	file := "mode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: mysql://db\nnode:\n  id: node-a\nserver:\n  relay:\n    enabled: true\n    listen: 127.0.0.1:9443\n    node_token: secret\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Relay.Endpoint != "127.0.0.1:9443" {
+		t.Fatalf("inferred relay endpoint = %q, want 127.0.0.1:9443", cfg.Server.Relay.Endpoint)
+	}
+	if cfg.Server.Relay.CA != "" || cfg.Server.Relay.Cert != "" || cfg.Server.Relay.Key != "" || cfg.Server.Relay.ServerName != "" {
+		t.Fatalf("plaintext relay unexpectedly has TLS config: %+v", cfg.Server.Relay)
+	}
+}
+
+func TestValidateRelayRejectsPartialTLSMaterial(t *testing.T) {
+	base := config.Config{
+		Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"},
+		Storage:  config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db"}},
+		Registry: config.RegistryConfig{Type: config.RegistryDatabase},
+		Server: config.ServerConfig{Relay: config.RelayConfig{
+			Enabled: true, Listen: ":9443", Endpoint: "relay.example:9443", NodeToken: "secret",
+		}},
+	}
+	partial := base
+	partial.Server.Relay.CA = "/ca.pem"
+	if err := config.Validate(partial); err == nil || !strings.Contains(err.Error(), "all CA, certificate, and key fields") {
+		t.Fatalf("Validate(partial TLS) error = %v, want complete TLS material error", err)
+	}
+
+	missingServerName := base
+	missingServerName.Server.Relay.CA = "/ca.pem"
+	missingServerName.Server.Relay.Cert = "/cert.pem"
+	missingServerName.Server.Relay.Key = "/key.pem"
+	if err := config.Validate(missingServerName); err == nil || !strings.Contains(err.Error(), "server name") {
+		t.Fatalf("Validate(missing server name) error = %v, want server name requirement", err)
+	}
+
+	plaintext := base
+	if err := config.Validate(plaintext); err != nil {
+		t.Fatalf("Validate(plaintext relay) error = %v", err)
+	}
+
+	disabled := base
+	disabled.Server.Relay.Enabled = false
+	disabled.Server.Relay.Listen = ""
+	disabled.Server.Relay.Endpoint = ""
+	disabled.Server.Relay.NodeToken = ""
+	if err := config.Validate(disabled); err != nil {
+		t.Fatalf("Validate(disabled relay) error = %v", err)
 	}
 }

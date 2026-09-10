@@ -68,9 +68,11 @@ type tokenReplayRecord struct {
 }
 
 type tokenScopePatch struct {
-	Protocols   *[]string `json:"protocols,omitempty"`
-	TargetCIDRs *[]string `json:"targetCIDRs,omitempty"`
-	TargetPorts *[]int    `json:"targetPorts,omitempty"`
+	AgentIDs      *[]string `json:"agentIds,omitempty"`
+	ServerNodeIDs *[]string `json:"serverNodeIds,omitempty"`
+	Protocols     *[]string `json:"protocols,omitempty"`
+	TargetCIDRs   *[]string `json:"targetCIDRs,omitempty"`
+	TargetPorts   *[]int    `json:"targetPorts,omitempty"`
 }
 
 type tokenUpdate struct {
@@ -365,8 +367,8 @@ func (s *TokenService) Update(ctx context.Context, actorUserID, id string, updat
 		return TokenView{}, fmt.Errorf("%w: expiresAt must be in the future", errInvalidTokenRequest)
 	}
 	var result storage.ServiceToken
-	err := s.db.ServiceTokenMutationTransaction(ctx, func(tokens storage.ServiceTokenRepository, audits storage.AuditRepository, _ storage.IdempotencyRepository) error {
-		current, err := tokens.Get(ctx, id)
+	err := s.db.ServiceTokenAuthorizedMutationTransaction(ctx, func(repos storage.ServiceTokenMutationRepositories) error {
+		current, err := repos.Tokens.Get(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -376,36 +378,44 @@ func (s *TokenService) Update(ctx context.Context, actorUserID, id string, updat
 		if current.ExpiresAt != nil && !current.ExpiresAt.After(time.Now().UTC()) {
 			return storage.ErrServiceTokenExpired
 		}
+		if update.Scope != nil {
+			if err := validateTokenScopePatch(current.Type, *update.Scope); err != nil {
+				return err
+			}
+		}
 		when := time.Now().UTC()
 		if update.Scope != nil {
 			scope, err := mergeTokenScope(current.Scope, *update.Scope)
 			if err != nil {
 				return err
 			}
+			if err := validateScopeResources(ctx, current, scope, repos.Agents, repos.Nodes); err != nil {
+				return err
+			}
 			encoded, err := json.Marshal(scope)
 			if err != nil {
 				return fmt.Errorf("encode token scope: %w", err)
 			}
-			if err := tokens.UpdateScope(ctx, id, string(encoded), when); err != nil {
+			if err := repos.Tokens.UpdateScope(ctx, id, string(encoded), when); err != nil {
 				return err
 			}
 		}
 		if update.HasExpiresAt {
-			if err := tokens.UpdateExpiration(ctx, id, update.ExpiresAt, when); err != nil {
+			if err := repos.Tokens.UpdateExpiration(ctx, id, update.ExpiresAt, when); err != nil {
 				return err
 			}
 		}
-		updated, err := tokens.Get(ctx, id)
+		updated, err := repos.Tokens.Get(ctx, id)
 		if err != nil {
 			return err
 		}
 		if update.Scope != nil {
-			if err := audits.Create(ctx, tokenAudit(actorUserID, "token.scope_updated", id, updated, "", "")); err != nil {
+			if err := repos.Audits.Create(ctx, tokenAudit(actorUserID, "token.scope_updated", id, updated, "", "")); err != nil {
 				return err
 			}
 		}
 		if update.HasExpiresAt {
-			if err := audits.Create(ctx, tokenAudit(actorUserID, "token.expiration_updated", id, updated, "", "")); err != nil {
+			if err := repos.Audits.Create(ctx, tokenAudit(actorUserID, "token.expiration_updated", id, updated, "", "")); err != nil {
 				return err
 			}
 		}
@@ -426,6 +436,12 @@ func mergeTokenScope(raw string, patch tokenScopePatch) (auth.TokenScope, error)
 	if patch.Protocols != nil {
 		scope.Protocols = *patch.Protocols
 	}
+	if patch.AgentIDs != nil {
+		scope.AgentIDs = *patch.AgentIDs
+	}
+	if patch.ServerNodeIDs != nil {
+		scope.ServerNodeIDs = *patch.ServerNodeIDs
+	}
 	if patch.TargetCIDRs != nil {
 		scope.TargetCIDRs = *patch.TargetCIDRs
 	}
@@ -437,6 +453,43 @@ func mergeTokenScope(raw string, patch tokenScopePatch) (auth.TokenScope, error)
 		return auth.TokenScope{}, invalidCredentialRequest(err)
 	}
 	return normalized, nil
+}
+
+func validateTokenScopePatch(tokenType storage.TokenType, patch tokenScopePatch) error {
+	if patch.AgentIDs != nil && tokenType != storage.TokenTypeClient {
+		return fmt.Errorf("%w: agentIds can only be updated for client tokens", errInvalidTokenRequest)
+	}
+	if patch.ServerNodeIDs != nil && tokenType != storage.TokenTypeServerNode {
+		return fmt.Errorf("%w: serverNodeIds can only be updated for server_node tokens", errInvalidTokenRequest)
+	}
+	return nil
+}
+
+func validateScopeResources(ctx context.Context, record storage.ServiceToken, scope auth.TokenScope, agents storage.AgentRepository, nodes storage.NodeRepository) error {
+	now := time.Now().UTC()
+	switch record.Type {
+	case storage.TokenTypeClient:
+		for _, agentID := range scope.AgentIDs {
+			agent, err := agents.Get(ctx, agentID)
+			if err != nil || !agent.Enabled || agent.OwnerUserID != record.OwnerUserID {
+				return invalidCredentialRequest(auth.ErrInvalidTokenScope)
+			}
+		}
+	case storage.TokenTypeServerNode:
+		for _, nodeID := range scope.ServerNodeIDs {
+			node, err := nodes.Get(ctx, nodeID)
+			if err != nil || !node.Enabled || node.DeletedAt != nil || (node.ExpiresAt != nil && !node.ExpiresAt.After(now)) {
+				return invalidCredentialRequest(auth.ErrInvalidTokenScope)
+			}
+		}
+	case storage.TokenTypeAgent:
+		for _, agentID := range scope.AgentIDs {
+			if agentID != record.AgentID {
+				return invalidCredentialRequest(auth.ErrInvalidTokenScope)
+			}
+		}
+	}
+	return nil
 }
 
 // RecordAuthorizationDenied persists only allowlisted non-secret identifiers.
@@ -597,12 +650,18 @@ func tokenStatus(ctx context.Context, record storage.ServiceToken, scope auth.To
 			}
 		}
 	case storage.TokenTypeServerNode:
-		node, err := nodes.Get(ctx, record.NodeID)
-		if errors.Is(err, sql.ErrNoRows) || (err == nil && node.ExpiresAt != nil && !node.ExpiresAt.After(now)) {
-			return "unavailable", nil
-		}
-		if err != nil {
-			return "", err
+		// Fleet tokens have an empty serverNodeIds scope and authorize any
+		// enabled server after relay verifies the caller's mTLS identity.
+		// Explicit lists must remain fully usable; one disabled member makes
+		// the token visible as unavailable rather than silently bypassed.
+		for _, nodeID := range scope.ServerNodeIDs {
+			node, err := nodes.Get(ctx, nodeID)
+			if errors.Is(err, sql.ErrNoRows) || (err == nil && (!node.Enabled || node.DeletedAt != nil || (node.ExpiresAt != nil && !node.ExpiresAt.After(now)))) {
+				return "unavailable", nil
+			}
+			if err != nil {
+				return "", err
+			}
 		}
 	default:
 		return "unavailable", nil

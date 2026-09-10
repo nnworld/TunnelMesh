@@ -234,6 +234,60 @@ paths:
         '401': {description: Missing or invalid management bearer Token}
         '403': {description: Owner/resource authorization denied}
         '409': {description: Idempotency-Key conflict or request in progress}
+  /api/v1/server-nodes:
+    get:
+      summary: List Server node inventory and runtime status
+      description: Administrator-only inventory. Status is derived from logical lifecycle, heartbeat expiry, and active Agent connection leases. Token secrets and private keys are never returned.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodePageEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
+  /api/v1/server-nodes/{nodeId}:
+    parameters:
+      - {name: nodeId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read one Server node
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Server node, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodeEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
+        '404': {description: Not found}
+    patch:
+      summary: Update a Server node display name or enabled state
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodeUpdateRequest'}}}}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodeEnvelope'}}}}
+        '400': {description: Invalid name or empty update}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
+        '404': {description: Not found}
+    delete:
+      summary: Logically delete a Server node
+      description: Sets deleted_at and disables the node while retaining its inventory record for restoration.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Logically deleted, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodeEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
+        '404': {description: Not found}
+  /api/v1/server-nodes/{nodeId}/restore:
+    parameters:
+      - {name: nodeId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Restore a logically deleted Server node
+      description: Clears deleted_at and enables the node. Relay mTLS and epoch checks still apply.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Restored, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodeEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
+        '404': {description: Not found}
   /api/v1/tokens/{tokenId}:
     parameters:
       - {name: tokenId, in: path, required: true, schema: {type: string}}
@@ -248,7 +302,7 @@ paths:
         '404': {description: Token not found}
     patch:
       summary: Update an active service Token
-      description: 'Updates `expiresAt` and/or authorization scope fields. Send `expiresAt: null` to make the Token non-expiring. Scope fields that are omitted remain unchanged; empty arrays remove that restriction. Token type, owner, and Agent/Node binding cannot be changed. Revoked and already expired Tokens must be rotated instead.'
+      description: 'Updates `expiresAt` and/or authorization scope fields. Send `expiresAt: null` to make the Token non-expiring. Scope fields that are omitted remain unchanged; empty arrays remove that restriction. `agentIds` is valid only for client Tokens, and `serverNodeIds` is valid only for server_node Tokens. Token type, owner, and Agent/Node binding cannot be changed. Revoked and already expired Tokens must be rotated instead.'
       security: [{bearerAuth: []}]
       requestBody:
         required: true
@@ -503,11 +557,55 @@ components:
                 items: {type: array, items: {$ref: '#/components/schemas/AuditLog'}}
                 nextCursor: {type: string}
                 hasMore: {type: boolean}
+    ServerNode:
+      type: object
+      additionalProperties: false
+      required: [id, name, address, epoch, enabled, status, activeConnections, activeStreams, healthScore, createdAt, updatedAt]
+      properties:
+        id: {type: string, maxLength: 255}
+        name: {type: string, minLength: 1, maxLength: 255}
+        address: {type: string}
+        epoch: {type: integer, format: int64, minimum: 0}
+        enabled: {type: boolean}
+        deletedAt: {type: string, format: date-time, nullable: true}
+        lastSeenAt: {type: string, format: date-time, nullable: true}
+        expiresAt: {type: string, format: date-time, nullable: true}
+        status: {type: string, enum: [online, offline, disabled, deleted]}
+        activeConnections: {type: integer, format: int64, minimum: 0}
+        activeStreams: {type: integer, format: int64, minimum: 0}
+        healthScore: {type: integer, format: int64, minimum: 0}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    ServerNodeUpdateRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        enabled: {type: boolean}
+    ServerNodeEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/ServerNode'}}
+    ServerNodePage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ServerNode'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    ServerNodePageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/ServerNodePage'}}
     TokenScope:
       type: object
       additionalProperties: false
       properties:
-        agentIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}}
+        agentIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}, description: Explicit client-token Agent allowlist; an empty or omitted array allows every Agent authorized to the token owner}
+        serverNodeIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}, description: Explicit server_node allowlist; an empty or omitted array allows every enabled, non-deleted Server node}
         protocols: {type: array, maxItems: 4, uniqueItems: true, items: {type: string, enum: [tcp, udp, http, ws, websocket]}}
         targetCIDRs: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, description: IPv4 or IPv6 CIDR}}
         targetPorts: {type: array, maxItems: 1024, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}}
@@ -515,6 +613,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        agentIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}, description: Client-token Agent allowlist; empty allows every Agent owned by the Token owner, omitted preserves the current value}
+        serverNodeIds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, maxLength: 255}, description: server_node allowlist; empty creates a fleet Token, omitted preserves the current value}
         protocols: {type: array, maxItems: 4, uniqueItems: true, items: {type: string, enum: [tcp, udp, http, ws, websocket]}, description: Empty array allows every protocol; omitted preserves the current value}
         targetCIDRs: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, description: IPv4 or IPv6 CIDR}, description: Empty array allows every target address; omitted preserves the current value}
         targetPorts: {type: array, maxItems: 1024, uniqueItems: true, items: {type: integer, minimum: 1, maximum: 65535}, description: Empty array allows every port; omitted preserves the current value}
@@ -526,7 +626,7 @@ components:
         type: {type: string, enum: [agent, client, server_node]}
         ownerUserId: {type: string, description: Defaults to the authenticated management user; only admins may name another owner}
         agentId: {type: string, description: Required only for agent Tokens}
-        nodeId: {type: string, description: Required only for server_node Tokens}
+        nodeId: {type: string, deprecated: true, description: Legacy single-node binding; new server_node Tokens use scope.serverNodeIds}
         scope:
           allOf: [{$ref: '#/components/schemas/TokenScope'}]
           description: Optional narrowing scope; omission is equivalent to an empty scope

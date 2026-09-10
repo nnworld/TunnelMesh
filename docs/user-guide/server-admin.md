@@ -68,13 +68,23 @@ IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/44
 
 Tunnels 页面显示本地 forward、publish route 和连接状态。异常时先查看 Agent online/lease 状态，再检查 policy、目标端口和 Server 审计事件。停止或重试操作应使用同一隧道 ID，避免重复创建。Agent metadata 的 stale 状态由 WebSocket 会话租约决定：正常在线 Agent 会通过协议级 `PING/PONG` 自动续期，断线或心跳停止超过 metadata TTL 后才显示为 stale。
 
+## Server 节点
+
+管理员可在“Server 节点”页面查看集群 Server 清单。表格显示名称、节点 ID、relay 地址、epoch、状态、活跃连接、活跃流、健康分、最后心跳和租约到期时间；详情抽屉展示全部非敏感字段。
+
+状态派生规则为 `deleted`、`disabled`、`online`、`offline`：逻辑删除优先，其次为禁用；启用且心跳租约未过期为 online，启用但租约已过期为 offline。Server 会在完成节点身份初始化后自动注册，并每 30 秒心跳一次，租约有效期 90 秒。
+
+启用/禁用、逻辑删除和恢复都是管理员操作，会写入审计日志。删除只设置 `deleted_at` 并禁用节点，记录可恢复；恢复会清空 `deleted_at` 并重新启用。节点被禁用或删除后，即使持有有效 fleet token 和 mTLS 证书，relay 认证也会拒绝。
+
+`node.id` 缺失时，Server `run` 会自动生成并回写 YAML。systemd 会在非特权服务前以 root 执行 `init-node-id`，因此 `/etc/tunnelmesh` 可以保持只读。每个节点仍必须使用独立 mTLS 证书，证书 SAN 与最终 `node.id` 精确一致。
+
 ## 审计日志
 
 Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel 操作、metadata 读取和 SSH/TCP proxy 上下文。列表按事件时间倒序显示，同一时间使用审计 ID 倒序作为稳定排序；分页继续沿用 cursor。表格上方可按时间范围、操作者、动作、资源类型和资源 ID 做服务端筛选，点击“查询”后从第一页加载，点击“重置”清空条件并恢复默认列表。列表显示时间、操作者、动作、资源类型和资源 ID；点击“详情”可查看该事件的结构化 JSON 详情。路由创建、更新和删除会记录 Agent、域名、路径、目标地址、端口和状态。日志不记录 metadata 明文、SSH 私钥、Token 明文或会话字节。
 
 ## 角色与权限
 
-- `admin`：管理所有 Agent、Policy、Route、Tunnel、用户和审计日志。
+- `admin`：管理所有 Agent、Policy、Route、Tunnel、Server 节点、用户和审计日志。
 - 普通用户：查看和操作自己拥有的 Agent 及其隧道，不能读取其他用户的 metadata。
 - 任何角色都不能通过管理 API 修改 Agent 上报值。
 
@@ -84,7 +94,11 @@ Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel 操作、meta
 
 Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`server_node` 三类服务凭据。普通用户只能为自己拥有且启用的 Agent 创建 Agent/Client token；`server_node` 仅管理员可创建。
 
-列表中的“详情”会调用 `GET /api/v1/tokens/{id}` 展示完整的脱敏元数据，包括 ID、类型、所有者、绑定、授权范围、状态、时间戳和幂等重放标记；它不返回 Token 明文或哈希。对于仍处于 `active` 状态的 Token，可以使用“有效期”入口调用 `PATCH /api/v1/tokens/{id}` 修改过期时间。请求必须显式携带 `expiresAt`；传 `null` 表示永不过期，传未来时间表示缩短或延长有效期。也可以使用“修改范围”入口更新协议、目标 CIDR 和目标端口；未提交的字段保持不变，空数组表示不限制。该接口不能修改 Token 类型、所有者或 Agent/Node 绑定。已撤销或已过期的 Token 不能通过修改有效期或范围复活，应先轮换出新 Token。
+创建 `client` token 时，Agent ID 为多选框，可按名称或 ID 模糊搜索。留空表示允许该 Token owner 有权访问的所有 Agent；选择多个 Agent 会写入 `scope.agentIds` 显式允许列表。一个 Client Token 只能选择同一 owner 的 Agent；管理员选择其他用户的 Agent 时会自动携带对应 `ownerUserId`，混选不同 owner 会被拒绝。
+
+创建 `server_node` token 时，Server 节点为多选框。留空表示 fleet token，可被所有启用且未逻辑删除的 Server 节点使用；选择节点则生成显式允许列表，仅列表内节点可用。Server 配置文件使用 `server.relay.node_token` 字段读取该 token。共享 token 不替代节点身份，每个 Server 仍使用独立 mTLS 证书并校验 SAN 和 epoch。
+
+列表中的“详情”会调用 `GET /api/v1/tokens/{id}` 展示完整的脱敏元数据，包括 ID、类型、所有者、绑定、授权范围、状态、时间戳和幂等重放标记；它不返回 Token 明文或哈希。列表的“绑定”列会直接展示 Client Token 的 Agent 允许列表和 server_node Token 的 Server 节点允许列表；空列表分别显示为“所有 Agent”和“所有 Server 节点”。对于仍处于 `active` 状态的 Token，可以使用“有效期”入口调用 `PATCH /api/v1/tokens/{id}` 修改过期时间。请求必须显式携带 `expiresAt`；传 `null` 表示永不过期，传未来时间表示缩短或延长有效期。也可以使用“修改范围”入口更新协议、目标 CIDR、目标端口、Client Token 的 Agent 允许列表和 server_node Token 的 Server 节点允许列表；未提交的字段保持不变，空数组表示不限制。该接口不能修改 Token 类型、所有者或 Agent/Node 绑定。已撤销或已过期的 Token 不能通过修改有效期或范围复活，应先轮换出新 Token。
 
 创建或轮换成功后，明文 secret 只在对话框显示一次。配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY` 后，数据库保存 AES-GCM 密文，管理员仍须通过显式 reveal API、确认头和审计流程读取；未配置密钥时保持 hash-only，旧 token 无法恢复。请立即复制到 Secret 管理系统；轮换会使旧 token 失效；撤销适用于泄露或设备退役。
 

@@ -93,7 +93,7 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 401：检查 token 是否为空、类型是否正确、是否已过期或已撤销；`agent` 连接 `/ws/agent`，`client` 连接 `/ws/client`。
 - 403：检查 token owner、Agent 绑定、scope 与 Agent Policy 的交集。
 - 409：轮换/撤销并发冲突时，复用同一个 `Idempotency-Key` 重试；不要期待再次返回 secret。
-- Server-node relay 失败：检查节点 ID、epoch、证书 SAN 是否精确匹配、CA 是否正确，以及 `server.relay.listen` 是否已监听。
+- Server-node relay 失败：检查 `server.relay.node_token` 是否有效、节点是否在 `scope.serverNodeIds` 允许列表内、节点是否被禁用或逻辑删除、epoch 是否一致，以及 `server.relay.listen` 是否已监听。mTLS 模式还需检查证书 SAN 是否精确匹配、共同 `server_name` 是否存在、CA 是否正确；明文模式需确认网络确实处于受控内网。
 
 明文 secret 只在创建/轮换响应出现一次。不要从日志、审计记录或数据库恢复 token；遗失时直接轮换并撤销旧 token。
 
@@ -116,3 +116,12 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 迁移失败时先查看具体 SQL 错误和已创建对象；MySQL DDL 可能已隐式提交，修复后可重试，版本号不会在失败前推进。
 - 回滚应用可保留 v7 新表；如需精确回滚业务数据，使用升级前备份恢复。
 - 连接池扩容发布顺序、指标和止血步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
+
+## Server 节点与 Schema v8
+
+- Server 未出现在 `/servers` 页面：确认已完成 `node.id` 初始化并成功启动；自注册失败会在 journal 中输出 `register server node` 相关错误。
+- 节点显示 offline：检查 Server 进程、数据库连通性、集群时间同步，以及 `last_seen_at/expires_at` 是否持续更新。
+- relay 认证拒绝：同时检查共享 token、允许列表、节点启用状态、逻辑删除状态和 epoch；mTLS 模式还需检查 SAN。任意一项不满足都会失败。
+- 升级前确认 `schema_meta.version=7`、v7→v8 增量脚本存在且数据库账号可执行 `ALTER TABLE`/`UPDATE`。
+- v8 只为 `server_nodes` 增加 `name`、`enabled`、`deleted_at` 并回填名称；失败时版本不会提前推进，MySQL DDL 可能已隐式提交，确认已完成的列后可重试。
+- 回滚应用时保留 v8 新增列；如需精确恢复 Schema，使用升级前备份，不要手工删除列或修改版本号。

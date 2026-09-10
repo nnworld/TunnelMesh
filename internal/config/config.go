@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,9 @@ type ConfigOptions struct {
 	// NodeIDPath persists an automatically generated cluster node identity.
 	// It is intentionally opt-in so read-only config validation has no side effects.
 	NodeIDPath string
+	// PersistGeneratedNodeIDToConfig writes a generated node.id back into the
+	// YAML source. Only long-running Server startup enables this side effect.
+	PersistGeneratedNodeIDToConfig bool
 	// AgentInstanceIDPath persists a stable physical Agent instance identity.
 	AgentInstanceIDPath string
 }
@@ -253,6 +257,16 @@ func Load(ctx context.Context, opts ConfigOptions) (Config, error) {
 	cfg.Storage.MySQLTLS = cfg.Storage.MySQL.TLS
 	cfg.Registry.EtcdEndpoints = append([]string(nil), cfg.Registry.Endpoints...)
 	cfg.Node.Identity = cfg.Node.ID
+	if cfg.Mode == ModeCluster && strings.TrimSpace(cfg.Node.ID) == "" && opts.PersistGeneratedNodeIDToConfig {
+		if strings.TrimSpace(configFile) == "" {
+			return Config{}, errors.New("persist generated cluster node identity requires a config file")
+		}
+		id, err := InitializeNodeID(configFile, opts.NodeIDPath)
+		if err != nil {
+			return Config{}, fmt.Errorf("initialize cluster node identity: %w", err)
+		}
+		cfg.Node.ID, cfg.Node.Identity = id, id
+	}
 	if cfg.Mode == ModeCluster && strings.TrimSpace(cfg.Node.ID) == "" && strings.TrimSpace(opts.NodeIDPath) != "" {
 		id, err := EnsureNodeID(opts.NodeIDPath)
 		if err != nil {
@@ -266,6 +280,13 @@ func Load(ctx context.Context, opts ConfigOptions) (Config, error) {
 			return Config{}, fmt.Errorf("ensure agent instance identity: %w", err)
 		}
 		cfg.Agent.InstanceID = id
+	}
+	if cfg.Server.Relay.Enabled && strings.TrimSpace(cfg.Server.Relay.Endpoint) == "" && strings.TrimSpace(cfg.Server.Relay.Listen) != "" {
+		endpoint, err := InferRelayEndpoint(cfg.Server.Relay.Listen)
+		if err != nil {
+			return Config{}, fmt.Errorf("infer relay endpoint: %w", err)
+		}
+		cfg.Server.Relay.Endpoint = endpoint
 	}
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
@@ -774,6 +795,113 @@ func validWebSocketURL(raw string) bool {
 	return u.IsAbs()
 }
 
+// InferRelayEndpoint derives the address other Server nodes should use from
+// the relay listen address. A specific listen IP is preserved; wildcard
+// listeners are replaced with a usable address from this host.
+func InferRelayEndpoint(listen string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(listen))
+	if err != nil {
+		return "", fmt.Errorf("parse relay listen address: %w", err)
+	}
+	if port == "" {
+		return "", errors.New("relay listen port is required")
+	}
+	if parsed := net.ParseIP(host); parsed != nil && !parsed.IsUnspecified() {
+		return net.JoinHostPort(parsed.String(), port), nil
+	}
+	ip, err := selectRelayAdvertiseIP(localRelayAdvertiseAddresses())
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(ip.String(), port), nil
+}
+
+func localRelayAdvertiseAddresses() []net.Addr {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var addrs []net.Addr
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		ifaceAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		addrs = append(addrs, ifaceAddrs...)
+	}
+	return addrs
+}
+
+func selectRelayAdvertiseIP(addrs []net.Addr) (net.IP, error) {
+	var ipv4, ipv6 []net.IP
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP == nil {
+			continue
+		}
+		ip := ipNet.IP
+		// Interface address lists should not contain broadcast entries, but a
+		// future provider could return one. Global unicast also excludes
+		// loopback, link-local, multicast, and unspecified candidates.
+		if !ip.IsGlobalUnicast() {
+			continue
+		}
+		if ip.To4() != nil {
+			ipv4 = append(ipv4, ip)
+		} else {
+			ipv6 = append(ipv6, ip)
+		}
+	}
+	candidates := ipv4
+	if len(candidates) == 0 {
+		candidates = ipv6
+	}
+	if len(candidates) == 0 {
+		return nil, errors.New("no usable relay advertise address; configure server.relay.endpoint explicitly")
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].String() < candidates[j].String() })
+	return candidates[0], nil
+}
+
+// relayTLSMode makes the all-or-nothing certificate policy explicit: omitted
+// material is plaintext, complete material is mTLS, and partial material is an
+// error so a bad deployment cannot silently lose transport security.
+func relayTLSMode(cfg RelayConfig) (useTLS bool, err error) {
+	materialCount := 0
+	for _, value := range []string{cfg.CA, cfg.Cert, cfg.Key} {
+		if strings.TrimSpace(value) != "" {
+			materialCount++
+		}
+	}
+	if materialCount == 0 {
+		return false, nil
+	}
+	if materialCount != 3 {
+		return false, errors.New("server relay requires all CA, certificate, and key fields for mTLS or none for plaintext")
+	}
+
+	var problems []string
+	if !filepath.IsAbs(strings.TrimSpace(cfg.CA)) {
+		problems = append(problems, "server relay CA path must be absolute")
+	}
+	if !filepath.IsAbs(strings.TrimSpace(cfg.Cert)) {
+		problems = append(problems, "server relay certificate path must be absolute")
+	}
+	if !filepath.IsAbs(strings.TrimSpace(cfg.Key)) {
+		problems = append(problems, "server relay private key path must be absolute")
+	}
+	if strings.TrimSpace(cfg.ServerName) == "" {
+		problems = append(problems, "server relay server name is required")
+	}
+	if len(problems) > 0 {
+		return true, errors.New(strings.Join(problems, "; "))
+	}
+	return true, nil
+}
+
 func validateTLS(cfg TLSConfig) []string {
 	if !cfg.Enabled {
 		return nil
@@ -808,17 +936,10 @@ func validateRelay(mode, nodeID string, cfg RelayConfig) []string {
 	if strings.TrimSpace(cfg.Endpoint) == "" {
 		problems = append(problems, "server relay requires a reachable endpoint address")
 	}
-	if strings.TrimSpace(cfg.CA) == "" || !filepath.IsAbs(cfg.CA) {
-		problems = append(problems, "server relay CA path must be absolute")
-	}
-	if strings.TrimSpace(cfg.Cert) == "" || !filepath.IsAbs(cfg.Cert) {
-		problems = append(problems, "server relay certificate path must be absolute")
-	}
-	if strings.TrimSpace(cfg.Key) == "" || !filepath.IsAbs(cfg.Key) {
-		problems = append(problems, "server relay private key path must be absolute")
-	}
-	if strings.TrimSpace(cfg.ServerName) == "" {
-		problems = append(problems, "server relay server name is required")
+	// Keep certificate policy in one place so config validation and future
+	// callers cannot disagree about plaintext versus mTLS.
+	if _, err := relayTLSMode(cfg); err != nil {
+		problems = append(problems, err.Error())
 	}
 	if strings.TrimSpace(cfg.NodeToken) == "" {
 		problems = append(problems, "server relay node token is required")

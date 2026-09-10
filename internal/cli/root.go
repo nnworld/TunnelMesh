@@ -42,6 +42,7 @@ func NewClientCommand() *cobra.Command { return NewClientRoot() }
 type rootOptions struct {
 	binaryName                  string
 	configFile                  string
+	nodeIDPath                  string
 	mode                        string
 	storage                     string
 	autoInit                    bool
@@ -69,7 +70,7 @@ type rootOptions struct {
 }
 
 func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Command {
-	opts := &rootOptions{binaryName: use}
+	opts := &rootOptions{binaryName: use, nodeIDPath: config.DefaultNodeIDPath}
 	root := &cobra.Command{
 		Use:           use,
 		Short:         "TunnelMesh " + strings.TrimPrefix(use, "tunnelmesh-") + " command",
@@ -143,7 +144,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				if strings.TrimSpace(opts.configFile) == "" {
 					return errors.New("--config is required")
 				}
-				id, err := config.InitializeNodeID(opts.configFile, config.DefaultNodeIDPath)
+				id, err := config.InitializeNodeID(opts.configFile, opts.nodeIDPath)
 				if err != nil {
 					return err
 				}
@@ -572,14 +573,15 @@ func configCommand(opts *rootOptions, name, short string, run func(*cobra.Comman
 		Short: short,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load(cmd.Context(), config.ConfigOptions{
-				ConfigFile: opts.configFile,
-				CLI:        changedFlags(cmd, opts),
+				ConfigFile:                     opts.configFile,
+				CLI:                            changedFlags(cmd, opts),
 				NodeIDPath: func() string {
 					if name == "run" {
-						return config.DefaultNodeIDPath
+						return opts.nodeIDPath
 					}
 					return ""
 				}(),
+				PersistGeneratedNodeIDToConfig: name == "run" && opts.binaryName == "tunnelmesh-server",
 				AgentInstanceIDPath: func() string {
 					if name == "run" && opts.binaryName == "tunnelmesh-agent" {
 						return config.DefaultAgentInstanceIDPath

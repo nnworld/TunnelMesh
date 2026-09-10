@@ -16,7 +16,7 @@
           <el-table-column prop="prefix" :label="t('tokens.prefix')" width="130" />
           <el-table-column prop="type" :label="t('tokens.type')" width="130" />
           <el-table-column prop="ownerUserId" :label="t('tokens.owner')" min-width="150" />
-          <el-table-column :label="t('tokens.binding')" min-width="160"><template #default="{ row }">{{ row.agentId || row.nodeId || t('tokens.scoped') }}</template></el-table-column>
+          <el-table-column :label="t('tokens.binding')" min-width="180"><template #default="{ row }">{{ tokenBinding(row) }}</template></el-table-column>
           <el-table-column :label="t('tokens.state')" width="120"><template #default="{ row }"><StatusTag :kind="row.status === 'revoked' ? 'info' : row.status === 'active' ? 'success' : 'warning'" :label="row.status" /></template></el-table-column>
           <el-table-column :label="t('tokens.expires')" width="180"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
           <el-table-column :label="t('tokens.lastUsed')" width="180"><template #default="{ row }">{{ formatDate(row.lastUsedAt) }}</template></el-table-column>
@@ -43,9 +43,19 @@
             <el-option v-for="agent in visibleAgents" :key="agent.id" :label="`${agent.name} · ${agent.id}`" :value="agent.id" />
           </el-select>
         </el-form-item>
-        <el-form-item v-if="form.type === 'server_node'" :label="t('tokens.nodeId')"><el-input v-model="form.nodeId" :placeholder="t('tokens.nodeId')" /></el-form-item>
-        <el-form-item v-if="form.type === 'client'" :label="t('tokens.agentIds')"><el-input v-model="agentIdsText" type="textarea" :rows="3" placeholder="agent-a&#10;agent-b" /></el-form-item>
-        <el-form-item :label="t('tokens.protocols')"><el-checkbox-group v-model="form.scope.protocols"><el-checkbox label="tcp" /><el-checkbox label="udp" /><el-checkbox label="http" /><el-checkbox label="websocket" /></el-checkbox-group></el-form-item>
+        <el-form-item v-if="form.type === 'server_node'" :label="t('tokens.serverNodes')">
+          <el-select v-model="form.serverNodeIds" multiple filterable clearable :loading="serverNodesLoading" :placeholder="t('tokens.searchServerNodes')">
+            <el-option v-for="node in serverNodes" :key="node.id" :label="`${node.name} · ${node.id}`" :value="node.id" />
+          </el-select>
+          <div class="field-help">{{ t('tokens.allServerNodes') }}</div>
+        </el-form-item>
+        <el-form-item v-if="form.type === 'client'" :label="t('tokens.agentIds')">
+          <el-select v-model="form.agentIds" multiple filterable clearable collapse-tags collapse-tags-tooltip :loading="agentsLoading" :filter-method="setAgentFilter" :placeholder="t('tokens.searchAgents')">
+            <el-option v-for="agent in visibleAgents" :key="agent.id" :label="`${agent.name} · ${agent.id}`" :value="agent.id" />
+          </el-select>
+          <div class="field-help">{{ t('tokens.allAgents') }}</div>
+        </el-form-item>
+        <el-form-item :label="t('tokens.protocols')"><el-checkbox-group v-model="form.scope.protocols"><el-checkbox label="tcp" /><el-checkbox label="udp" /><el-checkbox label="http" /><el-checkbox label="ws">WebSocket</el-checkbox></el-checkbox-group></el-form-item>
         <el-form-item :label="t('tokens.cidrs')"><el-input v-model="cidrsText" placeholder="10.0.0.0/24, 192.168.1.0/24" /></el-form-item>
         <el-form-item :label="t('tokens.ports')">
           <el-input v-model="portsText" placeholder="22, 80, 443" />
@@ -75,6 +85,7 @@
           <el-descriptions-item :label="t('tokens.scope')" :span="2">
             <div class="scope-list">
               <div><span>{{ t('tokens.agentIds') }}:</span>{{ formatList(detailToken.scope.agentIds) }}</div>
+              <div><span>{{ t('tokens.serverNodes') }}:</span>{{ formatServerNodeScope(detailToken) }}</div>
               <div><span>{{ t('tokens.protocols') }}:</span>{{ formatList(detailToken.scope.protocols) }}</div>
               <div><span>{{ t('tokens.cidrs') }}:</span>{{ formatList(detailToken.scope.targetCIDRs) }}</div>
               <div><span>{{ t('tokens.ports') }}:</span>{{ formatList(detailToken.scope.targetPorts) }}</div>
@@ -104,9 +115,21 @@
             <el-checkbox label="tcp" />
             <el-checkbox label="udp" />
             <el-checkbox label="http" />
-            <el-checkbox label="websocket" />
+            <el-checkbox label="ws">WebSocket</el-checkbox>
           </el-checkbox-group>
           <div class="field-help">{{ t('tokens.allProtocols') }}</div>
+        </el-form-item>
+        <el-form-item v-if="scopeToken?.type === 'client'" :label="t('tokens.agentIds')">
+          <el-select v-model="scopeForm.agentIds" multiple filterable clearable collapse-tags collapse-tags-tooltip :loading="agentsLoading" :filter-method="setAgentFilter" :placeholder="t('tokens.searchAgents')">
+            <el-option v-for="agent in visibleAgents" :key="agent.id" :label="`${agent.name} · ${agent.id}`" :value="agent.id" />
+          </el-select>
+          <div class="field-help">{{ t('tokens.allAgents') }}</div>
+        </el-form-item>
+        <el-form-item v-if="scopeToken?.type === 'server_node'" :label="t('tokens.serverNodes')">
+          <el-select v-model="scopeForm.serverNodeIds" multiple filterable clearable :loading="serverNodesLoading" :placeholder="t('tokens.searchServerNodes')">
+            <el-option v-for="node in serverNodes" :key="node.id" :label="`${node.name} · ${node.id}`" :value="node.id" />
+          </el-select>
+          <div class="field-help">{{ t('tokens.allServerNodes') }}</div>
         </el-form-item>
         <el-form-item :label="t('tokens.cidrs')">
           <el-input v-model="scopeForm.cidrsText" placeholder="10.0.0.0/24, 192.168.1.0/24" />
@@ -129,7 +152,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { createToken, getAgents, getTokenDetail, listTokens, revokeToken, rotateToken, revealToken, updateTokenExpiration, updateTokenScope, type Agent, type ServiceToken, type TokenType } from '../api/client'
+import { createToken, getAgents, getServerNodes, getTokenDetail, listTokens, revokeToken, rotateToken, revealToken, updateTokenExpiration, updateTokenScope, type Agent, type ServerNode, type ServiceToken, type TokenType } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { useI18n } from 'vue-i18n'
 import TokenSecretDialog from '../components/TokenSecretDialog.vue'
@@ -143,17 +166,32 @@ const auth = useAuthStore(); const {t}=useI18n(); const items = ref<ServiceToken
 const detailVisible = ref(false); const detailLoading = ref(false); const detailError = ref(false); const detailToken = ref<ServiceToken | null>(null)
 const expirationVisible = ref(false); const expirationSaving = ref(false); const expirationForm = ref(''); const expirationToken = ref<ServiceToken | null>(null)
 const scopeVisible = ref(false); const scopeSaving = ref(false); const scopeToken = ref<ServiceToken | null>(null)
-const scopeForm = reactive<{ protocols: string[]; cidrsText: string; portsText: string }>({ protocols: [], cidrsText: '', portsText: '' })
-const agents = ref<Agent[]>([]); const agentsLoading = ref(false); const agentFilter = ref(''); const visibleAgents = computed(() => filterAgents(agents.value, agentFilter.value)); const selectedAgent = computed(() => agents.value.find(agent => agent.id === form.agentId))
-const form = reactive<{ type: TokenType; agentId: string; nodeId: string; expiresAt: string; scope: { agentIds: string[]; protocols: string[]; targetCIDRs: string[]; targetPorts: number[] } }>({ type: 'client', agentId: '', nodeId: '', expiresAt: defaultTokenExpiration(), scope: { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] } })
-const agentIdsText = ref(''); const cidrsText = ref(''); const portsText = ref('')
+const scopeForm = reactive<{ agentIds: string[]; serverNodeIds: string[]; protocols: string[]; cidrsText: string; portsText: string }>({ agentIds: [], serverNodeIds: [], protocols: [], cidrsText: '', portsText: '' })
+const selectedScopeAgents = computed(() => scopeForm.agentIds.map(id => agents.value.find(agent => agent.id === id)).filter((agent): agent is Agent => Boolean(agent)))
+const agents = ref<Agent[]>([]); const agentsLoading = ref(false); const agentFilter = ref(''); const visibleAgents = computed(() => filterAgents(agents.value, agentFilter.value)); const selectedAgent = computed(() => agents.value.find(agent => agent.id === form.agentId)); const selectedClientAgents = computed(() => form.agentIds.map(id => agents.value.find(agent => agent.id === id)).filter((agent): agent is Agent => Boolean(agent)))
+const serverNodes = ref<ServerNode[]>([]); const serverNodesLoading = ref(false)
+const form = reactive<{ type: TokenType; agentId: string; agentIds: string[]; nodeId: string; serverNodeIds: string[]; expiresAt: string; scope: { agentIds: string[]; protocols: string[]; targetCIDRs: string[]; targetPorts: number[] } }>({ type: 'client', agentId: '', agentIds: [], nodeId: '', serverNodeIds: [], expiresAt: defaultTokenExpiration(), scope: { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] } })
+const cidrsText = ref(''); const portsText = ref('')
 const formatDate = useFormatDateTime()
 function clearSecret() { secret.value = '' }
 function openCreate() { resetForm(); createVisible.value = true }
-function resetForm() { form.type = 'client'; form.agentId = ''; form.nodeId = ''; form.expiresAt = defaultTokenExpiration(); form.scope = { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] }; agentIdsText.value = ''; cidrsText.value = ''; portsText.value = ''; agentFilter.value = '' }
+function resetForm() { form.type = 'client'; form.agentId = ''; form.agentIds = []; form.nodeId = ''; form.serverNodeIds = []; form.expiresAt = defaultTokenExpiration(); form.scope = { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] }; cidrsText.value = ''; portsText.value = ''; agentFilter.value = '' }
 function setAgentFilter(query: string) { agentFilter.value = query }
 function formatList(values?: Array<string | number>) { return values?.length ? values.join(', ') : '—' }
 function formatBoolean(value?: boolean) { return value ? t('common.yes') : t('common.no') }
+function tokenBinding(row: ServiceToken) {
+  if (row.type === 'server_node') return formatServerNodeScope(row)
+  if (row.type === 'client') return formatAgentScope(row)
+  return row.agentId || row.nodeId || t('tokens.scoped')
+}
+function formatAgentScope(row: ServiceToken) {
+  if (row.type !== 'client') return '—'
+  return row.scope.agentIds?.length ? row.scope.agentIds.join(', ') : t('tokens.allAgents')
+}
+function formatServerNodeScope(row: ServiceToken) {
+  if (row.type !== 'server_node') return '—'
+  return row.scope.serverNodeIds?.length ? row.scope.serverNodeIds.join(', ') : t('tokens.allServerNodes')
+}
 async function showDetail(row: ServiceToken) {
   detailVisible.value = true; detailLoading.value = true; detailError.value = false
   if (!detailToken.value || detailToken.value.id !== row.id) detailToken.value = row
@@ -165,6 +203,8 @@ async function retryDetail() { if (detailToken.value) await showDetail(detailTok
 function openExpiration(row: ServiceToken) { expirationToken.value = row; expirationForm.value = row.expiresAt || ''; expirationVisible.value = true }
 function openScope(row: ServiceToken) {
   scopeToken.value = row
+  scopeForm.agentIds = [...(row.scope.agentIds || [])]
+  scopeForm.serverNodeIds = [...(row.scope.serverNodeIds || [])]
   scopeForm.protocols = [...(row.scope.protocols || [])]
   scopeForm.cidrsText = (row.scope.targetCIDRs || []).join(', ')
   scopeForm.portsText = (row.scope.targetPorts || []).join(', ')
@@ -184,9 +224,13 @@ async function updateExpiration() {
 }
 async function updateScope() {
   if (!scopeToken.value) return
+  if (scopeToken.value.type === 'client' && (selectedScopeAgents.value.length !== scopeForm.agentIds.length || selectedScopeAgents.value.some(agent => agent.ownerUserId !== scopeToken.value?.ownerUserId))) { ElMessage.warning(t('tokens.agentOwnerMismatch')); return }
   scopeSaving.value = true
   try {
     const updated = await updateTokenScope(scopeToken.value.id, tokenScopePatchFromForm({
+      type: scopeToken.value.type,
+      agentIds: scopeForm.agentIds,
+      serverNodeIds: scopeForm.serverNodeIds,
       protocols: scopeForm.protocols,
       cidrsText: scopeForm.cidrsText,
       portsText: scopeForm.portsText,
@@ -200,13 +244,15 @@ async function updateScope() {
   finally { scopeSaving.value = false }
 }
 async function loadAgents() { agentsLoading.value = true; try { agents.value = await loadAgentsForSelection(getAgents) } finally { agentsLoading.value = false } }
+async function loadServerNodes() { serverNodesLoading.value = true; try { const page = await getServerNodes({ limit: 500 }); serverNodes.value = page.items } finally { serverNodesLoading.value = false } }
 async function reload() { loading.value = true; loadError.value = false; try { const page = await listTokens({ type: filterType.value || undefined }); items.value = page.items; nextCursor.value = page.nextCursor || '' } catch { loadError.value = true } finally { loading.value = false } }
 async function loadMore() { if (!nextCursor.value) return; loading.value = true; loadError.value = false; try { const page = await listTokens({ type: filterType.value || undefined, cursor: nextCursor.value }); items.value.push(...page.items); nextCursor.value = page.nextCursor || '' } catch { loadError.value = true } finally { loading.value = false } }
 async function create() {
   if (form.type === 'agent' && !form.agentId) { ElMessage.warning(t('tokens.agentRequired')); return }
+  if (form.type === 'client' && new Set(selectedClientAgents.value.map(agent => agent.ownerUserId)).size > 1) { ElMessage.warning(t('tokens.agentOwnerMismatch')); return }
   saving.value = true
   try {
-    const payload = tokenPayloadFromForm({ type: form.type, agentId: form.agentId, nodeId: form.nodeId, expiresAt: form.expiresAt, agentIdsText: agentIdsText.value, cidrsText: cidrsText.value, portsText: portsText.value, selectedAgent: selectedAgent.value, scope: { protocols: form.scope.protocols } })
+    const payload = tokenPayloadFromForm({ type: form.type, agentId: form.agentId, agentIds: form.agentIds, nodeId: form.nodeId, serverNodeIds: form.serverNodeIds, expiresAt: form.expiresAt, cidrsText: cidrsText.value, portsText: portsText.value, selectedAgent: selectedAgent.value, selectedAgents: selectedClientAgents.value, scope: { protocols: form.scope.protocols } })
     const created = await createToken(payload, crypto.randomUUID()); createVisible.value = false; secret.value = created.secret || ''; await reload(); ElMessage.success(t('tokens.created'))
   } catch { ElMessage.error(t('tokens.createFailed')) }
   finally { saving.value = false }
@@ -214,7 +260,7 @@ async function create() {
 async function rotate(row: ServiceToken) { try { await ElMessageBox.confirm(t('tokens.rotateConfirm'), t('tokens.rotateTitle'), { type: 'warning' }); const rotated = await rotateToken(row.id, crypto.randomUUID()); secret.value = rotated.secret || ''; await reload() } catch (error) { if (error === 'cancel' || error === 'close') return; ElMessage.error(t('tokens.rotateFailed')) } }
 async function reveal(row: ServiceToken) { try { const confirmation = await ElMessageBox.prompt(t('tokens.revealConfirm'), t('tokens.revealTitle'), { inputPattern: /^REVEAL$/, inputErrorMessage: t('tokens.revealInput'), type: 'warning' }); const revealed = await revealToken(row.id, confirmation.value, crypto.randomUUID()); secret.value = revealed.secret; } catch (error) { if (error === 'cancel' || error === 'close') return; ElMessage.error(t('tokens.revealFailed')) } }
 async function revoke(row: ServiceToken) { try { await ElMessageBox.confirm(t('tokens.revokeConfirm'), t('tokens.revokeTitle'), { type: 'warning' }); await revokeToken(row.id); ElMessage.success(t('tokens.revoked')); await reload() } catch (error) { if (error === 'cancel' || error === 'close') return; ElMessage.error(t('tokens.revokeFailed')) } }
-onMounted(() => { void reload(); void loadAgents() }); onBeforeUnmount(clearSecret)
+onMounted(() => { void reload(); void loadAgents(); if (auth.isAdmin) void loadServerNodes() }); onBeforeUnmount(clearSecret)
 </script>
 
 <style scoped>

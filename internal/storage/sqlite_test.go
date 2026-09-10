@@ -300,6 +300,59 @@ func TestSQLiteV6ToV7ConnectionLeaseMigrationPreservesLegacyRows(t *testing.T) {
 	}
 }
 
+func TestSQLiteV7ToV8ServerNodeManagementMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v7-to-v8.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	statements := []string{
+		`DROP TABLE server_nodes`,
+		`CREATE TABLE server_nodes (
+			id VARBINARY(255) PRIMARY KEY,
+			address VARBINARY(255) NOT NULL,
+			epoch INTEGER NOT NULL DEFAULT 0,
+			metadata TEXT NOT NULL,
+			last_seen_at TEXT,
+			expires_at TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,7)`,
+		`INSERT INTO server_nodes(id,address,epoch,metadata,created_at,updated_at)
+		 VALUES('legacy-server','127.0.0.1:9443',7,'{}','2026-09-10T00:00:00Z','2026-09-10T00:00:00Z')`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v7 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v7 to v8: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	node, err := db.Nodes().Get(context.Background(), "legacy-server")
+	if err != nil {
+		t.Fatalf("get migrated node: %v", err)
+	}
+	if node.Name != "legacy-server" || !node.Enabled || node.DeletedAt != nil {
+		t.Fatalf("migrated node = %+v, want managed defaults", node)
+	}
+}
+
 func TestSQLiteDDLAddsAgentPolicyIndex(t *testing.T) {
 	db := newTestDB(t)
 	rows, err := db.SQL().Query(`PRAGMA index_list(agent_policies)`)

@@ -25,6 +25,7 @@ const (
 	maxTokenScopeJSONBytes = 16 * 1024
 	maxScopeAgentIDs       = 128
 	maxScopeAgentIDBytes   = 255
+	maxScopeServerNodeIDs  = 128
 	maxScopeProtocols      = 4
 	maxScopeCIDRs          = 128
 	maxScopePorts          = 1024
@@ -32,20 +33,22 @@ const (
 )
 
 type TokenScope struct {
-	AgentIDs    []string `json:"agentIds,omitempty"`
-	Protocols   []string `json:"protocols,omitempty"`
-	TargetCIDRs []string `json:"targetCIDRs,omitempty"`
-	TargetPorts []int    `json:"targetPorts,omitempty"`
+	AgentIDs      []string `json:"agentIds,omitempty"`
+	ServerNodeIDs []string `json:"serverNodeIds,omitempty"`
+	Protocols     []string `json:"protocols,omitempty"`
+	TargetCIDRs   []string `json:"targetCIDRs,omitempty"`
+	TargetPorts   []int    `json:"targetPorts,omitempty"`
 }
 
 type TokenIdentity struct {
-	TokenID     string
-	OwnerUserID string
-	AgentID     string
-	NodeID      string
-	Prefix      string
-	Type        storage.TokenType
-	Scope       TokenScope
+	TokenID       string
+	OwnerUserID   string
+	AgentID       string
+	NodeID        string
+	ServerNodeIDs []string
+	Prefix        string
+	Type          storage.TokenType
+	Scope         TokenScope
 }
 
 type CreateTokenInput struct {
@@ -76,11 +79,12 @@ type lastUsedUpdate struct {
 }
 
 type compiledTokenScope struct {
-	scope     TokenScope
-	agentIDs  map[string]struct{}
-	protocols map[string]struct{}
-	cidrs     []*net.IPNet
-	ports     map[int]struct{}
+	scope         TokenScope
+	agentIDs      map[string]struct{}
+	serverNodeIDs map[string]struct{}
+	protocols     map[string]struct{}
+	cidrs         []*net.IPNet
+	ports         map[int]struct{}
 }
 
 type portInterval struct {
@@ -187,6 +191,9 @@ func (s *CredentialService) Create(ctx context.Context, in CreateTokenInput) (Cr
 		return CreatedToken{}, err
 	}
 	if err := s.validateScopedAgents(ctx, in.Type, in.OwnerUserID, in.AgentID, scope.AgentIDs); err != nil {
+		return CreatedToken{}, err
+	}
+	if err := s.validateScopedServerNodes(ctx, in.Type, scope.ServerNodeIDs); err != nil {
 		return CreatedToken{}, err
 	}
 	raw, err := randomToken(32)
@@ -359,8 +366,8 @@ func validateTokenBinding(in CreateTokenInput) error {
 			return errors.New("client token must be bound only to its owner")
 		}
 	case storage.TokenTypeServerNode:
-		if in.NodeID == "" || in.AgentID != "" {
-			return errors.New("server-node token requires only a node binding")
+		if in.NodeID != "" || in.AgentID != "" {
+			return fmt.Errorf("%w: server-node token must use scope.serverNodeIds", ErrInvalidTokenScope)
 		}
 	}
 	return nil
@@ -382,9 +389,22 @@ func (s *CredentialService) validateOwnerAndBinding(ctx context.Context, tokenTy
 			return ErrUnauthenticated
 		}
 	case storage.TokenTypeServerNode:
+		// Server-node authorization is defined by scope.serverNodeIds. An empty
+		// list is a deliberate fleet credential; relay still verifies the
+		// caller's mTLS identity and node epoch before accepting traffic.
+	}
+	return nil
+}
+
+func (s *CredentialService) validateScopedServerNodes(ctx context.Context, tokenType storage.TokenType, nodeIDs []string) error {
+	if tokenType != storage.TokenTypeServerNode {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, nodeID := range nodeIDs {
 		node, err := s.nodes.Get(ctx, nodeID)
-		if err != nil || (node.ExpiresAt != nil && !node.ExpiresAt.After(time.Now().UTC())) {
-			return ErrUnauthenticated
+		if err != nil || !node.Enabled || node.DeletedAt != nil || (node.ExpiresAt != nil && !node.ExpiresAt.After(now)) {
+			return ErrInvalidTokenScope
 		}
 	}
 	return nil
@@ -430,7 +450,10 @@ func (s *CredentialService) identityAndScopeFromRecord(ctx context.Context, reco
 	if err != nil {
 		return TokenIdentity{}, compiledTokenScope{}, ErrUnauthenticated
 	}
-	identity := TokenIdentity{TokenID: record.ID, OwnerUserID: record.OwnerUserID, AgentID: record.AgentID, NodeID: record.NodeID, Prefix: record.Prefix, Type: record.Type, Scope: compiled.scope}
+	if err := s.validateScopedServerNodes(ctx, record.Type, compiled.scope.ServerNodeIDs); err != nil {
+		return TokenIdentity{}, compiledTokenScope{}, ErrUnauthenticated
+	}
+	identity := TokenIdentity{TokenID: record.ID, OwnerUserID: record.OwnerUserID, AgentID: record.AgentID, NodeID: record.NodeID, ServerNodeIDs: compiled.scope.ServerNodeIDs, Prefix: record.Prefix, Type: record.Type, Scope: compiled.scope}
 	return identity, compiled, nil
 }
 
@@ -446,13 +469,19 @@ func NormalizeTokenScope(scope TokenScope) (TokenScope, error) {
 }
 
 func compileTokenScope(scope TokenScope) (compiledTokenScope, error) {
-	if len(scope.AgentIDs) > maxScopeAgentIDs || len(scope.Protocols) > maxScopeProtocols || len(scope.TargetCIDRs) > maxScopeCIDRs || len(scope.TargetPorts) > maxScopePorts {
+	if len(scope.AgentIDs) > maxScopeAgentIDs || len(scope.ServerNodeIDs) > maxScopeServerNodeIDs || len(scope.Protocols) > maxScopeProtocols || len(scope.TargetCIDRs) > maxScopeCIDRs || len(scope.TargetPorts) > maxScopePorts {
 		return compiledTokenScope{}, fmt.Errorf("%w: scope entry limit exceeded", ErrInvalidTokenScope)
 	}
 	stringBytes := 0
 	for _, value := range scope.AgentIDs {
 		if len(value) > maxScopeAgentIDBytes {
 			return compiledTokenScope{}, fmt.Errorf("%w: invalid agent id", ErrInvalidTokenScope)
+		}
+		stringBytes += len(value)
+	}
+	for _, value := range scope.ServerNodeIDs {
+		if len(value) > maxScopeAgentIDBytes {
+			return compiledTokenScope{}, fmt.Errorf("%w: invalid server node id", ErrInvalidTokenScope)
 		}
 		stringBytes += len(value)
 	}
@@ -472,10 +501,23 @@ func compileTokenScope(scope TokenScope) (compiledTokenScope, error) {
 		return compiledTokenScope{}, fmt.Errorf("%w: serialized scope exceeds %d bytes", ErrInvalidTokenScope, maxTokenScopeJSONBytes)
 	}
 	out := compiledTokenScope{
-		agentIDs:  make(map[string]struct{}, len(scope.AgentIDs)),
-		protocols: make(map[string]struct{}, len(scope.Protocols)),
-		cidrs:     make([]*net.IPNet, 0, len(scope.TargetCIDRs)),
-		ports:     make(map[int]struct{}, len(scope.TargetPorts)),
+		agentIDs:      make(map[string]struct{}, len(scope.AgentIDs)),
+		serverNodeIDs: make(map[string]struct{}, len(scope.ServerNodeIDs)),
+		protocols:     make(map[string]struct{}, len(scope.Protocols)),
+		cidrs:         make([]*net.IPNet, 0, len(scope.TargetCIDRs)),
+		ports:         make(map[int]struct{}, len(scope.TargetPorts)),
+	}
+	seenServerNodes := make(map[string]struct{})
+	for _, raw := range scope.ServerNodeIDs {
+		nodeID := strings.TrimSpace(raw)
+		if nodeID == "" || len(nodeID) > maxScopeAgentIDBytes {
+			return compiledTokenScope{}, fmt.Errorf("%w: invalid server node id", ErrInvalidTokenScope)
+		}
+		if _, ok := seenServerNodes[nodeID]; !ok {
+			seenServerNodes[nodeID] = struct{}{}
+			out.serverNodeIDs[nodeID] = struct{}{}
+			out.scope.ServerNodeIDs = append(out.scope.ServerNodeIDs, nodeID)
+		}
 	}
 	seenAgents := make(map[string]struct{})
 	for _, raw := range scope.AgentIDs {
@@ -526,6 +568,7 @@ func compileTokenScope(scope TokenScope) (compiledTokenScope, error) {
 		}
 	}
 	sort.Strings(out.scope.AgentIDs)
+	sort.Strings(out.scope.ServerNodeIDs)
 	sort.Strings(out.scope.Protocols)
 	sort.Strings(out.scope.TargetCIDRs)
 	sort.Ints(out.scope.TargetPorts)

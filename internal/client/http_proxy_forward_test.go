@@ -90,7 +90,11 @@ func TestHTTPProxyForwardConnectTunnelsTCP(t *testing.T) {
 	if _, err := conn.Write([]byte("CONNECT service.internal:8443 HTTP/1.1\r\nHost: service.internal:8443\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	// CONNECT responses and tunnel bytes can arrive in the same TCP segment.
+	// Reuse one buffered reader so bytes consumed with the response are not
+	// stranded in a discarded bufio.Reader and missed by the direct read below.
+	connReader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(connReader, nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT response=%+v err=%v", resp, err)
 	}
@@ -107,7 +111,7 @@ func TestHTTPProxyForwardConnectTunnelsTCP(t *testing.T) {
 	}
 	waitForRemoteWrite(t, remote)
 	got := make([]byte, len("tunnel-reply"))
-	if _, err := io.ReadFull(conn, got); err != nil {
+	if _, err := io.ReadFull(connReader, got); err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != "tunnel-reply" {

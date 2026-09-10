@@ -53,7 +53,7 @@ func TestCredentialServiceCreatesAndValidatesEachTokenType(t *testing.T) {
 	}{
 		{name: "agent", in: CreateTokenInput{Type: storage.TokenTypeAgent, OwnerUserID: "owner", AgentID: "agent-a"}},
 		{name: "client", in: CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: "owner"}},
-		{name: "server node", in: CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: "owner", NodeID: "node-a"}},
+		{name: "server node", in: CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: "owner"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -166,7 +166,7 @@ func TestCredentialServiceRejectsTypeCrossoverAndInvalidBindings(t *testing.T) {
 		{Type: storage.TokenTypeClient, OwnerUserID: "owner", AgentID: "agent-a"},
 		{Type: storage.TokenTypeAgent, OwnerUserID: "owner"},
 		{Type: storage.TokenTypeAgent, OwnerUserID: "owner", AgentID: "missing"},
-		{Type: storage.TokenTypeServerNode, OwnerUserID: "owner"},
+		{Type: storage.TokenTypeServerNode, OwnerUserID: "owner", NodeID: "node-a"},
 	}
 	for i, in := range invalid {
 		if _, err := service.Create(ctx, in); err == nil {
@@ -260,10 +260,136 @@ func TestCredentialServiceServerNodeStateFailsClosed(t *testing.T) {
 			}
 			repos.nodes.getErr = tt.getErr
 			raw := "node-secret"
-			repos.tokens.items["node-token"] = storage.ServiceToken{ID: "node-token", Type: storage.TokenTypeServerNode, OwnerUserID: "owner", NodeID: "node-a", TokenHash: hashToken(raw), Scope: `{}`}
+			repos.tokens.items["node-token"] = storage.ServiceToken{ID: "node-token", Type: storage.TokenTypeServerNode, OwnerUserID: "owner", TokenHash: hashToken(raw), Scope: mustScopeJSON(t, TokenScope{ServerNodeIDs: []string{"node-a"}})}
 			service := newTestCredentialService(t, repos)
 			if _, err := service.ValidateAs(ctx, raw, storage.TokenTypeServerNode); !errors.Is(err, ErrUnauthenticated) {
 				t.Fatalf("ValidateAs() error = %v, want ErrUnauthenticated", err)
+			}
+		})
+	}
+}
+
+func TestCredentialServiceCreatesFleetAndMultiNodeServerTokens(t *testing.T) {
+	ctx := context.Background()
+	repos := newCredentialRepos()
+	repos.users.items["owner"] = storage.User{ID: "owner"}
+	repos.nodes.items["server-a"] = storage.ServerNode{ID: "server-a", Enabled: true}
+	repos.nodes.items["server-b"] = storage.ServerNode{ID: "server-b", Enabled: true}
+	service := newTestCredentialService(t, repos)
+
+	fleet, err := service.Create(ctx, CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: "owner"})
+	if err != nil {
+		t.Fatalf("create fleet token: %v", err)
+	}
+	fleetIdentity, err := service.ValidateAs(ctx, fleet.Secret, storage.TokenTypeServerNode)
+	if err != nil {
+		t.Fatalf("validate fleet token: %v", err)
+	}
+	if len(fleetIdentity.ServerNodeIDs) != 0 {
+		t.Fatalf("fleet ServerNodeIDs = %v, want empty", fleetIdentity.ServerNodeIDs)
+	}
+
+	multi, err := service.Create(ctx, CreateTokenInput{
+		Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+		Scope: TokenScope{ServerNodeIDs: []string{"server-b", "server-a", "server-a"}},
+	})
+	if err != nil {
+		t.Fatalf("create multi-node token: %v", err)
+	}
+	multiIdentity, err := service.ValidateAs(ctx, multi.Secret, storage.TokenTypeServerNode)
+	if err != nil {
+		t.Fatalf("validate multi-node token: %v", err)
+	}
+	if strings.Join(multiIdentity.ServerNodeIDs, ",") != "server-a,server-b" {
+		t.Fatalf("ServerNodeIDs = %v, want deduplicated ordered server-a,server-b", multiIdentity.ServerNodeIDs)
+	}
+}
+
+func TestCredentialServiceRejectsInvalidServerNodeTokenScope(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	deletedAt := now
+	cases := []struct {
+		name  string
+		setup func(*credentialRepos)
+		input CreateTokenInput
+		want  error
+	}{
+		{
+			name:  "legacy node binding",
+			input: CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: "owner", NodeID: "server-a"},
+			want:  ErrInvalidTokenScope,
+		},
+		{
+			name: "missing node",
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: []string{"server-missing"}},
+			},
+			want: ErrInvalidTokenScope,
+		},
+		{
+			name: "disabled node",
+			setup: func(repos *credentialRepos) {
+				repos.nodes.items["server-a"] = storage.ServerNode{ID: "server-a", Enabled: false}
+			},
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: []string{"server-a"}},
+			},
+			want: ErrInvalidTokenScope,
+		},
+		{
+			name: "deleted node",
+			setup: func(repos *credentialRepos) {
+				repos.nodes.items["server-a"] = storage.ServerNode{ID: "server-a", Enabled: true, DeletedAt: &deletedAt}
+			},
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: []string{"server-a"}},
+			},
+			want: ErrInvalidTokenScope,
+		},
+		{
+			name: "expired node",
+			setup: func(repos *credentialRepos) {
+				expired := now.Add(-time.Second)
+				repos.nodes.items["server-a"] = storage.ServerNode{ID: "server-a", Enabled: true, ExpiresAt: &expired}
+			},
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: []string{"server-a"}},
+			},
+			want: ErrInvalidTokenScope,
+		},
+		{
+			name: "too many nodes",
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: repeatedStrings("server-", 129)},
+			},
+			want: ErrInvalidTokenScope,
+		},
+		{
+			name: "oversized node id",
+			input: CreateTokenInput{
+				Type: storage.TokenTypeServerNode, OwnerUserID: "owner",
+				Scope: TokenScope{ServerNodeIDs: []string{strings.Repeat("a", 256)}},
+			},
+			want: ErrInvalidTokenScope,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			repos := newCredentialRepos()
+			repos.users.items["owner"] = storage.User{ID: "owner"}
+			repos.nodes.items["server-a"] = storage.ServerNode{ID: "server-a", Enabled: true}
+			if tt.setup != nil {
+				tt.setup(repos)
+			}
+			service := newTestCredentialService(t, repos)
+			if _, err := service.Create(ctx, tt.input); !errors.Is(err, tt.want) {
+				t.Fatalf("Create() error = %v, want %v", err, tt.want)
 			}
 		})
 	}
@@ -753,6 +879,7 @@ type memoryNodes struct {
 }
 
 func (r *memoryNodes) Create(context.Context, storage.ServerNode) error { return nil }
+func (r *memoryNodes) Ensure(context.Context, storage.ServerNode) error { return nil }
 func (r *memoryNodes) Get(_ context.Context, id string) (storage.ServerNode, error) {
 	if r.getErr != nil {
 		return storage.ServerNode{}, r.getErr
@@ -767,6 +894,10 @@ func (r *memoryNodes) Update(context.Context, storage.ServerNode) error { return
 func (r *memoryNodes) Delete(context.Context, string) error             { return nil }
 func (r *memoryNodes) List(context.Context, string, int) (storage.Page[storage.ServerNode], error) {
 	return storage.Page[storage.ServerNode]{}, nil
+}
+func (r *memoryNodes) Touch(context.Context, string, time.Time, time.Time) error { return nil }
+func (r *memoryNodes) StatsByNodeIDs(context.Context, []string) (map[string]storage.ServerNodeStats, error) {
+	return map[string]storage.ServerNodeStats{}, nil
 }
 
 type memoryPolicies struct {

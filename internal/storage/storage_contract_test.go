@@ -202,6 +202,108 @@ func TestAgentConnectionLeaseRepositoryContract(t *testing.T) {
 	}
 }
 
+func TestServerNodeRepositoryLifecycleAndStatsContract(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	nodes := db.Nodes()
+
+	node := ServerNode{
+		ID: "server-a", Name: "edge-a", Address: "127.0.0.1:9443",
+		Epoch: 7, Enabled: true,
+	}
+	if err := nodes.Ensure(ctx, node); err != nil {
+		t.Fatalf("ensure node: %v", err)
+	}
+	found, err := nodes.Get(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if found.Name != "edge-a" || !found.Enabled || found.DeletedAt != nil {
+		t.Fatalf("node = %+v, want enabled edge-a", found)
+	}
+	startup := node
+	startup.Epoch = 1
+	if err := nodes.Ensure(ctx, startup); err != nil {
+		t.Fatalf("ensure startup node: %v", err)
+	}
+	found, err = nodes.Get(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("get startup node: %v", err)
+	}
+	if found.Epoch != 7 {
+		t.Fatalf("Ensure changed managed epoch to %d, want 7", found.Epoch)
+	}
+
+	disabled := found
+	disabled.Enabled = false
+	deletedAt := time.Now().UTC().Truncate(time.Microsecond)
+	disabled.DeletedAt = &deletedAt
+	if err := nodes.Update(ctx, disabled); err != nil {
+		t.Fatalf("disable node: %v", err)
+	}
+	if err := nodes.Ensure(ctx, node); err != nil {
+		t.Fatalf("ensure existing node: %v", err)
+	}
+	found, err = nodes.Get(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("get managed node: %v", err)
+	}
+	if found.Enabled || found.DeletedAt == nil {
+		t.Fatalf("Ensure re-enabled managed node: %+v", found)
+	}
+
+	managed := found
+	managed.Enabled = true
+	managed.DeletedAt = nil
+	if err := nodes.Update(ctx, managed); err != nil {
+		t.Fatalf("restore node: %v", err)
+	}
+	lastSeen := time.Now().UTC().Truncate(time.Microsecond)
+	expires := lastSeen.Add(90 * time.Second)
+	if err := nodes.Touch(ctx, node.ID, lastSeen, expires); err != nil {
+		t.Fatalf("touch node: %v", err)
+	}
+	found, err = nodes.Get(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("get touched node: %v", err)
+	}
+	if found.LastSeenAt == nil || !found.LastSeenAt.Equal(lastSeen) || found.ExpiresAt == nil || !found.ExpiresAt.Equal(expires) {
+		t.Fatalf("touched node = %+v, want lastSeen=%s expires=%s", found, lastSeen, expires)
+	}
+
+	lease := AgentLease{
+		AgentID: "server-node-stats-agent", NodeID: "server-a",
+		ConnectionID: "conn-active", ServerNodeID: "server-a",
+		ActiveStreams: 3, HealthScore: 90, TTL: time.Minute,
+	}
+	if _, err := db.Leases().RegisterConnection(ctx, lease); err != nil {
+		t.Fatalf("register active lease: %v", err)
+	}
+	expired := lease
+	expired.ConnectionID = "conn-expired"
+	expired.TTL = -time.Minute
+	if _, err := db.Leases().RegisterConnection(ctx, expired); err != nil {
+		t.Fatalf("register expired lease: %v", err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `UPDATE agent_connection_leases SET expires_at=? WHERE connection_id=?`, tm(time.Now().UTC().Add(-time.Minute)), "conn-expired"); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	stats, err := nodes.StatsByNodeIDs(ctx, []string{"server-a", "server-missing"})
+	if err != nil {
+		t.Fatalf("stats by node IDs: %v", err)
+	}
+	got, ok := stats["server-a"]
+	if !ok {
+		t.Fatalf("stats = %+v, want server-a", stats)
+	}
+	if got.ActiveConnections != 1 || got.ActiveStreams != 3 || got.HealthScore != 90 {
+		t.Fatalf("server-a stats = %+v, want one active connection, three streams, health 90", got)
+	}
+	if _, ok := stats["server-missing"]; ok {
+		t.Fatalf("stats = %+v, want no entry for missing node", stats)
+	}
+}
+
 func newTestDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := OpenSQLite(context.Background(), "file:contract?mode=memory&cache=shared")

@@ -4,17 +4,22 @@ type TokenFormInput = {
   type: TokenType
   agentId: string
   nodeId: string
+  serverNodeIds?: string[]
   expiresAt: string
-  agentIdsText: string
+  agentIds: string[]
   cidrsText: string
   portsText: string
   selectedAgent?: Agent
+  selectedAgents?: Agent[]
   scope: Pick<TokenScope, 'protocols'>
 }
 
 type AgentPage = { items: Agent[]; nextCursor?: string }
 
 type TokenScopePatchInput = {
+  type: TokenType
+  agentIds?: string[]
+  serverNodeIds?: string[]
   protocols?: string[]
   cidrsText: string
   portsText: string
@@ -44,25 +49,38 @@ export function defaultTokenExpiration(now = new Date()) {
 
 export function tokenPayloadFromForm(input: TokenFormInput) {
   const ports = parseTokenPorts(input.portsText)
+  const ownerUserId = tokenOwnerUserId(input)
   const scope: TokenScope = {
     ...input.scope,
-    agentIds: input.agentIdsText.split(/\r?\n/).map(value => value.trim()).filter(Boolean),
+    agentIds: [...input.agentIds],
     targetCIDRs: input.cidrsText.split(',').map(value => value.trim()).filter(Boolean),
     targetPorts: ports,
   }
+  if (input.type === 'server_node') scope.serverNodeIds = [...(input.serverNodeIds || [])]
   return {
     type: input.type,
-    ...(input.selectedAgent?.ownerUserId ? { ownerUserId: input.selectedAgent.ownerUserId } : {}),
+    ...(ownerUserId ? { ownerUserId } : {}),
     ...(input.agentId ? { agentId: input.agentId } : {}),
-    ...(input.nodeId ? { nodeId: input.nodeId } : {}),
+    ...(input.type !== 'server_node' && input.nodeId ? { nodeId: input.nodeId } : {}),
     scope,
     ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
   }
 }
 
+function tokenOwnerUserId(input: TokenFormInput) {
+  if (input.type === 'agent') return input.selectedAgent?.ownerUserId
+  if (input.type !== 'client') return undefined
+
+  const owners = new Set((input.selectedAgents || []).map(agent => agent.ownerUserId))
+  if (owners.size > 1) throw new Error('selected agents must have the same owner')
+  return owners.values().next().value
+}
+
 export function tokenScopePatchFromForm(input: TokenScopePatchInput) {
   const ports = parseTokenPorts(input.portsText)
   return {
+    ...(input.type === 'client' ? { agentIds: [...(input.agentIds || [])] } : {}),
+    ...(input.type === 'server_node' ? { serverNodeIds: [...(input.serverNodeIds || [])] } : {}),
     ...(input.protocols ? { protocols: input.protocols } : {}),
     targetCIDRs: input.cidrsText.split(',').map(value => value.trim()).filter(Boolean),
     targetPorts: ports,

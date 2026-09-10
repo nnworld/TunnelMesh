@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -272,11 +273,17 @@ func DialAuthenticatedGRPCNode(ctx context.Context, endpoint, nodeID string, epo
 	if strings.TrimSpace(nodeID) == "" || epoch <= 0 || strings.TrimSpace(rawToken) == "" {
 		return nil, errors.New("relay: server-node identity is required")
 	}
-	if cfg == nil || len(cfg.Certificates) == 0 || cfg.RootCAs == nil || cfg.ServerName == "" || cfg.InsecureSkipVerify || cfg.MinVersion < tls.VersionTLS12 {
-		return nil, errors.New("relay: authenticated mTLS requires client certificate, root CAs, server name, and TLS 1.2+")
+	var transportCredentials credentials.TransportCredentials
+	if cfg == nil {
+		transportCredentials = insecure.NewCredentials()
+	} else {
+		if len(cfg.Certificates) == 0 || cfg.RootCAs == nil || cfg.ServerName == "" || cfg.InsecureSkipVerify || cfg.MinVersion < tls.VersionTLS12 {
+			return nil, errors.New("relay: authenticated mTLS requires client certificate, root CAs, server name, and TLS 1.2+")
+		}
+		transportCredentials = credentials.NewTLS(cfg)
 	}
 	conn, err := grpc.DialContext(ctx, endpoint,
-		grpc.WithTransportCredentials(credentials.NewTLS(cfg)),
+		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithChainStreamInterceptor(NewServerNodeStreamClientInterceptor(nodeID, epoch, rawToken)),
 		grpc.WithChainUnaryInterceptor(NewServerNodeUnaryClientInterceptor(nodeID, epoch, rawToken)),
 		grpc.WithBlock(),

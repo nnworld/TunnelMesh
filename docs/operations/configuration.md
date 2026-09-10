@@ -61,11 +61,15 @@ node:
   id: server-1
 ```
 
-集群模式允许 MySQL 明文连接（`storage.mysql.tls: false`），但生产环境建议启用 TLS，并在 DSN 中设置 `tls=true`。关闭 TLS 时，DSN 里也不能残留 `tls=true`；程序会根据 `storage.mysql.tls` 覆盖 DSN 中的 `tls` 参数。若未配置 `node.id`，Server 在 `run` 时会生成并持久化到 `/var/lib/tunnelmesh/node-id`；也可以用以下命令将其写回 YAML（需要配置文件可写）：
+集群模式允许 MySQL 明文连接（`storage.mysql.tls: false`），但生产环境建议启用 TLS，并在 DSN 中设置 `tls=true`。关闭 TLS 时，DSN 里也不能残留 `tls=true`；程序会根据 `storage.mysql.tls` 覆盖 DSN 中的 `tls` 参数。
+
+若配置文件中没有 `node.id`，且没有命令行或环境变量覆盖，Server 的 `run` 命令会生成小写 `server-<32位十六进制>` 身份，先复用 `/var/lib/tunnelmesh/node-id`，再把最终值回写到 YAML 的 `node.id`。回写采用原子替换，保留注释、权限和 owner；已有 `node.id` 或显式覆盖时不会改写。`check-config`、`print-config` 等只读命令不会修改文件。也可以显式执行：
 
 ```bash
 tunnelmesh-server --config /etc/tunnelmesh/server.yaml init-node-id
 ```
+
+systemd 打包单元会在非特权 `check-config` 和 `run` 之前，以 root 执行一次 `init-node-id`。因此 `/etc/tunnelmesh` 对服务用户可以保持只读，`/var/lib/tunnelmesh` 仍由服务用户写入。生成 `node.id` 后再签发 relay 证书；mTLS 证书 SAN 必须包含最终 `node.id` 的精确条目，并同时包含所有节点共同的 `server.relay.server_name`。
 
 切换 etcd：
 
@@ -121,7 +125,16 @@ export TUNNELMESH_AGENT_TOKEN='one-time-agent-secret'
 export TUNNELMESH_CLIENT_TOKEN='one-time-client-secret'
 ```
 
-`server_node` token 必须与集群节点 ID 绑定，并和 relay mTLS 证书一起配置。启用 relay 时必须配置 `server.relay.endpoint`，且该地址要能被其他 Server 节点访问；连接租约会保存它用于跨节点查询和关闭。生产环境不把 token 放进提交的配置文件；`print-config` 不会输出明文。
+`server_node` token 配置在 `server.relay.node_token` 字段。一个 token 可以服务多个 Server 节点：`scope.serverNodeIds` 为空表示 fleet token，允许所有启用且未逻辑删除的节点；非空时仅允许列表内节点。token 本身不替代节点身份，epoch 也必须一致。
+
+`server.relay.endpoint` 可以留空。此时 Server 会读取 `server.relay.listen` 的端口：如果 listen 是具体 IP，则直接使用该 IP；如果是 `0.0.0.0`、`[::]` 或空 host，则选择本机第一个可用的非 loopback、非 link-local 地址，优先 IPv4。推导结果只保存在进程内，不回写 YAML。多网卡、容器 NAT 或跨网段环境应显式配置 endpoint。
+
+relay 证书字段有两种合法状态：
+
+- `ca/cert/key/server_name` 全部省略：明文模式，仍校验 token、节点状态和 epoch，但不提供传输加密或证书级节点身份；
+- `ca/cert/key/server_name` 全部配置：mTLS 模式，路径必须为绝对路径，证书 SAN 必须包含本节点 `node.id` 和共同的 `server_name`。
+
+部分填写 `ca/cert/key` 会被拒绝，避免意外降级。证书生成和轮换见 [Relay mTLS 证书生成与配置](relay-mtls.md)。生产环境不把 token 放进提交的配置文件；`print-config` 不会输出明文。
 
 ### Recoverable service-token secrets
 

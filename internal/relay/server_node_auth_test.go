@@ -45,7 +45,7 @@ func TestAuthenticatedGRPCRelayValidMTLSAndServerNodeToken(t *testing.T) {
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +103,105 @@ func TestAuthenticatedGRPCRelayValidMTLSAndServerNodeToken(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedGRPCRelayMultiNodeTokenSupportsAllowedNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:relay-auth-fleet?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "relay-fleet-owner", "relay-password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"node-a", "node-b", "node-c"} {
+		if err := db.Nodes().Create(ctx, storage.ServerNode{ID: nodeID, Epoch: 7}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credentialsService := auth.NewCredentialService(db)
+	defer credentialsService.Close()
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{
+		Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID,
+		Scope: auth.TokenScope{ServerNodeIDs: []string{"node-a", "node-b"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, serverTLS, clients := testRelayCertificatesForNodes(t, "node-a", "node-b", "node-c")
+	var handlerCalls atomic.Int32
+	var principalsMu sync.Mutex
+	principals := make(map[string]ServerNodePrincipal)
+	server := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainStreamInterceptor(NewServerNodeStreamInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(server, NewRelayServer(func(ctx context.Context, request StreamRequest) (io.ReadWriteCloser, error) {
+		handlerCalls.Add(1)
+		principal, _ := ServerNodePrincipalFromContext(ctx)
+		principalsMu.Lock()
+		principals[principal.NodeID] = principal
+		principalsMu.Unlock()
+		return newEchoConn(), nil
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go server.Serve(ln)
+	defer server.Stop()
+
+	for _, nodeID := range []string{"node-a", "node-b"} {
+		client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), nodeID, 7, created.Secret, clients[nodeID])
+		if err != nil {
+			t.Fatalf("dial %s: %v", nodeID, err)
+		}
+		stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", AgentID: "agent-a", Epoch: 7, StreamID: 1, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
+		if err != nil {
+			t.Fatalf("open stream from %s: %v", nodeID, err)
+		}
+		if _, err := stream.Write([]byte("hello")); err != nil {
+			t.Fatalf("write from %s: %v", nodeID, err)
+		}
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(stream, buf); err != nil || string(buf) != "hello" {
+			t.Fatalf("read from %s: %q err=%v", nodeID, buf, err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("close stream from %s: %v", nodeID, err)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatalf("close client %s: %v", nodeID, err)
+		}
+	}
+
+	rejected, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-c", 7, created.Secret, clients["node-c"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rejected.Close()
+	stream, err := rejected.OpenStream(ctx, StreamRequest{NodeID: "target-node", AgentID: "agent-a", Epoch: 7, StreamID: 1, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
+	if err == nil {
+		defer stream.Close()
+		_, err = stream.Read(make([]byte, 1))
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("OpenStream from unlisted node error = %v, code=%v, want PermissionDenied", err, status.Code(err))
+	}
+
+	principalsMu.Lock()
+	defer principalsMu.Unlock()
+	if len(principals) != 2 || principals["node-a"].NodeID != "node-a" || principals["node-b"].NodeID != "node-b" {
+		t.Fatalf("principals = %+v, want node-a and node-b", principals)
+	}
+	if handlerCalls.Load() != 2 {
+		t.Fatalf("handler calls = %d, want 2", handlerCalls.Load())
+	}
+}
+
 func TestRelayCloseAgentConnectionRequiresServerNodeAuth(t *testing.T) {
 	ctx := context.Background()
 	db, err := storage.OpenSQLite(ctx, "file:relay-close-unauth?mode=memory&cache=shared")
@@ -120,7 +219,7 @@ func TestRelayCloseAgentConnectionRequiresServerNodeAuth(t *testing.T) {
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	if _, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"}); err != nil {
+	if _, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID}); err != nil {
 		t.Fatal(err)
 	}
 	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
@@ -174,7 +273,7 @@ func TestRelayCloseAgentConnectionUsesExactEpoch(t *testing.T) {
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +341,7 @@ func TestGRPCNodeTransportCloseAgentConnectionPropagatesFailure(t *testing.T) {
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +391,7 @@ func TestAuthenticatedGRPCRelayRejectsStaleEpochBeforeHandler(t *testing.T) {
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +443,7 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 		{name: "certificate SAN mismatch", certNode: "node-b", tokenType: storage.TokenTypeServerNode, wantCode: codes.PermissionDenied},
 		{name: "wrong token type", certNode: "node-a", tokenType: storage.TokenTypeClient, wantCode: codes.Unauthenticated},
 		{name: "revoked token", certNode: "node-a", tokenType: storage.TokenTypeServerNode, revoke: true, wantCode: codes.Unauthenticated},
-		{name: "expired node", certNode: "node-a", tokenType: storage.TokenTypeServerNode, expired: true, wantCode: codes.Unauthenticated},
+		{name: "expired node", certNode: "node-a", tokenType: storage.TokenTypeServerNode, expired: true, wantCode: codes.FailedPrecondition},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -359,7 +458,7 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			node := storage.ServerNode{ID: "node-a", Epoch: 7}
+			node := storage.ServerNode{ID: "node-a", Epoch: 7, Enabled: true}
 			if err := db.Nodes().Create(ctx, node); err != nil {
 				t.Fatal(err)
 			}
@@ -367,7 +466,7 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 			defer credentialsService.Close()
 			input := auth.CreateTokenInput{Type: tt.tokenType, OwnerUserID: owner.ID}
 			if tt.tokenType == storage.TokenTypeServerNode {
-				input.NodeID = "node-a"
+				input.Scope = auth.TokenScope{}
 			}
 			created, err := credentialsService.Create(ctx, input)
 			if err != nil {
@@ -407,7 +506,11 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 			stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 7})
 			if err == nil {
 				defer stream.Close()
-				_, err = stream.Read(make([]byte, 1))
+				if _, writeErr := stream.Write([]byte("x")); writeErr == nil {
+					_, err = stream.Read(make([]byte, 1))
+				} else {
+					err = writeErr
+				}
 			}
 			if status.Code(err) != tt.wantCode {
 				t.Fatalf("OpenStream error = %v, code=%v, want %v", err, status.Code(err), tt.wantCode)
@@ -416,6 +519,204 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 				t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
 			}
 		})
+	}
+}
+
+func TestAuthenticatedGRPCRelayRejectsDisabledAndDeletedNodes(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(storage.ServerNode) storage.ServerNode
+	}{
+		{name: "disabled", mutate: func(node storage.ServerNode) storage.ServerNode {
+			node.Enabled = false
+			return node
+		}},
+		{name: "deleted", mutate: func(node storage.ServerNode) storage.ServerNode {
+			deletedAt := time.Now().UTC()
+			node.DeletedAt = &deletedAt
+			return node
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := storage.OpenSQLite(ctx, "file:relay-auth-"+strings.ReplaceAll(tt.name, " ", "-")+"?mode=memory&cache=shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			authService := auth.NewAuthService(db)
+			owner, err := authService.CreateUser(ctx, "relay-"+strings.ReplaceAll(tt.name, " ", "-")+"-owner", "relay-password", "user")
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := storage.ServerNode{ID: "node-a", Epoch: 7, Enabled: true}
+			if err := db.Nodes().Create(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+			credentialsService := auth.NewCredentialService(db)
+			defer credentialsService.Close()
+			created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Nodes().Update(ctx, tt.mutate(node)); err != nil {
+				t.Fatal(err)
+			}
+			_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
+			var handlerCalls atomic.Int32
+			server := grpc.NewServer(
+				grpc.Creds(credentials.NewTLS(serverTLS)),
+				grpc.ChainStreamInterceptor(NewServerNodeStreamInterceptor(credentialsService, db.Nodes())),
+			)
+			RegisterRelayServer(server, NewRelayServer(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+				handlerCalls.Add(1)
+				return newEchoConn(), nil
+			}))
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			go server.Serve(ln)
+			defer server.Stop()
+			client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 7})
+			if err == nil {
+				defer stream.Close()
+				_, err = stream.Read(make([]byte, 1))
+			}
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("OpenStream error = %v, code=%v, want PermissionDenied", err, status.Code(err))
+			}
+			if handlerCalls.Load() != 0 {
+				t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
+			}
+		})
+	}
+}
+
+func TestAuthenticatedGRPCRelayPlaintextStillValidatesTokenNodeAndEpoch(t *testing.T) {
+	tests := []struct {
+		name      string
+		tokenType storage.TokenType
+		scope     auth.TokenScope
+		epoch     int64
+		disabled  bool
+		wantCode  codes.Code
+	}{
+		{name: "valid fleet token", tokenType: storage.TokenTypeServerNode, epoch: 7, wantCode: codes.OK},
+		{name: "wrong token type", tokenType: storage.TokenTypeClient, epoch: 7, wantCode: codes.Unauthenticated},
+		{name: "scope excludes node", tokenType: storage.TokenTypeServerNode, scope: auth.TokenScope{ServerNodeIDs: []string{"node-b"}}, epoch: 7, wantCode: codes.PermissionDenied},
+		{name: "stale epoch", tokenType: storage.TokenTypeServerNode, epoch: 6, wantCode: codes.FailedPrecondition},
+		{name: "disabled node", tokenType: storage.TokenTypeServerNode, epoch: 7, disabled: true, wantCode: codes.PermissionDenied},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := storage.OpenSQLite(ctx, "file:relay-plaintext-"+strings.ReplaceAll(tt.name, " ", "-")+"?mode=memory&cache=shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			authService := auth.NewAuthService(db)
+			owner, err := authService.CreateUser(ctx, "relay-plaintext-"+strings.ReplaceAll(tt.name, " ", "-"), "password", "user")
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := storage.ServerNode{ID: "node-a", Epoch: 7, Enabled: true}
+			if err := db.Nodes().Create(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+			if len(tt.scope.ServerNodeIDs) > 0 {
+				for _, nodeID := range tt.scope.ServerNodeIDs {
+					if err := db.Nodes().Create(ctx, storage.ServerNode{ID: nodeID, Epoch: 7, Enabled: true}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			credentialsService := auth.NewCredentialService(db)
+			defer credentialsService.Close()
+			created, err := credentialsService.Create(ctx, auth.CreateTokenInput{
+				Type: tt.tokenType, OwnerUserID: owner.ID, Scope: tt.scope,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.disabled {
+				node.Enabled = false
+				if err := db.Nodes().Update(ctx, node); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var handlerCalls atomic.Int32
+			server := grpc.NewServer(grpc.ChainStreamInterceptor(
+				NewServerNodeStreamInterceptorWithMode(credentialsService, db.Nodes(), nil, false),
+			))
+			RegisterRelayServer(server, NewRelayServer(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+				handlerCalls.Add(1)
+				return newEchoConn(), nil
+			}))
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			go server.Serve(ln)
+			defer server.Stop()
+
+			client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", tt.epoch, created.Secret, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 7})
+			if tt.wantCode == codes.OK {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stream.Close()
+				if _, err := stream.Write([]byte("hello")); err != nil {
+					t.Fatal(err)
+				}
+				buf := make([]byte, 5)
+				if _, err := io.ReadFull(stream, buf); err != nil {
+					t.Fatal(err)
+				}
+				if string(buf) != "hello" || handlerCalls.Load() != 1 {
+					t.Fatalf("data=%q handlerCalls=%d, want plaintext relay echo", buf, handlerCalls.Load())
+				}
+				return
+			}
+			if err == nil {
+				defer stream.Close()
+				if _, writeErr := stream.Write([]byte("x")); writeErr == nil {
+					_, err = stream.Read(make([]byte, 1))
+				} else {
+					err = writeErr
+				}
+			}
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("OpenStream error = %v, code=%v, want %v", err, status.Code(err), tt.wantCode)
+			}
+			if handlerCalls.Load() != 0 {
+				t.Fatalf("handler calls = %d, want 0", handlerCalls.Load())
+			}
+		})
+	}
+}
+
+func TestDialAuthenticatedGRPCNodeRejectsIncompleteTLSConfig(t *testing.T) {
+	_, err := DialAuthenticatedGRPCNode(
+		context.Background(), "127.0.0.1:1", "node-a", 1, "secret",
+		&tls.Config{ServerName: "relay.local"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "mTLS") {
+		t.Fatalf("DialAuthenticatedGRPCNode() error = %v, want incomplete mTLS error", err)
 	}
 }
 
@@ -487,6 +788,11 @@ func TestCertificateSANMatchingIsExactAndDoesNotFallbackToCN(t *testing.T) {
 }
 
 func testRelayCertificates(t *testing.T, nodeID string) (*x509.CertPool, *tls.Config, *tls.Config) {
+	pool, serverTLS, clients := testRelayCertificatesForNodes(t, nodeID)
+	return pool, serverTLS, clients[nodeID]
+}
+
+func testRelayCertificatesForNodes(t *testing.T, nodeIDs ...string) (*x509.CertPool, *tls.Config, map[string]*tls.Config) {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -501,6 +807,8 @@ func testRelayCertificates(t *testing.T, nodeID string) (*x509.CertPool, *tls.Co
 	if err != nil {
 		t.Fatal(err)
 	}
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
 	newLeaf := func(serial int64, dns string, server bool) tls.Certificate {
 		key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if keyErr != nil {
@@ -517,10 +825,12 @@ func testRelayCertificates(t *testing.T, nodeID string) (*x509.CertPool, *tls.Co
 		return tls.Certificate{Certificate: [][]byte{der, caDER}, PrivateKey: key}
 	}
 	serverCert := newLeaf(2, "relay.local", true)
-	clientCert := newLeaf(3, nodeID, false)
-	pool := x509.NewCertPool()
-	pool.AddCert(caCert)
-	return pool, &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}, &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, ServerName: "relay.local", MinVersion: tls.VersionTLS12}
+	clients := make(map[string]*tls.Config, len(nodeIDs))
+	for i, nodeID := range nodeIDs {
+		clientCert := newLeaf(int64(3+i), nodeID, false)
+		clients[nodeID] = &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, ServerName: "relay.local", MinVersion: tls.VersionTLS12}
+	}
+	return pool, &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}, clients
 }
 
 type echoConn struct {

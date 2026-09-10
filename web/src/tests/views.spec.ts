@@ -9,7 +9,7 @@ describe('localized management views', () => {
   })
 
   it('uses i18n in every management view', () => {
-    for (const name of ['Dashboard','Agents','AgentDetail','Routes','Tunnels','Tokens','AuditLogs','Login']) {
+    for (const name of ['Dashboard','Agents','AgentDetail','Routes','Tunnels','Tokens','Servers','AuditLogs','Login']) {
       expect(readFileSync(`src/views/${name}.vue`, 'utf8'), name).toContain('useI18n')
     }
   })

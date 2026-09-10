@@ -224,14 +224,17 @@ func TestTokenAPIUpdatesScopeForActiveTokensOnly(t *testing.T) {
 	tokenID := tokenIDFromResponse(t, create.Body.Bytes())
 
 	update := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
-		"scope": map[string]any{"protocols": []string{"tcp", "http"}, "targetPorts": []int{22, 80}},
+		"scope": map[string]any{"agentIds": []string{"agent-alice-b"}, "protocols": []string{"websocket"}, "targetPorts": []int{22, 80}},
 	})
 	if update.Code != http.StatusOK {
 		t.Fatalf("scope update status = %d: %s", update.Code, update.Body.String())
 	}
 	scope, _ := tokenResponseData(t, update.Body.Bytes())["scope"].(map[string]any)
-	if !reflect.DeepEqual(scope["protocols"], []any{"http", "tcp"}) {
-		t.Fatalf("updated protocols = %#v, want [http tcp]", scope["protocols"])
+	if !reflect.DeepEqual(scope["agentIds"], []any{"agent-alice-b"}) {
+		t.Fatalf("updated agentIds = %#v, want [agent-alice-b]", scope["agentIds"])
+	}
+	if !reflect.DeepEqual(scope["protocols"], []any{"ws"}) {
+		t.Fatalf("updated protocols = %#v, want [ws]", scope["protocols"])
 	}
 	if !reflect.DeepEqual(scope["targetCIDRs"], []any{"10.0.0.0/8"}) {
 		t.Fatalf("omitted CIDRs should be preserved: %#v", scope["targetCIDRs"])
@@ -242,13 +245,14 @@ func TestTokenAPIUpdatesScopeForActiveTokensOnly(t *testing.T) {
 	assertNoSensitiveFields(t, tokenResponseData(t, update.Body.Bytes()))
 
 	clear := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
-		"scope": map[string]any{"protocols": []string{}, "targetCIDRs": []string{}, "targetPorts": []int{}},
+		"scope": map[string]any{"agentIds": []string{}, "protocols": []string{}, "targetCIDRs": []string{}, "targetPorts": []int{}},
 	})
 	if clear.Code != http.StatusOK {
 		t.Fatalf("clear scope status = %d: %s", clear.Code, clear.Body.String())
 	}
 	scope, _ = tokenResponseData(t, clear.Body.Bytes())["scope"].(map[string]any)
 	if (scope["protocols"] != nil && len(scope["protocols"].([]any)) != 0) ||
+		(scope["agentIds"] != nil && len(scope["agentIds"].([]any)) != 0) ||
 		(scope["targetCIDRs"] != nil && len(scope["targetCIDRs"].([]any)) != 0) ||
 		(scope["targetPorts"] != nil && len(scope["targetPorts"].([]any)) != 0) {
 		t.Fatalf("empty arrays should remove scope restrictions: %#v", scope)
@@ -259,6 +263,24 @@ func TestTokenAPIUpdatesScopeForActiveTokensOnly(t *testing.T) {
 	})
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid scope status = %d, want 400: %s", invalid.Code, invalid.Body.String())
+	}
+	foreignAgent := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"agentIds": []string{"agent-bob"}},
+	})
+	if foreignAgent.Code != http.StatusBadRequest {
+		t.Fatalf("foreign agent scope status = %d, want 400: %s", foreignAgent.Code, foreignAgent.Body.String())
+	}
+	disabledAgent := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"agentIds": []string{"agent-alice-disabled"}},
+	})
+	if disabledAgent.Code != http.StatusBadRequest {
+		t.Fatalf("disabled agent scope status = %d, want 400: %s", disabledAgent.Code, disabledAgent.Body.String())
+	}
+	crossType := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{
+		"scope": map[string]any{"serverNodeIds": []string{"node-a"}},
+	})
+	if crossType.Code != http.StatusBadRequest {
+		t.Fatalf("client server-node scope status = %d, want 400: %s", crossType.Code, crossType.Body.String())
 	}
 	missing := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.ownerToken, "", map[string]any{})
 	if missing.Code != http.StatusBadRequest {
@@ -297,6 +319,58 @@ func TestTokenAPIUpdatesScopeForActiveTokensOnly(t *testing.T) {
 	}
 }
 
+func TestTokenAPIUpdatesServerNodeScope(t *testing.T) {
+	fixture := newTokenAPIFixture(t)
+	if err := fixture.api.DB.Nodes().Create(context.Background(), storage.ServerNode{ID: "node-b", Address: "127.0.0.1:9444", Epoch: 1}); err != nil {
+		t.Fatal(err)
+	}
+	create := apiJSON(t, fixture.api, http.MethodPost, "/api/v1/tokens", fixture.adminToken, "server-scope-create", map[string]any{
+		"type": "server_node", "scope": map[string]any{"serverNodeIds": []string{"node-a"}},
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	tokenID := tokenIDFromResponse(t, create.Body.Bytes())
+
+	update := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.adminToken, "", map[string]any{
+		"scope": map[string]any{"serverNodeIds": []string{"node-b"}},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("server scope update status = %d: %s", update.Code, update.Body.String())
+	}
+	scope, _ := tokenResponseData(t, update.Body.Bytes())["scope"].(map[string]any)
+	if !reflect.DeepEqual(scope["serverNodeIds"], []any{"node-b"}) {
+		t.Fatalf("updated serverNodeIds = %#v, want [node-b]", scope["serverNodeIds"])
+	}
+
+	clear := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.adminToken, "", map[string]any{
+		"scope": map[string]any{"serverNodeIds": []string{}},
+	})
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear server scope status = %d: %s", clear.Code, clear.Body.String())
+	}
+	scope, _ = tokenResponseData(t, clear.Body.Bytes())["scope"].(map[string]any)
+	if scope["serverNodeIds"] != nil && len(scope["serverNodeIds"].([]any)) != 0 {
+		t.Fatalf("empty serverNodeIds should create a fleet token: %#v", scope)
+	}
+
+	missing := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.adminToken, "", map[string]any{
+		"scope": map[string]any{"serverNodeIds": []string{"node-missing"}},
+	})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("missing server node status = %d, want 400: %s", missing.Code, missing.Body.String())
+	}
+	crossType := apiJSON(t, fixture.api, http.MethodPatch, "/api/v1/tokens/"+tokenID, fixture.adminToken, "", map[string]any{
+		"scope": map[string]any{"agentIds": []string{"agent-alice-a"}},
+	})
+	if crossType.Code != http.StatusBadRequest {
+		t.Fatalf("server-node agent scope status = %d, want 400: %s", crossType.Code, crossType.Body.String())
+	}
+	if got := countTokenLifecycleAudits(t, fixture.api.DB, tokenID, "token.scope_updated"); got != 2 {
+		t.Fatalf("server scope update audit count = %d, want 2", got)
+	}
+}
+
 func TestAgentTracerouteAPIEnforcesSensitiveBoundary(t *testing.T) {
 	fixture := newTokenAPIFixture(t)
 	request := map[string]any{"maxHops": 8}
@@ -332,7 +406,7 @@ func TestTokenAPIAdminCreatesAllTypesAndReplaysWithoutSecret(t *testing.T) {
 	}{
 		{name: "agent", key: "admin-agent-token", body: map[string]any{"type": "agent", "ownerUserId": fixture.owner.ID, "agentId": "agent-alice-a", "scope": map[string]any{"agentIds": []string{"agent-alice-a"}, "protocols": []string{"tcp"}}}},
 		{name: "client", key: "admin-client-token", body: map[string]any{"type": "client", "ownerUserId": fixture.owner.ID, "scope": map[string]any{"agentIds": []string{"agent-alice-a", "agent-alice-b"}, "targetPorts": []int{22}}}},
-		{name: "server_node", key: "admin-node-token", body: map[string]any{"type": "server_node", "ownerUserId": fixture.admin.ID, "nodeId": "node-a", "scope": map[string]any{}}},
+		{name: "server_node", key: "admin-node-token", body: map[string]any{"type": "server_node", "ownerUserId": fixture.admin.ID, "scope": map[string]any{}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -780,7 +854,7 @@ func TestTokenAPIStatusStorageErrorsReturn500(t *testing.T) {
 		{name: "Agent repository", body: map[string]any{"type": "agent", "ownerUserId": "OWNER", "agentId": "agent-alice-a", "scope": map[string]any{"agentIds": []string{"agent-alice-a"}}}, inject: func(service *TokenService, want error) {
 			service.agents = failingAgentGetRepository{AgentRepository: service.agents, err: want}
 		}},
-		{name: "node repository", body: map[string]any{"type": "server_node", "nodeId": "node-a", "scope": map[string]any{}}, inject: func(service *TokenService, want error) {
+		{name: "node repository", body: map[string]any{"type": "server_node", "scope": map[string]any{"serverNodeIds": []string{"node-a"}}}, inject: func(service *TokenService, want error) {
 			service.nodes = failingNodeGetRepository{NodeRepository: service.nodes, err: want}
 		}},
 	}

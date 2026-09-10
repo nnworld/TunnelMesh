@@ -8,6 +8,7 @@ Type=simple
 User=tunnelmesh
 Group=tunnelmesh
 WorkingDirectory=/var/lib/tunnelmesh
+ExecStartPre=+/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml init-node-id
 ExecStartPre=/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml check-config
 ExecStart=/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml run
 Restart=on-failure

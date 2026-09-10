@@ -43,7 +43,10 @@ func TestRuntimeCloseAgentConnectionUsesAuthenticatedCallerAndExactLeaseEpoch(t 
 	}
 	credentialsService := auth.NewCredentialService(db)
 	defer credentialsService.Close()
-	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "node-a"})
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{
+		Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID,
+		Scope: auth.TokenScope{ServerNodeIDs: []string{"node-a"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

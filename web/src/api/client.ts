@@ -82,8 +82,8 @@ export type AuditLogFilter = {
 }
 
 export type TokenType = 'agent' | 'client' | 'server_node'
-export type TokenScope = { agentIds?: string[]; protocols?: string[]; targetCIDRs?: string[]; targetPorts?: number[] }
-export type TokenScopePatch = Partial<Pick<TokenScope, 'protocols' | 'targetCIDRs' | 'targetPorts'>>
+export type TokenScope = { agentIds?: string[]; serverNodeIds?: string[]; protocols?: string[]; targetCIDRs?: string[]; targetPorts?: number[] }
+export type TokenScopePatch = Partial<Pick<TokenScope, 'agentIds' | 'serverNodeIds' | 'protocols' | 'targetCIDRs' | 'targetPorts'>>
 export type ServiceToken = {
   id: string; type: TokenType; ownerUserId: string; agentId?: string; nodeId?: string
   prefix: string; scope: TokenScope; status: string; expiresAt?: string; revokedAt?: string
@@ -95,6 +95,25 @@ export type UserAccount = { id: string; username: string; role: 'user'; disabled
 export type UserPage = { items: UserAccount[]; nextCursor?: string; hasMore?: boolean }
 export type TemporaryPasswordResult = { user: UserAccount; temporaryPassword: string }
 export type DashboardSummary = { agentsTotal:number; agentsOnline:number; activeTunnels:number; managedRoutes:number; validServiceTokens:number; recentEvents:Array<{id:string;action:string;resourceType:string;resourceId:string;createdAt:string}> }
+export type ServerNodeStatus = 'online' | 'offline' | 'disabled' | 'deleted'
+export type ServerNode = {
+  id: string
+  name: string
+  address: string
+  epoch: number
+  enabled: boolean
+  deletedAt?: string | null
+  lastSeenAt?: string | null
+  expiresAt?: string | null
+  createdAt: string
+  updatedAt: string
+  status: ServerNodeStatus
+  activeConnections: number
+  activeStreams: number
+  healthScore: number
+}
+export type ServerNodePage = { items: ServerNode[]; nextCursor?: string; hasMore?: boolean }
+export type ServerNodeUpdateInput = { name?: string; enabled?: boolean }
 
 let token = localStorage.getItem('tunnelmesh_token') || ''
 export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
@@ -195,6 +214,20 @@ export function deleteUser(id: string) { return api<UserAccount>(`/users/${encod
 export function restoreUser(id: string) { return api<UserAccount>(`/users/${encodeURIComponent(id)}/restore`, { method: 'POST' }) }
 export function changePassword(currentPassword: string, newPassword: string) { return api<UserAccount>('/auth/password', { method: 'PUT', body: JSON.stringify({ currentPassword, newPassword }) }) }
 export function getDashboardSummary() { return api<DashboardSummary>('/dashboard/summary') }
+
+export function getServerNodes(params: { cursor?: string; limit?: number } = {}) {
+  const query = new URLSearchParams()
+  if (params.cursor) query.set('cursor', params.cursor)
+  if (params.limit) query.set('limit', String(params.limit))
+  const suffix = query.toString() ? `?${query}` : ''
+  return api<ServerNodePage>(`/server-nodes${suffix}`)
+}
+export function getServerNode(id: string) { return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}`) }
+export function updateServerNode(id: string, input: ServerNodeUpdateInput) {
+  return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) })
+}
+export function deleteServerNode(id: string) { return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}`, { method: 'DELETE' }) }
+export function restoreServerNode(id: string) { return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}/restore`, { method: 'POST' }) }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)

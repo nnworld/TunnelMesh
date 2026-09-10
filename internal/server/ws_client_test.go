@@ -51,7 +51,10 @@ func TestClientWSRouteIsExactAndRejectsWrongCredentialTypesBeforeUpgrade(t *test
 	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "client-ws-node", Address: "127.0.0.1:1", Epoch: 1}); err != nil {
 		t.Fatal(err)
 	}
-	nodeToken, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID, NodeID: "client-ws-node"})
+	nodeToken, err := credentials.Create(ctx, auth.CreateTokenInput{
+		Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID,
+		Scope: auth.TokenScope{ServerNodeIDs: []string{"client-ws-node"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

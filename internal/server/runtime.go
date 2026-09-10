@@ -69,6 +69,7 @@ type ServerRuntime struct {
 	ClientTransport       relay.NodeTransport
 	LocalAgentRelay       *AgentRelayTransport
 	managedRoutes         *ManagedRouteHandler
+	serverNodeLifecycle   *ServerNodeLifecycle
 	relayServer           *grpc.Server
 	relayListener         net.Listener
 	config                RuntimeConfig
@@ -117,6 +118,21 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
 	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	var serverNodeLifecycle *ServerNodeLifecycle
+	closeStartup := func() {
+		if serverNodeLifecycle != nil {
+			_ = serverNodeLifecycle.Close()
+		}
+		_ = credentialService.Close()
+	}
+	if strings.TrimSpace(runtimeConfig.NodeID) != "" {
+		serverNodeLifecycle = NewServerNodeLifecycle(db, runtimeConfig.NodeID, runtimeConfig.Relay.Endpoint, defaultServerNodeHeartbeatInterval, defaultServerNodeHeartbeatTTL)
+		if err := serverNodeLifecycle.Start(context.TODO()); err != nil {
+			closeStartup()
+			return nil, fmt.Errorf("server runtime: register server node: %w", err)
+		}
+		runtime.serverNodeLifecycle = serverNodeLifecycle
+	}
 	dialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (AgentConnectionRelayClient, error) {
 		client, err := runtime.DialRelayNode(ctx, endpoint, epoch)
 		if err != nil {
@@ -137,25 +153,28 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	if runtimeConfig.Relay.Enabled {
 		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
-			_ = credentialService.Close()
+			closeStartup()
 			return nil, errors.New("server runtime: relay requires node identity")
 		}
 		tlsConfig, err := loadRelayServerTLS(runtimeConfig.Relay)
 		if err != nil {
-			_ = credentialService.Close()
+			closeStartup()
 			return nil, err
 		}
 		listener, err := net.Listen("tcp", runtimeConfig.Relay.Listen)
 		if err != nil {
-			_ = credentialService.Close()
+			closeStartup()
 			return nil, fmt.Errorf("server runtime: listen relay: %w", err)
 		}
 		runtime.relayListener = listener
-		runtime.relayServer = grpc.NewServer(
-			grpc.Creds(credentials.NewTLS(tlsConfig)),
-			grpc.ChainStreamInterceptor(relay.NewServerNodeStreamInterceptorWithMetrics(credentialService, db.Nodes(), runtime.metrics)),
-			grpc.ChainUnaryInterceptor(relay.NewServerNodeUnaryInterceptor(credentialService, db.Nodes())),
-		)
+		serverOptions := []grpc.ServerOption{
+			grpc.ChainStreamInterceptor(relay.NewServerNodeStreamInterceptorWithMode(credentialService, db.Nodes(), runtime.metrics, tlsConfig != nil)),
+			grpc.ChainUnaryInterceptor(relay.NewServerNodeUnaryInterceptorWithMode(credentialService, db.Nodes(), tlsConfig != nil)),
+		}
+		if tlsConfig != nil {
+			serverOptions = append(serverOptions, grpc.Creds(credentials.NewTLS(tlsConfig)))
+		}
+		runtime.relayServer = grpc.NewServer(serverOptions...)
 		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithClose(localAgentRelay.OpenStream, runtime.closeAgentConnection))
 	}
 	runtime.Credentials = credentialService
@@ -169,7 +188,10 @@ func (r *ServerRuntime) Close() error {
 		return nil
 	}
 	r.closed.Store(true)
-	var relayErr, credentialErr error
+	var relayErr, credentialErr, serverNodeErr error
+	if r.serverNodeLifecycle != nil {
+		serverNodeErr = r.serverNodeLifecycle.Close()
+	}
 	if r.LocalAgentRelay != nil {
 		relayErr = r.LocalAgentRelay.Close()
 	}
@@ -182,7 +204,7 @@ func (r *ServerRuntime) Close() error {
 	if r.Credentials != nil {
 		credentialErr = r.Credentials.Close()
 	}
-	return errors.Join(relayErr, credentialErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr)
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The
@@ -577,6 +599,10 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 }
 
 func loadRelayServerTLS(cfg config.RelayConfig) (*tls.Config, error) {
+	complete, err := relayTLSMaterialComplete(cfg)
+	if err != nil || !complete {
+		return nil, err
+	}
 	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("server runtime: load relay certificate: %w", err)
@@ -593,6 +619,10 @@ func loadRelayServerTLS(cfg config.RelayConfig) (*tls.Config, error) {
 }
 
 func loadRelayClientTLS(cfg config.RelayConfig) (*tls.Config, error) {
+	complete, err := relayTLSMaterialComplete(cfg)
+	if err != nil || !complete {
+		return nil, err
+	}
 	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("server runtime: load relay client certificate: %w", err)
@@ -606,6 +636,23 @@ func loadRelayClientTLS(cfg config.RelayConfig) (*tls.Config, error) {
 		return nil, errors.New("server runtime: relay client CA contains no certificates")
 	}
 	return relay.NewRelayClientTLSConfig(cert, roots, cfg.ServerName)
+}
+
+func relayTLSMaterialComplete(cfg config.RelayConfig) (bool, error) {
+	count := 0
+	for _, value := range []string{cfg.CA, cfg.Cert, cfg.Key} {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	switch count {
+	case 0:
+		return false, nil
+	case 3:
+		return true, nil
+	default:
+		return false, errors.New("server runtime: relay requires all CA, certificate, and key fields for mTLS or none for plaintext")
+	}
 }
 
 type xNetWSFrameConn struct{ conn *websocket.Conn }

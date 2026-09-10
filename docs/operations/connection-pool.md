@@ -39,6 +39,19 @@ agent:
 
 Agent 只使用一个 `server_url`。多个 WebSocket 都连接该 URL；多 `server_urls` 不属于当前实现。
 
+## Server 节点与共享令牌
+
+`server.relay.node_token` 是 Server 节点服务令牌的唯一配置字段。管理员可以在 Tokens 页面创建：
+
+- **fleet token**：`scope.serverNodeIds` 留空，所有启用、未逻辑删除的 Server 节点都可使用；
+- **显式允许列表**：选择一个或多个 Server 节点，只有列表内节点可以使用。
+
+共享 token 只解决凭据分发，不降低授权边界。mTLS 模式下每个 Server 使用独立证书，证书 SAN 必须精确包含自己的 `node.id`，并包含所有节点共同的 `server_name`；数据库中的节点 epoch 也必须与调用方一致。禁用或逻辑删除 Server 后，即使 token 和证书仍有效，relay 认证也会拒绝。
+
+Server 启动时会把自身注册到 `server_nodes`，并每 30 秒更新一次心跳，租约有效期为 90 秒。没有 Agent 连接的节点也会显示 online/offline；有连接时，管理页额外汇总活跃连接、活跃流和健康分。
+
+`node.id` 缺失时由 `run` 自动生成并回写 YAML。systemd 会在非特权服务启动前以 root 执行 `init-node-id`，因此 mTLS 证书签发顺序是：安装配置 → 初始化 `node.id` → 按 `node.id` 和共同 `server_name` 签发 relay 证书 → 配置共享 token 和 mTLS → 启动。证书生成步骤见 [Relay mTLS 证书生成与配置](relay-mtls.md)。
+
 ## 升级与发布
 
 1. 备份 MySQL/SQLite 数据库，确认备份可恢复。
@@ -58,6 +71,19 @@ Schema v7 新增 `agent_connection_leases` 和 `agent_instance_metadata`。迁�
 - 新版代码回写的新连接/新实例只存在于 v7 表，旧版会回到 `agent_runtime_*` 数据。
 - 若业务已经依赖 v7 数据且需要精确回滚，使用升级前备份恢复，而不是自动生成反向 DDL。
 - 回滚前停止写入并保留 5 分钟内可执行的备份恢复步骤。
+
+## Schema v8 升级与回滚
+
+v8 为 `server_nodes` 增加 `name`、`enabled` 和 `deleted_at`，用于后台逻辑管理。升级前：
+
+1. 备份 MySQL/SQLite，并验证备份可恢复。
+2. 确认当前 `schema_meta.version=7`，且 `migrations/incremental/v0007_to_v0008/` 中对应驱动脚本存在。
+3. 确认数据库账号有 `ALTER TABLE` 和 `UPDATE` 权限；MySQL 5.6 需保持默认 767-byte 索引前缀限制。
+4. 停止或滚动停止 Server 写入，避免迁移期间同时更新节点心跳。
+
+`storage.auto_init=true` 时会执行增量脚本并推进到 v8。脚本会为存量节点回填 `name=id`、`enabled=1`，`deleted_at` 保持空。ALTER TABLE 可能短暂持有元数据锁，预计锁表时间取决于 `server_nodes` 行数；本表只保存 Server 清单，通常远小于 Agent 连接租约表。失败时版本不会提前推进；MySQL DDL 可能已隐式提交，按日志确认已添加的列后可重试。
+
+回滚应用到 v7 时保留 v8 新增列，不执行反向 DDL。新版写入的 `name/enabled/deleted_at` 对旧版无影响。如果必须精确恢复 Schema，使用升级前备份；不要手工删除列或修改 `schema_meta.version`。
 
 ## 监控
 
@@ -87,8 +113,9 @@ tunnelmesh_agent_selection_total
 ### 前置条件
 
 - 每个 Server 配置唯一且稳定的 `node.id`；不要让两个进程使用同一个 ID。
-- 启用 `server.relay.enabled`，并配置同一 CA 签发的 mTLS 证书、私钥、`server_name` 和 server-node token。
-- `server.relay.endpoint` 必须是其他 Server 节点可路由的地址。连接租约会保存该地址，远端关闭通过它发起 authenticated relay 控制调用。
+- 启用 `server.relay.enabled`，并配置 server-node token。
+- 生产环境配置同一 CA 签发的 mTLS 证书、私钥和 `server_name`；受控内网可省略这些证书字段运行明文模式。
+- `server.relay.endpoint` 可以留空并自动推导，也可以显式配置为其他 Server 节点可路由的地址。连接租约会保存该地址，远端关闭通过它发起 authenticated relay 控制调用。
 - 所有参与节点都必须运行支持连接租约和 relay close RPC 的版本；旧节点上的连接不会出现在完整集群视图中。
 - 集群节点时间同步，否则租约到期和 epoch 判断可能异常。
 
