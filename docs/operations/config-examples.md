@@ -251,13 +251,20 @@ TUNNELMESH_REGION='shanghai'
 
 ## Client
 
-Client 通过 `/ws/client` 建立会话。隧道条目可写入配置文件，也可以用 `forward`/`proxy` 命令临时指定。
+Client 通过 `/ws/client` 建立会话。`client.tunnels` 可同时配置多个本地入口；执行 `run` 时，本地 listener 先启动，再按 `agent_id` 建立独立 WebSocket 连接池。同一 Agent 的 stream 复用该 Agent 的 WebSocket，断线时只重连 WebSocket，不重建本地 listener。临时转发仍可用 `forward`/`proxy` 命令。
 
 ```yaml
 mode: local
 
 client:
   server_url: wss://tunnel.example.com/ws/client
+  connections:
+    min: 1
+    max: 4
+    high_watermark: 16
+    low_watermark: 2
+    evaluation_interval: 10s
+    cooldown: 30s
   stream:
     open_timeout: 8s
     inbound_buffer_bytes: 262144
@@ -286,6 +293,14 @@ client:
       agent_id: agent-web
       target_host: 127.0.0.1
       target_port: 8080
+    - name: socks-a
+      protocol: socks5
+      listen: 127.0.0.1:10866
+      agent_id: agent-a
+    - name: socks-b
+      protocol: socks5
+      listen: 127.0.0.1:10867
+      agent_id: agent-b
 ```
 
 环境文件示例：
@@ -296,7 +311,26 @@ TUNNELMESH_CLIENT_TOKEN='replace-with-client-service-token'
 
 ### SOCKS5 本地入口
 
-SOCKS5 当前作为临时 `forward socks5` 命令提供，不写入 `client.tunnels` 配置。默认监听 loopback 且不启用本地认证：
+SOCKS5 可写入 `client.tunnels`，随 `run` 命令启动。默认监听 loopback 且不启用本地认证：
+
+```yaml
+client:
+  tunnels:
+    - name: socks-a
+      protocol: socks5
+      listen: 127.0.0.1:10866
+      agent_id: agent-a
+    - name: socks-b
+      protocol: socks5
+      listen: 127.0.0.1:10867
+      agent_id: agent-b
+```
+
+```bash
+tunnelmesh-client --config /etc/tunnelmesh/client.yaml run
+```
+
+需要临时启动单个入口时，也可使用命令行：
 
 ```bash
 tunnelmesh-client forward socks5 \
@@ -304,7 +338,19 @@ tunnelmesh-client forward socks5 \
   --agent agent-devbox
 ```
 
-如需监听非 loopback 地址，必须同时开启 `--allow-remote` 和 `--auth password`，并从环境变量注入本地入口凭据：
+如需监听非 loopback 地址，配置文件必须同时设置 `allow_remote: true` 和 `auth_mode: password`，并从环境变量注入本地入口凭据。命令行模式对应 `--allow-remote` 和 `--auth password`：
+
+```yaml
+client:
+  tunnels:
+    - name: remote-socks
+      protocol: socks5
+      listen: 0.0.0.0:1080
+      agent_id: agent-devbox
+      allow_remote: true
+      auth_mode: password
+      auth_url: http://auth.internal/validate
+```
 
 ```bash
 TUNNELMESH_SOCKS5_USERNAME='alice' \
@@ -318,7 +364,7 @@ tunnelmesh-client forward socks5 \
 
 这两个环境变量只用于本地 SOCKS5 入口认证，不用于 Server 或 Agent 的 service token。
 
-如需启用远程校验，可额外指定 `--auth-url`：
+如需启用远程校验，配置文件可设置 `auth_url`；临时命令可额外指定 `--auth-url`：
 
 ```bash
 tunnelmesh-client forward socks5 \
@@ -359,6 +405,10 @@ tunnelmesh-client forward http-proxy \
   --agent agent-devbox \
   --auth-url http://auth.internal/validate
 ```
+
+### Client 全协议配置示例
+
+连接池参数是全局配置，作用于每个逻辑 Agent：多个 Agent 至少各有一条 WebSocket，同一 Agent 可按负载扩容到 `max`。`high_watermark` 表示单条 WebSocket 的活跃 stream 数，达到后扩容；`low_watermark` 表示缩容阈值。完整示例见 [Client 配置示例](client-configuration-examples.md)。
 
 ## 检查与文件权限
 

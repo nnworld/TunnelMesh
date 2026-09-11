@@ -84,12 +84,22 @@ type AgentRepository interface {
 	List(context.Context, string, int) (Page[Agent], error)
 }
 
+type PolicyStatus string
+
+const (
+	PolicyStatusActive  PolicyStatus = "active"
+	PolicyStatusDeleted PolicyStatus = "deleted"
+	PolicyStatusAll     PolicyStatus = "all"
+)
+
 type PolicyRepository interface {
 	Create(context.Context, AgentPolicy) error
 	Get(context.Context, string) (AgentPolicy, error)
 	Update(context.Context, AgentPolicy) error
 	Delete(context.Context, string) error
 	ListByAgent(context.Context, string, string, int) (Page[AgentPolicy], error)
+	ListByAgentStatus(context.Context, string, string, int, PolicyStatus) (Page[AgentPolicy], error)
+	Restore(context.Context, string) error
 }
 
 type TunnelRepository interface {
@@ -1035,16 +1045,18 @@ func (r *policyRepo) Create(ctx context.Context, v AgentPolicy) error {
 		v.AllowedPorts = "[]"
 	}
 	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
-		_, err := exec.ExecContext(ctx, `INSERT INTO agent_policies(id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, v.ID, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.CreatedAt), tm(v.UpdatedAt))
+		_, err := exec.ExecContext(ctx, `INSERT INTO agent_policies(id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, v.ID, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, nullableTime(v.DeletedAt), tm(v.CreatedAt), tm(v.UpdatedAt))
 		return err
 	})
 }
 func (r *policyRepo) Get(ctx context.Context, id string) (AgentPolicy, error) {
 	var v AgentPolicy
 	var c, u string
-	err := r.db.QueryRowContext(ctx, `SELECT id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,created_at,updated_at FROM agent_policies WHERE id=?`, id).Scan(&v.ID, &v.AgentID, &v.TargetHost, &v.TargetPort, &v.Protocol, &v.AllowedCIDRs, &v.AllowedPorts, &c, &u)
+	var deleted sql.NullString
+	err := r.db.QueryRowContext(ctx, `SELECT id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,deleted_at,created_at,updated_at FROM agent_policies WHERE id=?`, id).Scan(&v.ID, &v.AgentID, &v.TargetHost, &v.TargetPort, &v.Protocol, &v.AllowedCIDRs, &v.AllowedPorts, &deleted, &c, &u)
 	v.CreatedAt = parseTime(c)
 	v.UpdatedAt = parseTime(u)
+	v.DeletedAt = parseTM(deleted)
 	return v, err
 }
 func (r *policyRepo) Update(ctx context.Context, v AgentPolicy) error {
@@ -1052,20 +1064,42 @@ func (r *policyRepo) Update(ctx context.Context, v AgentPolicy) error {
 		v.UpdatedAt = time.Now().UTC()
 	}
 	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
-		res, err := exec.ExecContext(ctx, `UPDATE agent_policies SET agent_id=?,target_host=?,target_port=?,protocol=?,allowed_cidrs=?,allowed_ports=?,updated_at=? WHERE id=?`, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.UpdatedAt), v.ID)
+		res, err := exec.ExecContext(ctx, `UPDATE agent_policies SET agent_id=?,target_host=?,target_port=?,protocol=?,allowed_cidrs=?,allowed_ports=?,updated_at=? WHERE id=? AND deleted_at IS NULL`, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.UpdatedAt), v.ID)
 		return checkAffected(res, err)
 	})
 }
 func (r *policyRepo) Delete(ctx context.Context, id string) error {
 	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
-		res, err := exec.ExecContext(ctx, `DELETE FROM agent_policies WHERE id=?`, id)
+		now := tm(time.Now().UTC())
+		res, err := exec.ExecContext(ctx, `UPDATE agent_policies SET deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL`, now, now, id)
+		return checkAffected(res, err)
+	})
+}
+func (r *policyRepo) Restore(ctx context.Context, id string) error {
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE agent_policies SET deleted_at=NULL,updated_at=? WHERE id=? AND deleted_at IS NOT NULL`, tm(time.Now().UTC()), id)
 		return checkAffected(res, err)
 	})
 }
 func (r *policyRepo) ListByAgent(ctx context.Context, agentID, cursor string, limit int) (Page[AgentPolicy], error) {
+	return r.listByAgent(ctx, agentID, cursor, limit, PolicyStatusActive)
+}
+func (r *policyRepo) ListByAgentStatus(ctx context.Context, agentID, cursor string, limit int, status PolicyStatus) (Page[AgentPolicy], error) {
+	return r.listByAgent(ctx, agentID, cursor, limit, status)
+}
+func (r *policyRepo) listByAgent(ctx context.Context, agentID, cursor string, limit int, status PolicyStatus) (Page[AgentPolicy], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,created_at,updated_at FROM agent_policies WHERE agent_id=?`
+	q := `SELECT id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,deleted_at,created_at,updated_at FROM agent_policies WHERE agent_id=?`
 	args := []any{agentID}
+	switch status {
+	case PolicyStatusActive:
+		q += ` AND deleted_at IS NULL`
+	case PolicyStatusDeleted:
+		q += ` AND deleted_at IS NOT NULL`
+	case PolicyStatusAll:
+	default:
+		return Page[AgentPolicy]{}, fmt.Errorf("unsupported policy status %q", status)
+	}
 	if c := decodeCursor(cursor); c != "" {
 		q += ` AND id>?`
 		args = append(args, c)
@@ -1081,11 +1115,13 @@ func (r *policyRepo) ListByAgent(ctx context.Context, agentID, cursor string, li
 	for rows.Next() {
 		var v AgentPolicy
 		var c, u string
-		if err := rows.Scan(&v.ID, &v.AgentID, &v.TargetHost, &v.TargetPort, &v.Protocol, &v.AllowedCIDRs, &v.AllowedPorts, &c, &u); err != nil {
+		var deleted sql.NullString
+		if err := rows.Scan(&v.ID, &v.AgentID, &v.TargetHost, &v.TargetPort, &v.Protocol, &v.AllowedCIDRs, &v.AllowedPorts, &deleted, &c, &u); err != nil {
 			return Page[AgentPolicy]{}, err
 		}
 		v.CreatedAt = parseTime(c)
 		v.UpdatedAt = parseTime(u)
+		v.DeletedAt = parseTM(deleted)
 		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -1099,6 +1135,8 @@ func (r *policyRepo) ListByAgent(ctx context.Context, agentID, cursor string, li
 	}
 	return p, nil
 }
+
+var _ PolicyRepository = (*policyRepo)(nil)
 
 type tunnelRepo struct{ db *sql.DB }
 

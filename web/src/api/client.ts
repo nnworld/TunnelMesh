@@ -17,6 +17,26 @@ export type AgentMetadata = {
   reportedAt: string; updatedAt: string; items: AgentMetadataItem[]
   instances?: AgentMetadataInstance[]; connections?: AgentConnection[]
 }
+export type AgentPolicy = {
+  id: string
+  agentId: string
+  protocol: string
+  targetHost: string
+  targetPort: number
+  allowedCIDRs: string[]
+  allowedPorts: number[]
+  deletedAt?: string | null
+  createdAt: string
+  updatedAt: string
+}
+export type AgentPolicyInput = {
+  protocol: string
+  targetHost: string
+  targetPort: number
+  allowedCIDRs: string[]
+  allowedPorts: number[]
+}
+export type AgentPolicyPage = { items: AgentPolicy[]; nextCursor?: string; hasMore?: boolean }
 export type ClusterAgentConnection = {
   agentId: string
   instanceId: string
@@ -126,6 +146,37 @@ export function getAgents(params: { cursor?: string; limit?: number } = {}) {
   return api<{items: Agent[]; nextCursor?: string}>(`/agents${query.size ? `?${query}` : ''}`)
 }
 export function createAgent(input: AgentCreateInput) { return api<Agent>('/agents', { method: 'POST', body: JSON.stringify(input) }) }
+export function listAgentPolicies(agentId: string, params: { cursor?: string; limit?: number; status?: 'active' | 'deleted' | 'all' } = {}) {
+  const query = new URLSearchParams()
+  if (params.cursor) query.set('cursor', params.cursor)
+  if (params.limit) query.set('limit', String(params.limit))
+  if (params.status) query.set('status', params.status)
+  const suffix = query.toString() ? `?${query}` : ''
+  return api<AgentPolicyPage>(`/agents/${encodeURIComponent(agentId)}/policies${suffix}`)
+}
+export function createAgentPolicy(agentId: string, input: AgentPolicyInput, idempotencyKey: string) {
+  return api<AgentPolicy>(`/agents/${encodeURIComponent(agentId)}/policies`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify(input),
+  })
+}
+export function updateAgentPolicy(agentId: string, policyId: string, input: AgentPolicyInput) {
+  return api<AgentPolicy>(`/agents/${encodeURIComponent(agentId)}/policies/${encodeURIComponent(policyId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  })
+}
+export function deleteAgentPolicy(agentId: string, policyId: string) {
+  return api<AgentPolicy>(`/agents/${encodeURIComponent(agentId)}/policies/${encodeURIComponent(policyId)}`, {
+    method: 'DELETE',
+  })
+}
+export function restoreAgentPolicy(agentId: string, policyId: string) {
+  return api<AgentPolicy>(`/agents/${encodeURIComponent(agentId)}/policies/${encodeURIComponent(policyId)}/restore`, {
+    method: 'POST',
+  })
+}
 export function listRoutes(params: { cursor?: string; limit?: number } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)

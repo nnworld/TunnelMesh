@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 9
+	SchemaVersion = 10
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -338,6 +338,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			script = migrations.V8ToV9SQLite
 			if driver == DriverMySQL {
 				script = migrations.V8ToV9MySQL
+			}
+		case 9:
+			script = migrations.V9ToV10SQLite
+			if driver == DriverMySQL {
+				script = migrations.V9ToV10MySQL
 			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)

@@ -103,7 +103,7 @@ type CredentialService struct {
 	users       storage.UserRepository
 	agents      storage.AgentRepository
 	nodes       storage.NodeRepository
-	policies    storage.PolicyRepository
+	policies    AgentPolicyReader
 	secretStore *SecretStore
 
 	workerCtx                   context.Context
@@ -112,6 +112,12 @@ type CredentialService struct {
 	authorizationChangeNotifier func()
 	wg                          sync.WaitGroup
 	closeOnce                   sync.Once
+}
+
+// AgentPolicyReader keeps stream authorization independent from management
+// lifecycle operations such as logical deletion and restoration.
+type AgentPolicyReader interface {
+	ListByAgent(context.Context, string, string, int) (storage.Page[storage.AgentPolicy], error)
 }
 
 // SetSecretStore enables encrypted-at-rest recovery for newly issued and
@@ -170,7 +176,7 @@ func bindCredentialRepository(s *CredentialService, source any) {
 		s.agents = v
 	case storage.NodeRepository:
 		s.nodes = v
-	case storage.PolicyRepository:
+	case AgentPolicyReader:
 		s.policies = v
 	}
 }
@@ -690,6 +696,9 @@ func (s *CredentialService) agentPolicyAllows(ctx context.Context, req StreamAut
 }
 
 func policyAllows(policy storage.AgentPolicy, req StreamAuthorizationRequest, targetIP net.IP) (bool, error) {
+	if policy.DeletedAt != nil {
+		return false, ErrForbidden
+	}
 	if len(policy.AgentID) > maxScopeAgentIDBytes {
 		return false, ErrForbidden
 	}
@@ -717,13 +726,13 @@ func policyAllows(policy storage.AgentPolicy, req StreamAuthorizationRequest, ta
 	if host == "" {
 		return false, ErrForbidden
 	}
-	if !strings.EqualFold(host, req.TargetHost) {
+	if host != "*" && !strings.EqualFold(host, req.TargetHost) {
 		return false, nil
 	}
-	if policy.TargetPort < 1 || policy.TargetPort > 65535 {
+	if policy.TargetPort < 0 || policy.TargetPort > 65535 {
 		return false, ErrForbidden
 	}
-	if policy.TargetPort != req.TargetPort {
+	if policy.TargetPort != 0 && policy.TargetPort != req.TargetPort {
 		return false, nil
 	}
 	cidrs, err := parseCIDRList(policy.AllowedCIDRs)

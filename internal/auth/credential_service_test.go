@@ -466,6 +466,130 @@ func TestScopeAuthorizationIntersectsTokenAndAgentPolicy(t *testing.T) {
 	}
 }
 
+func TestAgentPolicyWildcardsAuthorizeAnyHostAndPort(t *testing.T) {
+	ctx := context.Background()
+	repos := newCredentialRepos()
+	repos.users.items["owner"] = storage.User{ID: "owner"}
+	repos.agents.items["agent-a"] = storage.Agent{ID: "agent-a", OwnerUserID: "owner", Enabled: true}
+	repos.policies.items["agent-a"] = []storage.AgentPolicy{{
+		ID: "allow-any-tcp", AgentID: "agent-a", TargetHost: "*", TargetPort: 0, Protocol: "tcp",
+	}}
+	service := newTestCredentialService(t, repos)
+	created, err := service.Create(ctx, CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := service.ValidateAs(ctx, created.Secret, storage.TokenTypeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requests := []StreamAuthorizationRequest{
+		{AgentID: "agent-a", Protocol: "tcp", TargetHost: "example.com", TargetPort: 443},
+		{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.20.30.40", TargetPort: 8080},
+	}
+	for _, req := range requests {
+		if err := service.AuthorizeStream(ctx, id, req); err != nil {
+			t.Fatalf("AuthorizeStream(%+v) error = %v, want nil", req, err)
+		}
+	}
+}
+
+func TestAgentPolicyLogicalDeleteFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	repos := newCredentialRepos()
+	repos.users.items["owner"] = storage.User{ID: "owner"}
+	repos.agents.items["agent-a"] = storage.Agent{ID: "agent-a", OwnerUserID: "owner", Enabled: true}
+	policy := storage.AgentPolicy{ID: "allow-ssh", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22, Protocol: "tcp", AllowedCIDRs: "0.0.0.0/0,::/0"}
+	repos.policies.items["agent-a"] = []storage.AgentPolicy{policy}
+	service := newTestCredentialService(t, repos)
+	created, err := service.Create(ctx, CreateTokenInput{
+		Type:        storage.TokenTypeClient,
+		OwnerUserID: "owner",
+		Scope:       TokenScope{AgentIDs: []string{"agent-a"}, Protocols: []string{"tcp"}, TargetCIDRs: []string{"0.0.0.0/0", "::/0"}, TargetPorts: []int{22}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := service.ValidateAs(ctx, created.Secret, storage.TokenTypeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22}
+	if err := service.AuthorizeStream(ctx, id, request); err != nil {
+		t.Fatalf("AuthorizeStream(active policy) error = %v", err)
+	}
+
+	deletedAt := time.Now().UTC()
+	repos.policies.items["agent-a"][0].DeletedAt = &deletedAt
+	if err := service.AuthorizeStream(ctx, id, request); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("AuthorizeStream(deleted policy) error = %v, want ErrForbidden", err)
+	}
+
+	repos.policies.items["agent-a"][0].DeletedAt = nil
+	if err := service.AuthorizeStream(ctx, id, request); err != nil {
+		t.Fatalf("AuthorizeStream(restored policy) error = %v", err)
+	}
+}
+
+func TestAgentPolicyWildcardStillAppliesCIDRAndPortLimits(t *testing.T) {
+	ctx := context.Background()
+	repos := newCredentialRepos()
+	repos.users.items["owner"] = storage.User{ID: "owner"}
+	repos.agents.items["agent-a"] = storage.Agent{ID: "agent-a", OwnerUserID: "owner", Enabled: true}
+	repos.policies.items["agent-a"] = []storage.AgentPolicy{{
+		ID: "allow-private-https", AgentID: "agent-a", TargetHost: "*", TargetPort: 0, Protocol: "tcp",
+		AllowedCIDRs: "10.20.0.0/16", AllowedPorts: "443,8443",
+	}}
+	service := newTestCredentialService(t, repos)
+	created, err := service.Create(ctx, CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := service.ValidateAs(ctx, created.Secret, storage.TokenTypeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		request StreamAuthorizationRequest
+		wantErr error
+	}{
+		{
+			name:    "allowed cidr and port",
+			request: StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.20.30.40", TargetPort: 443},
+		},
+		{
+			name:    "allowed cidr and alternate port",
+			request: StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.20.30.40", TargetPort: 8443},
+		},
+		{
+			name:    "cidr outside allowlist",
+			request: StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.21.30.40", TargetPort: 443},
+			wantErr: ErrForbidden,
+		},
+		{
+			name:    "port outside allowlist",
+			request: StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.20.30.40", TargetPort: 8080},
+			wantErr: ErrForbidden,
+		},
+		{
+			name:    "hostname cannot be proven within cidr allowlist",
+			request: StreamAuthorizationRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "example.com", TargetPort: 443},
+			wantErr: ErrForbidden,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := service.AuthorizeStream(ctx, id, tt.request)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("AuthorizeStream(%+v) error = %v, want %v", tt.request, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestScopeAuthorizationRechecksStateAndFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	repos := newCredentialRepos()
@@ -511,7 +635,7 @@ func TestCredentialPolicyMalformedBindingsFailClosed(t *testing.T) {
 		{name: "empty target host", policy: storage.AgentPolicy{AgentID: "agent-a", TargetPort: 22, Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
 		{name: "oversized target host", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: strings.Repeat("a", 256), TargetPort: 22, Protocol: "tcp"}, req: streamRequest(strings.Repeat("a", 256), 22)},
 		{name: "wrong target host", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.9", TargetPort: 22, Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
-		{name: "zero target port", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.8", Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
+		{name: "negative target port", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: -1, Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
 		{name: "oversized target port", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 65536, Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
 		{name: "wrong target port", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 23, Protocol: "tcp"}, req: streamRequest("10.0.0.8", 22)},
 		{name: "empty protocol", policy: storage.AgentPolicy{AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22}, req: streamRequest("10.0.0.8", 22)},

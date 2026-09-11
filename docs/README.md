@@ -17,6 +17,7 @@
 - [Windows Service 安装](deployment/windows-service.md)
 - [配置说明](operations/configuration.md)
 - [Server / Agent / Client 配置示例](operations/config-examples.md)
+- [Client 全协议与连接池配置示例](operations/client-configuration-examples.md)
 - [Schema 升级与回滚](operations/schema-upgrades.md)
 - [Relay mTLS 证书生成与配置](operations/relay-mtls.md)
 - [逻辑 Agent 连接池](operations/connection-pool.md)

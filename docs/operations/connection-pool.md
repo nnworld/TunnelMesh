@@ -1,6 +1,6 @@
 # 逻辑 Agent 连接池运维指南
 
-本文说明从 Schema v6 升级到 v7 后，如何启用和运维“多物理连接、一个逻辑 Agent”的连接池。默认配置保持 `min=1,max=1`，行为与旧版单连接 Agent 一致。
+本文说明从 Schema v6 升级到 v7 后，如何启用和运维“多物理连接、一个逻辑 Agent”的 Agent 连接池，并说明 Client 侧按 Agent 分组的连接池。Agent 与 Client 的默认配置都保持 `min=1,max=1`。
 
 ## 身份模型
 
@@ -38,6 +38,27 @@ agent:
 ```
 
 Agent 只使用一个 `server_url`。多个 WebSocket 都连接该 URL；多 `server_urls` 不属于当前实现。
+
+## Client 配置
+
+Client 侧连接池按 `agent_id` 分组。多个 Agent 至少各有一条 WebSocket；同一 Agent 的 stream 复用该 Agent 池内 WebSocket。默认不扩容：
+
+```yaml
+client:
+  connections:
+    min: 1
+    max: 1
+    high_watermark: 16
+    low_watermark: 2
+    evaluation_interval: 10s
+    cooldown: 30s
+```
+
+当某个 Agent 的所有 WebSocket 活跃 stream 都达到 `high_watermark`，且连接数小于 `max` 时，Client 会为该 Agent 增加一条 WebSocket；所有 WebSocket 活跃数降到 `low_watermark` 及以下时，再缩回 `min`。本地 listener 与 WebSocket 生命周期解耦，断线重连不会关闭本地端口。
+
+Client 新建 stream 时，优先选择活跃 stream 数最少的 WebSocket；活跃数相同时，使用最近一次 PING/PONG 心跳 RTT 较低的连接。选择只影响性能，不改变 Token 授权和目标策略校验。
+
+Client 只使用一个 `server_url`。完整协议示例见 [Client 配置示例](client-configuration-examples.md)。
 
 ## 负载与延迟信号
 

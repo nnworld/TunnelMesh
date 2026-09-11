@@ -161,6 +161,66 @@ func TestMetadataManagerScopesLeasesToAgentInstances(t *testing.T) {
 	}
 }
 
+func TestRefreshSessionMetadataLeaseHandlesConnectionPool(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:metadata-connection-pool-lease?mode=memory&cache=shared", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	expired := time.Now().UTC().Add(-time.Minute)
+	if err := db.Metadata().Upsert(context.Background(), storage.AgentRuntimeMetadata{
+		AgentID:    "agent-pool-heartbeat",
+		InstanceID: "instance-pool",
+		NodeID:     "node-a",
+		Epoch:      7,
+		Revision:   1,
+		Metadata:   `{"items":[]}`,
+		ReportedAt: time.Now().UTC().Add(-2 * time.Minute),
+		LastSeenAt: time.Now().UTC().Add(-2 * time.Minute),
+		ExpiresAt:  &expired,
+		Stale:      true,
+		UpdatedAt:  time.Now().UTC().Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewAgentSessionManager(AgentSessionConfig{
+		MetadataService: NewAgentMetadataService(db.Metadata()),
+		MetadataTTL:     time.Minute,
+	})
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-pool-heartbeat", NodeID: "node-a", Epoch: 7,
+		InstanceID: "instance-pool", ConnectionID: "conn-a", ConnectionEpoch: 1,
+	}, newFakeTransport()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-pool-heartbeat", NodeID: "node-a", Epoch: 7,
+		InstanceID: "instance-pool", ConnectionID: "conn-b", ConnectionEpoch: 1,
+	}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := second.LastHeartbeat()
+
+	if err := manager.RefreshSessionMetadataLease(context.Background(), second); err != nil {
+		t.Fatalf("refresh pooled connection lease: %v", err)
+	}
+	if second.LastHeartbeat().Before(before) {
+		t.Fatal("pooled connection heartbeat timestamp was not refreshed")
+	}
+
+	repo, ok := db.Metadata().(storage.AgentInstanceMetadataRepository)
+	if !ok {
+		t.Fatal("metadata repository does not implement instance operations")
+	}
+	metadata, err := repo.GetInstance(context.Background(), "agent-pool-heartbeat", "instance-pool")
+	if err != nil || metadata.Stale || metadata.ExpiresAt == nil || !metadata.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("refreshed pooled instance metadata=%+v err=%v", metadata, err)
+	}
+}
+
 type metadataSessionWSConn struct {
 	mu         sync.Mutex
 	reads      [][]byte

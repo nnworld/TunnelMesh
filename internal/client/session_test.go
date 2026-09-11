@@ -79,6 +79,31 @@ func TestSessionSlowStreamDoesNotBlockPing(t *testing.T) {
 	}
 }
 
+func TestSessionPingMatchesCorrelationID(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 1), recv: make(chan protocol.Frame, 1), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	defer session.Close()
+	session.Start()
+
+	go func() {
+		select {
+		case frame := <-tr.sent:
+			tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload}
+		case <-time.After(time.Second):
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	rtt, err := session.Ping(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rtt < 0 {
+		t.Fatalf("Ping() RTT=%v, want non-negative", rtt)
+	}
+}
+
 func TestSessionSlowDatagramDoesNotBlockPing(t *testing.T) {
 	tr := newBlockingDataTransport()
 	session := NewSession(tr)

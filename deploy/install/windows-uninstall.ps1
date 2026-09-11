@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('server','agent')][string]$Role = 'agent',
+  [ValidateSet('server','agent','client')][string]$Role = 'agent',
   [string]$InstallDir = "$env:ProgramFiles\TunnelMesh"
 )
 $ErrorActionPreference = 'Stop'

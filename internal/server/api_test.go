@@ -199,6 +199,324 @@ func TestAPIRouteAcceptsTMWildcardAndRejectsGenericWildcard(t *testing.T) {
 	}
 }
 
+func TestAPIAgentPolicyAcceptsWildcardTarget(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	createdAgent := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "wildcard-policy-agent", map[string]any{"name": "wildcard-policy-agent"})
+	if createdAgent.Code != http.StatusCreated {
+		t.Fatalf("create agent status=%d: %s", createdAgent.Code, createdAgent.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdAgent.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+
+	body := map[string]any{
+		"protocol":     "tcp",
+		"targetHost":   "*",
+		"targetPort":   0,
+		"allowedCIDRs": []string{},
+		"allowedPorts": []int{},
+	}
+	response := apiJSON(t, h, http.MethodPost, "/api/v1/agents/"+agent.Data.ID+"/policies", token, "wildcard-policy", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create wildcard policy status=%d: %s", response.Code, response.Body.String())
+	}
+	var created struct {
+		Data struct {
+			TargetHost string `json:"targetHost"`
+			TargetPort int    `json:"targetPort"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Data.TargetHost != "*" || created.Data.TargetPort != 0 {
+		t.Fatalf("created policy = %+v, want targetHost=* and targetPort=0", created.Data)
+	}
+}
+
+func TestAPIAgentPolicyPatchCanSetWildcardPort(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	createdAgent := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "wildcard-patch-agent", map[string]any{"name": "wildcard-patch-agent"})
+	if createdAgent.Code != http.StatusCreated {
+		t.Fatalf("create agent status=%d: %s", createdAgent.Code, createdAgent.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdAgent.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := "/api/v1/agents/" + agent.Data.ID + "/policies"
+	created := apiJSON(t, h, http.MethodPost, policyPath, token, "wildcard-patch-policy", map[string]any{
+		"protocol": "tcp", "targetHost": "service.internal", "targetPort": 22,
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create policy status=%d: %s", created.Code, created.Body.String())
+	}
+	var createdPolicy struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPolicy); err != nil {
+		t.Fatal(err)
+	}
+
+	patched := apiJSON(t, h, http.MethodPatch, policyPath+"/"+createdPolicy.Data.ID, token, "", map[string]any{
+		"targetHost": "*", "targetPort": 0, "allowedCIDRs": []string{}, "allowedPorts": []int{},
+	})
+	if patched.Code != http.StatusOK {
+		t.Fatalf("patch policy status=%d: %s", patched.Code, patched.Body.String())
+	}
+	var updated struct {
+		Data struct {
+			TargetHost string `json:"targetHost"`
+			TargetPort int    `json:"targetPort"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(patched.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Data.TargetHost != "*" || updated.Data.TargetPort != 0 {
+		t.Fatalf("updated policy = %+v, want targetHost=* and targetPort=0", updated.Data)
+	}
+}
+
+func TestAPIAgentPolicyLogicalLifecycle(t *testing.T) {
+	api, admin, user := apiTestServer(t)
+	h := api.Handler()
+	adminToken := apiToken(t, api, admin.Username, "admin-pass")
+	userToken := apiToken(t, api, user.Username, "alice-pass")
+
+	createdAgent := apiJSON(t, h, http.MethodPost, "/api/v1/agents", adminToken, "lifecycle-agent", map[string]any{"name": "lifecycle-agent"})
+	if createdAgent.Code != http.StatusCreated {
+		t.Fatalf("create agent status=%d: %s", createdAgent.Code, createdAgent.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdAgent.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := "/api/v1/agents/" + agent.Data.ID + "/policies"
+	created := apiJSON(t, h, http.MethodPost, policyPath, adminToken, "lifecycle-policy", map[string]any{
+		"protocol": "tcp", "targetHost": "service.internal", "targetPort": 443,
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create policy status=%d: %s", created.Code, created.Body.String())
+	}
+	var createdPolicy struct {
+		Data struct {
+			ID        string     `json:"id"`
+			DeletedAt *time.Time `json:"deletedAt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPolicy); err != nil {
+		t.Fatal(err)
+	}
+	policyResource := policyPath + "/" + createdPolicy.Data.ID
+	if createdPolicy.Data.ID == "" || createdPolicy.Data.DeletedAt != nil {
+		t.Fatalf("created policy = %+v, want active with id", createdPolicy.Data)
+	}
+
+	type policyPage struct {
+		Data struct {
+			Items []struct {
+				ID        string     `json:"id"`
+				DeletedAt *time.Time `json:"deletedAt"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	assertItems := func(response *httptest.ResponseRecorder, wantIDs ...string) []struct {
+		ID        string     `json:"id"`
+		DeletedAt *time.Time `json:"deletedAt"`
+	} {
+		t.Helper()
+		if response.Code != http.StatusOK {
+			t.Fatalf("list status=%d: %s", response.Code, response.Body.String())
+		}
+		var page policyPage
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Data.Items) != len(wantIDs) {
+			t.Fatalf("items = %+v, want IDs %v", page.Data.Items, wantIDs)
+		}
+		for i, id := range wantIDs {
+			if page.Data.Items[i].ID != id {
+				t.Fatalf("items = %+v, want IDs %v", page.Data.Items, wantIDs)
+			}
+		}
+		return page.Data.Items
+	}
+
+	if userResponse := apiJSON(t, h, http.MethodGet, policyPath+"?status=deleted", userToken, "", nil); userResponse.Code != http.StatusForbidden {
+		t.Fatalf("user deleted status = %d, want 403", userResponse.Code)
+	}
+	if userResponse := apiJSON(t, h, http.MethodDelete, policyResource, userToken, "", nil); userResponse.Code != http.StatusForbidden {
+		t.Fatalf("user delete status = %d, want 403", userResponse.Code)
+	}
+	if userResponse := apiJSON(t, h, http.MethodPost, policyResource+"/restore", userToken, "", nil); userResponse.Code != http.StatusForbidden {
+		t.Fatalf("user restore status = %d, want 403", userResponse.Code)
+	}
+
+	assertItems(apiJSON(t, h, http.MethodGet, policyPath, adminToken, "", nil), createdPolicy.Data.ID)
+	deletedResponse := apiJSON(t, h, http.MethodDelete, policyResource, adminToken, "", nil)
+	if deletedResponse.Code != http.StatusOK {
+		t.Fatalf("delete status=%d: %s", deletedResponse.Code, deletedResponse.Body.String())
+	}
+	assertItems(apiJSON(t, h, http.MethodGet, policyPath, adminToken, "", nil))
+	deletedItems := assertItems(apiJSON(t, h, http.MethodGet, policyPath+"?status=deleted", adminToken, "", nil), createdPolicy.Data.ID)
+	if deletedItems[0].DeletedAt == nil {
+		t.Fatal("deleted policy response does not expose deletedAt")
+	}
+	assertItems(apiJSON(t, h, http.MethodGet, policyPath+"?status=all", adminToken, "", nil), createdPolicy.Data.ID)
+
+	conflict := apiJSON(t, h, http.MethodPatch, policyResource, adminToken, "", map[string]any{"targetHost": "updated.internal"})
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("patch deleted status=%d: %s", conflict.Code, conflict.Body.String())
+	}
+	restored := apiJSON(t, h, http.MethodPost, policyResource+"/restore", adminToken, "", nil)
+	if restored.Code != http.StatusOK {
+		t.Fatalf("restore status=%d: %s", restored.Code, restored.Body.String())
+	}
+	assertItems(apiJSON(t, h, http.MethodGet, policyPath, adminToken, "", nil), createdPolicy.Data.ID)
+	if invalid := apiJSON(t, h, http.MethodGet, policyPath+"?status=invalid", adminToken, "", nil); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status filter = %d, want 400", invalid.Code)
+	}
+
+	audits, err := api.DB.Audits().List(context.Background(), storage.AuditFilter{}, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions := make(map[string]bool)
+	for _, audit := range audits.Items {
+		if audit.ResourceID == createdPolicy.Data.ID {
+			actions[audit.Action] = true
+		}
+	}
+	if !actions["policy.deleted"] || !actions["policy.restored"] {
+		t.Fatalf("policy lifecycle audits = %v", actions)
+	}
+}
+
+func TestAPIAgentPolicyRejectsPartialWildcardTarget(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	createdAgent := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "partial-wildcard-agent", map[string]any{"name": "partial-wildcard-agent"})
+	if createdAgent.Code != http.StatusCreated {
+		t.Fatalf("create agent status=%d: %s", createdAgent.Code, createdAgent.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdAgent.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := "/api/v1/agents/" + agent.Data.ID + "/policies"
+
+	created := apiJSON(t, h, http.MethodPost, policyPath, token, "partial-wildcard-create", map[string]any{
+		"protocol": "tcp", "targetHost": "service-*.internal", "targetPort": 443,
+	})
+	if created.Code != http.StatusBadRequest {
+		t.Fatalf("create partial wildcard status=%d: %s", created.Code, created.Body.String())
+	}
+
+	valid := apiJSON(t, h, http.MethodPost, policyPath, token, "partial-wildcard-seed", map[string]any{
+		"protocol": "tcp", "targetHost": "service.internal", "targetPort": 443,
+	})
+	if valid.Code != http.StatusCreated {
+		t.Fatalf("create valid policy status=%d: %s", valid.Code, valid.Body.String())
+	}
+	var seed struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(valid.Body.Bytes(), &seed); err != nil {
+		t.Fatal(err)
+	}
+	patched := apiJSON(t, h, http.MethodPatch, policyPath+"/"+seed.Data.ID, token, "", map[string]any{
+		"targetHost": "*.internal",
+	})
+	if patched.Code != http.StatusBadRequest {
+		t.Fatalf("patch partial wildcard status=%d: %s", patched.Code, patched.Body.String())
+	}
+}
+
+func TestAPIAgentPolicyPatchOmittedAllowedFields(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	createdAgent := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "policy-patch-allowed-agent", map[string]any{"name": "policy-patch-allowed-agent"})
+	if createdAgent.Code != http.StatusCreated {
+		t.Fatalf("create agent status=%d: %s", createdAgent.Code, createdAgent.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdAgent.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := "/api/v1/agents/" + agent.Data.ID + "/policies"
+	created := apiJSON(t, h, http.MethodPost, policyPath, token, "policy-patch-allowed-seed", map[string]any{
+		"protocol": "tcp", "targetHost": "service.internal", "targetPort": 443,
+		"allowedCIDRs": []string{}, "allowedPorts": []int{},
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create policy status=%d: %s", created.Code, created.Body.String())
+	}
+	var seed struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &seed); err != nil {
+		t.Fatal(err)
+	}
+
+	patched := apiJSON(t, h, http.MethodPatch, policyPath+"/"+seed.Data.ID, token, "", map[string]any{
+		"targetHost": "*",
+	})
+	if patched.Code != http.StatusOK {
+		t.Fatalf("patch policy status=%d: %s", patched.Code, patched.Body.String())
+	}
+	var updated struct {
+		Data struct {
+			AllowedCIDRs []string `json:"allowedCIDRs"`
+			AllowedPorts []int    `json:"allowedPorts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(patched.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Data.AllowedCIDRs) != 0 || len(updated.Data.AllowedPorts) != 0 {
+		t.Fatalf("updated allowlists = %+v, want empty values preserved", updated.Data)
+	}
+}
+
 func TestAPIRouteUpstreamDomainAndTLSConfig(t *testing.T) {
 	api, admin, _ := apiTestServer(t)
 	h := api.Handler()

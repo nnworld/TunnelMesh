@@ -10,7 +10,16 @@ launchctl print "gui/$(id -u)/com.tunnelmesh.agent"
 tail -f "$HOME/Library/Logs/tunnelmesh-agent.log"
 ```
 
-Server 同样支持 `server` 参数。默认日志位置为 `~/Library/Logs/tunnelmesh-server.log` 和 `.err.log`。停止并移除：
+Client 安装：
+
+```bash
+./tunnelmesh-client --config "$HOME/.config/tunnelmesh/client.yaml" check-config
+./deploy/install/macos-install.sh client ./tunnelmesh-client "$HOME/.config/tunnelmesh/client.yaml"
+launchctl print "gui/$(id -u)/com.tunnelmesh.client"
+tail -f "$HOME/Library/Logs/tunnelmesh-client.log"
+```
+
+Server 同样支持 `server` 参数。默认日志位置为 `~/Library/Logs/tunnelmesh-server.log`、`tunnelmesh-agent.log` 和 `tunnelmesh-client.log`，错误日志为同名 `.err.log`。停止并移除：
 
 ```bash
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.tunnelmesh.agent.plist"

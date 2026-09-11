@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('server','agent')][string]$Role = 'agent',
+  [ValidateSet('server','agent','client')][string]$Role = 'agent',
   [Parameter(Mandatory=$true)][string]$Binary,
   [Parameter(Mandatory=$true)][string]$Config,
   [Parameter(Mandatory=$true)][string]$WinSW,
@@ -19,7 +19,10 @@ $xml = Join-Path $InstallDir "$service-service.xml"
 Copy-Item -Force $Binary (Join-Path $InstallDir "tunnelmesh-$Role.exe")
 Copy-Item -Force $WinSW $wrapper
 $binaryName = "tunnelmesh-$Role.exe"
-@"
+if ($Role -eq 'client') {
+  Get-Content -Raw -Path "$PSScriptRoot\..\windows\tunnelmesh-client-service.xml" | Set-Content -Encoding UTF8 -Path $xml
+} else {
+  @"
 <service>
   <id>$service</id>
   <name>TunnelMesh $Role</name>
@@ -32,6 +35,7 @@ $binaryName = "tunnelmesh-$Role.exe"
   <onfailure action="restart" delay="5 sec" />
 </service>
 "@ | Set-Content -Encoding UTF8 -Path $xml
+}
 & $wrapper stop 2>$null; & $wrapper uninstall 2>$null
 & $wrapper install
 & $wrapper start

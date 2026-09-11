@@ -164,14 +164,37 @@ paths:
       responses: {'200': {description: Cursor page of probe summaries}}
   /api/v1/agents/{agentId}/policies:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
-    get: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}], responses: {'200': {description: Policies}}}
+    get:
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}, description: Non-active filters require the administrator role}
+      responses:
+        '200': {description: Policies, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyPageEnvelope'}}}}
+        '400': {description: Invalid status filter}
+        '403': {description: Non-administrator requested deleted or all policies}
     post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'201': {description: Created}}}
   /api/v1/agents/{agentId}/policies/{policyId}:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}, {name: policyId, in: path, required: true, schema: {type: string}}]
-    get: {security: [{bearerAuth: []}], responses: {'200': {description: Policy}}}
+    get: {security: [{bearerAuth: []}], responses: {'200': {description: Policy, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyEnvelope'}}}}}}
     put: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
-    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}}}
-    delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
+    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/PolicyRequest'}}}}, responses: {'200': {description: Updated}, '409': {description: Policy is logically deleted}}}
+    delete:
+      security: [{bearerAuth: []}]
+      description: Logically deletes the policy. It immediately stops participating in authorization and can be restored by an administrator.
+      responses:
+        '200': {description: Logically deleted policy, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyEnvelope'}}}}
+        '403': {description: Administrator required}
+  /api/v1/agents/{agentId}/policies/{policyId}/restore:
+    parameters: [{name: agentId, in: path, required: true, schema: {type: string}}, {name: policyId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Restore a logically deleted Agent Policy
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Restored policy, content: {application/json: {schema: {$ref: '#/components/schemas/PolicyEnvelope'}}}}
+        '403': {description: Administrator required}
+        '404': {description: Policy is not deleted}
   /api/v1/routes:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Managed routes}}}
     post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}, '409': {description: Duplicate route}}}
@@ -500,7 +523,48 @@ components:
         source: {type: string, enum: [file, env]}
         value: {type: string, description: Omitted for redacted sensitive fields}
         redacted: {type: boolean}
-    PolicyRequest: {type: object, required: [targetHost, targetPort], properties: {targetHost: {type: string}, targetPort: {type: integer, minimum: 1, maximum: 65535}, protocol: {type: string}, allowedCIDRs: {type: array, items: {type: string}}, allowedPorts: {type: array, items: {type: integer}}}}
+    PolicyRequest:
+      type: object
+      required: [targetHost, targetPort]
+      properties:
+        targetHost: {type: string, description: Exact IP or hostname; use * to match any host}
+        targetPort: {type: integer, minimum: 0, maximum: 65535, description: Exact target port; use 0 to match any port}
+        protocol: {type: string}
+        allowedCIDRs: {type: array, items: {type: string}, description: Additional IP allowlist; an empty array means unrestricted}
+        allowedPorts: {type: array, items: {type: integer}, description: Additional port allowlist; an empty array means unrestricted}
+    PolicyEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/Policy'}
+    PolicyPageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/PolicyPage'}
+    Policy:
+      type: object
+      required: [id, agentId, protocol, targetHost, targetPort, allowedCIDRs, allowedPorts, createdAt, updatedAt]
+      properties:
+        id: {type: string}
+        agentId: {type: string}
+        protocol: {type: string}
+        targetHost: {type: string}
+        targetPort: {type: integer, minimum: 0, maximum: 65535}
+        allowedCIDRs: {type: array, items: {type: string}}
+        allowedPorts: {type: array, items: {type: integer}}
+        deletedAt: {type: string, format: date-time, nullable: true, description: Non-null means the policy is logically deleted and does not authorize traffic}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    PolicyPage:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Policy'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
     TunnelRequest:
       type: object
       required: [agentId, targetHost, targetPort]

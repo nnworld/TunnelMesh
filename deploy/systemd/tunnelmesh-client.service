@@ -1,0 +1,43 @@
+[Unit]
+Description=TunnelMesh Client
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tunnelmesh
+Group=tunnelmesh
+WorkingDirectory=/var/lib/tunnelmesh-client
+EnvironmentFile=/etc/tunnelmesh/client.env
+ExecStartPre=/usr/local/bin/tunnelmesh-client --config /etc/tunnelmesh/client.yaml check-config
+ExecStart=/usr/local/bin/tunnelmesh-client --config /etc/tunnelmesh/client.yaml run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tunnelmesh-client
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnelmesh-client
+
+[Install]
+WantedBy=multi-user.target

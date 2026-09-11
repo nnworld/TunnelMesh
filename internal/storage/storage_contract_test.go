@@ -70,6 +70,62 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	if err := db.Policies().Create(ctx, AgentPolicy{ID: "policy-1", AgentID: agent.ID, TargetHost: "10.0.0.1", TargetPort: 22, Protocol: "tcp"}); err != nil {
 		t.Fatalf("create policy: %v", err)
 	}
+	policy, err := db.Policies().Get(ctx, "policy-1")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	activePage, err := db.Policies().ListByAgent(ctx, agent.ID, "", 10)
+	if err != nil {
+		t.Fatalf("list active policies: %v", err)
+	}
+	if len(activePage.Items) != 1 {
+		t.Fatalf("active policies = %+v, want one", activePage.Items)
+	}
+	if err := db.Policies().Delete(ctx, "policy-1"); err != nil {
+		t.Fatalf("logically delete policy: %v", err)
+	}
+	policy.UpdatedAt = time.Now().UTC()
+	if err := db.Policies().Update(ctx, policy); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("update deleted policy error = %v, want sql.ErrNoRows", err)
+	}
+	deleted, err := db.Policies().Get(ctx, "policy-1")
+	if err != nil {
+		t.Fatalf("get deleted policy: %v", err)
+	}
+	if deleted.DeletedAt == nil {
+		t.Fatal("deleted policy DeletedAt is nil, want logical delete timestamp")
+	}
+	activePage, err = db.Policies().ListByAgent(ctx, agent.ID, "", 10)
+	if err != nil {
+		t.Fatalf("list active policies after delete: %v", err)
+	}
+	if len(activePage.Items) != 0 {
+		t.Fatalf("active policies after delete = %+v, want none", activePage.Items)
+	}
+	deletedPage, err := db.Policies().ListByAgentStatus(ctx, agent.ID, "", 10, PolicyStatusDeleted)
+	if err != nil {
+		t.Fatalf("list deleted policies: %v", err)
+	}
+	if len(deletedPage.Items) != 1 || deletedPage.Items[0].ID != "policy-1" {
+		t.Fatalf("deleted policies = %+v, want policy-1", deletedPage.Items)
+	}
+	if err := db.Policies().Restore(ctx, "policy-1"); err != nil {
+		t.Fatalf("restore policy: %v", err)
+	}
+	restored, err := db.Policies().Get(ctx, "policy-1")
+	if err != nil {
+		t.Fatalf("get restored policy: %v", err)
+	}
+	if restored.DeletedAt != nil {
+		t.Fatalf("restored policy DeletedAt = %v, want nil", restored.DeletedAt)
+	}
+	activePage, err = db.Policies().ListByAgent(ctx, agent.ID, "", 10)
+	if err != nil {
+		t.Fatalf("list active policies after restore: %v", err)
+	}
+	if len(activePage.Items) != 1 {
+		t.Fatalf("active policies after restore = %+v, want one", activePage.Items)
+	}
 	if err := db.Tunnels().Create(ctx, Tunnel{ID: "tunnel-1", AgentID: agent.ID, Protocol: "tcp", Domain: "ssh.example.test", TargetHost: "10.0.0.1", TargetPort: 22, Config: `{}`}); err != nil {
 		t.Fatalf("create tunnel: %v", err)
 	}
@@ -170,6 +226,7 @@ func runAuthorizationRevisionBumpContract(t *testing.T, db *DB) {
 	policy.TargetPort = 80
 	assertBump("update policy", func() error { return db.Policies().Update(ctx, policy) })
 	assertBump("delete policy", func() error { return db.Policies().Delete(ctx, policy.ID) })
+	assertBump("restore policy", func() error { return db.Policies().Restore(ctx, policy.ID) })
 
 	now := time.Now().UTC()
 	token := ServiceToken{

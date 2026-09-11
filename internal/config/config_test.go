@@ -274,6 +274,203 @@ func TestLoadPrecedenceIsCLIThenEnvironmentThenFileThenDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAndValidateMultipleSOCKS5Tunnels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	yaml := `mode: local
+client:
+  server_url: wss://tunnel.example.com/ws/client
+  token: client-secret
+  tunnels:
+    - name: socks-a
+      protocol: socks5
+      listen: 127.0.0.1:10866
+      agent_id: agent-a
+    - name: socks-b
+      protocol: socks5
+      listen: 127.0.0.1:10867
+      agent_id: agent-b
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Client.Tunnels) != 2 {
+		t.Fatalf("tunnels = %d, want 2", len(cfg.Client.Tunnels))
+	}
+	if cfg.Client.Tunnels[0].Protocol != "socks5" || cfg.Client.Tunnels[0].ListenAddr != "127.0.0.1:10866" || cfg.Client.Tunnels[0].AgentID != "agent-a" {
+		t.Fatalf("first tunnel = %+v", cfg.Client.Tunnels[0])
+	}
+	if cfg.Client.Tunnels[1].Protocol != "socks5" || cfg.Client.Tunnels[1].ListenAddr != "127.0.0.1:10867" || cfg.Client.Tunnels[1].AgentID != "agent-b" {
+		t.Fatalf("second tunnel = %+v", cfg.Client.Tunnels[1])
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate(valid SOCKS5 tunnels) error = %v", err)
+	}
+}
+
+func TestLoadClientConnectionPoolDefaultsAndValidation(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := config.ClientConnectionConfig{
+		Min: 1, Max: 1, HighWatermark: 16, LowWatermark: 2,
+		EvaluationInterval: 10 * time.Second, Cooldown: 30 * time.Second,
+	}
+	if cfg.Client.Connections != want {
+		t.Fatalf("Client.Connections = %+v, want %+v", cfg.Client.Connections, want)
+	}
+
+	base := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
+	base.Client.ServerURL = "wss://tunnel.example.com/ws/client"
+	base.Client.Connections = want
+	cases := []struct {
+		name string
+		edit func(*config.ClientConnectionConfig)
+		want string
+	}{
+		{name: "min below one", edit: func(c *config.ClientConnectionConfig) { c.Min = 0 }, want: "client connections min must be at least 1"},
+		{name: "max below min", edit: func(c *config.ClientConnectionConfig) { c.Min, c.Max = 2, 1 }, want: "client connections max must be greater than or equal to min"},
+		{name: "max above limit", edit: func(c *config.ClientConnectionConfig) { c.Max = 17 }, want: "client connections max must be at most 16"},
+		{name: "low above high", edit: func(c *config.ClientConnectionConfig) { c.LowWatermark = 17 }, want: "client connections low watermark must be less than or equal to high watermark"},
+		{name: "invalid interval", edit: func(c *config.ClientConnectionConfig) { c.EvaluationInterval = 0 }, want: "client connections evaluation interval must be positive"},
+		{name: "invalid cooldown", edit: func(c *config.ClientConnectionConfig) { c.Cooldown = 0 }, want: "client connections cooldown must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg.Client.Connections)
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadAndValidateHTTPProxyTunnel(t *testing.T) {
+	valid := `mode: local
+client:
+  server_url: wss://tunnel.example.com/ws/client
+  token: client-secret
+  tunnels:
+    - name: http-proxy
+      protocol: http-proxy
+      listen: 127.0.0.1:18081
+      agent_id: agent-web
+      auth_mode: none
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load(valid) error = %v", err)
+	}
+	if len(cfg.Client.Tunnels) != 1 || cfg.Client.Tunnels[0].Protocol != "http-proxy" {
+		t.Fatalf("tunnels = %+v, want one http-proxy tunnel", cfg.Client.Tunnels)
+	}
+
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "invalid auth mode",
+			yaml: "client:\n  tunnels:\n    - protocol: http-proxy\n      listen: 127.0.0.1:18081\n      agent_id: agent-web\n      auth_mode: password\n",
+			want: "http-proxy auth mode must be none or basic",
+		},
+		{
+			name: "remote listener without permission",
+			yaml: "client:\n  tunnels:\n    - protocol: http-proxy\n      listen: 0.0.0.0:18081\n      agent_id: agent-web\n",
+			want: "non-loopback http-proxy tunnel requires allow_remote",
+		},
+		{
+			name: "remote listener without basic auth",
+			yaml: "client:\n  tunnels:\n    - protocol: http-proxy\n      listen: 0.0.0.0:18081\n      agent_id: agent-web\n      allow_remote: true\n",
+			want: "non-loopback http-proxy tunnel requires basic auth",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "client.yaml")
+			if err := os.WriteFile(path, []byte(test.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+			if err == nil {
+				err = config.Validate(cfg)
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidSOCKS5TunnelConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "missing agent id",
+			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n",
+			want: "requires agent_id",
+		},
+		{
+			name: "duplicate listen address",
+			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n      agent_id: agent-a\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n      agent_id: agent-b\n",
+			want: "duplicate tunnel listen address",
+		},
+		{
+			name: "invalid auth mode",
+			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n      agent_id: agent-a\n      auth_mode: token\n",
+			want: "socks5 auth mode must be none or password",
+		},
+		{
+			name: "remote listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 0.0.0.0:10866\n      agent_id: agent-a\n",
+			want: "non-loopback socks5 tunnel requires allow_remote",
+		},
+		{
+			name: "remote listener without password auth",
+			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 0.0.0.0:10866\n      agent_id: agent-a\n      allow_remote: true\n",
+			want: "non-loopback socks5 tunnel requires password auth",
+		},
+		{
+			name: "unsupported protocol",
+			yaml: "client:\n  tunnels:\n    - protocol: quic\n      listen: 127.0.0.1:10866\n      agent_id: agent-a\n",
+			want: "unsupported tunnel protocol",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "client.yaml")
+			if err := os.WriteFile(path, []byte(test.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+			if err == nil {
+				err = config.Validate(cfg)
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadAndValidateDynamicRouteSuffix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tunnelmesh.yaml")

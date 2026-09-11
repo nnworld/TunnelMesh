@@ -2,10 +2,12 @@ package client
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
@@ -56,6 +58,8 @@ type Session struct {
 	writer                *streamsession.FairFrameWriter
 	streams               map[uint32]*frameStream
 	datagrams             map[uint32]*frameDatagramStream
+	pendingPings          map[uint64]chan struct{}
+	nextPingID            atomic.Uint64
 	openMode              SessionOpenMode
 	initialWindow         uint32
 	windowUpdateThreshold uint32
@@ -66,7 +70,11 @@ func NewSession(tr FrameTransport) *Session {
 }
 
 func NewSessionWithOpenMode(tr FrameTransport, mode SessionOpenMode) *Session {
-	s := &Session{transport: tr, done: make(chan struct{}), streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream)}
+	s := &Session{
+		transport: tr, done: make(chan struct{}),
+		streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream),
+		pendingPings: make(map[uint64]chan struct{}),
+	}
 	if tr != nil {
 		s.writer = streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
 			ControlQueueSize: 64, StreamQueueBytes: 262144, QuantumBytes: 32768,
@@ -175,6 +183,53 @@ func (s *Session) Wait(ctx context.Context) error {
 		err := s.runErr
 		s.mu.RUnlock()
 		return err
+	}
+}
+
+// Ping sends a correlation-ID PING and waits for the peer's matching PONG.
+// It gives the connection pool a current RTT sample for tie-breaking.
+func (s *Session) Ping(ctx context.Context) (time.Duration, error) {
+	if s == nil {
+		return 0, ErrSessionClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id := s.nextPingID.Add(1)
+	pong := make(chan struct{})
+	s.mu.Lock()
+	if s.closed || s.transport == nil {
+		s.mu.Unlock()
+		return 0, ErrSessionClosed
+	}
+	s.pendingPings[id] = pong
+	s.mu.Unlock()
+
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, id)
+	started := time.Now()
+	if err := s.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: payload}); err != nil {
+		s.finishPing(id)
+		return 0, err
+	}
+	select {
+	case <-pong:
+		return time.Since(started), nil
+	case <-s.done:
+		return 0, ErrSessionClosed
+	case <-ctx.Done():
+		s.finishPing(id)
+		return 0, ctx.Err()
+	}
+}
+
+func (s *Session) finishPing(id uint64) {
+	s.mu.Lock()
+	pong, exists := s.pendingPings[id]
+	delete(s.pendingPings, id)
+	s.mu.Unlock()
+	if exists {
+		close(pong)
 	}
 }
 
@@ -401,6 +456,9 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			continue
 		}
 		if f.Type == protocol.FramePong {
+			if len(f.Payload) >= 8 {
+				s.finishPing(binary.BigEndian.Uint64(f.Payload[:8]))
+			}
 			if s.Metrics != nil {
 				s.Metrics.ObserveHeartbeat("client", "pong", 0)
 			}

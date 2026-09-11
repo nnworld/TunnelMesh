@@ -26,7 +26,7 @@ func TestEmbeddedWebDistContainsAgentMetadataUI(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := bundle.String()
-	for _, keyword := range []string{"Agent details", "Redacted", "includeStale"} {
+	for _, keyword := range []string{"Agent details", "Redacted", "includeStale", "Access policies", "Delete access policy", "Access policy restored", "restore-agent-policy"} {
 		if !strings.Contains(content, keyword) {
 			t.Fatalf("embedded web bundle does not contain %q", keyword)
 		}

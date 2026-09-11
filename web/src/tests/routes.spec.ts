@@ -153,7 +153,7 @@ describe('admin routes', () => {
 
   it('agent detail view renders metadata states without edit controls', () => {
     const source = readFileSync('src/views/AgentDetail.vue', 'utf8')
-    expect(source).toContain("t('agentDetail.metadata')")
+    expect(source).toContain("t('agentDetail.logicalSummary')")
     expect(source).toContain("t('agentDetail.source')")
     expect(source).toContain("t('agentDetail.value')")
     expect(source).toContain("t('agentDetail.stale')")

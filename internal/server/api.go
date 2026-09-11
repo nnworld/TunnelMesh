@@ -166,6 +166,9 @@ func (s *apiService) GetPolicy(ctx context.Context, id string) (storage.AgentPol
 func (s *apiService) ListPolicies(ctx context.Context, agentID, cursor string, limit int) (storage.Page[storage.AgentPolicy], error) {
 	return s.policies.ListByAgent(ctx, agentID, cursor, limit)
 }
+func (s *apiService) ListPoliciesStatus(ctx context.Context, agentID, cursor string, limit int, status storage.PolicyStatus) (storage.Page[storage.AgentPolicy], error) {
+	return s.policies.ListByAgentStatus(ctx, agentID, cursor, limit, status)
+}
 func (s *apiService) CreatePolicy(ctx context.Context, v storage.AgentPolicy) error {
 	return s.policies.Create(ctx, v)
 }
@@ -174,6 +177,9 @@ func (s *apiService) UpdatePolicy(ctx context.Context, v storage.AgentPolicy) er
 }
 func (s *apiService) DeletePolicy(ctx context.Context, id string) error {
 	return s.policies.Delete(ctx, id)
+}
+func (s *apiService) RestorePolicy(ctx context.Context, id string) error {
+	return s.policies.Restore(ctx, id)
 }
 func (s *apiService) GetTunnel(ctx context.Context, id string) (storage.Tunnel, error) {
 	return s.tunnels.Get(ctx, id)
@@ -695,7 +701,19 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 	}
 	if len(parts) == 0 {
 		if r.Method == http.MethodGet {
-			page, err := a.service.ListPolicies(r.Context(), agentID, r.URL.Query().Get("cursor"), queryLimit(r))
+			status := storage.PolicyStatusActive
+			if rawStatus := r.URL.Query().Get("status"); rawStatus != "" && rawStatus != string(storage.PolicyStatusActive) {
+				status = storage.PolicyStatus(rawStatus)
+				if !isAdmin(p) {
+					writeAPIError(w, http.StatusForbidden, "admin role required")
+					return
+				}
+			}
+			if status != storage.PolicyStatusActive && status != storage.PolicyStatusDeleted && status != storage.PolicyStatusAll {
+				writeAPIError(w, http.StatusBadRequest, "invalid policy status")
+				return
+			}
+			page, err := a.service.ListPoliciesStatus(r.Context(), agentID, r.URL.Query().Get("cursor"), queryLimit(r), status)
 			if err != nil {
 				writeStorageError(w, err)
 				return
@@ -717,7 +735,8 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 				writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 				return
 			}
-			if req.TargetHost == "" || req.TargetPort < 1 || req.TargetPort > 65535 {
+			req.TargetHost = strings.TrimSpace(req.TargetHost)
+			if req.TargetHost == "" || req.TargetPort == nil || !validAgentPolicyTargetHost(req.TargetHost) || !validAgentPolicyTargetPort(*req.TargetPort) {
 				writeAPIError(w, http.StatusBadRequest, "target host and port are required")
 				return
 			}
@@ -725,7 +744,7 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 				writeAPIError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			v := storage.AgentPolicy{AgentID: agentID, TargetHost: req.TargetHost, TargetPort: req.TargetPort, Protocol: strings.ToLower(req.Protocol), AllowedCIDRs: strings.Join(req.AllowedCIDRs, ","), AllowedPorts: intsCSV(req.AllowedPorts)}
+			v := storage.AgentPolicy{AgentID: agentID, TargetHost: req.TargetHost, TargetPort: *req.TargetPort, Protocol: strings.ToLower(req.Protocol), AllowedCIDRs: strings.Join(req.AllowedCIDRs, ","), AllowedPorts: intsCSV(req.AllowedPorts)}
 			status, data, err := a.mutate(r, p, func() (int, any, error) {
 				if err := a.service.CreatePolicy(r.Context(), v); err != nil {
 					return 0, nil, err
@@ -757,6 +776,28 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 		writeAPIError(w, http.StatusNotFound, "policy not found")
 		return
 	}
+	if len(parts) >= 2 && parts[1] == "restore" {
+		if r.Method != http.MethodPost {
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !isAdmin(p) {
+			writeAPIError(w, http.StatusForbidden, "admin role required")
+			return
+		}
+		if err := a.service.RestorePolicy(r.Context(), policyID); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		restored, err := a.service.GetPolicy(r.Context(), policyID)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		a.audit(r.Context(), p, "policy.restored", "agent_policy", policyID)
+		writeJSON(w, http.StatusOK, publicPolicy(restored))
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, publicPolicy(policy))
@@ -765,16 +806,21 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeAPIError(w, http.StatusForbidden, "admin role required")
 			return
 		}
+		if policy.DeletedAt != nil {
+			writeAPIError(w, http.StatusConflict, "policy is deleted")
+			return
+		}
 		var req policyRequest
 		if err := decodeJSON(r, &req); err != nil {
 			writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
+		req.TargetHost = strings.TrimSpace(req.TargetHost)
 		if req.TargetHost != "" {
 			policy.TargetHost = req.TargetHost
 		}
-		if req.TargetPort != 0 {
-			policy.TargetPort = req.TargetPort
+		if req.TargetPort != nil {
+			policy.TargetPort = *req.TargetPort
 		}
 		if req.Protocol != "" {
 			policy.Protocol = strings.ToLower(req.Protocol)
@@ -784,6 +830,10 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 		}
 		if req.AllowedPorts != nil {
 			policy.AllowedPorts = intsCSV(req.AllowedPorts)
+		}
+		if policy.TargetHost == "" || !validAgentPolicyTargetHost(policy.TargetHost) || !validAgentPolicyTargetPort(policy.TargetPort) {
+			writeAPIError(w, http.StatusBadRequest, "target host and port are required")
+			return
 		}
 		if _, err := routing.NewPolicy(nonemptySplit(policy.AllowedCIDRs), decodeInts(policy.AllowedPorts)); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -805,8 +855,13 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeStorageError(w, err)
 			return
 		}
+		deleted, err := a.service.GetPolicy(r.Context(), policyID)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
 		a.audit(r.Context(), p, "policy.deleted", "agent_policy", policyID)
-		writeJSON(w, http.StatusOK, map[string]string{"id": policyID})
+		writeJSON(w, http.StatusOK, publicPolicy(deleted))
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -814,10 +869,18 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 
 type policyRequest struct {
 	TargetHost   string   `json:"targetHost"`
-	TargetPort   int      `json:"targetPort"`
+	TargetPort   *int     `json:"targetPort"`
 	Protocol     string   `json:"protocol"`
 	AllowedCIDRs []string `json:"allowedCIDRs"`
 	AllowedPorts []int    `json:"allowedPorts"`
+}
+
+func validAgentPolicyTargetPort(port int) bool {
+	return port == 0 || (port >= 1 && port <= 65535)
+}
+
+func validAgentPolicyTargetHost(host string) bool {
+	return host == "*" || !strings.Contains(host, "*")
 }
 
 func (a *API) handleTunnels(w http.ResponseWriter, r *http.Request, p auth.Principal, parts []string) {
@@ -1368,7 +1431,7 @@ func publicAgent(v storage.Agent) map[string]any {
 	return map[string]any{"id": v.ID, "name": v.Name, "ownerUserId": v.OwnerUserID, "capabilities": decodeStrings(v.Capabilities), "enabled": v.Enabled, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
 }
 func publicPolicy(v storage.AgentPolicy) map[string]any {
-	return map[string]any{"id": v.ID, "agentId": v.AgentID, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "protocol": v.Protocol, "allowedCIDRs": nonemptySplit(v.AllowedCIDRs), "allowedPorts": decodeInts(v.AllowedPorts), "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+	return map[string]any{"id": v.ID, "agentId": v.AgentID, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "protocol": v.Protocol, "allowedCIDRs": nonemptySplit(v.AllowedCIDRs), "allowedPorts": decodeInts(v.AllowedPorts), "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
 }
 func publicTunnel(v storage.Tunnel) map[string]any {
 	upstream := publicUpstreamRouteConfig(v)
@@ -1390,10 +1453,16 @@ func publicUpstreamRouteConfig(v storage.Tunnel) upstreamRouteConfig {
 	return config
 }
 func nonemptySplit(s string) []string {
-	if strings.TrimSpace(s) == "" {
+	// Policy repositories may persist an empty allowlist as either an empty
+	// string or JSON's "[]"; both forms must decode back to an empty slice.
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || trimmed == "[]" {
 		return []string{}
 	}
-	return strings.Split(s, ",")
+	if strings.HasPrefix(trimmed, "[") {
+		return decodeStrings(trimmed)
+	}
+	return strings.Split(trimmed, ",")
 }
 func defaultJSON(s string) string {
 	if strings.TrimSpace(s) == "" {

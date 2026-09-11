@@ -8,10 +8,11 @@ START=0
 
 usage() {
   cat >&2 <<'EOF'
-Usage: linux-install.sh [--role server|agent|both] [--binary-dir DIR] [--enable] [--start]
+Usage: linux-install.sh [--role server|agent|client|both] [--binary-dir DIR] [--enable] [--start]
 
 The script installs binaries and systemd units. It never creates or overwrites
-configuration files; create /etc/tunnelmesh/server.yaml or agent.yaml first.
+configuration files; create /etc/tunnelmesh/server.yaml, agent.yaml, or
+client.yaml first.
 EOF
 }
 
@@ -30,12 +31,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
   echo "run as root" >&2
   exit 1
 fi
-case "$ROLE" in server|agent|both) ;; *) echo "invalid role: $ROLE" >&2; exit 2 ;; esac
+case "$ROLE" in server|agent|client|both) ;; *) echo "invalid role: $ROLE" >&2; exit 2 ;; esac
 
-install -d -m 0750 /etc/tunnelmesh /var/lib/tunnelmesh /var/lib/tunnelmesh-agent
+install -d -m 0750 /etc/tunnelmesh /var/lib/tunnelmesh /var/lib/tunnelmesh-agent /var/lib/tunnelmesh-client
 if ! getent group tunnelmesh >/dev/null 2>&1; then groupadd --system tunnelmesh; fi
 if ! id tunnelmesh >/dev/null 2>&1; then useradd --system --gid tunnelmesh --home-dir /var/lib/tunnelmesh --shell /usr/sbin/nologin tunnelmesh; fi
-chown tunnelmesh:tunnelmesh /var/lib/tunnelmesh /var/lib/tunnelmesh-agent
+chown tunnelmesh:tunnelmesh /var/lib/tunnelmesh /var/lib/tunnelmesh-agent /var/lib/tunnelmesh-client
 
 install_binary() {
   local name="$1"
@@ -53,6 +54,11 @@ if [[ "$ROLE" == agent || "$ROLE" == both ]]; then
   install_binary tunnelmesh-agent
   install -m 0644 "$(dirname "$0")/../systemd/tunnelmesh-agent.service" /etc/systemd/system/tunnelmesh-agent.service
   services+=(tunnelmesh-agent.service)
+fi
+if [[ "$ROLE" == client ]]; then
+  install_binary tunnelmesh-client
+  install -m 0644 "$(dirname "$0")/../systemd/tunnelmesh-client.service" /etc/systemd/system/tunnelmesh-client.service
+  services+=(tunnelmesh-client.service)
 fi
 
 systemctl daemon-reload

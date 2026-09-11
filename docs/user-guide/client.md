@@ -40,6 +40,7 @@ tunnelmesh-client --config tunnelmesh.yaml status
 | `forward tcp` | TCP | 本地监听 → Agent 内网服务 | 有序字节流 |
 | `forward udp` | UDP | 本地监听 → Agent 内网服务 | 保留 datagram 边界，按源地址复用 association |
 | `forward http` | HTTP | 本地监听 → Agent 内网 HTTP 服务 | 适合本地 Web 服务 |
+| `run` | TCP/UDP/HTTP/SOCKS5/HTTP 代理 | 本地监听 → Agent 内网服务 | 按配置文件在一个进程内启动多个入口，并按 Agent 建立 WebSocket 连接池 |
 | `publish http` | HTTP/HTTPS/WebSocket | Server 公网入口 → Agent 服务 | 通过管理路由或 wildcard 域名访问 |
 | `proxy tcp` | TCP | stdin/stdout ↔ Agent 内网服务 | 用于 SSH `ProxyCommand` 和 websocat |
 | `tunnel status/stop` | - | 本地隧道管理 | 查看或停止配置的隧道 |
@@ -299,6 +300,32 @@ client:
 
 ## 9. SOCKS5 转发
 
+多个 SOCKS5 入口建议写入 `client.tunnels`，并用 `run` 命令在一个进程内启动：
+
+```yaml
+mode: local
+client:
+  server_url: wss://tunnel.example.com/ws/client
+  token: replace-with-client-token
+  tunnels:
+    - name: socks-a
+      protocol: socks5
+      listen: 127.0.0.1:10866
+      agent_id: agent-a
+    - name: socks-b
+      protocol: socks5
+      listen: 127.0.0.1:10867
+      agent_id: agent-b
+```
+
+```bash
+tunnelmesh-client --config /Users/me/.config/tunnelmesh/client.yaml run
+```
+
+所有配置的入口共享同一条 Client WebSocket 会话；任一入口创建失败时，进程会关闭已启动的入口并退出，避免出现半启动状态。
+
+`forward socks5` 适合临时启动单个入口：
+
 `forward socks5` 在本机启动一个 SOCKS5 CONNECT 入口，浏览器或支持 SOCKS5 的工具可以按请求动态选择 Agent 侧目标：
 
 ```bash
@@ -347,6 +374,27 @@ Server、Agent 和跨 Server relay 都支持 `OPEN_RESULT` 时，SOCKS5 只有�
 | `agent_offline`、`queue_full`、`timeout`、`internal_error` | `0x01` general SOCKS server failure |
 
 打开超时只 reset 当前流，并返回可重试的 `timeout` 结果。旧版本 Server 没有协商子协议时，Client 会自动使用 legacy open 语义重连；Server 已协商 strict open 但 Agent 或跨 Server relay 不支持时，Client 会得到明确的 `unsupported_capability`，不会伪造 SOCKS5 成功。升级完整链路后，新连接会自动启用 strict open。
+
+如需把 SOCKS5 作为通用代理，管理员可以在后台的 Agent 详情页“访问策略”中创建一条通配 Agent Policy，也可以直接调用管理 API：
+
+```json
+{
+  "protocol": "tcp",
+  "targetHost": "*",
+  "targetPort": 0,
+  "allowedCIDRs": [],
+  "allowedPorts": []
+}
+```
+
+其中：
+
+- `targetHost: "*"` 表示匹配任意主机；
+- `targetPort: 0` 表示匹配任意端口；
+- `allowedCIDRs` 和 `allowedPorts` 仍可作为二次限制，空数组表示不限制。
+- 配置 `allowedCIDRs` 后，域名目标会因无法在授权前证明解析 IP 属于允许网段而被拒绝；需要代理域名目标时请保持 CIDR 为空。
+
+管理员可以在 Agent 详情页编辑、删除和恢复访问策略。删除是逻辑删除：策略立即退出授权判定，记录保留；切换到“已删除”筛选后可以恢复。已删除策略必须先恢复才能修改。普通用户只能查看有效策略，不能创建、修改、删除或恢复。
 
 如需让局域网内其他机器访问该 SOCKS5 入口，必须同时显式开启远程监听和密码认证：
 
@@ -449,10 +497,19 @@ tunnelmesh-client stop
 
 ## 13. 配置文件中的多个隧道
 
+执行 `run` 时，以下配置会在一个 Client 进程内启动 PostgreSQL、DNS 和两个 SOCKS5 入口。不同 Agent 使用独立 WebSocket 连接池；同一 Agent 的 stream 复用该 Agent 的 WebSocket。
+
 ```yaml
 mode: local
 client:
   server_url: wss://tunnel.example.com/client
+  connections:
+    min: 1
+    max: 4
+    high_watermark: 16
+    low_watermark: 2
+    evaluation_interval: 10s
+    cooldown: 30s
   tunnels:
     - name: postgres
       protocol: tcp
@@ -466,7 +523,33 @@ client:
       agent_id: agent-net
       target_host: 10.0.0.53
       target_port: 53
+    - name: socks-a
+      protocol: socks5
+      listen: 127.0.0.1:10866
+      agent_id: agent-a
+    - name: socks-b
+      protocol: socks5
+      listen: 127.0.0.1:10867
+      agent_id: agent-b
 ```
+
+```bash
+tunnelmesh-client --config tunnelmesh.yaml run
+```
+
+标准 HTTP 代理也可以写入 `client.tunnels`，并通过 `run` 启动：
+
+```yaml
+client:
+  tunnels:
+    - name: http-proxy
+      protocol: http-proxy
+      listen: 127.0.0.1:18081
+      agent_id: agent-devbox
+      auth_mode: none
+```
+
+连接池参数、认证环境变量和多 Agent 示例见 [Client 配置示例](../operations/client-configuration-examples.md)。
 
 ## 安全建议
 

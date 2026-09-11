@@ -20,12 +20,24 @@ sudo install -o tunnelmesh -g tunnelmesh -m 0600 agent.yaml /etc/tunnelmesh/agen
 sudo systemctl enable --now tunnelmesh-agent.service
 ```
 
+安装 Client：
+
+```bash
+sudo ./deploy/install/linux-install.sh --role client --binary-dir ./dist/v0.1.0
+sudo install -o root -g tunnelmesh -m 0640 client.yaml /etc/tunnelmesh/client.yaml
+sudo install -o root -g tunnelmesh -m 0640 client.env /etc/tunnelmesh/client.env
+sudo systemctl enable --now tunnelmesh-client.service
+```
+
+Client token、本地代理密码等敏感值应写入 `/etc/tunnelmesh/client.env`，由 systemd 的 `EnvironmentFile` 注入；不要写入 YAML 或 unit。Client 本地入口默认只监听 loopback，非 loopback 必须显式 `allow_remote: true` 并启用认证。
+
 查看状态和日志：
 
 ```bash
 systemctl status tunnelmesh-server.service
 journalctl -u tunnelmesh-server.service -f
 journalctl -u tunnelmesh-agent.service --since '15 min ago'
+journalctl -u tunnelmesh-client.service -f
 ```
 
-卸载时先 `systemctl disable --now`，再移除 unit 和二进制。脚本不会删除 `/etc/tunnelmesh` 配置或 `/var/lib/tunnelmesh*` 数据。
+卸载时先 `systemctl disable --now`，再移除 unit 和二进制。脚本不会删除 `/etc/tunnelmesh` 配置、`/etc/tunnelmesh/client.env` 或 `/var/lib/tunnelmesh*` 数据。

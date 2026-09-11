@@ -80,6 +80,7 @@ type AgentPolicy struct {
 	Protocol     string
 	AllowedCIDRs string
 	AllowedPorts string
+	DeletedAt    *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }

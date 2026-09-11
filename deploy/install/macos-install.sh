@@ -4,12 +4,15 @@ set -euo pipefail
 ROLE="${1:-agent}"
 BINARY="${2:-$(pwd)/tunnelmesh-$ROLE}"
 CONFIG="${3:-$HOME/.config/tunnelmesh/$ROLE.yaml}"
-case "$ROLE" in server|agent) ;; *) echo "usage: macos-install.sh server|agent [binary] [config]" >&2; exit 2 ;; esac
+case "$ROLE" in server|agent|client) ;; *) echo "usage: macos-install.sh server|agent|client [binary] [config]" >&2; exit 2 ;; esac
 test -x "$BINARY" || { echo "missing executable: $BINARY" >&2; exit 1; }
 mkdir -p "$HOME/.local/bin" "$HOME/.config/tunnelmesh" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 install -m 0755 "$BINARY" "$HOME/.local/bin/tunnelmesh-$ROLE"
 label="com.tunnelmesh.$ROLE"
 plist="$HOME/Library/LaunchAgents/$label.plist"
+if [[ "$ROLE" == client ]]; then
+  sed "s|__HOME__|$HOME|g" "$(dirname "$0")/../macos/tunnelmesh-client.plist" > "$plist"
+else
 cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,6 +27,7 @@ cat > "$plist" <<EOF
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/tunnelmesh-$ROLE.err.log</string>
 </dict></plist>
 EOF
+fi
 plutil -lint "$plist"
 launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"

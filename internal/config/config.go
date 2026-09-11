@@ -223,8 +223,18 @@ type ClientConfig struct {
 	ServerURL        string                 `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
 	Token            string                 `mapstructure:"token" json:"-" yaml:"-"`
 	Tunnels          []TunnelConfig         `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
+	Connections      ClientConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
 	RemoteValidation RemoteValidationConfig `mapstructure:"remote_validation" json:"remote_validation" yaml:"remote_validation"`
+}
+
+type ClientConnectionConfig struct {
+	Min                int           `mapstructure:"min" json:"min" yaml:"min"`
+	Max                int           `mapstructure:"max" json:"max" yaml:"max"`
+	HighWatermark      int           `mapstructure:"high_watermark" json:"high_watermark" yaml:"high_watermark"`
+	LowWatermark       int           `mapstructure:"low_watermark" json:"low_watermark" yaml:"low_watermark"`
+	EvaluationInterval time.Duration `mapstructure:"evaluation_interval" json:"evaluation_interval" yaml:"evaluation_interval"`
+	Cooldown           time.Duration `mapstructure:"cooldown" json:"cooldown" yaml:"cooldown"`
 }
 
 type ClientStreamConfig struct {
@@ -242,12 +252,15 @@ type RemoteValidationConfig struct {
 // TunnelConfig describes a client tunnel loaded from a configuration file.
 // CLI flags can override these fields for one-off forwards.
 type TunnelConfig struct {
-	Name       string `mapstructure:"name" json:"name" yaml:"name"`
-	Protocol   string `mapstructure:"protocol" json:"protocol" yaml:"protocol"`
-	ListenAddr string `mapstructure:"listen" json:"listen" yaml:"listen"`
-	AgentID    string `mapstructure:"agent_id" json:"agent_id" yaml:"agent_id"`
-	TargetHost string `mapstructure:"target_host" json:"target_host" yaml:"target_host"`
-	TargetPort int    `mapstructure:"target_port" json:"target_port" yaml:"target_port"`
+	Name        string `mapstructure:"name" json:"name" yaml:"name"`
+	Protocol    string `mapstructure:"protocol" json:"protocol" yaml:"protocol"`
+	ListenAddr  string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	AgentID     string `mapstructure:"agent_id" json:"agent_id" yaml:"agent_id"`
+	TargetHost  string `mapstructure:"target_host" json:"target_host" yaml:"target_host"`
+	TargetPort  int    `mapstructure:"target_port" json:"target_port" yaml:"target_port"`
+	AuthMode    string `mapstructure:"auth_mode" json:"auth_mode" yaml:"auth_mode"`
+	AllowRemote bool   `mapstructure:"allow_remote" json:"allow_remote" yaml:"allow_remote"`
+	AuthURL     string `mapstructure:"auth_url" json:"auth_url" yaml:"auth_url"`
 }
 
 // Load applies the documented precedence: CLI > environment > file >
@@ -451,6 +464,12 @@ func setDefaults(v *viper.Viper) {
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
 		"agent.streams.inbound_buffer_bytes":                 262144,
+		"client.connections.min":                             1,
+		"client.connections.max":                             1,
+		"client.connections.high_watermark":                  16,
+		"client.connections.low_watermark":                   2,
+		"client.connections.evaluation_interval":             10 * time.Second,
+		"client.connections.cooldown":                        30 * time.Second,
 		"client.stream.open_timeout":                         8 * time.Second,
 		"client.stream.inbound_buffer_bytes":                 262144,
 		"client.remote_validation.positive_ttl":              15 * time.Second,
@@ -490,6 +509,10 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
+	if cfg.Client.ServerURL != "" || len(cfg.Client.Tunnels) > 0 {
+		problems = append(problems, validateClientConnections(cfg.Client.Connections)...)
+		problems = append(problems, validateClientTunnels(cfg.Client.Tunnels)...)
+	}
 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
 	problems = append(problems, validateSecurity(cfg.Security)...)
 	problems = append(problems, validateTLS(cfg.TLS)...)
@@ -634,6 +657,141 @@ func validateRemoteValidation(cfg RemoteValidationConfig) []string {
 	}
 	if cfg.MaxEntries <= 0 {
 		problems = append(problems, "remote validation max entries must be positive")
+	}
+	return problems
+}
+
+func validateClientTunnels(tunnels []TunnelConfig) []string {
+	var problems []string
+	seenListen := make(map[string]struct{}, len(tunnels))
+	for i, tunnel := range tunnels {
+		label := fmt.Sprintf("tunnel %d", i+1)
+		if name := strings.TrimSpace(tunnel.Name); name != "" {
+			label = fmt.Sprintf("tunnel %q", name)
+		}
+		protocol := strings.ToLower(strings.TrimSpace(tunnel.Protocol))
+		switch protocol {
+		case "tcp", "udp", "http":
+			if strings.TrimSpace(tunnel.ListenAddr) == "" {
+				problems = append(problems, label+" requires listen")
+			}
+			if strings.TrimSpace(tunnel.AgentID) == "" {
+				problems = append(problems, label+" requires agent_id")
+			}
+			if strings.TrimSpace(tunnel.TargetHost) == "" {
+				problems = append(problems, label+" requires target_host")
+			}
+			if tunnel.TargetPort < 1 || tunnel.TargetPort > 65535 {
+				problems = append(problems, label+" target_port must be between 1 and 65535")
+			}
+		case "socks5":
+			if strings.TrimSpace(tunnel.ListenAddr) == "" {
+				problems = append(problems, label+" requires listen")
+			}
+			if strings.TrimSpace(tunnel.AgentID) == "" {
+				problems = append(problems, label+" requires agent_id")
+			}
+			authMode := strings.ToLower(strings.TrimSpace(tunnel.AuthMode))
+			if authMode == "" {
+				authMode = "none"
+			}
+			if authMode != "none" && authMode != "password" {
+				problems = append(problems, label+" socks5 auth mode must be none or password")
+			}
+			if host, _, err := net.SplitHostPort(tunnel.ListenAddr); err != nil {
+				problems = append(problems, label+" listen must be a valid host:port address")
+			} else if !isLoopbackListenHost(host) {
+				if !tunnel.AllowRemote {
+					problems = append(problems, label+" non-loopback socks5 tunnel requires allow_remote")
+				}
+				if authMode != "password" {
+					problems = append(problems, label+" non-loopback socks5 tunnel requires password auth")
+				}
+			}
+		case "http-proxy":
+			if strings.TrimSpace(tunnel.ListenAddr) == "" {
+				problems = append(problems, label+" requires listen")
+			}
+			if strings.TrimSpace(tunnel.AgentID) == "" {
+				problems = append(problems, label+" requires agent_id")
+			}
+			authMode := strings.ToLower(strings.TrimSpace(tunnel.AuthMode))
+			if authMode == "" {
+				authMode = "none"
+			}
+			if authMode != "none" && authMode != "basic" {
+				problems = append(problems, label+" http-proxy auth mode must be none or basic")
+			}
+			if host, _, err := net.SplitHostPort(tunnel.ListenAddr); err != nil {
+				problems = append(problems, label+" listen must be a valid host:port address")
+			} else if !isLoopbackListenHost(host) {
+				if !tunnel.AllowRemote {
+					problems = append(problems, label+" non-loopback http-proxy tunnel requires allow_remote")
+				}
+				if authMode != "basic" {
+					problems = append(problems, label+" non-loopback http-proxy tunnel requires basic auth")
+				}
+			}
+		case "":
+			problems = append(problems, label+" protocol is required")
+		default:
+			problems = append(problems, fmt.Sprintf("%s unsupported tunnel protocol %q", label, tunnel.Protocol))
+		}
+		if listen := normalizeTunnelListen(tunnel.ListenAddr); listen != "" {
+			if _, exists := seenListen[listen]; exists {
+				problems = append(problems, fmt.Sprintf("duplicate tunnel listen address %q", tunnel.ListenAddr))
+			} else {
+				seenListen[listen] = struct{}{}
+			}
+		}
+	}
+	return problems
+}
+
+func normalizeTunnelListen(listen string) string {
+	listen = strings.ToLower(strings.TrimSpace(listen))
+	if listen == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func isLoopbackListenHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validateClientConnections(c ClientConnectionConfig) []string {
+	var problems []string
+	if c.Min < 1 {
+		problems = append(problems, "client connections min must be at least 1")
+	}
+	if c.Max < c.Min || c.Max > 16 {
+		if c.Max < c.Min {
+			problems = append(problems, "client connections max must be greater than or equal to min")
+		}
+		if c.Max > 16 {
+			problems = append(problems, "client connections max must be at most 16")
+		}
+	}
+	if c.LowWatermark > c.HighWatermark {
+		problems = append(problems, "client connections low watermark must be less than or equal to high watermark")
+	}
+	if c.EvaluationInterval <= 0 {
+		problems = append(problems, "client connections evaluation interval must be positive")
+	}
+	if c.Cooldown <= 0 {
+		problems = append(problems, "client connections cooldown must be positive")
 	}
 	return problems
 }

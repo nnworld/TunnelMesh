@@ -276,6 +276,11 @@ func clientCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "login requested for %s\n", cfg.Client.ServerURL)
 			return nil
 		}),
+		configCommand(opts, "run", "start the configured client tunnels", runClientTunnels),
+		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
+			return nil
+		}),
 		configCommand(opts, "agent", "inspect an agent", clientShellRun("agent")),
 		configCommand(opts, "stop", "stop a local tunnel", clientShellRun("stop")),
 		configCommand(opts, "status", "show local tunnel status", clientShellRun("status")),
@@ -706,7 +711,10 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 }
 
 var (
-	runClientWebSocket     = client.RunWebSocket
+	runClientWebSocket   = client.RunWebSocket
+	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error) error {
+		return client.RunWebSocketWithOptions(ctx, serverURL, token, onReady, client.WebSocketRunOptions{})
+	}
 	errClientProxyComplete = errors.New("client proxy complete")
 )
 

@@ -391,6 +391,70 @@ func TestSQLiteV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 	}
 }
 
+func TestSQLiteV9ToV10AgentPolicyLogicalDeleteMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v9-to-v10.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	rows, err := raw.Query(`PRAGMA table_info(agent_policies)`)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	hasDeletedAt := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			raw.Close()
+			t.Fatal(err)
+		}
+		if name == "deleted_at" {
+			hasDeletedAt = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		raw.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	statements := []string{`UPDATE schema_meta SET version=9 WHERE id=1`}
+	if hasDeletedAt {
+		statements = append(statements, `ALTER TABLE agent_policies DROP COLUMN deleted_at`)
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v9 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v9 to v10: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	if err := db.SQL().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pragma_table_info('agent_policies') WHERE name='deleted_at'`).Scan(new(int)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAuthorizationRevisionCurrentInitializesToOne(t *testing.T) {
 	db := newTestDB(t)
 	revision, err := db.AuthorizationRevisions().Current(context.Background())

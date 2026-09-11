@@ -496,6 +496,25 @@ func (m *AgentSessionManager) Heartbeat(id string, epoch int64) error {
 	return nil
 }
 
+// heartbeatSession refreshes one exact pooled connection. Heartbeat(id, epoch)
+// intentionally rejects ambiguous Agent-wide matches, but a logical Agent may
+// legitimately own multiple live WebSockets with the same epoch.
+func (m *AgentSessionManager) heartbeatSession(s *AgentSession) error {
+	if m == nil || s == nil {
+		return ErrSessionClosed
+	}
+	if current, ok := m.GetConnection(s.AgentID, s.ConnectionID); !ok || current != s {
+		return ErrSessionClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.closing {
+		return ErrSessionClosed
+	}
+	s.lastHeartbeat = time.Now().UTC()
+	return nil
+}
+
 // RefreshMetadataLease extends metadata freshness for the current session.
 // Missing metadata is harmless because an Agent may heartbeat before its first
 // accepted metadata snapshot.
@@ -526,7 +545,7 @@ func (m *AgentSessionManager) RefreshSessionMetadataLease(ctx context.Context, s
 	if m == nil || s == nil {
 		return ErrSessionClosed
 	}
-	if err := m.Heartbeat(s.AgentID, s.Epoch); err != nil {
+	if err := m.heartbeatSession(s); err != nil {
 		return err
 	}
 	if s.metadataService == nil {

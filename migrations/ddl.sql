@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS agent_policies (
     protocol VARCHAR(32) NOT NULL,
     allowed_cidrs TEXT NOT NULL,
     allowed_ports TEXT NOT NULL,
+    deleted_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

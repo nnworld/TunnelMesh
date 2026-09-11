@@ -36,8 +36,10 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details 可查看 Agent 详情及运行时 metadata：
 
-- 当前在线/过期（Stale）状态；
-- node、epoch、revision、最后上报时间和更新时间；
+- 逻辑 Agent 在线/离线状态；
+- 活跃实例数按健康连接的实例 ID 去重统计；实例列表仍会显示历史过期实例；
+- 实例列表中的连接数按该实例的健康连接数统计，不使用后端兼容字段；
+- 最新上报时间和更新时间；实例列表继续展示 node、epoch、revision 等实例级字段；
 - 集群内所有物理连接的 instance、connection、connection epoch、所属 Server 节点、Server 地址、活跃流、最后心跳和租约到期时间；
 - 字段名称、来源类型（`file` 或 `env`）和值；
 - 敏感字段显示为 Redacted，后台没有编辑上报值的入口。
@@ -67,6 +69,8 @@ IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/44
 ## Tunnel 状态
 
 Tunnels 页面显示本地 forward、publish route 和连接状态。异常时先查看 Agent online/lease 状态，再检查 policy、目标端口和 Server 审计事件。停止或重试操作应使用同一隧道 ID，避免重复创建。Agent metadata 的 stale 状态由 WebSocket 会话租约决定：正常在线 Agent 会通过协议级 `PING/PONG` 自动续期，断线或心跳停止超过 metadata TTL 后才显示为 stale。
+
+Agent 详情页的“逻辑 Agent 状态”按连接池健康状态推导：至少一条健康连接即在线。元数据租约只表示最近一次元数据上报是否过期，不再单独作为逻辑 Agent 的在线状态。实例状态同样按该实例是否存在健康连接推导，活跃实例数按健康连接的实例 ID 去重统计。
 
 ## Server 节点
 
