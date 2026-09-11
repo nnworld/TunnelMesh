@@ -158,6 +158,62 @@ func TestSessionFlowControlRejectsOverSendAndAdvertisesWindow(t *testing.T) {
 	}
 }
 
+func TestSessionOpenModeNegotiatesClientMetadata(t *testing.T) {
+	legacy := &receiveTransport{sent: make(chan protocol.Frame, 1), recv: make(chan protocol.Frame, 1), done: make(chan struct{})}
+	if got := sessionOpenModeForTransport(legacy); got != SessionOpenLegacy {
+		t.Fatalf("legacy OpenMode()=%v, want legacy", got)
+	}
+
+	metadata := &metadataReceiveTransport{receiveTransport: legacy}
+	if got := sessionOpenModeForTransport(metadata); got != SessionOpenMetadata {
+		t.Fatalf("metadata OpenMode()=%v, want metadata", got)
+	}
+}
+
+func TestSessionSendsClientHelloBeforeOpenStream(t *testing.T) {
+	tr := &metadataReceiveTransport{receiveTransport: &receiveTransport{
+		sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{}),
+	}}
+	collector, err := NewClientMetadataCollector(ClientMetadataOptions{InstanceID: "client-0123456789abcdef0123456789abcdef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSessionWithOpenModeAndMetadata(tr, SessionOpenMetadata, collector)
+	defer session.Close()
+	session.Start()
+
+	if err := session.OpenStream(context.Background(), StreamRequest{StreamID: 1, AgentID: "agent", Protocol: "tcp", TargetHost: "example", TargetPort: 80}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := <-tr.sent
+	if first.Type != protocol.FrameClientHello {
+		t.Fatalf("first frame type=%v, want CLIENT_HELLO", first.Type)
+	}
+	payload, err := protocol.DecodeClientMetadataPayload(first.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.InstanceID != "client-0123456789abcdef0123456789abcdef" || payload.Revision != 1 {
+		t.Fatalf("CLIENT_HELLO payload=%#v", payload)
+	}
+	second := <-tr.sent
+	if second.Type != protocol.FrameOpenStream {
+		t.Fatalf("second frame type=%v, want OPEN", second.Type)
+	}
+	if second.Window == 0 {
+		t.Fatal("metadata mode did not retain flow-control window")
+	}
+}
+
+type metadataReceiveTransport struct {
+	*receiveTransport
+}
+
+func (t *metadataReceiveTransport) Subprotocol() string {
+	return protocol.SubprotocolClientMetadata
+}
+
 func TestSessionFlowControlSendsThresholdWindowUpdate(t *testing.T) {
 	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
 	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)

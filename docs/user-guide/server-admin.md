@@ -50,6 +50,25 @@ Agent 详情中的连接列表来自数据库连接租约，并用当前 Server 
 
 远端 Server 节点不可达时，关闭请求返回 `503`，页面提示租约已保留。此时不要手工删除数据库租约；应先恢复远端 relay，再刷新列表重试。`409` 表示 connection epoch 已过期，通常发生在连接被替换后；刷新列表并使用新 epoch 即可。
 
+## Client 运行观测与连接管理
+
+Clients 页面用于查看当前用户权限范围内的客户端实例、metadata 和物理 WebSocket 连接。管理员可以按 Owner、Token、Server 节点、状态、Agent 和关键词筛选；普通用户的 Owner 过滤固定为自己的用户 ID，并在数据库查询内完成，不能通过分页绕过。
+
+客户端会通过 metadata 子协议上报稳定实例 ID、版本、commit、平台、主机名、进程启动时间、本地监听入口、允许的 Agent 和非敏感自定义字段。自定义字段必须写入 Client 配置的 `client.metadata` allowlist，来源只能是绝对路径文件或指定环境变量。最多 32 项，单项 4 KiB，总 payload 32 KiB；包含 password、passphrase、token、secret、private key、api key、credential、authorization、cookie 或 DSN 语义的名称会被拒绝。metadata 只用于观测，不参与任何授权判断。
+
+新版客户端鉴权后必须先发送 `CLIENT_HELLO`，之后才能发送 `CLIENT_METADATA_UPDATE`。未按顺序发送的更新会被拒绝，不会更新实例或连接租约。旧客户端不会协商 metadata 子协议，Server 会显示为 `metadata_unavailable`。
+
+状态含义如下：
+
+- `online`：至少一条连接租约未过期；
+- `offline`：当前没有未过期连接租约；
+- `stale`：metadata 已超过 TTL；
+- `metadata_unavailable`：旧客户端未协商 metadata 子协议，仅能看到基础连接信息。
+
+连接列表展示每条物理 WebSocket 的 connection ID、connection epoch、所属 Server 节点、Token、活跃流、健康分、获取时间、最后心跳和租约到期时间。关闭连接必须携带列表中的 connection epoch；本地连接直接关闭，远端连接通过已认证的 Server-node relay 控制通道转发。请求只影响这一条物理连接，客户端连接池可能自动重连。
+
+关闭返回 `409` 表示 epoch 已过期，应刷新列表后使用新值；返回 `503` 表示目标 Server 节点不可达，durable lease 会保留，不要手工删除数据库记录；连接已经不存在时返回幂等成功。
+
 ## Agent Policy
 
 Policy 页面限制 Agent 可访问的协议、目标 CIDR 和端口。建议按最小权限创建规则，例如 SSH 只允许 `tcp/22` 和明确的内网 CIDR。拒绝规则会在 Agent 侧返回 policy 错误，不会关闭其他隧道。

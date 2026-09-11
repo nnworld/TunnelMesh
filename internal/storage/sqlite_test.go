@@ -455,6 +455,45 @@ func TestSQLiteV9ToV10AgentPolicyLogicalDeleteMigration(t *testing.T) {
 	}
 }
 
+func TestSQLiteV10ToV11ClientObservabilityMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v10-to-v11.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE client_connection_leases`,
+		`DROP TABLE client_instance_metadata`,
+		`UPDATE schema_meta SET version=10 WHERE id=1`,
+	} {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v10 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v10 to v11: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	for _, table := range []string{"client_instance_metadata", "client_connection_leases"} {
+		if err := db.SQL().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(new(int)); err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+	}
+}
+
 func TestAuthorizationRevisionCurrentInitializesToOne(t *testing.T) {
 	db := newTestDB(t)
 	revision, err := db.AuthorizationRevisions().Current(context.Background())

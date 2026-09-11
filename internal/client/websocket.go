@@ -23,10 +23,12 @@ var (
 )
 
 type WebSocketRunOptions struct {
-	BaseBackoff time.Duration
-	MaxBackoff  time.Duration
-	Rand        *rand.Rand
-	Metrics     *observability.Metrics
+	BaseBackoff    time.Duration
+	MaxBackoff     time.Duration
+	Rand           *rand.Rand
+	Metrics        *observability.Metrics
+	Metadata       *ClientMetadataOptions
+	ConnectionSlot int
 }
 
 func RunWebSocket(ctx context.Context, serverURL, token string, onReady func(*Session) error) error {
@@ -65,7 +67,17 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("client", "websocket", "started", "")
 			}
-			session := NewSessionWithOpenMode(transport, sessionOpenModeForTransport(transport))
+			openMode := sessionOpenModeForTransport(transport)
+			var collector *ClientMetadataCollector
+			if openMode.supportsClientMetadata() && options.Metadata != nil {
+				var err error
+				collector, err = NewClientMetadataCollector(*options.Metadata)
+				if err != nil {
+					_ = transport.Close()
+					return err
+				}
+			}
+			session := NewSessionWithOpenModeAndMetadata(transport, openMode, collector)
 			session.Metrics = options.Metrics
 			session.Start()
 			if onReady != nil {
@@ -156,6 +168,8 @@ func sessionOpenModeForTransport(transport FrameTransport) SessionOpenMode {
 		return SessionOpenLegacy
 	}
 	switch negotiator.Subprotocol() {
+	case protocol.SubprotocolClientMetadata:
+		return SessionOpenMetadata
 	case protocol.SubprotocolFlowControl:
 		return SessionOpenFlowControl
 	case protocol.SubprotocolOpenResult:

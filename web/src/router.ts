@@ -10,13 +10,15 @@ const Tunnels = () => import('./views/Tunnels.vue')
 const AuditLogs = () => import('./views/AuditLogs.vue')
 const Tokens = () => import('./views/Tokens.vue')
 const Servers = () => import('./views/Servers.vue')
+const Clients = () => import('./views/Clients.vue')
+const Downloads = () => import('./views/Downloads.vue')
 const Users = () => import('./views/Users.vue')
 const AccountSecurity = () => import('./views/AccountSecurity.vue')
 
 const router = createRouter({ history: createWebHistory(), routes: [
   {path:'/login', component:Login}, {path:'/', component:Dashboard, meta:{auth:true}},
   {path:'/agents', component:Agents, meta:{auth:true}}, {path:'/agents/:id', component:AgentDetail, meta:{auth:true}}, {path:'/routes', component:Routes, meta:{auth:true}},
-{path:'/tunnels', component:Tunnels, meta:{auth:true}}, {path:'/tokens', component:Tokens, meta:{auth:true}}, {path:'/servers', component:Servers, meta:{auth:true, admin:true}}, {path:'/users', component:Users, meta:{auth:true, admin:true}}, {path:'/account/security', component:AccountSecurity, meta:{auth:true}}, {path:'/audit-logs', component:AuditLogs, meta:{auth:true, admin:true}}
+{path:'/tunnels', component:Tunnels, meta:{auth:true}}, {path:'/tokens', component:Tokens, meta:{auth:true}}, {path:'/clients', component:Clients, meta:{auth:true}}, {path:'/servers', component:Servers, meta:{auth:true, admin:true}}, {path:'/downloads', component:Downloads, meta:{auth:true, admin:true}}, {path:'/users', component:Users, meta:{auth:true, admin:true}}, {path:'/account/security', component:AccountSecurity, meta:{auth:true}}, {path:'/audit-logs', component:AuditLogs, meta:{auth:true, admin:true}}
 ]})
 router.beforeEach(async (to) => { const auth = useAuthStore(); if (auth.token && !auth.user) await auth.load(); if (to.meta.auth && !auth.user) return '/login'; if (to.meta.admin && !auth.isAdmin) return '/'; return true })
 export default router

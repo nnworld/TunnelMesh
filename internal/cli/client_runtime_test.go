@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
@@ -130,7 +131,7 @@ client:
 
 	transports := make(chan *cliFrameTransport, 2)
 	ready := make(chan error, 2)
-	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error) error {
+	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error, _ client.WebSocketRunOptions) error {
 		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
 			ready <- fmt.Errorf("runner URL=%q token=%q", serverURL, token)
 			return <-ready
@@ -223,6 +224,99 @@ client:
 	}
 }
 
+func TestClientRunPassesRuntimeMetadataToSessionPool(t *testing.T) {
+	previous := runClientSessionPool
+	defer func() { runClientSessionPool = previous }()
+
+	listen := reserveLoopbackListenAddress(t)
+	dir := t.TempDir()
+	identityPath := filepath.Join(dir, "client-instance-id")
+	regionPath := filepath.Join(dir, "region")
+	if err := os.WriteFile(regionPath, []byte("cn-north"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "client.yaml")
+	yaml := `mode: local
+client:
+  server_url: ws://server.example/ws/client
+  token: client-secret
+  instance_id_path: ` + identityPath + `
+  metadata:
+    - name: region
+      source: file
+      path: ` + regionPath + `
+  tunnels:
+    - name: socks-a
+      protocol: socks5
+      listen: ` + listen + `
+      agent_id: agent-a
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	optionsCh := make(chan client.WebSocketRunOptions, 1)
+	runClientSessionPool = func(ctx context.Context, _, _ string, onReady func(*client.Session) error, options client.WebSocketRunOptions) error {
+		optionsCh <- options
+		transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 1)}
+		session := client.NewSession(transport)
+		session.Start()
+		if err := onReady(session); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		_ = session.Close()
+		return ctx.Err()
+	}
+
+	root := NewClientRoot()
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"--config", path, "run"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- root.ExecuteContext(ctx) }()
+
+	select {
+	case options := <-optionsCh:
+		if options.Metadata == nil {
+			t.Fatal("client run did not pass metadata options to the session pool")
+		}
+		metadata := *options.Metadata
+		if !strings.HasPrefix(metadata.InstanceID, "client-") || metadata.InstanceID != strings.ToLower(metadata.InstanceID) {
+			t.Fatalf("generated instance ID = %q", metadata.InstanceID)
+		}
+		if len(metadata.AgentIDs) != 1 || metadata.AgentIDs[0] != "agent-a" {
+			t.Fatalf("metadata agent IDs = %#v", metadata.AgentIDs)
+		}
+		if metadata.Version != build.Version || metadata.Commit != build.Commit {
+			t.Fatalf("metadata build identity = %#v", metadata)
+		}
+		if len(metadata.Listeners) != 1 || metadata.Listeners[0].Protocol != "socks5" || metadata.Listeners[0].ListenAddress != listen || metadata.Listeners[0].AgentID != "agent-a" || !metadata.Listeners[0].Enabled {
+			t.Fatalf("metadata listeners = %#v", metadata.Listeners)
+		}
+		if len(metadata.Metadata) != 1 || metadata.Metadata[0].Name != "region" || metadata.Metadata[0].Value != "cn-north" {
+			t.Fatalf("metadata fields = %#v", metadata.Metadata)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client run did not start the session pool")
+	}
+
+	persisted, err := os.ReadFile(identityPath)
+	if err != nil {
+		t.Fatalf("read generated client instance ID: %v", err)
+	}
+	if strings.TrimSpace(string(persisted)) == "" {
+		t.Fatal("generated client instance ID file is empty")
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecuteContext() error = %v", err)
+	}
+}
+
 func TestClientRunStartsHTTPProxyTunnel(t *testing.T) {
 	previous := runClientSessionPool
 	defer func() { runClientSessionPool = previous }()
@@ -246,7 +340,7 @@ client:
 
 	ready := make(chan error, 1)
 	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}
-	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error) error {
+	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error, _ client.WebSocketRunOptions) error {
 		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
 			ready <- fmt.Errorf("runner URL=%q token=%q", serverURL, token)
 			return <-ready
@@ -346,7 +440,7 @@ client:
 
 	ready := make(chan *cliFrameTransport, 2)
 	reconnect := make(chan struct{})
-	runClientSessionPool = func(ctx context.Context, _, _ string, onReady func(*client.Session) error) error {
+	runClientSessionPool = func(ctx context.Context, _, _ string, onReady func(*client.Session) error, _ client.WebSocketRunOptions) error {
 		for round := 0; round < 2; round++ {
 			transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}
 			session := client.NewSession(transport)

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -25,7 +27,7 @@ type ClientWSHandler struct{ Sessions *ClientSessionManager }
 func (h *ClientWSHandler) Attach(id string, c WSConn) *WSFrameTransport {
 	tr := NewWSFrameTransport(c)
 	if h != nil && h.Sessions != nil {
-		h.Sessions.Register(id, tr)
+		h.Sessions.Register(ClientSessionRecord{ConnectionID: id, ConnectionEpoch: 1}, tr)
 	}
 	return tr
 }
@@ -85,6 +87,10 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 	streams := make(map[uint32]*clientRelayStream)
 	openings := make(map[uint32]OpenFuture)
 	seen := make(map[uint32]struct{})
+	var clientObservability *ClientObservabilityService
+	if service != nil {
+		clientObservability = service.observability
+	}
 	closeStream := func(id uint32) {
 		mu.Lock()
 		stream := streams[id]
@@ -92,6 +98,9 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 		mu.Unlock()
 		if stream != nil {
 			_ = stream.conn.Close()
+		}
+		if clientObservability != nil {
+			_ = clientObservability.StreamClosed(principal)
 		}
 	}
 	newRelayStream := func(id uint32, conn io.ReadWriteCloser, proto string, initialWindow uint32) *clientRelayStream {
@@ -133,6 +142,46 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 		}
 		return sendControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: id, Payload: payload})
 	}
+	sendMetadataAck := func(ack protocol.ClientMetadataAckPayload) error {
+		payload, err := protocol.EncodeClientMetadataAckPayload(ack)
+		if err != nil {
+			return err
+		}
+		return sendControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameClientMetadataAck, Payload: payload})
+	}
+	if clientObservability != nil {
+		epoch, err := newClientConnectionEpoch()
+		if err != nil {
+			return err
+		}
+		clientObservability.manager.Register(ClientSessionRecord{
+			ConnectionID: principal.ConnectionID, TokenID: principal.Identity.TokenID,
+			OwnerUserID: principal.Identity.OwnerUserID, ServerNodeID: clientObservability.serverNodeID,
+			ConnectionEpoch: epoch, StartedAt: time.Now().UTC(), MetadataEnabled: principal.MetadataEnabled,
+		}, tr)
+		heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+		heartbeatDone := make(chan struct{})
+		go func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(DefaultClientConnectionHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatCtx.Done():
+					return
+				case <-ticker.C:
+					_ = clientObservability.Heartbeat(heartbeatCtx, principal)
+				}
+			}
+		}()
+		defer func() {
+			stopHeartbeat()
+			<-heartbeatDone
+			_ = clientObservability.Release(context.Background(), principal)
+			clientObservability.manager.Remove(principal.ConnectionID)
+		}()
+	}
+	metadataHelloSeen := !principal.MetadataEnabled
 	for {
 		frame, err := tr.Receive()
 		if err != nil {
@@ -148,9 +197,61 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 			}
 			return err
 		}
+		if clientObservability != nil && principal.MetadataEnabled && !metadataHelloSeen {
+			metadataHelloSeen = true
+			if frame.Type == protocol.FrameClientHello {
+				payload, decodeErr := protocol.DecodeClientMetadataPayload(frame.Payload)
+				var ack protocol.ClientMetadataAckPayload
+				if decodeErr != nil {
+					ack = rejectedClientMetadataAck(payload, "invalid_payload")
+					_, _ = clientObservability.RegisterLegacy(ctx, principal)
+				} else {
+					var helloErr error
+					ack, helloErr = clientObservability.Hello(ctx, principal, payload)
+					if helloErr != nil {
+						_, _ = clientObservability.RegisterLegacy(ctx, principal)
+					}
+				}
+				if err := sendMetadataAck(ack); err != nil {
+					return err
+				}
+				continue
+			}
+			// A caller may negotiate the metadata subprotocol but wrap the
+			// transport in a legacy Session. Preserve that connection by
+			// downgrading observability and processing the first frame normally.
+			_ = sendMetadataAck(protocol.ClientMetadataAckPayload{
+				Accepted: false, Errors: []protocol.ClientMetadataError{{
+					Name: "client_hello", Code: "invalid_frame", Message: "CLIENT_HELLO is required",
+				}},
+			})
+			_, _ = clientObservability.RegisterLegacy(ctx, principal)
+		}
 		switch frame.Type {
 		case protocol.FramePing:
+			if clientObservability != nil {
+				clientObservability.manager.ObserveHeartbeat(principal.ConnectionID)
+			}
 			if err := sendControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: append([]byte(nil), frame.Payload...)}); err != nil {
+				return err
+			}
+		case protocol.FrameClientMetadataUpdate:
+			if clientObservability == nil || !principal.MetadataEnabled {
+				_ = reset(frame.StreamID)
+				continue
+			}
+			payload, decodeErr := protocol.DecodeClientMetadataPayload(frame.Payload)
+			if decodeErr != nil {
+				_ = sendMetadataAck(protocol.ClientMetadataAckPayload{Accepted: false, Errors: []protocol.ClientMetadataError{{
+					Name: "client_metadata", Code: "invalid_payload", Message: "metadata payload is invalid",
+				}}})
+				continue
+			}
+			ack, updateErr := clientObservability.Update(ctx, principal, payload)
+			if updateErr != nil {
+				ack.Accepted = false
+			}
+			if err := sendMetadataAck(ack); err != nil {
 				return err
 			}
 		case protocol.FramePong:
@@ -212,6 +313,9 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 						return
 					}
 					go relayToClient(id, stream, writer, &mu, streams)
+					if clientObservability != nil {
+						_ = clientObservability.StreamOpened(principal)
+					}
 					if metrics != nil {
 						metrics.ObserveStream(request.Protocol, "accepted", "")
 					}
@@ -238,6 +342,9 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 			streams[frame.StreamID] = stream
 			mu.Unlock()
 			go relayToClient(frame.StreamID, stream, writer, &mu, streams)
+			if clientObservability != nil {
+				_ = clientObservability.StreamOpened(principal)
+			}
 			if metrics != nil {
 				metrics.ObserveStream(request.Protocol, "accepted", "")
 			}
@@ -435,6 +542,21 @@ func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.F
 			return
 		}
 	}
+}
+
+func newClientConnectionEpoch() (int64, error) {
+	var entropy [8]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return 0, err
+	}
+	epoch := int64(binary.BigEndian.Uint64(entropy[:]))
+	if epoch <= 0 {
+		epoch = -epoch
+	}
+	if epoch <= 0 {
+		epoch = 1
+	}
+	return epoch, nil
 }
 
 func waitForClientWindow(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, size int) error {

@@ -65,6 +65,17 @@ type CloseAgentConnectionRequest struct {
 }
 
 type CloseAgentConnectionFunc func(context.Context, CloseAgentConnectionRequest) error
+
+// CloseClientConnectionRequest is the inter-server control message for one
+// physical Client WebSocket lease. RequestedByNodeID is verified against the
+// authenticated Server-node identity by the receiving runtime.
+type CloseClientConnectionRequest struct {
+	ConnectionID      string
+	ConnectionEpoch   int64
+	RequestedByNodeID string
+}
+
+type CloseClientConnectionFunc func(context.Context, CloseClientConnectionRequest) error
 type NodeTransport interface {
 	OpenStream(context.Context, StreamRequest) (io.ReadWriteCloser, error)
 	Close() error

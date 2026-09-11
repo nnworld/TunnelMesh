@@ -3,13 +3,14 @@ package protocol
 import "strings"
 
 const (
-	SubprotocolLegacy      = "tunnelmesh.v1"
-	SubprotocolOpenResult  = "tunnelmesh.v1.open-result"
-	SubprotocolFlowControl = "tunnelmesh.v1.open-result.flow-control"
+	SubprotocolLegacy         = "tunnelmesh.v1"
+	SubprotocolOpenResult     = "tunnelmesh.v1.open-result"
+	SubprotocolFlowControl    = "tunnelmesh.v1.open-result.flow-control"
+	SubprotocolClientMetadata = "tunnelmesh.v1.open-result.flow-control.metadata"
 )
 
 func ClientSubprotocols() []string {
-	return []string{SubprotocolFlowControl, SubprotocolOpenResult, SubprotocolLegacy}
+	return []string{SubprotocolClientMetadata, SubprotocolFlowControl, SubprotocolOpenResult, SubprotocolLegacy}
 }
 
 func SelectSubprotocol(offered []string) (string, bool) {
@@ -22,7 +23,7 @@ func SelectSubprotocol(offered []string) (string, bool) {
 		}
 	}
 	offered = normalized
-	for _, candidate := range []string{SubprotocolFlowControl, SubprotocolOpenResult} {
+	for _, candidate := range []string{SubprotocolClientMetadata, SubprotocolFlowControl, SubprotocolOpenResult} {
 		for _, value := range offered {
 			if value == candidate {
 				return candidate, true

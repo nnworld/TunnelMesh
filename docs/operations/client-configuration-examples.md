@@ -16,6 +16,13 @@ mode: local
 
 client:
   server_url: wss://tunnel.example.com/ws/client
+  # 可省略。run 首次启动会生成小写 client-<32hex> 并持久化。
+  instance_id: client-0123456789abcdef0123456789abcdef
+  # 可自定义状态文件。默认：
+  # Linux: /var/lib/tunnelmesh-client/client-instance-id
+  # macOS: ~/Library/Application Support/TunnelMesh/client-instance-id
+  # Windows: %ProgramData%\TunnelMesh\client-instance-id
+  instance_id_path: /var/lib/tunnelmesh-client/client-instance-id
   connections:
     min: 1
     max: 4
@@ -28,6 +35,14 @@ client:
     negative_ttl: 2s
     timeout: 3s
     max_entries: 10000
+  # 显式 allowlist 后才会上报自定义观测字段；file 必须使用绝对路径。
+  metadata:
+    - name: device_id
+      source: file
+      path: /etc/machine-id
+    - name: region
+      source: env
+      key: TUNNELMESH_CLIENT_REGION
   tunnels:
     - name: postgres
       protocol: tcp
@@ -70,6 +85,7 @@ Client service token 通过环境变量注入，不写入 YAML：
 
 ```bash
 TUNNELMESH_CLIENT_TOKEN='replace-with-client-service-token'
+TUNNELMESH_CLIENT_REGION='cn-north'
 ```
 
 远程 SOCKS5 与远程 HTTP 代理必须显式开启远程监听，并使用本地入口认证。凭据同样通过环境变量注入：

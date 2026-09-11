@@ -258,6 +258,12 @@ mode: local
 
 client:
   server_url: wss://tunnel.example.com/ws/client
+  # 可省略；首次 run 生成小写 client-<32hex> 并持久化。
+  # Linux 默认 /var/lib/tunnelmesh-client/client-instance-id，
+  # macOS 默认 ~/Library/Application Support/TunnelMesh/client-instance-id，
+  # Windows 默认 %ProgramData%\TunnelMesh\client-instance-id。
+  instance_id: client-0123456789abcdef0123456789abcdef
+  instance_id_path: /var/lib/tunnelmesh-client/client-instance-id
   connections:
     min: 1
     max: 4
@@ -273,6 +279,13 @@ client:
     negative_ttl: 2s
     timeout: 3s
     max_entries: 10000
+  metadata:
+    - name: device_id
+      source: file
+      path: /etc/machine-id
+    - name: region
+      source: env
+      key: TUNNELMESH_CLIENT_REGION
   # token 由 TUNNELMESH_CLIENT_TOKEN 注入。
   tunnels:
     - name: postgres
@@ -307,7 +320,10 @@ client:
 
 ```bash
 TUNNELMESH_CLIENT_TOKEN='replace-with-client-service-token'
+TUNNELMESH_CLIENT_REGION='cn-north'
 ```
+
+`client.metadata` 最多 32 项，单项 4 KiB，总 payload 32 KiB。名称只能使用字母、数字、`.`、`_`、`-`，且不能包含 password、passphrase、token、secret、private key、api key、credential、authorization、cookie 或 DSN 语义。字段值会在启动时读取一次并随 metadata 帧上报；读取失败只记录为该字段的 metadata 错误，不会泄露文件路径或值。
 
 ### SOCKS5 本地入口
 

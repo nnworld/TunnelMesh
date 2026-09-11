@@ -8,8 +8,11 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 // runClientTunnels starts every configured local ingress in one process. The
@@ -32,6 +35,10 @@ func runClientTunnels(cmd *cobra.Command, cfg config.Config) error {
 	}
 	defer closeActive()
 
+	metadata, err := clientRuntimeMetadata(cfg)
+	if err != nil {
+		return err
+	}
 	manager := client.NewSessionPoolManager(client.SessionPoolManagerOptions{
 		ServerURL: cfg.Client.ServerURL,
 		Token:     cfg.Client.Token,
@@ -43,7 +50,8 @@ func runClientTunnels(cmd *cobra.Command, cfg config.Config) error {
 			EvaluationInterval: cfg.Client.Connections.EvaluationInterval,
 			Cooldown:           cfg.Client.Connections.Cooldown,
 		},
-		Runner: runClientSessionPool,
+		Metadata: metadata,
+		Runner:   runClientSessionPool,
 	})
 
 	for _, tunnel := range cfg.Client.Tunnels {
@@ -60,6 +68,56 @@ func runClientTunnels(cmd *cobra.Command, cfg config.Config) error {
 	}
 
 	return manager.Run(cmd.Context())
+}
+
+// clientRuntimeMetadata builds the shared observability snapshot for every
+// physical WebSocket. The instance identity is persisted before listeners start
+// so reconnects and per-Agent pools aggregate under one Client resource.
+func clientRuntimeMetadata(cfg config.Config) (client.ClientMetadataOptions, error) {
+	instanceID := strings.TrimSpace(cfg.Client.InstanceID)
+	if instanceID == "" {
+		identityPath := strings.TrimSpace(cfg.Client.InstanceIDPath)
+		if identityPath == "" {
+			identityPath = client.DefaultClientInstanceIDPath()
+		}
+		generated, err := client.EnsureClientInstanceID(identityPath)
+		if err != nil {
+			return client.ClientMetadataOptions{}, fmt.Errorf("ensure client instance identity: %w", err)
+		}
+		instanceID = generated
+	}
+
+	collected, err := metadata.NewCollector(cfg.Client.Metadata).Collect(context.Background())
+	if err != nil {
+		return client.ClientMetadataOptions{}, fmt.Errorf("collect client metadata: %w", err)
+	}
+	fields := make([]client.MetadataField, 0, len(collected.Fields))
+	for _, field := range collected.Fields {
+		fields = append(fields, client.MetadataField{Name: field.Name, Source: field.Source, Value: field.Value})
+	}
+
+	agentIDs := make([]string, 0, len(cfg.Client.Tunnels))
+	seenAgents := make(map[string]struct{}, len(cfg.Client.Tunnels))
+	listeners := make([]protocol.ClientListener, 0, len(cfg.Client.Tunnels))
+	for _, tunnel := range cfg.Client.Tunnels {
+		agentID := strings.TrimSpace(tunnel.AgentID)
+		if agentID == "" {
+			continue
+		}
+		if _, exists := seenAgents[agentID]; !exists {
+			seenAgents[agentID] = struct{}{}
+			agentIDs = append(agentIDs, agentID)
+		}
+		listeners = append(listeners, protocol.ClientListener{
+			Protocol:      strings.ToLower(strings.TrimSpace(tunnel.Protocol)),
+			ListenAddress: tunnel.ListenAddr, AgentID: agentID, Enabled: true,
+		})
+	}
+	info := build.Current()
+	return client.ClientMetadataOptions{
+		InstanceID: instanceID, AgentIDs: agentIDs, Version: info.Version, Commit: info.Commit,
+		Listeners: listeners, Metadata: fields,
+	}, nil
 }
 
 func newConfiguredClientForward(opener client.StreamOpener, cfg config.ClientConfig, tunnel config.TunnelConfig) (clientForward, string, error) {

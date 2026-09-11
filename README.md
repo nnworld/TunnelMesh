@@ -50,6 +50,15 @@ compatibility pointer to that single source of truth.
 - [Logging](docs/operations/logging.md)
 - [Troubleshooting](docs/operations/troubleshooting.md)
 
+## Releases
+
+Prebuilt Linux, macOS, and Windows archives are published to
+[GitHub Releases](https://github.com/nnworld/TunnelMesh/releases). Every
+release includes all three binaries, platform service templates,
+`SHA256SUMS`, and a `manifest.json` with the current Schema version. Tags use
+immutable `vMAJOR.MINOR.PATCH` versions; mutable major or minor tags are not
+published.
+
 Build the three container variants with:
 
 ```sh

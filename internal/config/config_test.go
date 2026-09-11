@@ -67,6 +67,48 @@ func TestLoadDefaultsToLocalSQLiteDatabaseRegistryAndTCPBridge(t *testing.T) {
 	}
 }
 
+func TestLoadDownloadsDefaultRepository(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Downloads.GitHubRepository != "nnworld/TunnelMesh" {
+		t.Fatalf("Downloads.GitHubRepository = %q, want nnworld/TunnelMesh", cfg.Downloads.GitHubRepository)
+	}
+}
+
+func TestValidateDownloadsRepository(t *testing.T) {
+	base, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cases := []struct {
+		name       string
+		repository string
+		valid      bool
+	}{
+		{name: "default", repository: config.DefaultGitHubRepository, valid: true},
+		{name: "organization and name", repository: "example/release", valid: true},
+		{name: "omitted", repository: "", valid: true},
+		{name: "extra path segment", repository: "example/release/extra", valid: false},
+		{name: "missing owner", repository: "/release", valid: false},
+		{name: "missing name", repository: "example/", valid: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.Downloads.GitHubRepository = tc.repository
+			err := config.Validate(cfg)
+			if tc.valid && err != nil {
+				t.Fatalf("Validate() error = %v, want nil", err)
+			}
+			if !tc.valid && (err == nil || !strings.Contains(err.Error(), "downloads github repository")) {
+				t.Fatalf("Validate() error = %v, want downloads github repository error", err)
+			}
+		})
+	}
+}
+
 func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
 	if err != nil {
@@ -779,6 +821,39 @@ func TestValidateMetadataSourcesRejectsUnsafeEntries(t *testing.T) {
 			cfg.Agent.Metadata = []config.MetadataSource{tc.source}
 			err := config.Validate(cfg)
 			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateClientMetadataSourcesRejectsUnsafeEntries(t *testing.T) {
+	cfg := config.Config{Mode: config.ModeLocal, Storage: config.StorageConfig{Driver: config.StorageSQLite}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}}
+	cfg.Client.Metadata = []config.MetadataSource{{Name: "api_key", Source: "env", Key: "CLIENT_API_KEY"}}
+	err := config.Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "sensitive") {
+		t.Fatalf("Validate() error = %v, want sensitive client metadata name", err)
+	}
+}
+
+func TestValidateMetadataSourcesRejectsCrossSourceFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		source config.MetadataSource
+		want   string
+	}{
+		{name: "file with env key", source: config.MetadataSource{Name: "device", Source: "file", Path: "/etc/machine-id", Key: "DEVICE"}, want: "env key"},
+		{name: "env with file path", source: config.MetadataSource{Name: "region", Source: "env", Key: "REGION", Path: "/etc/region"}, want: "file path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, loadErr := config.Load(context.Background(), config.ConfigOptions{})
+			if loadErr != nil {
+				t.Fatalf("Load() error = %v", loadErr)
+			}
+			cfg.Agent.Metadata = []config.MetadataSource{tc.source}
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
 			}
 		})

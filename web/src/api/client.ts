@@ -134,6 +134,65 @@ export type ServerNode = {
 }
 export type ServerNodePage = { items: ServerNode[]; nextCursor?: string; hasMore?: boolean }
 export type ServerNodeUpdateInput = { name?: string; enabled?: boolean }
+export type DownloadAsset = { platform: string; archive: string; url: string }
+export type DownloadInfo = {
+  version: string
+  commit: string
+  buildTime: string
+  repository: string
+  releaseUrl: string
+  checksumUrl: string
+  manifestUrl: string
+  schemaVersion: number
+  assets: DownloadAsset[]
+}
+export type ClientStatus = 'online' | 'offline' | 'stale' | 'metadata_unavailable'
+export type ClientListener = { protocol: string; listenAddress: string; agentId: string; enabled: boolean }
+export type ClientConnection = {
+  connectionId: string
+  clientInstanceId: string
+  tokenId: string
+  ownerUserId: string
+  serverNodeId: string
+  connectionEpoch: number
+  activeStreams: number
+  healthScore: number
+  acquiredAt: string
+  lastHeartbeatAt: string
+  expiresAt: string
+  local: boolean
+}
+export type ClientInstance = {
+  id: string
+  instanceId: string
+  ownerUserId: string
+  tokenIds: string[]
+  agentIds: string[]
+  version: string
+  commit: string
+  platform: string
+  hostname: string
+  processStartAt: string
+  status: ClientStatus
+  activeConnections: number
+  activeStreams: number
+  serverNodeIds: string[]
+  lastSeenAt: string
+  metadata: Record<string, string>
+  capabilities: string[]
+  listeners: ClientListener[]
+}
+export type ClientPage = { items: ClientInstance[]; nextCursor?: string; hasMore?: boolean }
+export type ClientListParams = {
+  ownerUserId?: string
+  tokenId?: string
+  serverNodeId?: string
+  status?: ClientStatus
+  agentId?: string
+  keyword?: string
+  cursor?: string
+  limit?: number
+}
 
 let token = localStorage.getItem('tunnelmesh_token') || ''
 export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
@@ -279,6 +338,36 @@ export function updateServerNode(id: string, input: ServerNodeUpdateInput) {
 }
 export function deleteServerNode(id: string) { return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}`, { method: 'DELETE' }) }
 export function restoreServerNode(id: string) { return api<ServerNode>(`/server-nodes/${encodeURIComponent(id)}/restore`, { method: 'POST' }) }
+
+export function getDownloads() { return api<DownloadInfo>('/downloads') }
+
+export function listClients(params: ClientListParams = {}) {
+  const query = new URLSearchParams()
+  if (params.ownerUserId) query.set('ownerUserId', params.ownerUserId)
+  if (params.status) query.set('status', params.status)
+  if (params.tokenId) query.set('tokenId', params.tokenId)
+  if (params.serverNodeId) query.set('serverNodeId', params.serverNodeId)
+  if (params.agentId) query.set('agentId', params.agentId)
+  if (params.keyword) query.set('keyword', params.keyword)
+  if (params.cursor) query.set('cursor', params.cursor)
+  if (params.limit) query.set('limit', String(params.limit))
+  const suffix = query.toString() ? `?${query}` : ''
+  return api<ClientPage>(`/clients${suffix}`)
+}
+export function getClientDetail(clientInstanceId: string) {
+  return api<ClientInstance>(`/clients/${encodeURIComponent(clientInstanceId)}`)
+}
+export function listClientConnections(clientInstanceId: string) {
+  return api<{ connections: ClientConnection[] }>(`/clients/${encodeURIComponent(clientInstanceId)}/connections`)
+    .then(data => data.connections)
+}
+export function closeClientConnection(clientInstanceId: string, connectionId: string, connectionEpoch: number) {
+  const query = new URLSearchParams({ connectionEpoch: String(connectionEpoch) })
+  return api<{ clientInstanceId: string; connectionId: string; connectionEpoch: number; closed: boolean }>(
+    `/clients/${encodeURIComponent(clientInstanceId)}/connections/${encodeURIComponent(connectionId)}?${query}`,
+    { method: 'DELETE' },
+  )
+}
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)

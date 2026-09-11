@@ -38,7 +38,20 @@ const (
 	SessionOpenLegacy SessionOpenMode = iota
 	SessionOpenStrict
 	SessionOpenFlowControl
+	SessionOpenMetadata
 )
+
+func (mode SessionOpenMode) supportsOpenResult() bool {
+	return mode == SessionOpenStrict || mode == SessionOpenFlowControl || mode == SessionOpenMetadata
+}
+
+func (mode SessionOpenMode) supportsFlowControl() bool {
+	return mode == SessionOpenFlowControl || mode == SessionOpenMetadata
+}
+
+func (mode SessionOpenMode) supportsClientMetadata() bool {
+	return mode == SessionOpenMetadata
+}
 
 const (
 	defaultStreamWindow          = 262144
@@ -63,6 +76,8 @@ type Session struct {
 	openMode              SessionOpenMode
 	initialWindow         uint32
 	windowUpdateThreshold uint32
+	metadataCollector     *ClientMetadataCollector
+	metadataRevision      uint64
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -70,10 +85,15 @@ func NewSession(tr FrameTransport) *Session {
 }
 
 func NewSessionWithOpenMode(tr FrameTransport, mode SessionOpenMode) *Session {
+	return NewSessionWithOpenModeAndMetadata(tr, mode, nil)
+}
+
+func NewSessionWithOpenModeAndMetadata(tr FrameTransport, mode SessionOpenMode, collector *ClientMetadataCollector) *Session {
 	s := &Session{
 		transport: tr, done: make(chan struct{}),
 		streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream),
-		pendingPings: make(map[uint64]chan struct{}),
+		pendingPings:      make(map[uint64]chan struct{}),
+		metadataCollector: collector,
 	}
 	if tr != nil {
 		s.writer = streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
@@ -139,7 +159,7 @@ func (s *Session) OpenStream(ctx context.Context, req StreamRequest) error {
 		return err
 	}
 	frame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload}
-	if s.OpenMode() == SessionOpenFlowControl {
+	if s.OpenMode().supportsFlowControl() {
 		frame.Window = s.initialWindow
 	}
 	err = s.sendFrame(frame)
@@ -164,7 +184,57 @@ func (s *Session) Start() {
 		s.finishReceive(errors.New("client session transport does not receive frames"))
 		return
 	}
+	if s.OpenMode().supportsClientMetadata() && s.metadataCollector != nil {
+		if err := s.sendClientMetadata(protocol.FrameClientHello); err != nil {
+			s.finishReceive(err)
+			return
+		}
+		go s.reportClientMetadata()
+	}
 	s.recvOnce.Do(func() { go s.receiveLoop(tr) })
+}
+
+func (s *Session) sendClientMetadata(frameType protocol.FrameType) error {
+	if s == nil || s.metadataCollector == nil {
+		return ErrSessionClosed
+	}
+	payload := s.metadataCollector.Snapshot(context.Background())
+	encoded, err := protocol.EncodeClientMetadataPayload(payload)
+	if err != nil {
+		return err
+	}
+	frame := protocol.Frame{Version: protocol.CurrentVersion, Type: frameType, Payload: encoded}
+	if s.writer != nil {
+		// Metadata is connection identity and must be on the wire before the
+		// caller can open a stream through the same session.
+		if err := s.writer.EnqueueControlSync(frame); err != nil {
+			return err
+		}
+	} else if err := s.transport.Send(frame); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if payload.Revision > s.metadataRevision {
+		s.metadataRevision = payload.Revision
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) reportClientMetadata() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			if err := s.sendClientMetadata(protocol.FrameClientMetadataUpdate); err != nil {
+				s.finishReceive(err)
+				return
+			}
+		}
+	}
 }
 
 func (s *Session) Wait(ctx context.Context) error {
@@ -350,7 +420,7 @@ func (s *Session) OpenStreamResult(ctx context.Context, req StreamRequest) (io.R
 		Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen,
 		StreamID: req.StreamID, Payload: payload,
 	}
-	if s.OpenMode() == SessionOpenFlowControl {
+	if s.OpenMode().supportsFlowControl() {
 		openFrame.Window = s.initialWindow
 	}
 	if err := s.sendFrame(openFrame); err != nil {
@@ -398,7 +468,7 @@ func (o SessionOpener) OpenStream(ctx context.Context, req StreamRequest) (io.Re
 	if o.Session == nil {
 		return nil, ErrSessionClosed
 	}
-	if o.Session.OpenMode() != SessionOpenLegacy {
+	if o.Session.OpenMode().supportsOpenResult() {
 		stream, result, err := o.Session.OpenStreamResult(ctx, req)
 		if err != nil {
 			return nil, err
@@ -415,7 +485,7 @@ func (o SessionOpener) OpenStreamResult(ctx context.Context, req StreamRequest) 
 	if o.Session == nil {
 		return nil, failureOpenResult(protocol.OpenResultCodeInternalError), ErrSessionClosed
 	}
-	if o.Session.OpenMode() != SessionOpenLegacy {
+	if o.Session.OpenMode().supportsOpenResult() {
 		return o.Session.OpenStreamResult(ctx, req)
 	}
 	stream, err := o.Session.OpenStreamConn(ctx, req)
@@ -587,7 +657,7 @@ func newFrameStream(s *Session, id uint32) *frameStream {
 		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(262144),
 		readSignal: make(chan struct{}, 1), done: make(chan struct{}),
 	}
-	if s.OpenMode() == SessionOpenFlowControl {
+	if s.OpenMode().supportsFlowControl() {
 		if state, err := protocol.NewStreamState(id, s.initialWindow); err == nil {
 			_ = state.OpenLocal()
 			stream.flow = state

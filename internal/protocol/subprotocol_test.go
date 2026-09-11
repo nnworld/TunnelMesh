@@ -5,6 +5,7 @@ import "testing"
 func TestClientSubprotocolsArePriorityOrdered(t *testing.T) {
 	got := ClientSubprotocols()
 	want := []string{
+		"tunnelmesh.v1.open-result.flow-control.metadata",
 		"tunnelmesh.v1.open-result.flow-control",
 		"tunnelmesh.v1.open-result",
 		"tunnelmesh.v1",
@@ -16,6 +17,13 @@ func TestClientSubprotocolsArePriorityOrdered(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("subprotocols = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestClientSubprotocolsPreferMetadata(t *testing.T) {
+	selected, ok := SelectSubprotocol(ClientSubprotocols())
+	if !ok || selected != SubprotocolClientMetadata {
+		t.Fatalf("selected = %q, ok=%v", selected, ok)
 	}
 }
 

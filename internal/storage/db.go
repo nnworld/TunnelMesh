@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 10
+	SchemaVersion = 11
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -43,6 +43,8 @@ type DB struct {
 	idempotency            IdempotencyRepository
 	dashboard              DashboardRepository
 	authorizationRevisions AuthorizationRevisionRepository
+	clientInstances        ClientInstanceRepository
+	clientConnections      ClientConnectionRepository
 	metrics                *observability.Metrics
 }
 
@@ -282,6 +284,8 @@ func newDB(db *sql.DB, driver string) *DB {
 		idempotency:            &idempotencyRepo{db},
 		dashboard:              &dashboardRepo{db: db},
 		authorizationRevisions: &authorizationRevisionRepo{db: db},
+		clientInstances:        NewClientInstanceRepositoryWithDriver(db, driver),
+		clientConnections:      NewClientConnectionRepositoryWithDriver(db, driver),
 	}
 }
 
@@ -343,6 +347,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			script = migrations.V9ToV10SQLite
 			if driver == DriverMySQL {
 				script = migrations.V9ToV10MySQL
+			}
+		case 10:
+			script = migrations.V10ToV11SQLite
+			if driver == DriverMySQL {
+				script = migrations.V10ToV11MySQL
 			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
@@ -410,7 +419,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases"} {
+	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
@@ -513,6 +522,10 @@ func (d *DB) Leases() LeaseRepository                   { return d.leases }
 func (d *DB) Audits() AuditRepository                   { return d.audits }
 func (d *DB) Idempotency() IdempotencyRepository        { return d.idempotency }
 func (d *DB) Dashboard() DashboardRepository            { return d.dashboard }
+func (d *DB) ClientInstances() ClientInstanceRepository { return d.clientInstances }
+func (d *DB) ClientConnections() ClientConnectionRepository {
+	return d.clientConnections
+}
 func (d *DB) AuthorizationRevisions() AuthorizationRevisionRepository {
 	return d.authorizationRevisions
 }

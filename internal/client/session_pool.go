@@ -25,7 +25,10 @@ type SessionPoolConfig struct {
 	Cooldown           time.Duration
 }
 
-type SessionPoolRunner func(ctx context.Context, serverURL, token string, onReady func(*Session) error) error
+// SessionPoolRunner starts one physical WebSocket. The pool supplies final
+// run options, including the connection slot and metadata snapshot, so custom
+// runners cannot accidentally omit observability identity.
+type SessionPoolRunner func(ctx context.Context, serverURL, token string, onReady func(*Session) error, options WebSocketRunOptions) error
 
 type SessionPoolManagerOptions struct {
 	ServerURL string
@@ -33,6 +36,7 @@ type SessionPoolManagerOptions struct {
 	Config    SessionPoolConfig
 	Runner    SessionPoolRunner
 	WebSocket WebSocketRunOptions
+	Metadata  ClientMetadataOptions
 }
 
 type SessionPoolManager struct {
@@ -221,7 +225,7 @@ func (p *agentSessionPool) sampleRTT(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, entry := range entries {
-		if entry.session.OpenMode() != SessionOpenFlowControl {
+		if !entry.session.OpenMode().supportsFlowControl() {
 			continue
 		}
 		wg.Add(1)
@@ -254,15 +258,20 @@ func (p *agentSessionPool) startSlot(ctx context.Context) {
 
 	runner := p.options.Runner
 	if runner == nil {
-		runner = func(runCtx context.Context, serverURL, token string, onReady func(*Session) error) error {
-			return RunWebSocketWithOptions(runCtx, serverURL, token, onReady, p.options.WebSocket)
-		}
+		runner = RunWebSocketWithOptions
+	}
+	runOptions := p.options.WebSocket
+	if p.options.Metadata.InstanceID != "" {
+		metadata := cloneClientMetadataOptions(p.options.Metadata)
+		metadata.ConnectionSlot = slotID + 1
+		runOptions.Metadata = &metadata
+		runOptions.ConnectionSlot = slotID + 1
 	}
 
 	go func() {
 		err := runner(slotCtx, p.options.ServerURL, p.options.Token, func(session *Session) error {
 			return p.registerSession(slotCtx, slotID, session)
-		})
+		}, runOptions)
 		p.removeSlot(slotID)
 		// slotCtx is canceled on scale-down or manager shutdown; those are not
 		// terminal pool failures. Only an error while the pool is still active

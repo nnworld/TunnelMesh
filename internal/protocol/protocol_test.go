@@ -147,6 +147,47 @@ func TestAgentMetadataConnectionFieldsRemainOptionalForLegacyAgents(t *testing.T
 	}
 }
 
+func TestClientMetadataPayloadRoundTrip(t *testing.T) {
+	payload := ClientMetadataPayload{
+		InstanceID:     "client-0123456789abcdef0123456789abcdef",
+		ConnectionSlot: 2,
+		AgentIDs:       []string{"agent-0123456789abcdef"},
+		Version:        "v1.2.3",
+		Commit:         "0123456789abcdef",
+		Platform:       "darwin/arm64",
+		Hostname:       "workstation",
+		ReportedAt:     time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC),
+		Revision:       1,
+		Listeners: []ClientListener{{
+			Protocol: "socks5", ListenAddress: "127.0.0.1:10866", AgentID: "agent-0123456789abcdef", Enabled: true,
+		}},
+		Items:        []ClientMetadataItem{{Name: "region", Source: "env", Value: "cn-north"}},
+		Capabilities: []string{"client_metadata.v1"},
+	}
+	encoded, err := EncodeClientMetadataPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeClientMetadataPayload(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.InstanceID != payload.InstanceID || decoded.Listeners[0].ListenAddress != payload.Listeners[0].ListenAddress {
+		t.Fatalf("decoded payload mismatch: %#v", decoded)
+	}
+}
+
+func TestClientMetadataControlFramesUseStreamZero(t *testing.T) {
+	frame := Frame{Version: CurrentVersion, Type: FrameClientHello, Payload: []byte(`{}`)}
+	if err := frame.Validate(); err != nil {
+		t.Fatalf("CLIENT_HELLO with stream zero: %v", err)
+	}
+	frame.Type = FrameClientMetadataUpdate
+	if err := frame.Validate(); err != nil {
+		t.Fatalf("CLIENT_METADATA_UPDATE with stream zero: %v", err)
+	}
+}
+
 func TestFrameRoundTrip(t *testing.T) {
 	in := Frame{Version: CurrentVersion, Type: FrameData, Flags: FlagFin, StreamID: 42, Window: 8192, Payload: []byte("hello")}
 	var b bytes.Buffer

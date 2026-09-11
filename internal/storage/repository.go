@@ -186,6 +186,27 @@ type AuthorizationRevisionRepository interface {
 	Current(context.Context) (uint64, error)
 }
 
+type ClientInstanceRepository interface {
+	Upsert(context.Context, ClientInstance) (ClientInstance, error)
+	GetByOwnerAndInstance(context.Context, string, string) (ClientInstance, error)
+	Get(context.Context, string) (ClientInstance, error)
+	List(context.Context, ClientInstanceFilter, string, int) (Page[ClientInstance], error)
+	TouchInstance(context.Context, string, string, time.Time, time.Time) error
+	MarkStale(context.Context, string, time.Time) error
+	MarkExpired(context.Context, time.Time) (int64, error)
+}
+
+type ClientConnectionRepository interface {
+	Register(context.Context, ClientConnectionLease) (ClientConnectionLease, error)
+	Get(context.Context, string) (ClientConnectionLease, error)
+	Renew(context.Context, string, int64, time.Duration) error
+	Release(context.Context, string, int64) error
+	List(context.Context, ClientConnectionFilter, string, int) (Page[ClientConnectionLease], error)
+	ListByInstance(context.Context, string) ([]ClientConnectionLease, error)
+	ListByInstances(context.Context, []string) ([]ClientConnectionLease, error)
+	UpdateStats(context.Context, ClientConnectionLease) error
+}
+
 // AtomicIdempotencyRepository is an optional stronger contract used by the
 // HTTP API when the backing store supports compare-and-set key claiming.
 type AtomicIdempotencyRepository interface {
@@ -229,6 +250,19 @@ func NewAgentMetadataRepositoryWithDriver(db *sql.DB, driver string) AgentMetada
 		return &agentMetadataRepo{db: db, driver: DriverMySQL}
 	}
 	return &agentMetadataRepo{db: db, driver: DriverSQLite}
+}
+func NewClientInstanceRepositoryWithDriver(db *sql.DB, driver string) ClientInstanceRepository {
+	return &clientInstanceRepo{db: db, driver: normalizeDriver(driver)}
+}
+func NewClientConnectionRepositoryWithDriver(db *sql.DB, driver string) ClientConnectionRepository {
+	return &clientConnectionRepo{db: db, driver: normalizeDriver(driver)}
+}
+func normalizeDriver(driver string) string {
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if driver == "sqlite3" {
+		return DriverSQLite
+	}
+	return driver
 }
 
 func NewAgentRuntimeStatsRepository(db *sql.DB) AgentRuntimeStatsRepository {

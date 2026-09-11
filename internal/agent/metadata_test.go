@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -180,11 +181,35 @@ func TestMetadataCollectorRejectsFieldAndAggregateLimits(t *testing.T) {
 	}
 }
 
+func TestMetadataCollectorRejectsExpandedSensitiveNames(t *testing.T) {
+	collector := NewMetadataCollector([]config.MetadataSource{
+		{Name: "authorization_header", Source: "env", Key: "TUNNELMESH_AUTHORIZATION"},
+	})
+	snapshot, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Errors) != 1 || !strings.Contains(strings.ToLower(snapshot.Errors[0].Error), "sensitive") {
+		t.Fatalf("errors = %+v, want expanded sensitive-name rejection", snapshot.Errors)
+	}
+}
+
+func TestMetadataCollectorNilReceiverReturnsEmptySnapshot(t *testing.T) {
+	var collector *MetadataCollector
+	snapshot, err := collector.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Fields) != 0 || len(snapshot.Values) != 0 {
+		t.Fatalf("nil collector snapshot = %+v, want empty snapshot", snapshot)
+	}
+}
+
 func TestOversizedEnvironmentValueIsRejectedBeforeCopy(t *testing.T) {
 	t.Setenv("TUNNELMESH_HUGE", strings.Repeat("x", DefaultMetadataFieldBytes+1))
 	source := config.MetadataSource{Name: "huge", Source: "env", Key: "TUNNELMESH_HUGE"}
 	allocs := testing.AllocsPerRun(100, func() {
-		_, _ = readMetadataSource(context.Background(), source, DefaultMetadataFieldBytes)
+		_, _ = metadata.ReadSource(context.Background(), source, DefaultMetadataFieldBytes)
 	})
 	t.Logf("oversized environment read allocations = %.2f", allocs)
 	if allocs > 1 {

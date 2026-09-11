@@ -107,6 +107,36 @@ func TestAgentSessionRegistrationNegotiatesAndHeartbeats(t *testing.T) {
 		t.Fatalf("expected epoch fencing, got %v", err)
 	}
 }
+
+func TestClientSessionManagerTracksHeartbeatAndStreams(t *testing.T) {
+	manager := NewClientSessionManager()
+	transport := newFakeTransport()
+	manager.Register(ClientSessionRecord{
+		ConnectionID: "client_connection_1", TokenID: "token-1", OwnerUserID: "owner-1",
+		ServerNodeID: "server-1", ConnectionEpoch: 1, StartedAt: time.Now().UTC(),
+	}, transport)
+	manager.ObserveHeartbeat("client_connection_1")
+	manager.ObserveStreamOpened("client_connection_1")
+	manager.ObserveStreamClosed("client_connection_1")
+	record, ok := manager.Get("client_connection_1")
+	if !ok {
+		t.Fatal("connection not found")
+	}
+	if record.LastHeartbeatAt.IsZero() || record.ActiveStreams != 0 {
+		t.Fatalf("record = %#v", record)
+	}
+	if err := manager.CloseConnection("client_connection_1", 2); !errors.Is(err, ErrEpoch) {
+		t.Fatalf("stale close error=%v, want ErrEpoch", err)
+	}
+	if err := manager.CloseConnection("client_connection_1", 1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.closed:
+	case <-time.After(time.Second):
+		t.Fatal("current connection was not closed")
+	}
+}
 func TestAgentSessionGoAwayAndBackpressure(t *testing.T) {
 	m := NewAgentSessionManager(AgentSessionConfig{QueueSize: 1})
 	tr := newGatedTransport()
@@ -218,7 +248,7 @@ func (t *gatedTransport) Close() error {
 func TestClientSessionOpenLocalRouting(t *testing.T) {
 	c := NewClientSessionManager()
 	tr := newFakeTransport()
-	c.Register("u", tr)
+	c.Register(ClientSessionRecord{ConnectionID: "u", ConnectionEpoch: 1}, tr)
 	if err := c.OpenStream(context.Background(), "u", StreamOpenRequest{StreamID: 7, Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80}); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +265,7 @@ func TestClientSessionOpenLocalRouting(t *testing.T) {
 func TestClientSessionOpenStreamEncodesRouteFields(t *testing.T) {
 	c := NewClientSessionManager()
 	tr := newFakeTransport()
-	c.Register("u", tr)
+	c.Register(ClientSessionRecord{ConnectionID: "u", ConnectionEpoch: 1}, tr)
 	if err := c.OpenStream(context.Background(), "u", StreamOpenRequest{StreamID: 9, Protocol: "udp", TargetHost: "10.0.0.2", TargetPort: 5353, Metadata: []byte("m")}); err != nil {
 		t.Fatal(err)
 	}

@@ -313,6 +313,36 @@ func TestNewServerRuntimeWiresAgentMetadataPersistence(t *testing.T) {
 	}
 }
 
+func TestNewServerRuntimeWiresClientObservability(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:server-runtime-client-observability?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.ClientSessions == nil {
+		t.Fatal("ClientSessions was not wired")
+	}
+	if runtime.ClientConnectionLeases == nil {
+		t.Fatal("ClientConnectionLeases was not wired")
+	}
+	if runtime.ClientObservability == nil {
+		t.Fatal("ClientObservability was not wired")
+	}
+	if runtime.ClientStreamService == nil || runtime.ClientStreamService.observability != runtime.ClientObservability {
+		t.Fatal("ClientStreamService was not wired to ClientObservability")
+	}
+	if runtime.clientMetadataSweeper == nil || runtime.clientMetadataSweeperCancel == nil || runtime.clientMetadataSweeperDone == nil {
+		t.Fatal("ClientMetadataSweeper was not started")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
 func TestNewServerRuntimeWiresAuthorizationCacheAndReadiness(t *testing.T) {
 	ctx := context.Background()
 	db, err := storage.OpenSQLite(ctx, "file:runtime-authorization-cache?mode=memory&cache=shared")

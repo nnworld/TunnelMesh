@@ -14,13 +14,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
 	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
@@ -41,6 +41,9 @@ const (
 	// outside the read-only /etc configuration. It must stay inside the Agent
 	// systemd unit's ReadWritePaths directory.
 	DefaultAgentInstanceIDPath = "/var/lib/tunnelmesh-agent/agent-instance-id"
+	// DefaultGitHubRepository is the public release source used by the
+	// management UI. Deployments can override it for a GitHub Enterprise mirror.
+	DefaultGitHubRepository = "nnworld/TunnelMesh"
 )
 
 // ConfigOptions controls the sources used by Load.  CLI and Overrides are
@@ -69,15 +72,23 @@ type ConfigOptions struct {
 }
 
 type Config struct {
-	Mode     string         `mapstructure:"mode" json:"mode" yaml:"mode"`
-	Storage  StorageConfig  `mapstructure:"storage" json:"storage" yaml:"storage"`
-	Registry RegistryConfig `mapstructure:"registry" json:"registry" yaml:"registry"`
-	Node     NodeConfig     `mapstructure:"node" json:"node" yaml:"node"`
-	Server   ServerConfig   `mapstructure:"server" json:"server" yaml:"server"`
-	Security SecurityConfig `mapstructure:"security" json:"security" yaml:"security"`
-	TLS      TLSConfig      `mapstructure:"tls" json:"tls" yaml:"tls"`
-	Agent    AgentConfig    `mapstructure:"agent" json:"agent" yaml:"agent"`
-	Client   ClientConfig   `mapstructure:"client" json:"client" yaml:"client"`
+	Mode      string          `mapstructure:"mode" json:"mode" yaml:"mode"`
+	Storage   StorageConfig   `mapstructure:"storage" json:"storage" yaml:"storage"`
+	Registry  RegistryConfig  `mapstructure:"registry" json:"registry" yaml:"registry"`
+	Node      NodeConfig      `mapstructure:"node" json:"node" yaml:"node"`
+	Server    ServerConfig    `mapstructure:"server" json:"server" yaml:"server"`
+	Security  SecurityConfig  `mapstructure:"security" json:"security" yaml:"security"`
+	TLS       TLSConfig       `mapstructure:"tls" json:"tls" yaml:"tls"`
+	Agent     AgentConfig     `mapstructure:"agent" json:"agent" yaml:"agent"`
+	Client    ClientConfig    `mapstructure:"client" json:"client" yaml:"client"`
+	Downloads DownloadsConfig `mapstructure:"downloads" json:"downloads" yaml:"downloads"`
+}
+
+// DownloadsConfig identifies the GitHub repository that stores immutable
+// release archives. Only owner/name is configured; asset names are generated
+// from the release contract so Server and build tooling cannot drift.
+type DownloadsConfig struct {
+	GitHubRepository string `mapstructure:"github_repository" json:"github_repository" yaml:"github_repository"`
 }
 
 type StorageConfig struct {
@@ -204,28 +215,26 @@ type AgentConnectionConfig struct {
 	Cooldown           time.Duration `mapstructure:"cooldown" json:"cooldown" yaml:"cooldown"`
 }
 
-// MetadataSource is an explicit allowlisted host value source. File sources
-// read one configured absolute path; env sources read one configured key.
-type MetadataSource struct {
-	Name   string `mapstructure:"name" json:"name" yaml:"name"`
-	Source string `mapstructure:"source" json:"source" yaml:"source"`
-	Path   string `mapstructure:"path" json:"path" yaml:"path"`
-	Key    string `mapstructure:"key" json:"key" yaml:"key"`
-}
+// MetadataSource is an explicit allowlisted host value source. The concrete
+// type lives in internal/metadata so Agent and Client share the same rules.
+type MetadataSource = metadata.Source
 
 const (
-	MetadataMaxFields       = 32
-	MetadataFieldMaxBytes   = 4 << 10
-	MetadataPayloadMaxBytes = 32 << 10
+	MetadataMaxFields       = metadata.MaxFields
+	MetadataFieldMaxBytes   = metadata.MaxFieldBytes
+	MetadataPayloadMaxBytes = metadata.MaxPayloadBytes
 )
 
 type ClientConfig struct {
 	ServerURL        string                 `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	InstanceID       string                 `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
+	InstanceIDPath   string                 `mapstructure:"instance_id_path" json:"instance_id_path" yaml:"instance_id_path"`
 	Token            string                 `mapstructure:"token" json:"-" yaml:"-"`
 	Tunnels          []TunnelConfig         `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
 	Connections      ClientConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
 	RemoteValidation RemoteValidationConfig `mapstructure:"remote_validation" json:"remote_validation" yaml:"remote_validation"`
+	Metadata         []MetadataSource       `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
 }
 
 type ClientConnectionConfig struct {
@@ -298,6 +307,9 @@ func Load(ctx context.Context, opts ConfigOptions) (Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	if strings.TrimSpace(cfg.Downloads.GitHubRepository) == "" {
+		cfg.Downloads.GitHubRepository = DefaultGitHubRepository
 	}
 	// Support both the nested spelling used in files and the flat flag spelling
 	// used by Cobra. The nested key is canonical, while the flat key is an
@@ -476,6 +488,7 @@ func setDefaults(v *viper.Viper) {
 		"client.remote_validation.negative_ttl":              2 * time.Second,
 		"client.remote_validation.timeout":                   3 * time.Second,
 		"client.remote_validation.max_entries":               10000,
+		"downloads.github_repository":                        DefaultGitHubRepository,
 	}
 	for key, value := range defaults {
 		v.SetDefault(key, value)
@@ -495,7 +508,8 @@ func bindEnvironment(v *viper.Viper) {
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
 		"server.authorization_cache.enabled",
-		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.token",
+		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
+		"downloads.github_repository",
 	}
 	for _, key := range keys {
 		_ = v.BindEnv(key)
@@ -514,9 +528,11 @@ func Validate(cfg Config) error {
 		problems = append(problems, validateClientTunnels(cfg.Client.Tunnels)...)
 	}
 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
+	problems = append(problems, validateMetadataSources(cfg.Client.Metadata)...)
 	problems = append(problems, validateSecurity(cfg.Security)...)
 	problems = append(problems, validateTLS(cfg.TLS)...)
 	problems = append(problems, validateRelay(cfg.Mode, cfg.Node.ID, cfg.Server.Relay)...)
+	problems = append(problems, validateDownloads(cfg.Downloads)...)
 	if suffix := strings.TrimSpace(cfg.Server.DynamicSuffix); suffix != "" && !validDynamicSuffix(suffix) {
 		problems = append(problems, fmt.Sprintf("dynamic route suffix %q must be a DNS domain without a wildcard", suffix))
 	}
@@ -563,6 +579,18 @@ func Validate(cfg Config) error {
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func validateDownloads(cfg DownloadsConfig) []string {
+	repository := strings.TrimSpace(cfg.GitHubRepository)
+	// Load applies the default for normal startup; Validate is also used by
+	// embedders that construct Config literals, so an omitted repository is not
+	// an error. An explicitly malformed repository must still fail fast.
+	owner, name, found := strings.Cut(repository, "/")
+	if repository != "" && (!found || strings.Count(repository, "/") != 1 || owner == "" || name == "" || strings.Contains(repository, "//") || strings.Contains(repository, "..") || strings.ContainsAny(repository, " \t\r\n?#@")) {
+		return []string{fmt.Sprintf("downloads github repository %q must be owner/name", cfg.GitHubRepository)}
 	}
 	return nil
 }
@@ -1271,9 +1299,6 @@ func validateRelay(mode, nodeID string, cfg RelayConfig) []string {
 	return problems
 }
 
-var metadataNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
-var metadataSensitivePattern = regexp.MustCompile(`(?i)(password|token|secret|private[_-]?key|dsn)`)
-
 func validateMetadataSources(sources []MetadataSource) []string {
 	var problems []string
 	if len(sources) > MetadataMaxFields {
@@ -1282,36 +1307,12 @@ func validateMetadataSources(sources []MetadataSource) []string {
 	seen := make(map[string]struct{}, len(sources))
 	for i, source := range sources {
 		prefix := fmt.Sprintf("metadata[%d]", i)
-		if source.Name == "" || len(source.Name) > 64 || !metadataNamePattern.MatchString(source.Name) {
-			problems = append(problems, prefix+" name must match [a-zA-Z0-9_.-] and be at most 64 characters")
-		}
-		if metadataSensitivePattern.MatchString(source.Name) {
-			problems = append(problems, prefix+" name is sensitive and cannot be reported")
-		}
-		if _, ok := seen[source.Name]; ok {
-			problems = append(problems, prefix+" name is duplicated")
+		// Keep user-facing prefixes here, while internal/metadata owns the
+		// shared source and sensitive-name policy for both Agent and Client.
+		if err := metadata.ValidateSource(source, seen); err != nil {
+			problems = append(problems, prefix+" "+err.Error())
 		}
 		seen[source.Name] = struct{}{}
-		switch source.Source {
-		case "file":
-			if !filepath.IsAbs(source.Path) {
-				problems = append(problems, prefix+" file path must be absolute")
-			}
-			if source.Key != "" {
-				problems = append(problems, prefix+" file source cannot set env key")
-			}
-		case "env":
-			if source.Key == "" {
-				problems = append(problems, prefix+" env source requires a key")
-			} else if strings.ContainsAny(source.Key, "*?[]") {
-				problems = append(problems, prefix+" env key cannot contain wildcard")
-			}
-			if source.Path != "" {
-				problems = append(problems, prefix+" env source cannot set file path")
-			}
-		default:
-			problems = append(problems, prefix+" source must be file or env")
-		}
 	}
 	return problems
 }

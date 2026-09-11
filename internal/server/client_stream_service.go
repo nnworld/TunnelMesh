@@ -18,6 +18,7 @@ type ClientStreamServiceConfig struct {
 	MaxConcurrentOpens int
 	MaxPendingOpens    int
 	OpenTimeout        time.Duration
+	Observability      *ClientObservabilityService
 }
 
 type OpenFuture interface {
@@ -69,13 +70,14 @@ type clientOpenJob struct {
 }
 
 type ClientStreamService struct {
-	authorizer StreamAuthorizer
-	transport  relay.NodeTransport
-	config     ClientStreamServiceConfig
-	metrics    *observability.Metrics
-	queue      chan clientOpenJob
-	closeOnce  sync.Once
-	workers    sync.WaitGroup
+	authorizer    StreamAuthorizer
+	transport     relay.NodeTransport
+	config        ClientStreamServiceConfig
+	observability *ClientObservabilityService
+	metrics       *observability.Metrics
+	queue         chan clientOpenJob
+	closeOnce     sync.Once
+	workers       sync.WaitGroup
 }
 
 func NewClientStreamService(authorizer StreamAuthorizer, transport relay.NodeTransport, config ClientStreamServiceConfig, metrics *observability.Metrics) *ClientStreamService {
@@ -89,7 +91,8 @@ func NewClientStreamService(authorizer StreamAuthorizer, transport relay.NodeTra
 		config.OpenTimeout = 8 * time.Second
 	}
 	service := &ClientStreamService{
-		authorizer: authorizer, transport: transport, config: config, metrics: metrics,
+		authorizer: authorizer, transport: transport, config: config,
+		observability: config.Observability, metrics: metrics,
 		queue: make(chan clientOpenJob, config.MaxPendingOpens),
 	}
 	service.workers.Add(config.MaxConcurrentOpens)

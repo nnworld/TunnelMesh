@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -44,7 +45,11 @@ type API struct {
 	localAgentRelay    *AgentRelayTransport
 	clusterConnections AgentConnectionLister
 	connectionCloser   AgentConnectionCloseService
+	clientInstances    storage.ClientInstanceRepository
+	clientConnections  storage.ClientConnectionRepository
+	clientCloser       ClientConnectionCloseService
 	localNodeID        string
+	downloads          config.DownloadsConfig
 }
 
 // apiService is the application layer between HTTP handlers and storage. It
@@ -75,6 +80,8 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 		a.serverNodes = NewServerNodeService(db)
 		a.traceroute = NewTracerouteService(db)
 		a.probeService = NewProbeService(db)
+		a.clientInstances = db.ClientInstances()
+		a.clientConnections = db.ClientConnections()
 	}
 	return a
 }
@@ -282,6 +289,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleTokens(w, r, p, parts[1:])
 	case "server-nodes":
 		a.handleServerNodes(w, r, p, parts[1:])
+	case "clients":
+		a.handleClients(w, r, p, parts[1:])
+	case "downloads":
+		if len(parts) == 1 {
+			a.handleDownloads(w, r, p)
+			return
+		}
+		writeAPIError(w, http.StatusNotFound, "not found")
 	case "users":
 		a.handleUsers(w, r, p, parts[1:])
 	case "dashboard":

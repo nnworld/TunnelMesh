@@ -114,12 +114,15 @@ func TestClientWSRouteIsExactAndRejectsWrongCredentialTypesBeforeUpgrade(t *test
 
 func TestClientWebSocketHandshakeSelectsSubprotocol(t *testing.T) {
 	tests := []struct {
-		name     string
-		offered  []string
-		selected string
+		name            string
+		offered         []string
+		selected        string
+		strictOpen      bool
+		metadataEnabled bool
 	}{
-		{name: "modern", offered: protocol.ClientSubprotocols(), selected: protocol.SubprotocolFlowControl},
-		{name: "open result only", offered: []string{protocol.SubprotocolOpenResult}, selected: protocol.SubprotocolOpenResult},
+		{name: "modern", offered: protocol.ClientSubprotocols(), selected: protocol.SubprotocolClientMetadata, strictOpen: true, metadataEnabled: true},
+		{name: "open result only", offered: []string{protocol.SubprotocolOpenResult}, selected: protocol.SubprotocolOpenResult, strictOpen: true},
+		{name: "flow control", offered: []string{protocol.SubprotocolFlowControl}, selected: protocol.SubprotocolFlowControl, strictOpen: true},
 		{name: "legacy", offered: []string{protocol.SubprotocolLegacy}, selected: protocol.SubprotocolLegacy},
 		{name: "missing", selected: ""},
 		{name: "unsupported", offered: []string{"private.v9"}, selected: ""},
@@ -137,7 +140,9 @@ func TestClientWebSocketHandshakeSelectsSubprotocol(t *testing.T) {
 			}
 			wsConfig := &websocket.Config{Protocol: test.offered}
 			handshake := clientWebSocketHandshake(config.SecurityConfig{AllowedOrigins: []string{"https://tunnel.example.com"}}, func(context.Context, string) (ClientSessionPrincipal, error) {
-				return ClientSessionPrincipal{ConnectionID: "connection", StrictOpen: test.selected == protocol.SubprotocolOpenResult || test.selected == protocol.SubprotocolFlowControl}, nil
+				return ClientSessionPrincipal{
+					ConnectionID: "connection", Identity: auth.TokenIdentity{TokenID: "token"},
+				}, nil
 			})
 			if err := handshake(wsConfig, request); err != nil {
 				t.Fatal(err)
@@ -150,6 +155,13 @@ func TestClientWebSocketHandshakeSelectsSubprotocol(t *testing.T) {
 			}
 			if len(wsConfig.Protocol) != 1 || wsConfig.Protocol[0] != test.selected {
 				t.Fatalf("selected protocols=%v, want %s", wsConfig.Protocol, test.selected)
+			}
+			principal, ok := clientPrincipalFromContext(request.Context())
+			if !ok {
+				t.Fatal("principal missing from request context")
+			}
+			if principal.StrictOpen != test.strictOpen || principal.MetadataEnabled != test.metadataEnabled {
+				t.Fatalf("principal capabilities strict=%v metadata=%v, want strict=%v metadata=%v", principal.StrictOpen, principal.MetadataEnabled, test.strictOpen, test.metadataEnabled)
 			}
 		})
 	}
@@ -181,6 +193,105 @@ func TestServeClientSessionStrictOpenDoesNotBlockPing(t *testing.T) {
 	result := receiveChannelClientFrame(t, transport)
 	if result.Type != protocol.FrameOpenResult || result.StreamID != 7 {
 		t.Fatalf("open response=%+v, want OPEN_RESULT", result)
+	}
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeClientSessionHandlesMetadataHelloAndRelease(t *testing.T) {
+	instances := &fakeClientInstanceRepo{nextID: "client-instance-1"}
+	connections := &fakeClientConnectionRepo{}
+	manager := NewClientSessionManager()
+	leases := NewClientConnectionLeaseController(connections, manager, "server-1", 90*time.Second)
+	observabilityService := NewClientObservabilityService(instances, leases, manager, "server-1", 5*time.Minute)
+	transport := newChannelClientTransport()
+	opener := &recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)}
+	authorizer := streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil })
+	service := NewClientStreamService(authorizer, opener, ClientStreamServiceConfig{
+		MaxConcurrentOpens: 1, MaxPendingOpens: 1, OpenTimeout: time.Second,
+		Observability: observabilityService,
+	}, nil)
+	defer service.Close()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-metadata", StrictOpen: true, MetadataEnabled: true,
+		Identity: auth.TokenIdentity{TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveClientSessionWithService(context.Background(), principal, transport, authorizer, opener, maxClientOpenAttempts, nil, service)
+	}()
+
+	helloPayload, err := protocol.EncodeClientMetadataPayload(protocol.ClientMetadataPayload{
+		InstanceID: "client-0123456789abcdef", Revision: 1, ReportedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameClientHello, Payload: helloPayload}
+	ackFrame := receiveChannelClientFrame(t, transport)
+	if ackFrame.Type != protocol.FrameClientMetadataAck {
+		t.Fatalf("metadata response=%+v, want ACK", ackFrame)
+	}
+	ack, err := protocol.DecodeClientMetadataAckPayload(ackFrame.Payload)
+	if err != nil || !ack.Accepted || ack.ClientInstanceID != "client-instance-1" {
+		t.Fatalf("metadata ack=%#v err=%v", ack, err)
+	}
+
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("ping")}
+	if pong := receiveChannelClientFrame(t, transport); pong.Type != protocol.FramePong {
+		t.Fatalf("PING response=%+v, want PONG", pong)
+	}
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(connections.registered) != 1 || len(connections.released) != 1 {
+		t.Fatalf("leases registered=%#v released=%#v", connections.registered, connections.released)
+	}
+	if _, exists := manager.Get("connection-metadata"); exists {
+		t.Fatal("connection was not removed from manager")
+	}
+}
+
+func TestServeClientSessionDowngradesWhenMetadataHelloIsMissing(t *testing.T) {
+	instances := &fakeClientInstanceRepo{nextID: "client-instance-legacy"}
+	connections := &fakeClientConnectionRepo{}
+	manager := NewClientSessionManager()
+	leases := NewClientConnectionLeaseController(connections, manager, "server-1", 90*time.Second)
+	observabilityService := NewClientObservabilityService(instances, leases, manager, "server-1", 5*time.Minute)
+	transport := newChannelClientTransport()
+	opener := &recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)}
+	authorizer := streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil })
+	service := NewClientStreamService(authorizer, opener, ClientStreamServiceConfig{
+		MaxConcurrentOpens: 1, MaxPendingOpens: 1, OpenTimeout: time.Second,
+		Observability: observabilityService,
+	}, nil)
+	defer service.Close()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-metadata-legacy", StrictOpen: true, MetadataEnabled: true,
+		Identity: auth.TokenIdentity{TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveClientSessionWithService(context.Background(), principal, transport, authorizer, opener, maxClientOpenAttempts, nil, service)
+	}()
+
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.receive <- protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 19, Payload: payload,
+	}
+	select {
+	case request := <-opener.opened:
+		if request.StreamID != 19 {
+			t.Fatalf("legacy request stream ID=%d, want 19", request.StreamID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first OPEN was discarded after missing metadata hello")
 	}
 	close(transport.receive)
 	if err := <-done; err != nil {
@@ -714,6 +825,29 @@ func TestServeClientSessionRejectsZeroStreamIDAsConnectionProtocolError(t *testi
 	err := ServeClientSession(context.Background(), ClientSessionPrincipal{ConnectionID: "connection-zero", Identity: auth.TokenIdentity{TokenID: "token", Type: storage.TokenTypeClient}}, transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), &recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)})
 	if !errors.Is(err, protocol.ErrInvalidFrame) {
 		t.Fatalf("ServeClientSession() error = %v, want ErrInvalidFrame", err)
+	}
+}
+
+func TestServeClientSessionWithoutObservabilityAcceptsAuthenticatedClient(t *testing.T) {
+	transport := newScriptedClientTransport(protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("ping"),
+	})
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-without-observability",
+		Identity: auth.TokenIdentity{
+			TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient,
+		},
+	}
+	err := ServeClientSession(
+		context.Background(), principal, transport,
+		streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }),
+		&recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)},
+	)
+	if err != nil {
+		t.Fatalf("ServeClientSession() error = %v", err)
+	}
+	if len(transport.sent) != 1 || transport.sent[0].Type != protocol.FramePong {
+		t.Fatalf("responses = %#v, want one PONG", transport.sent)
 	}
 }
 

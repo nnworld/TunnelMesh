@@ -26,6 +26,31 @@ func TestServerRootExposesConfigurationCommands(t *testing.T) {
 	}
 }
 
+func TestRootsExposeBuildVersion(t *testing.T) {
+	roots := map[string]func() *cobra.Command{
+		"tunnelmesh-server": cli.NewServerRoot,
+		"tunnelmesh-agent":  cli.NewAgentRoot,
+		"tunnelmesh-client": cli.NewClientRoot,
+	}
+	for name, factory := range roots {
+		t.Run(name, func(t *testing.T) {
+			root := factory()
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			root.SetArgs([]string{"--version"})
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for _, expected := range []string{name, "commit=", "built="} {
+				if !strings.Contains(output.String(), expected) {
+					t.Fatalf("--version output %q does not contain %q", output.String(), expected)
+				}
+			}
+		})
+	}
+}
+
 func TestServerAdminExposesCredentialRegeneration(t *testing.T) {
 	root := cli.NewServerRoot()
 	admin := findCommand(root, "admin")

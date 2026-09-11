@@ -157,6 +157,7 @@ type GRPCNodeTransport struct {
 type RelayServer interface {
 	OpenStream(RelayOpenStreamServer) error
 	CloseAgentConnection(context.Context, CloseAgentConnectionRequest) error
+	CloseClientConnection(context.Context, CloseClientConnectionRequest) error
 }
 
 type RelayOpenResultHandler func(context.Context, RelayOpenMetadata) (io.ReadWriteCloser, RelayOpenResult, error)
@@ -166,9 +167,10 @@ type RelayOpenStreamServer interface {
 	grpc.ServerStream
 }
 type relayServer struct {
-	handler           func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
-	openResultHandler RelayOpenResultHandler
-	closeHandler      CloseAgentConnectionFunc
+	handler            func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+	openResultHandler  RelayOpenResultHandler
+	closeHandler       CloseAgentConnectionFunc
+	clientCloseHandler CloseClientConnectionFunc
 }
 
 func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)) RelayServer {
@@ -186,12 +188,34 @@ func NewRelayServerWithOpenResult(handler RelayOpenResultHandler) RelayServer {
 func NewRelayServerWithOpenResultAndClose(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeHandler CloseAgentConnectionFunc) RelayServer {
 	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeHandler}
 }
+func NewRelayServerWithControls(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeAgentHandler CloseAgentConnectionFunc, closeClientHandler CloseClientConnectionFunc) RelayServer {
+	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeAgentHandler, clientCloseHandler: closeClientHandler}
+}
 func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
 	s.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "tunnelmesh.relay.v1.Relay", HandlerType: (*RelayServer)(nil),
-		Methods: []grpc.MethodDesc{{MethodName: "CloseAgentConnection", Handler: relayCloseAgentConnectionHandler}},
+		Methods: []grpc.MethodDesc{
+			{MethodName: "CloseAgentConnection", Handler: relayCloseAgentConnectionHandler},
+			{MethodName: "CloseClientConnection", Handler: relayCloseClientConnectionHandler},
+		},
 		Streams: []grpc.StreamDesc{{StreamName: "OpenStream", Handler: relayOpenStreamHandler, ServerStreams: true, ClientStreams: true}},
 	}, srv)
+}
+
+func relayCloseClientConnectionHandler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(structpb.Struct)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	req := closeClientConnectionRequestFromMetadata(in.GetFields())
+	if interceptor == nil {
+		return nil, srv.(RelayServer).CloseClientConnection(ctx, req)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tunnelmesh.relay.v1.Relay/CloseClientConnection"}
+	handler := func(ctx context.Context, request interface{}) (interface{}, error) {
+		return nil, srv.(RelayServer).CloseClientConnection(ctx, request.(CloseClientConnectionRequest))
+	}
+	return interceptor(ctx, req, info, handler)
 }
 func relayOpenStreamHandler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(RelayServer).OpenStream(&relayOpenStreamServer{ServerStream: stream})
@@ -391,6 +415,18 @@ func (r *relayServer) CloseAgentConnection(ctx context.Context, req CloseAgentCo
 	return r.closeHandler(closeCtx, req)
 }
 
+func (r *relayServer) CloseClientConnection(ctx context.Context, req CloseClientConnectionRequest) error {
+	if r.clientCloseHandler == nil {
+		return status.Error(codes.Unimplemented, "relay client close control is not configured")
+	}
+	if req.ConnectionID == "" || req.ConnectionEpoch <= 0 || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay client close request is invalid")
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return r.clientCloseHandler(closeCtx, req)
+}
+
 var relayStreamDesc = &grpc.StreamDesc{StreamName: "OpenStream", ServerStreams: true, ClientStreams: true}
 
 func DialGRPCNode(ctx context.Context, endpoint string, cfg *tls.Config) (*GRPCNodeTransport, error) {
@@ -516,6 +552,20 @@ func (n *GRPCNodeTransport) CloseAgentConnection(ctx context.Context, req CloseA
 	return n.conn.Invoke(ctx, "/tunnelmesh.relay.v1.Relay/CloseAgentConnection", msg, &emptypb.Empty{})
 }
 
+func (n *GRPCNodeTransport) CloseClientConnection(ctx context.Context, req CloseClientConnectionRequest) error {
+	if n == nil || n.conn == nil {
+		return ErrNodeDisconnected
+	}
+	if req.ConnectionID == "" || req.ConnectionEpoch <= 0 || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay client close request is invalid")
+	}
+	msg, err := structpb.NewStruct(closeClientConnectionMetadata(req))
+	if err != nil {
+		return err
+	}
+	return n.conn.Invoke(ctx, "/tunnelmesh.relay.v1.Relay/CloseClientConnection", msg, &emptypb.Empty{})
+}
+
 func relayStreamMetadata(req StreamRequest) map[string]any {
 	return map[string]any{
 		"node_id": req.NodeID, "agent_id": req.AgentID,
@@ -562,6 +612,22 @@ func closeAgentConnectionMetadata(req CloseAgentConnectionRequest) map[string]an
 func closeAgentConnectionRequestFromMetadata(fields map[string]*structpb.Value) CloseAgentConnectionRequest {
 	return CloseAgentConnectionRequest{
 		AgentID:           fields["agent_id"].GetStringValue(),
+		ConnectionID:      fields["connection_id"].GetStringValue(),
+		ConnectionEpoch:   int64(fields["connection_epoch"].GetNumberValue()),
+		RequestedByNodeID: fields["requested_by_node_id"].GetStringValue(),
+	}
+}
+
+func closeClientConnectionMetadata(req CloseClientConnectionRequest) map[string]any {
+	return map[string]any{
+		"connection_id":        req.ConnectionID,
+		"connection_epoch":     req.ConnectionEpoch,
+		"requested_by_node_id": req.RequestedByNodeID,
+	}
+}
+
+func closeClientConnectionRequestFromMetadata(fields map[string]*structpb.Value) CloseClientConnectionRequest {
+	return CloseClientConnectionRequest{
 		ConnectionID:      fields["connection_id"].GetStringValue(),
 		ConnectionEpoch:   int64(fields["connection_epoch"].GetNumberValue()),
 		RequestedByNodeID: fields["requested_by_node_id"].GetStringValue(),

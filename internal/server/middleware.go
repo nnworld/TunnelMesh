@@ -85,7 +85,10 @@ func clientWebSocketHandshake(security config.SecurityConfig, authenticate func(
 		} else {
 			wsConfig.Protocol = []string{selected}
 		}
-		principal.StrictOpen = selected == protocol.SubprotocolOpenResult || selected == protocol.SubprotocolFlowControl
+		principal.StrictOpen = selected == protocol.SubprotocolOpenResult ||
+			selected == protocol.SubprotocolFlowControl ||
+			selected == protocol.SubprotocolClientMetadata
+		principal.MetadataEnabled = selected == protocol.SubprotocolClientMetadata
 		*r = *r.WithContext(context.WithValue(r.Context(), clientPrincipalContextKey{}, principal))
 		return nil
 	}

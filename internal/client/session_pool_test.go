@@ -1,15 +1,91 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/net/websocket"
+
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
+
+func TestSessionPoolPassesSlotSpecificMetadataToDefaultRunner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slots := make(chan int, 2)
+	server := httptest.NewServer(websocket.Server{
+		Handshake: func(config *websocket.Config, request *http.Request) error {
+			selected, ok := protocol.SelectSubprotocol(request.Header.Values("Sec-WebSocket-Protocol"))
+			if !ok || selected != protocol.SubprotocolClientMetadata {
+				return errors.New("metadata subprotocol was not selected")
+			}
+			config.Protocol = []string{selected}
+			return nil
+		},
+		Handler: func(conn *websocket.Conn) {
+			defer conn.Close()
+			var raw []byte
+			if err := websocket.Message.Receive(conn, &raw); err != nil {
+				return
+			}
+			frame, err := protocol.NewDecoder(bytes.NewReader(raw)).ReadFrame()
+			if err != nil || frame.Type != protocol.FrameClientHello {
+				return
+			}
+			payload, err := protocol.DecodeClientMetadataPayload(frame.Payload)
+			if err != nil || payload.InstanceID != "client-0123456789abcdef0123456789abcdef" {
+				return
+			}
+			slots <- payload.ConnectionSlot
+		},
+	})
+	defer server.Close()
+
+	manager := NewSessionPoolManager(SessionPoolManagerOptions{
+		ServerURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/client",
+		Token:     "client-secret",
+		Config:    SessionPoolConfig{Min: 2, Max: 2},
+		Metadata: ClientMetadataOptions{
+			InstanceID: "client-0123456789abcdef0123456789abcdef",
+		},
+	})
+	_ = manager.Opener("agent-a")
+	errCh := make(chan error, 1)
+	go func() { errCh <- manager.Run(ctx) }()
+
+	got := make([]int, 0, 2)
+	deadline := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case slot := <-slots:
+			got = append(got, slot)
+		case <-deadline:
+			t.Fatalf("received connection slots=%v, want two metadata hellos", got)
+		}
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error=%v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop")
+	}
+	sort.Ints(got)
+	if got[0] != 1 || got[1] != 2 {
+		t.Fatalf("connection slots=%v, want [1 2]", got)
+	}
+}
 
 func TestSessionPoolCreatesOneConnectionPerAgent(t *testing.T) {
 	calls := make(chan *poolTestTransport, 4)
@@ -103,13 +179,13 @@ func TestSessionPoolSelectsLeastActiveSession(t *testing.T) {
 	gates := make([]chan struct{}, 2)
 	gates[0] = make(chan struct{})
 	gates[1] = make(chan struct{})
-	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error) error {
+	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error, options WebSocketRunOptions) error {
 		mu.Lock()
 		index := callCount
 		callCount++
 		mu.Unlock()
 		<-gates[index]
-		return newPoolTestRunner(calls)(ctx, "", "", onReady)
+		return newPoolTestRunner(calls)(ctx, "", "", onReady, options)
 	}
 	manager := NewSessionPoolManager(SessionPoolManagerOptions{
 		ServerURL: "ws://server.example/ws/client",
@@ -290,7 +366,7 @@ func TestSessionPoolScalesUpAndDown(t *testing.T) {
 
 func TestSessionPoolReconnectsWithoutReplacingOpener(t *testing.T) {
 	ready := make(chan *poolTestTransport, 2)
-	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error) error {
+	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error, _ WebSocketRunOptions) error {
 		first := newPoolTestTransport()
 		firstSession := NewSession(first)
 		firstSession.Start()
@@ -363,7 +439,7 @@ func TestSessionPoolRunnerErrorFailsRun(t *testing.T) {
 		ServerURL: "ws://server.example/ws/client",
 		Token:     "client-secret",
 		Config:    SessionPoolConfig{Min: 1, Max: 1},
-		Runner: func(context.Context, string, string, func(*Session) error) error {
+		Runner: func(context.Context, string, string, func(*Session) error, WebSocketRunOptions) error {
 			return errors.New("runner failed")
 		},
 	})
@@ -386,7 +462,7 @@ func TestSessionPoolRequiresAtLeastOneAgent(t *testing.T) {
 }
 
 func newPoolTestRunner(calls chan *poolTestTransport) SessionPoolRunner {
-	return func(ctx context.Context, _, _ string, onReady func(*Session) error) error {
+	return func(ctx context.Context, _, _ string, onReady func(*Session) error, _ WebSocketRunOptions) error {
 		transport := newPoolTestTransport()
 		session := NewSession(transport)
 		session.Start()

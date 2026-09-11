@@ -56,31 +56,37 @@ type RuntimeConfig struct {
 	RemoteRelay        *relay.RelayService
 	Stream             config.ServerStreamConfig
 	AuthorizationCache config.AuthorizationCacheConfig
+	Downloads          config.DownloadsConfig
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
 // and authenticated Agent WebSocket handlers. The caller owns DB lifecycle.
 type ServerRuntime struct {
-	DB                        *storage.DB
-	AgentSessions             *AgentSessionManager
-	AgentConnectionLeases     *AgentConnectionLeaseController
-	ClientSessions            *ClientSessionManager
-	API                       *API
-	Auth                      *auth.AuthService
-	Credentials               *auth.CredentialService
-	ClientAuthorizer          StreamAuthorizer
-	ClientTransport           relay.NodeTransport
-	ClientStreamService       *ClientStreamService
-	LocalAgentRelay           *AgentRelayTransport
-	managedRoutes             *ManagedRouteHandler
-	serverNodeLifecycle       *ServerNodeLifecycle
-	relayServer               *grpc.Server
-	relayListener             net.Listener
-	config                    RuntimeConfig
-	metricsRegistry           *prometheus.Registry
-	metrics                   *observability.Metrics
-	authorizationCacheCleanup func() error
-	closed                    atomic.Bool
+	DB                          *storage.DB
+	AgentSessions               *AgentSessionManager
+	AgentConnectionLeases       *AgentConnectionLeaseController
+	ClientSessions              *ClientSessionManager
+	ClientConnectionLeases      *ClientConnectionLeaseController
+	ClientObservability         *ClientObservabilityService
+	API                         *API
+	Auth                        *auth.AuthService
+	Credentials                 *auth.CredentialService
+	ClientAuthorizer            StreamAuthorizer
+	ClientTransport             relay.NodeTransport
+	ClientStreamService         *ClientStreamService
+	LocalAgentRelay             *AgentRelayTransport
+	managedRoutes               *ManagedRouteHandler
+	serverNodeLifecycle         *ServerNodeLifecycle
+	relayServer                 *grpc.Server
+	relayListener               net.Listener
+	clientMetadataSweeper       *ClientMetadataSweeper
+	clientMetadataSweeperCancel context.CancelFunc
+	clientMetadataSweeperDone   chan error
+	config                      RuntimeConfig
+	metricsRegistry             *prometheus.Registry
+	metrics                     *observability.Metrics
+	authorizationCacheCleanup   func() error
+	closed                      atomic.Bool
 }
 
 // NewServerRuntime creates the server runtime with durable Agent metadata
@@ -115,14 +121,18 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	agentConnectionLeases := NewAgentConnectionLeaseController(connectionRegistry, agentSessions, localAgentRelay, serverNodeID, runtimeConfig.Relay.Endpoint, defaultAgentConnectionLeaseTTL)
 	agentSessions.SetHeartbeatCallback(agentConnectionLeases.HeartbeatForSession)
+	clientSessions := NewClientSessionManager()
+	clientConnectionLeases := NewClientConnectionLeaseController(db.ClientConnections(), clientSessions, serverNodeID, DefaultClientConnectionLeaseTTL)
+	clientObservability := NewClientObservabilityService(db.ClientInstances(), clientConnectionLeases, clientSessions, serverNodeID, DefaultClientMetadataTTL)
 	clientTransport := relay.NodeTransport(localAgentRelay)
 	if _, ok := connectionSelector.(*AgentConnectionSelector); !ok || runtimeConfig.RemoteRelay != nil {
 		clientTransport = relay.NewSelectedTransport(connectionSelector, localAgentRelay, runtimeConfig.RemoteRelay)
 	}
 	routeTable := NewManagedRouteTable(db, runtimeConfig.DynamicSuffix, managedRouteCacheTTL)
 	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
-	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
+	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: clientSessions, ClientConnectionLeases: clientConnectionLeases, ClientObservability: clientObservability, API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	runtime.API.SetDownloads(runtimeConfig.Downloads)
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error
 	closeStartup := func() {
@@ -151,6 +161,11 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	connectionCloser := NewClusterAgentConnectionCloseService(connectionRegistry, agentConnectionLeases, serverNodeID, dialRelayNode)
 	runtime.API.SetClusterAgentConnections(connectionRegistry, connectionCloser, serverNodeID)
+	clientDialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (ClientConnectionRelayClient, error) {
+		return runtime.DialRelayNode(ctx, endpoint, epoch)
+	}
+	clientConnectionCloser := NewClusterClientConnectionCloseService(db.ClientConnections(), db.Nodes(), clientConnectionLeases, serverNodeID, clientDialRelayNode)
+	runtime.API.SetClusterClientConnections(clientConnectionCloser)
 	registry := runtimeConfig.MetricsRegistry
 	if registry == nil {
 		registry = prometheus.NewRegistry()
@@ -186,6 +201,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		MaxConcurrentOpens: runtimeConfig.Stream.MaxConcurrentOpens,
 		MaxPendingOpens:    runtimeConfig.Stream.MaxPendingOpens,
 		OpenTimeout:        clientOpenTimeoutFromConfig(runtimeConfig.Stream),
+		Observability:      clientObservability,
 	}, runtime.metrics)
 	if runtimeConfig.Relay.Enabled {
 		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
@@ -211,15 +227,23 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 			serverOptions = append(serverOptions, grpc.Creds(credentials.NewTLS(tlsConfig)))
 		}
 		runtime.relayServer = grpc.NewServer(serverOptions...)
-		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithOpenResultAndClose(
+		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithControls(
 			func(ctx context.Context, metadata relay.RelayOpenMetadata) (io.ReadWriteCloser, relay.RelayOpenResult, error) {
 				return localAgentRelay.OpenStreamResult(ctx, metadata.Request)
 			},
 			localAgentRelay.OpenStream,
 			runtime.closeAgentConnection,
+			runtime.closeClientConnection,
 		))
 	}
 	runtime.Credentials = credentialService
+	runtime.clientMetadataSweeper = NewClientMetadataSweeper(db.ClientInstances(), DefaultClientMetadataSweepInterval)
+	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
+	runtime.clientMetadataSweeperCancel = stopSweeper
+	runtime.clientMetadataSweeperDone = make(chan error, 1)
+	go func() {
+		runtime.clientMetadataSweeperDone <- runtime.clientMetadataSweeper.Run(sweeperCtx)
+	}()
 	return runtime, nil
 }
 
@@ -230,7 +254,14 @@ func (r *ServerRuntime) Close() error {
 		return nil
 	}
 	r.closed.Store(true)
-	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr error
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr error
+	if r.clientMetadataSweeperCancel != nil {
+		r.clientMetadataSweeperCancel()
+		if err := <-r.clientMetadataSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
+			clientMetadataSweeperErr = err
+		}
+		r.clientMetadataSweeperCancel = nil
+	}
 	if r.authorizationCacheCleanup != nil {
 		authorizationCacheErr = r.authorizationCacheCleanup()
 	}
@@ -252,7 +283,7 @@ func (r *ServerRuntime) Close() error {
 	if r.ClientStreamService != nil {
 		_ = r.ClientStreamService.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr)
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The
@@ -280,6 +311,27 @@ func (r *ServerRuntime) closeAgentConnection(ctx context.Context, req relay.Clos
 	default:
 		return status.Error(codes.Internal, "agent connection close failed")
 	}
+}
+
+func (r *ServerRuntime) closeClientConnection(ctx context.Context, req relay.CloseClientConnectionRequest) error {
+	if r == nil || r.ClientConnectionLeases == nil {
+		return status.Error(codes.Unimplemented, "client connection close control is not configured")
+	}
+	principal, ok := relay.ServerNodePrincipalFromContext(ctx)
+	if !ok || principal.NodeID != req.RequestedByNodeID {
+		return status.Error(codes.PermissionDenied, "relay close caller identity is denied")
+	}
+	if err := r.ClientConnectionLeases.CloseConnection(req.ConnectionID, req.ConnectionEpoch); err != nil {
+		switch {
+		case errors.Is(err, ErrEpoch):
+			return status.Error(codes.FailedPrecondition, "client connection epoch is stale")
+		case errors.Is(err, ErrSessionClosed):
+			return status.Error(codes.NotFound, "client connection is not found")
+		default:
+			return status.Error(codes.Internal, "client connection close failed")
+		}
+	}
+	return nil
 }
 
 // DialRelayNode is the authenticated production client path for a cluster
@@ -424,8 +476,6 @@ func (r *ServerRuntime) serveClientWS(conn *websocket.Conn) {
 		r.metrics.ObserveConnection("server", "client", "started", "")
 	}
 	transport := NewWSFrameTransport(&xNetWSFrameConn{conn: conn})
-	r.ClientSessions.Register(principal.ConnectionID, transport)
-	defer r.ClientSessions.Remove(principal.ConnectionID)
 	defer func() {
 		if r.metrics != nil {
 			r.metrics.ObserveConnection("server", "client", "closed", "")

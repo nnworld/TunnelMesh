@@ -203,6 +203,50 @@ type AgentLease struct {
 // Lease is a compatibility alias used by registry adapters.
 type Lease = AgentLease
 
+type ClientInstanceFilter struct {
+	OwnerUserID  string
+	TokenID      string
+	ServerNodeID string
+	Status       string
+	AgentID      string
+	Keyword      string
+}
+
+type ClientConnectionFilter struct {
+	ClientInstanceID string
+	OwnerUserID      string
+	TokenID          string
+	ServerNodeID     string
+	IncludeExpired   bool
+}
+
+type ClientInstance struct {
+	ID           string
+	OwnerUserID  string
+	InstanceID   string
+	Metadata     string
+	Capabilities string
+	ReportedAt   time.Time
+	LastSeenAt   time.Time
+	ExpiresAt    *time.Time
+	Stale        bool
+	UpdatedAt    time.Time
+}
+
+type ClientConnectionLease struct {
+	ConnectionID     string
+	ClientInstanceID string
+	TokenID          string
+	OwnerUserID      string
+	ServerNodeID     string
+	ConnectionEpoch  int64
+	ActiveStreams    int64
+	HealthScore      int64
+	AcquiredAt       time.Time
+	ExpiresAt        time.Time
+	UpdatedAt        time.Time
+}
+
 type AuditLog struct {
 	ID           string
 	ActorUserID  string

@@ -140,6 +140,64 @@ paths:
         '409': {description: Connection epoch is stale; a replacement connection was not closed}
         '500': {description: Connection close failed}
         '503': {description: Owning Server node or cluster registry is unavailable; the lease is preserved}
+  /api/v1/clients:
+    get:
+      summary: List Client instances within the caller's ownership scope
+      description: Administrators may filter across owners. Ordinary users are always restricted to their own Clients in the repository query, before cursor pagination.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: ownerUserId, in: query, schema: {type: string}, description: Administrator-only owner filter}
+        - {name: tokenId, in: query, schema: {type: string}}
+        - {name: serverNodeId, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [online, offline, stale, metadata_unavailable]}}
+        - {name: agentId, in: query, schema: {type: string}}
+        - {name: keyword, in: query, schema: {type: string, maxLength: 255}}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/ClientPageEnvelope'}}}}
+        '400': {description: Invalid status filter}
+        '401': {description: Unauthenticated}
+        '403': {description: Non-administrator requested another owner}
+  /api/v1/clients/{clientInstanceId}:
+    parameters: [{name: clientInstanceId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: Read one Client instance and its observability metadata
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Client, content: {application/json: {schema: {$ref: '#/components/schemas/ClientEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Client is not owned by the caller}
+        '404': {description: Client not found}
+  /api/v1/clients/{clientInstanceId}/connections:
+    parameters: [{name: clientInstanceId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: List physical Client WebSocket leases
+      description: Returns durable leases across Server nodes. The list does not expose credentials or client metadata values.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Connection leases, content: {application/json: {schema: {$ref: '#/components/schemas/ClientConnectionClusterEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Client is not owned by the caller}
+        '404': {description: Client not found}
+  /api/v1/clients/{clientInstanceId}/connections/{connectionId}:
+    parameters:
+      - {name: clientInstanceId, in: path, required: true, schema: {type: string}}
+      - {name: connectionId, in: path, required: true, schema: {type: string}}
+      - {name: connectionEpoch, in: query, required: true, schema: {type: integer, format: int64, minimum: 1}, description: Durable lease epoch used for cross-node close fencing}
+    delete:
+      summary: Close one exact physical Client WebSocket
+      description: The API verifies Client ownership, connection ownership, and epoch before delegation. Local leases are closed directly; remote leases use authenticated Server-node relay control. An absent lease is idempotent; an unreachable owner Server preserves the lease and returns 503.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Connection closed or already absent, content: {application/json: {schema: {$ref: '#/components/schemas/ClientConnectionCloseEnvelope'}}}}
+        '400': {description: connectionEpoch is missing or invalid}
+        '401': {description: Unauthenticated}
+        '403': {description: Client is not owned by the caller}
+        '404': {description: Client or connection not found}
+        '409': {description: Connection epoch is stale}
+        '500': {description: Connection close failed}
+        '503': {description: Owning Server node is unavailable; the lease is preserved}
   /api/v1/agents/{agentId}/trace:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     post:
@@ -401,6 +459,15 @@ paths:
         '200': {description: Cursor page of audit records, content: {application/json: {schema: {$ref: '#/components/schemas/AuditLogPageEnvelope'}}}}
         '400': {description: Invalid time filter}
         '403': {description: Admin permission required}
+  /api/v1/downloads:
+    get:
+      summary: Read current release download metadata
+      description: Administrator-only release information. URLs point to immutable GitHub release assets for the configured repository and never include credentials or private configuration.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Current release metadata, content: {application/json: {schema: {$ref: '#/components/schemas/DownloadInfoEnvelope'}}}}
+        '401': {description: Missing or invalid management bearer Token}
+        '403': {description: Administrator required}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
@@ -512,6 +579,99 @@ components:
       required: [agentId, connectionId, connectionEpoch, closed]
       properties:
         agentId: {type: string}
+        connectionId: {type: string}
+        connectionEpoch: {type: integer, format: int64}
+        closed: {type: boolean}
+    ClientPageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/ClientPage'}
+    ClientEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/Client'}
+    ClientPage:
+      type: object
+      required: [items, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Client'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    Client:
+      type: object
+      additionalProperties: false
+      required: [id, instanceId, ownerUserId, tokenIds, agentIds, status, activeConnections, activeStreams, serverNodeIds, lastSeenAt, metadata, capabilities, listeners]
+      properties:
+        id: {type: string, description: Server-managed Client instance resource ID}
+        instanceId: {type: string, description: Stable client-generated logical instance ID}
+        ownerUserId: {type: string}
+        tokenIds: {type: array, items: {type: string}}
+        agentIds: {type: array, items: {type: string}}
+        version: {type: string}
+        commit: {type: string}
+        platform: {type: string}
+        hostname: {type: string}
+        processStartAt: {type: string, format: date-time}
+        status: {type: string, enum: [online, offline, stale, metadata_unavailable]}
+        activeConnections: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0}
+        serverNodeIds: {type: array, items: {type: string}}
+        lastSeenAt: {type: string, format: date-time}
+        metadata: {type: object, additionalProperties: {type: string}, description: Bounded non-secret annotations reported by the Client}
+        capabilities: {type: array, items: {type: string}}
+        listeners:
+          type: array
+          items:
+            type: object
+            required: [protocol, listenAddress, agentId, enabled]
+            properties:
+              protocol: {type: string}
+              listenAddress: {type: string}
+              agentId: {type: string}
+              enabled: {type: boolean}
+    ClientConnectionClusterEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [connections]
+              properties:
+                connections: {type: array, items: {$ref: '#/components/schemas/ClientConnection'}}
+    ClientConnection:
+      type: object
+      additionalProperties: false
+      required: [connectionId, clientInstanceId, tokenId, ownerUserId, serverNodeId, connectionEpoch, activeStreams, healthScore, acquiredAt, lastHeartbeatAt, expiresAt, local]
+      properties:
+        connectionId: {type: string}
+        clientInstanceId: {type: string}
+        tokenId: {type: string}
+        ownerUserId: {type: string}
+        serverNodeId: {type: string}
+        connectionEpoch: {type: integer, format: int64}
+        activeStreams: {type: integer, minimum: 0}
+        healthScore: {type: integer, format: int64, minimum: 0}
+        acquiredAt: {type: string, format: date-time}
+        lastHeartbeatAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        local: {type: boolean}
+    ClientConnectionCloseEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/ClientConnectionCloseResult'}
+    ClientConnectionCloseResult:
+      type: object
+      additionalProperties: false
+      required: [clientInstanceId, connectionId, connectionEpoch, closed]
+      properties:
+        clientInstanceId: {type: string}
         connectionId: {type: string}
         connectionEpoch: {type: integer, format: int64}
         closed: {type: boolean}
@@ -793,3 +953,31 @@ components:
         host: {type: string, maxLength: 255}
         port: {type: integer, minimum: 1, maximum: 65535}
         timeoutMs: {type: integer, minimum: 10, maximum: 30000}
+    DownloadInfoEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/DownloadInfo'}
+    DownloadInfo:
+      type: object
+      additionalProperties: false
+      required: [version, commit, buildTime, repository, releaseUrl, checksumUrl, manifestUrl, schemaVersion, assets]
+      properties:
+        version: {type: string}
+        commit: {type: string}
+        buildTime: {type: string}
+        repository: {type: string, description: GitHub owner/name repository}
+        releaseUrl: {type: string, format: uri}
+        checksumUrl: {type: string, format: uri}
+        manifestUrl: {type: string, format: uri}
+        schemaVersion: {type: integer, minimum: 1}
+        assets: {type: array, minItems: 1, items: {$ref: '#/components/schemas/DownloadAsset'}}
+    DownloadAsset:
+      type: object
+      additionalProperties: false
+      required: [platform, archive, url]
+      properties:
+        platform: {type: string, enum: [linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64, windows-arm64]}
+        archive: {type: string}
+        url: {type: string, format: uri}

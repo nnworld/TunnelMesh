@@ -324,6 +324,35 @@ tunnelmesh-client --config /Users/me/.config/tunnelmesh/client.yaml run
 
 所有配置的入口共享同一条 Client WebSocket 会话；任一入口创建失败时，进程会关闭已启动的入口并退出，避免出现半启动状态。
 
+`run` 会为客户端生成稳定 `instance_id`，并在后续连接和 metadata 上报中复用该身份。默认状态文件为：
+
+- Linux：`/var/lib/tunnelmesh-client/client-instance-id`
+- macOS：`~/Library/Application Support/TunnelMesh/client-instance-id`
+- Windows：`%ProgramData%\TunnelMesh\client-instance-id`
+
+也可以显式配置：
+
+```yaml
+client:
+  instance_id: client-0123456789abcdef0123456789abcdef
+  instance_id_path: /var/lib/tunnelmesh-client/client-instance-id
+```
+
+如需上报非敏感自定义观测字段，必须显式配置 allowlist。文件来源使用绝对路径，环境变量来源只读取指定 key：
+
+```yaml
+client:
+  metadata:
+    - name: device_id
+      source: file
+      path: /etc/machine-id
+    - name: region
+      source: env
+      key: TUNNELMESH_CLIENT_REGION
+```
+
+最多可配置 32 项，单项 4 KiB，总 payload 32 KiB。包含 password、passphrase、token、secret、private key、api key、credential、authorization、cookie 或 DSN 语义的名称会被拒绝。metadata 只用于后台观测，不参与授权。
+
 `forward socks5` 适合临时启动单个入口：
 
 `forward socks5` 在本机启动一个 SOCKS5 CONNECT 入口，浏览器或支持 SOCKS5 的工具可以按请求动态选择 Agent 侧目标：

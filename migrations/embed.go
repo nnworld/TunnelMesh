@@ -38,3 +38,9 @@ var V9ToV10MySQL string
 
 //go:embed incremental/v0009_to_v0010/sqlite.sql
 var V9ToV10SQLite string
+
+//go:embed incremental/v0010_to_v0011/mysql.sql
+var V10ToV11MySQL string
+
+//go:embed incremental/v0010_to_v0011/sqlite.sql
+var V10ToV11SQLite string

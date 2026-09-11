@@ -42,6 +42,26 @@ func TestMySQLV6ToV7ConnectionLeaseMigrationUsesCompatibleDDL(t *testing.T) {
 	}
 }
 
+func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T) {
+	script := migrations.V10ToV11MySQL
+	upper := strings.ToUpper(script)
+	for _, forbidden := range []string{"JSON", "WITH RECURSIVE", "ON DUPLICATE KEY"} {
+		if strings.Contains(upper, forbidden) {
+			t.Fatalf("migration must not use MySQL 5.6-incompatible fragment %q: %s", forbidden, script)
+		}
+	}
+	for _, fragment := range []string{
+		"last_seen_at VARCHAR(32) NOT NULL",
+		"expires_at VARCHAR(32) NOT NULL",
+		"CREATE INDEX idx_client_instance_metadata_owner ON client_instance_metadata(owner_user_id, stale, last_seen_at)",
+		"CREATE INDEX idx_client_connection_leases_expires ON client_connection_leases(expires_at)",
+	} {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("migration missing required fragment %q: %s", fragment, script)
+		}
+	}
+}
+
 func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {

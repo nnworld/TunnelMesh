@@ -6,6 +6,7 @@
 - [Agent 使用帮助](user-guide/agent.md)
 - [Server 管理后台](user-guide/server-admin.md)
 - [Server 节点与共享令牌](user-guide/server-admin.md#server-节点)
+- [Client 运行观测与连接管理](user-guide/server-admin.md#client-运行观测与连接管理)
 - [托管 HTTP 路由](user-guide/managed-http-route.md)
 - [SSH / websocat TCP 代理](user-guide/tcp-over-websocket-ssh.md)
 - [Docker 部署](deployment/docker.md)

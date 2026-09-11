@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
@@ -74,9 +75,11 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	root := &cobra.Command{
 		Use:           use,
 		Short:         "TunnelMesh " + strings.TrimPrefix(use, "tunnelmesh-") + " command",
+		Version:       build.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 	flags := root.PersistentFlags()
 	flags.StringVar(&opts.configFile, "config", "", "path to a YAML, JSON, or TOML configuration file")
 	flags.StringVar(&opts.mode, "mode", "", "operation mode (local or cluster)")
@@ -121,7 +124,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads})
 			if err != nil {
 				return err
 			}
@@ -712,8 +715,8 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 
 var (
 	runClientWebSocket   = client.RunWebSocket
-	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error) error {
-		return client.RunWebSocketWithOptions(ctx, serverURL, token, onReady, client.WebSocketRunOptions{})
+	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error, options client.WebSocketRunOptions) error {
+		return client.RunWebSocketWithOptions(ctx, serverURL, token, onReady, options)
 	}
 	errClientProxyComplete = errors.New("client proxy complete")
 )

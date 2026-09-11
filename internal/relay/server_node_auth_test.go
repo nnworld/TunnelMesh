@@ -256,6 +256,104 @@ func TestRelayCloseAgentConnectionRequiresServerNodeAuth(t *testing.T) {
 	}
 }
 
+func TestRelayCloseClientConnectionAuthenticatesAndFencesEpoch(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:relay-close-client-auth?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "relay-close-client-owner", "relay-password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Nodes().Create(ctx, storage.ServerNode{ID: "node-a", Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	credentialsService := auth.NewCredentialService(db)
+	defer credentialsService.Close()
+	created, err := credentialsService.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, serverTLS, clientTLS := testRelayCertificates(t, "node-a")
+	var requests []CloseClientConnectionRequest
+	var requestMu sync.Mutex
+	server := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainUnaryInterceptor(NewServerNodeUnaryInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(server, NewRelayServerWithControls(nil, func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return nil, ErrNodeDisconnected
+	}, nil, func(_ context.Context, request CloseClientConnectionRequest) error {
+		requestMu.Lock()
+		requests = append(requests, request)
+		requestMu.Unlock()
+		if request.ConnectionEpoch != 9 {
+			return status.Error(codes.FailedPrecondition, "relay client connection epoch is stale")
+		}
+		return nil
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go server.Serve(ln)
+	defer server.Stop()
+
+	unauthenticated, err := DialGRPCNode(ctx, ln.Addr().String(), clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unauthenticated.Close()
+	valid := CloseClientConnectionRequest{ConnectionID: "client_connection_1", ConnectionEpoch: 9, RequestedByNodeID: "node-b"}
+	if err := unauthenticated.CloseClientConnection(ctx, valid); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("unauthenticated CloseClientConnection() error = %v, code = %v", err, status.Code(err))
+	}
+
+	client, err := DialAuthenticatedGRPCNode(ctx, ln.Addr().String(), "node-a", 7, created.Secret, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.CloseClientConnection(ctx, valid); err != nil {
+		t.Fatalf("CloseClientConnection(valid) error = %v", err)
+	}
+	stale := valid
+	stale.ConnectionEpoch = 8
+	if err := client.CloseClientConnection(ctx, stale); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("CloseClientConnection(stale) error = %v, code = %v, want FailedPrecondition", err, status.Code(err))
+	}
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	if len(requests) != 2 || requests[0] != valid || requests[1] != stale {
+		t.Fatalf("requests = %#v", requests)
+	}
+
+	legacyServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(serverTLS)),
+		grpc.ChainUnaryInterceptor(NewServerNodeUnaryInterceptor(credentialsService, db.Nodes())),
+	)
+	RegisterRelayServer(legacyServer, NewRelayServerWithOpenResultAndClose(nil, nil, nil))
+	legacyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyLn.Close()
+	go legacyServer.Serve(legacyLn)
+	defer legacyServer.Stop()
+	legacyClient, err := DialAuthenticatedGRPCNode(ctx, legacyLn.Addr().String(), "node-a", 7, created.Secret, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyClient.Close()
+	if err := legacyClient.CloseClientConnection(ctx, valid); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("legacy CloseClientConnection() error = %v, code = %v, want Unimplemented", err, status.Code(err))
+	}
+}
+
 func TestRelayCloseAgentConnectionUsesExactEpoch(t *testing.T) {
 	ctx := context.Background()
 	db, err := storage.OpenSQLite(ctx, "file:relay-close-epoch?mode=memory&cache=shared")

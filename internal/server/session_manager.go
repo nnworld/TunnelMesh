@@ -869,40 +869,80 @@ type StreamOpenRequest struct {
 	Metadata             []byte
 }
 type StreamOpenPayload = protocol.StreamOpenPayload
+
+type ClientSessionRecord struct {
+	ConnectionID     string
+	ClientInstanceID string
+	TokenID          string
+	OwnerUserID      string
+	ServerNodeID     string
+	ConnectionEpoch  int64
+	StartedAt        time.Time
+	LastHeartbeatAt  time.Time
+	ActiveStreams    int64
+	MetadataEnabled  bool
+}
+
 type ClientSessionManager struct {
 	mu       sync.RWMutex
-	sessions map[string]FrameTransport
+	sessions map[string]clientSessionEntry
+}
+
+type clientSessionEntry struct {
+	record    ClientSessionRecord
+	transport FrameTransport
 }
 
 func NewClientSessionManager() *ClientSessionManager {
-	return &ClientSessionManager{sessions: make(map[string]FrameTransport)}
+	return &ClientSessionManager{sessions: make(map[string]clientSessionEntry)}
 }
-func (m *ClientSessionManager) Register(id string, tr FrameTransport) {
-	if tr == nil {
+
+func (m *ClientSessionManager) Register(record ClientSessionRecord, tr FrameTransport) {
+	if tr == nil || record.ConnectionID == "" || record.ConnectionEpoch <= 0 {
 		return
 	}
+	if record.StartedAt.IsZero() {
+		record.StartedAt = time.Now().UTC()
+	}
 	m.mu.Lock()
-	old := m.sessions[id]
-	m.sessions[id] = tr
+	old := m.sessions[record.ConnectionID]
+	m.sessions[record.ConnectionID] = clientSessionEntry{record: record, transport: tr}
 	m.mu.Unlock()
-	if old != nil {
-		_ = old.Close()
+	if old.transport != nil {
+		_ = old.transport.Close()
 	}
 }
 func (m *ClientSessionManager) Remove(id string) {
 	m.mu.Lock()
-	tr := m.sessions[id]
+	entry := m.sessions[id]
 	delete(m.sessions, id)
 	m.mu.Unlock()
-	if tr != nil {
-		_ = tr.Close()
+	if entry.transport != nil {
+		_ = entry.transport.Close()
 	}
 }
+
+func (m *ClientSessionManager) Get(id string) (ClientSessionRecord, bool) {
+	m.mu.RLock()
+	entry, ok := m.sessions[id]
+	m.mu.RUnlock()
+	return entry.record, ok
+}
+
+func (m *ClientSessionManager) SetClientInstanceID(id, clientInstanceID string) {
+	m.mu.Lock()
+	if entry, ok := m.sessions[id]; ok {
+		entry.record.ClientInstanceID = clientInstanceID
+		m.sessions[id] = entry
+	}
+	m.mu.Unlock()
+}
+
 func (m *ClientSessionManager) OpenStream(ctx context.Context, id string, req StreamOpenRequest) error {
 	m.mu.RLock()
-	tr := m.sessions[id]
+	entry := m.sessions[id]
 	m.mu.RUnlock()
-	if tr == nil {
+	if entry.transport == nil {
 		return ErrSessionClosed
 	}
 	if req.StreamID == 0 || req.TargetPort < 1 || req.TargetPort > 65535 {
@@ -917,5 +957,58 @@ func (m *ClientSessionManager) OpenStream(ctx context.Context, id string, req St
 	if err != nil {
 		return err
 	}
-	return tr.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
+	return entry.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: req.StreamID, Payload: payload})
+}
+
+func (m *ClientSessionManager) ObserveHeartbeat(id string) {
+	m.mu.Lock()
+	if entry, ok := m.sessions[id]; ok {
+		entry.record.LastHeartbeatAt = time.Now().UTC()
+		m.sessions[id] = entry
+	}
+	m.mu.Unlock()
+}
+
+func (m *ClientSessionManager) ObserveStreamOpened(id string) {
+	m.mu.Lock()
+	if entry, ok := m.sessions[id]; ok && entry.record.ActiveStreams >= 0 {
+		entry.record.ActiveStreams++
+		m.sessions[id] = entry
+	}
+	m.mu.Unlock()
+}
+
+func (m *ClientSessionManager) ObserveStreamClosed(id string) {
+	m.mu.Lock()
+	if entry, ok := m.sessions[id]; ok && entry.record.ActiveStreams > 0 {
+		entry.record.ActiveStreams--
+		m.sessions[id] = entry
+	}
+	m.mu.Unlock()
+}
+
+func (m *ClientSessionManager) ActiveStreams(id string) int {
+	m.mu.RLock()
+	entry, ok := m.sessions[id]
+	m.mu.RUnlock()
+	if !ok || entry.record.ActiveStreams < 0 {
+		return 0
+	}
+	return int(entry.record.ActiveStreams)
+}
+
+func (m *ClientSessionManager) CloseConnection(id string, epoch int64) error {
+	if m == nil || id == "" {
+		return ErrSessionClosed
+	}
+	m.mu.RLock()
+	entry, ok := m.sessions[id]
+	m.mu.RUnlock()
+	if !ok || entry.transport == nil {
+		return ErrSessionClosed
+	}
+	if entry.record.ConnectionEpoch != epoch {
+		return ErrEpoch
+	}
+	return entry.transport.Close()
 }

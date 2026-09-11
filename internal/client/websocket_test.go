@@ -96,11 +96,20 @@ func TestClientWebSocketNegotiatesStrictOpenSubprotocol(t *testing.T) {
 	defer cancel()
 	server := httptest.NewServer(websocket.Server{
 		Handshake: func(config *websocket.Config, request *http.Request) error {
-			selected, ok := protocol.SelectSubprotocol(request.Header.Values("Sec-WebSocket-Protocol"))
-			if !ok || selected != protocol.SubprotocolFlowControl {
-				return errors.New("flow-control subprotocol was not selected")
+			offered := false
+			for _, header := range request.Header.Values("Sec-WebSocket-Protocol") {
+				for _, value := range strings.Split(header, ",") {
+					if strings.TrimSpace(value) == protocol.SubprotocolFlowControl {
+						offered = true
+					}
+				}
 			}
-			config.Protocol = []string{selected}
+			if !offered {
+				return errors.New("flow-control subprotocol was not offered")
+			}
+			// The client prefers metadata, so this fixture must force the
+			// lower capability to keep testing flow-control negotiation.
+			config.Protocol = []string{protocol.SubprotocolFlowControl}
 			return nil
 		},
 		Handler: func(conn *websocket.Conn) { _ = conn.Close() },

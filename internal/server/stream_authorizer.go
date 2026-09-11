@@ -17,6 +17,9 @@ type ClientSessionPrincipal struct {
 	ConnectionID string
 	Identity     auth.TokenIdentity
 	StrictOpen   bool
+	// MetadataEnabled records the negotiated WebSocket subprotocol so legacy
+	// clients can be represented without inventing a client identity.
+	MetadataEnabled bool
 }
 
 type StreamAuthorizer interface {
