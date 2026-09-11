@@ -74,6 +74,16 @@ func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
 	if frame.Type == protocol.FrameAgentMetadataAck {
 		if ack, err := protocol.DecodeAgentMetadataAckPayload(frame.Payload); err == nil {
 			h.supported = ack.ConnectionPoolSupported
+			if h.dispatcher != nil {
+				strictOpen := false
+				for _, capability := range ack.Capabilities {
+					if capability == protocol.CapabilityStreamOpenResult {
+						strictOpen = true
+						break
+					}
+				}
+				h.dispatcher.SetOpenResultEnabled(strictOpen)
+			}
 		}
 	}
 	h.report(0)
@@ -105,9 +115,27 @@ func (h *connectionPoolHandler) report(rtt time.Duration) {
 	if rtt == 0 {
 		rtt = h.session.LastHeartbeatRTT()
 	}
-	h.controller.Report(h.connectionID, ConnectionStats{
+	stats := ConnectionStats{
 		ConnectionPoolSupported: h.supported, ActiveStreams: active, RTT: rtt,
-	})
+	}
+	if source, ok := h.inner.(interface {
+		PendingDials() int
+		OpenP95() time.Duration
+		TTFBP95() time.Duration
+	}); ok {
+		stats.PendingDials = source.PendingDials()
+		stats.OpenP95 = source.OpenP95()
+		stats.TTFBP95 = source.TTFBP95()
+	}
+	if source, ok := h.inner.(interface{ WriterQueueWaitP95() time.Duration }); ok {
+		stats.WriterQueueWait = source.WriterQueueWaitP95()
+	}
+	if h.session != nil {
+		if wait := h.session.WriterQueueWaitP95(); wait > stats.WriterQueueWait {
+			stats.WriterQueueWait = wait
+		}
+	}
+	h.controller.Report(h.connectionID, stats)
 }
 
 func max64(a, b int64) int64 {

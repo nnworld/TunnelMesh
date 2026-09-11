@@ -10,6 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 type recordingConnectionRunner struct {
@@ -125,5 +126,120 @@ func TestConnectionControllerRequiresServerAckAndRestartsFailedConnection(t *tes
 	waitActiveConnections(t, controller, 1)
 	if runner.count() < 2 {
 		t.Fatalf("connection restarts=%d, want at least 2", runner.count())
+	}
+}
+
+func TestConnectionControllerTracksLatencySignals(t *testing.T) {
+	controller := NewConnectionController(ConnectionControllerOptions{Runner: func(context.Context, string, int64) error { return nil }})
+	controller.Report("conn-1", ConnectionStats{
+		PendingDials: 2, OpenP95: 150 * time.Millisecond, TTFBP95: 220 * time.Millisecond, WriterQueueWait: 30 * time.Millisecond,
+	})
+	snapshot := controller.Snapshot()
+	if snapshot.MaxPendingDials != 2 || snapshot.MaxOpenP95 != 150*time.Millisecond ||
+		snapshot.MaxTTFBP95 != 220*time.Millisecond || snapshot.MaxWriterQueueWait != 30*time.Millisecond {
+		t.Fatalf("snapshot=%+v, want all latency signals", snapshot)
+	}
+}
+
+type latencyStatsHandler struct {
+	pendingDials    int
+	openP95         time.Duration
+	ttfbP95         time.Duration
+	writerQueueWait time.Duration
+}
+
+func (h *latencyStatsHandler) Handle(protocol.Frame) error       { return nil }
+func (h *latencyStatsHandler) Close() error                      { return nil }
+func (h *latencyStatsHandler) PendingDials() int                 { return h.pendingDials }
+func (h *latencyStatsHandler) OpenP95() time.Duration            { return h.openP95 }
+func (h *latencyStatsHandler) TTFBP95() time.Duration            { return h.ttfbP95 }
+func (h *latencyStatsHandler) WriterQueueWaitP95() time.Duration { return h.writerQueueWait }
+
+type dispatcherLatencyStatsHandler struct {
+	pendingDials int
+	openP95      time.Duration
+	ttfbP95      time.Duration
+}
+
+func (h *dispatcherLatencyStatsHandler) Handle(protocol.Frame) error { return nil }
+func (h *dispatcherLatencyStatsHandler) Close() error                { return nil }
+func (h *dispatcherLatencyStatsHandler) PendingDials() int           { return h.pendingDials }
+func (h *dispatcherLatencyStatsHandler) OpenP95() time.Duration      { return h.openP95 }
+func (h *dispatcherLatencyStatsHandler) TTFBP95() time.Duration      { return h.ttfbP95 }
+
+func TestConnectionPoolReportsLatencySignals(t *testing.T) {
+	controller := NewConnectionController(ConnectionControllerOptions{Runner: func(context.Context, string, int64) error { return nil }})
+	session := NewSession(&blockingTransport{closed: make(chan struct{})})
+	defer session.Close()
+	handler := &connectionPoolHandler{
+		controller: controller, connectionID: "conn-latency", session: session,
+		inner: &latencyStatsHandler{pendingDials: 1, openP95: 40 * time.Millisecond, ttfbP95: 60 * time.Millisecond, writerQueueWait: 7 * time.Millisecond},
+	}
+	handler.report(0)
+	snapshot := controller.Snapshot()
+	if snapshot.MaxPendingDials != 1 || snapshot.MaxOpenP95 != 40*time.Millisecond ||
+		snapshot.MaxTTFBP95 != 60*time.Millisecond || snapshot.MaxWriterQueueWait != 7*time.Millisecond {
+		t.Fatalf("snapshot=%+v, want dispatcher latency signals", snapshot)
+	}
+}
+
+func TestConnectionPoolReportsSessionWriterQueueWait(t *testing.T) {
+	controller := NewConnectionController(ConnectionControllerOptions{Runner: func(context.Context, string, int64) error { return nil }})
+	transport := newBlockingAgentFrameTransport()
+	session := NewSession(transport)
+	defer func() {
+		close(transport.release)
+		_ = session.Close()
+		controller.closeAll()
+		controller.wg.Wait()
+	}()
+	handler := &connectionPoolHandler{
+		controller: controller, connectionID: "conn-writer", session: session,
+		inner: &dispatcherLatencyStatsHandler{pendingDials: 1, openP95: 40 * time.Millisecond, ttfbP95: 60 * time.Millisecond},
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := session.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: uint32(i + 1), Payload: []byte("queued")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for session.WriterQueueWaitP95() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	handler.report(0)
+
+	snapshot := controller.Snapshot()
+	if snapshot.MaxWriterQueueWait <= 0 {
+		t.Fatalf("snapshot=%+v, want writer queue wait from Session", snapshot)
+	}
+}
+
+func TestConnectionControllerScalesOnLatencySignals(t *testing.T) {
+	controller := NewConnectionController(ConnectionControllerOptions{
+		Min: 1, Max: 2, HighWatermark: 16, LowWatermark: 2,
+		Runner: func(ctx context.Context, _ string, _ int64) error {
+			<-ctx.Done()
+			return context.Canceled
+		},
+	})
+	defer func() {
+		controller.closeAll()
+		controller.wg.Wait()
+	}()
+	controller.mu.Lock()
+	controller.startLocked(context.Background())
+	controller.mu.Unlock()
+	controller.Report("conn-1", ConnectionStats{
+		ConnectionPoolSupported: true,
+		PendingDials:            1,
+		OpenP95:                 2 * time.Second,
+		TTFBP95:                 2 * time.Second,
+		WriterQueueWait:         200 * time.Millisecond,
+	})
+	controller.evaluate(time.Time{})
+	controller.evaluate(time.Time{})
+	if active := controller.Snapshot().Active; active != 2 {
+		t.Fatalf("active connections=%d, want 2 after sustained latency load", active)
 	}
 }

@@ -240,6 +240,37 @@ func TestCredentialServiceRotateRevokeAndTouchLastUsed(t *testing.T) {
 	}
 }
 
+func TestCredentialServiceNotifiesAuthorizationCacheAfterLocalWrites(t *testing.T) {
+	repos := newCredentialRepos()
+	repos.users.items["owner"] = storage.User{ID: "owner"}
+	service := newTestCredentialService(t, repos)
+	notifications := 0
+	service.SetAuthorizationChangeNotifier(func() { notifications++ })
+
+	created, err := service.Create(context.Background(), CreateTokenInput{
+		Type: storage.TokenTypeClient, OwnerUserID: "owner", Scope: TokenScope{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 1 {
+		t.Fatalf("notifications after create=%d, want 1", notifications)
+	}
+	rotated, err := service.Rotate(context.Background(), created.TokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 2 {
+		t.Fatalf("notifications after rotate=%d, want 2", notifications)
+	}
+	if err := service.Revoke(context.Background(), rotated.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if notifications != 3 {
+		t.Fatalf("notifications after revoke=%d, want 3", notifications)
+	}
+}
+
 func TestCredentialServiceServerNodeStateFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()

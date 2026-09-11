@@ -84,6 +84,11 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 	if session == nil {
 		return nil, relay.ErrNodeDisconnected
 	}
+	if request.StrictOpen && !session.Supports(protocol.CapabilityStreamOpenResult) {
+		// Strict opens require an explicit Agent acknowledgement. Reject before
+		// sending so legacy Agents never wait for a frame they cannot emit.
+		return nil, ErrCapability
+	}
 	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{
 		AgentID: agentID, Protocol: request.Protocol, TargetHost: request.TargetHost,
 		TargetPort: request.TargetPort, TargetScheme: request.TargetScheme,
@@ -109,15 +114,73 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 		return nil, errAgentRelayWireIDsExhausted
 	}
 	allocator.next++
-	stream := &agentRelayStream{transport: t, agentID: agentID, connectionID: session.ConnectionID, connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration, wireID: uint32(allocator.next), readCh: make(chan []byte, 16), done: make(chan struct{})}
+	stream := &agentRelayStream{
+		transport: t, agentID: agentID, connectionID: session.ConnectionID,
+		connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration,
+		wireID: uint32(allocator.next), readCh: make(chan []byte, 16), controlCh: make(chan protocol.Frame, 16), done: make(chan struct{}),
+		controlSignal: make(chan struct{}, 1),
+	}
+	if request.StrictOpen {
+		stream.strictOpen = true
+		stream.openResult = make(chan protocol.OpenResultPayload, 1)
+	}
 	t.streams[stream.key()] = stream
 	t.mu.Unlock()
-	if err := t.manager.sendServerGeneration(stream.agentID, stream.serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: stream.wireID, Payload: payload}); err != nil {
+	openFlags := uint16(0)
+	if request.StrictOpen {
+		openFlags |= protocol.FlagStrictOpen
+	}
+	openFrame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: openFlags, StreamID: stream.wireID, Window: request.InitialWindow, Payload: payload}
+	if err := t.manager.sendServerGeneration(stream.agentID, stream.serverGeneration, openFrame); err != nil {
 		t.detach(stream)
 		stream.fail(err)
 		return nil, err
 	}
 	return stream, nil
+}
+
+// OpenStreamResult waits for an Agent OPEN_RESULT in strict mode. Legacy opens
+// retain the immediate-success contract used by existing route handlers.
+func (t *AgentRelayTransport) OpenStreamResult(ctx context.Context, request relay.StreamRequest) (io.ReadWriteCloser, relay.RelayOpenResult, error) {
+	stream, err := t.OpenStream(ctx, request)
+	if err != nil || stream == nil {
+		code := protocol.OpenResultCodeInternalError
+		if errors.Is(err, ErrCapability) {
+			code = protocol.OpenResultCodeUnsupportedCapability
+			err = nil
+		}
+		return nil, relay.RelayOpenResult{Payload: failureResult(protocol.OpenResultStageRelay, code)}, err
+	}
+	agentStream, ok := stream.(*agentRelayStream)
+	if !ok {
+		_ = stream.Close()
+		return nil, relay.RelayOpenResult{Payload: failureResult(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, nil
+	}
+	if !request.StrictOpen {
+		return stream, relay.RelayOpenResult{Payload: protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK}}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var payload protocol.OpenResultPayload
+	select {
+	case payload = <-agentStream.openResult:
+	default:
+		select {
+		case payload = <-agentStream.openResult:
+		case <-agentStream.done:
+			return nil, relay.RelayOpenResult{Payload: failureResult(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, nil
+		case <-ctx.Done():
+			_ = stream.Close()
+			return nil, relay.RelayOpenResult{Payload: failureResult(protocol.OpenResultStageRelay, protocol.OpenResultCodeTimeout)}, ctx.Err()
+		}
+	}
+	if !payload.Accepted {
+		t.detach(agentStream)
+		agentStream.finish(protocol.ErrStreamReset)
+		return nil, relay.RelayOpenResult{Payload: payload}, nil
+	}
+	return stream, relay.RelayOpenResult{Payload: payload}, nil
 }
 
 // HandleAgentFrame is the single inbound dispatch point used by the Agent
@@ -152,6 +215,13 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 	}
 	var resetStream bool
 	switch frame.Type {
+	case protocol.FrameOpenResult:
+		payload, decodeErr := protocol.DecodeOpenResultPayload(frame.Payload)
+		if decodeErr != nil || !stream.deliverOpenResult(payload) {
+			delete(t.streams, key)
+			stream.fail(protocol.ErrInvalidFrame)
+			resetStream = true
+		}
 	case protocol.FrameData:
 		if enqueueErr := stream.enqueue(frame.Payload); enqueueErr != nil {
 			delete(t.streams, key)
@@ -161,6 +231,18 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 	case protocol.FrameHalfClose:
 		if stream.remoteHalfClose() {
 			delete(t.streams, key)
+		}
+	case protocol.FrameWindowUpdate:
+		select {
+		case stream.controlCh <- frame:
+			select {
+			case stream.controlSignal <- struct{}{}:
+			default:
+			}
+		default:
+			delete(t.streams, key)
+			stream.fail(protocol.ErrWindowExhausted)
+			resetStream = true
 		}
 	case protocol.FrameReset:
 		delete(t.streams, key)
@@ -283,14 +365,31 @@ type agentRelayStream struct {
 	serverGeneration uint64
 	wireID           uint32
 	readCh           chan []byte
+	controlCh        chan protocol.Frame
+	controlSignal    chan struct{}
+	openResult       chan protocol.OpenResultPayload
 	done             chan struct{}
 	doneOnce         sync.Once
 	closeOnce        sync.Once
+	openResultOnce   sync.Once
+	strictOpen       bool
 	mu               sync.Mutex
 	readBuf          []byte
 	err              error
 	localHalf        bool
 	remoteHalf       bool
+}
+
+func (s *agentRelayStream) deliverOpenResult(payload protocol.OpenResultPayload) bool {
+	if !s.strictOpen {
+		return false
+	}
+	delivered := false
+	s.openResultOnce.Do(func() {
+		s.openResult <- payload
+		delivered = true
+	})
+	return delivered
 }
 
 func (s *agentRelayStream) key() agentRelayStreamKey {
@@ -316,6 +415,11 @@ func (s *agentRelayStream) Read(buffer []byte) (int, error) {
 			s.readBuf = append(s.readBuf, payload...)
 			s.mu.Unlock()
 			continue
+		default:
+		}
+		select {
+		case <-s.controlSignal:
+			return 0, nil
 		default:
 		}
 		s.mu.Lock()
@@ -357,6 +461,33 @@ func (s *agentRelayStream) Write(payload []byte) (int, error) {
 		return 0, err
 	}
 	return len(payload), nil
+}
+
+func (s *agentRelayStream) WriteControl(frame protocol.Frame) error {
+	if frame.Type != protocol.FrameWindowUpdate {
+		return protocol.ErrInvalidFrame
+	}
+	frame.Version = protocol.CurrentVersion
+	frame.StreamID = s.wireID
+	if err := s.transport.manager.sendServerGeneration(s.agentID, s.serverGeneration, frame); err != nil {
+		s.transport.detach(s)
+		s.fail(err)
+		return err
+	}
+	return nil
+}
+
+func (s *agentRelayStream) ReadControl() (protocol.Frame, bool) {
+	select {
+	case frame := <-s.controlCh:
+		select {
+		case <-s.controlSignal:
+		default:
+		}
+		return frame, true
+	default:
+		return protocol.Frame{}, false
+	}
 }
 
 func (s *agentRelayStream) CloseWrite() error {

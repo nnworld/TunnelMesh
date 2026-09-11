@@ -20,31 +20,43 @@ type ConnectionStats struct {
 	QueuePressure           int
 	RTT                     time.Duration
 	Errors                  int64
+	PendingDials            int
+	OpenP95                 time.Duration
+	TTFBP95                 time.Duration
+	WriterQueueWait         time.Duration
 }
 
 type ConnectionPoolSnapshot struct {
-	Active           int
-	Min              int
-	Max              int
-	MaxActiveStreams int64
-	MaxQueuePressure int
-	MaxRTT           time.Duration
-	LastScaleAt      time.Time
-	Closed           bool
+	Active             int
+	Min                int
+	Max                int
+	MaxActiveStreams   int64
+	MaxQueuePressure   int
+	MaxRTT             time.Duration
+	MaxPendingDials    int
+	MaxOpenP95         time.Duration
+	MaxTTFBP95         time.Duration
+	MaxWriterQueueWait time.Duration
+	LastScaleAt        time.Time
+	Closed             bool
 }
 
 type ConnectionControllerOptions struct {
-	AgentID            string
-	InstanceID         string
-	Metrics            *observability.Metrics
-	Min                int
-	Max                int
-	HighWatermark      int
-	LowWatermark       int
-	EvaluationInterval time.Duration
-	Cooldown           time.Duration
-	HighRTT            time.Duration
-	Runner             ConnectionRunner
+	AgentID             string
+	InstanceID          string
+	Metrics             *observability.Metrics
+	Min                 int
+	Max                 int
+	HighWatermark       int
+	LowWatermark        int
+	EvaluationInterval  time.Duration
+	Cooldown            time.Duration
+	HighRTT             time.Duration
+	HighPendingDials    int
+	HighOpenP95         time.Duration
+	HighTTFBP95         time.Duration
+	HighWriterQueueWait time.Duration
+	Runner              ConnectionRunner
 }
 
 type managedConnection struct {
@@ -90,6 +102,18 @@ func NewConnectionController(options ConnectionControllerOptions) *ConnectionCon
 	}
 	if options.HighRTT <= 0 {
 		options.HighRTT = 500 * time.Millisecond
+	}
+	if options.HighPendingDials <= 0 {
+		options.HighPendingDials = 1
+	}
+	if options.HighOpenP95 <= 0 {
+		options.HighOpenP95 = time.Second
+	}
+	if options.HighTTFBP95 <= 0 {
+		options.HighTTFBP95 = time.Second
+	}
+	if options.HighWriterQueueWait <= 0 {
+		options.HighWriterQueueWait = 100 * time.Millisecond
 	}
 	return &ConnectionController{
 		options: options, connections: make(map[string]*managedConnection),
@@ -160,6 +184,18 @@ func (c *ConnectionController) Snapshot() ConnectionPoolSnapshot {
 		if stats.RTT > snapshot.MaxRTT {
 			snapshot.MaxRTT = stats.RTT
 		}
+		if stats.PendingDials > snapshot.MaxPendingDials {
+			snapshot.MaxPendingDials = stats.PendingDials
+		}
+		if stats.OpenP95 > snapshot.MaxOpenP95 {
+			snapshot.MaxOpenP95 = stats.OpenP95
+		}
+		if stats.TTFBP95 > snapshot.MaxTTFBP95 {
+			snapshot.MaxTTFBP95 = stats.TTFBP95
+		}
+		if stats.WriterQueueWait > snapshot.MaxWriterQueueWait {
+			snapshot.MaxWriterQueueWait = stats.WriterQueueWait
+		}
 	}
 	return snapshot
 }
@@ -210,7 +246,11 @@ func (c *ConnectionController) evaluate(now time.Time) {
 	for _, stats := range c.stats {
 		serverSupported = serverSupported || stats.ConnectionPoolSupported
 		if stats.ActiveStreams >= int64(c.options.HighWatermark) ||
-			stats.QueuePressure >= 80 || stats.RTT >= c.options.HighRTT {
+			stats.QueuePressure >= 80 || stats.RTT >= c.options.HighRTT ||
+			stats.PendingDials >= c.options.HighPendingDials ||
+			stats.OpenP95 >= c.options.HighOpenP95 ||
+			stats.TTFBP95 >= c.options.HighTTFBP95 ||
+			stats.WriterQueueWait >= c.options.HighWriterQueueWait {
 			high = true
 		}
 		if stats.ActiveStreams > int64(c.options.LowWatermark) {

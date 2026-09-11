@@ -112,6 +112,131 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	if err != nil || idem.Response != `{"ok":true}` {
 		t.Fatalf("idempotency = %+v err=%v", idem, err)
 	}
+	runAuthorizationRevisionBumpContract(t, db)
+	revision, err := db.AuthorizationRevisions().Current(ctx)
+	if err != nil || revision < 2 {
+		t.Fatalf("authorization revision = %d, err = %v, want at least 2", revision, err)
+	}
+}
+
+func runAuthorizationRevisionBumpContract(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	current := func() uint64 {
+		t.Helper()
+		revision, err := db.AuthorizationRevisions().Current(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return revision
+	}
+	assertBump := func(name string, operation func() error) {
+		t.Helper()
+		before := current()
+		if err := operation(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if after := current(); after != before+1 {
+			t.Fatalf("%s revision = %d, want %d", name, after, before+1)
+		}
+	}
+
+	user := User{ID: "revision-user", Username: "revision-user", Role: "user", PasswordHash: "hash"}
+	if err := db.Users().Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	user.Disabled = true
+	assertBump("disable user", func() error { return db.Users().Update(ctx, user) })
+	user.Disabled = false
+	assertBump("enable user", func() error { return db.Users().Update(ctx, user) })
+	assertBump("delete user", func() error { return db.Users().Delete(ctx, user.ID) })
+
+	agent := Agent{ID: "revision-agent", Name: "revision-agent", OwnerUserID: "revision-owner", Enabled: true}
+	assertBump("create agent", func() error { return db.Agents().Create(ctx, agent) })
+	agent.Enabled = false
+	assertBump("update agent", func() error { return db.Agents().Update(ctx, agent) })
+	assertBump("delete agent", func() error { return db.Agents().Delete(ctx, agent.ID) })
+
+	policyOwner := User{ID: "revision-policy-owner", Username: "revision-policy-owner", Role: "user", PasswordHash: "hash"}
+	if err := db.Users().Create(ctx, policyOwner); err != nil {
+		t.Fatal(err)
+	}
+	policyAgent := Agent{ID: "revision-policy-agent", Name: "revision-policy-agent", OwnerUserID: policyOwner.ID, Enabled: true}
+	if err := db.Agents().Create(ctx, policyAgent); err != nil {
+		t.Fatal(err)
+	}
+	policy := AgentPolicy{ID: "revision-policy", AgentID: policyAgent.ID, TargetHost: "10.0.0.1", TargetPort: 22, Protocol: "tcp"}
+	assertBump("create policy", func() error { return db.Policies().Create(ctx, policy) })
+	policy.TargetPort = 80
+	assertBump("update policy", func() error { return db.Policies().Update(ctx, policy) })
+	assertBump("delete policy", func() error { return db.Policies().Delete(ctx, policy.ID) })
+
+	now := time.Now().UTC()
+	token := ServiceToken{
+		ID: "revision-token", OwnerUserID: policyOwner.ID, Prefix: "rev", TokenHash: "revision-token-hash",
+		Scope: `{}`, Type: TokenTypeClient, CreatedAt: now, UpdatedAt: now,
+	}
+	assertBump("create service token", func() error { return db.ServiceTokens().Create(ctx, token) })
+	assertBump("update service token scope", func() error {
+		return db.ServiceTokens().UpdateScope(ctx, token.ID, `{"protocols":["tcp"]}`, now.Add(time.Second))
+	})
+	replacement := token
+	replacement.ID = "revision-token-replacement"
+	replacement.TokenHash = "revision-token-replacement-hash"
+	replacement.Prefix = "rev2"
+	assertBump("rotate service token", func() error {
+		return db.ServiceTokens().Rotate(ctx, token.ID, replacement, now.Add(2*time.Second))
+	})
+	assertBump("revoke service token", func() error {
+		return db.ServiceTokens().Revoke(ctx, replacement.ID, now.Add(3*time.Second))
+	})
+}
+
+func TestAuthorizationRevisionTransactionRollbackDoesNotBump(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user := User{ID: "revision-rollback-user", Username: "revision-rollback-user", Role: "user", PasswordHash: "hash"}
+	if err := db.Users().Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.AuthorizationRevisions().Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.AccountTransaction(ctx, func(repos AccountRepositories) error {
+		user.Disabled = true
+		return repos.Users.Update(ctx, user)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := db.AuthorizationRevisions().Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed != before+1 {
+		t.Fatalf("revision after committed transaction=%d, want %d", committed, before+1)
+	}
+
+	wantErr := errors.New("abort authorization revision")
+	err = db.AccountTransaction(ctx, func(repos AccountRepositories) error {
+		user.Disabled = true
+		if err := repos.Users.Update(ctx, user); err != nil {
+			return err
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("AccountTransaction error=%v, want %v", err, wantErr)
+	}
+	after, err := db.AuthorizationRevisions().Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != committed {
+		t.Fatalf("revision after rollback=%d, want %d", after, committed)
+	}
 }
 
 func TestIdempotencyExpiredRecordsAreNotReplayed(t *testing.T) {

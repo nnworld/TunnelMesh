@@ -60,12 +60,12 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		transport, err := DialWebSocket(ctx, serverURL, token)
+		transport, err := dialWebSocketWithLegacyFallback(ctx, serverURL, token)
 		if err == nil {
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("client", "websocket", "started", "")
 			}
-			session := NewSession(transport)
+			session := NewSessionWithOpenMode(transport, sessionOpenModeForTransport(transport))
 			session.Metrics = options.Metrics
 			session.Start()
 			if onReady != nil {
@@ -96,6 +96,28 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 }
 
 func DialWebSocket(ctx context.Context, serverURL, token string) (ReceiveTransport, error) {
+	return dialWebSocket(ctx, serverURL, token, true)
+}
+
+func dialWebSocketWithLegacyFallback(ctx context.Context, serverURL, token string) (ReceiveTransport, error) {
+	transport, err := dialWebSocket(ctx, serverURL, token, true)
+	if err == nil {
+		return transport, nil
+	}
+	// Older x/net servers reject a multi-valued Sec-WebSocket-Protocol offer
+	// unless their Handshake callback selects one value. Retry once without a
+	// subprotocol so legacy deployments remain reachable.
+	var dialErr *websocket.DialError
+	if errors.As(err, &dialErr) && errors.Is(dialErr.Err, websocket.ErrBadStatus) {
+		legacyTransport, legacyErr := dialWebSocket(ctx, serverURL, token, false)
+		if legacyErr == nil {
+			return legacyTransport, nil
+		}
+	}
+	return nil, err
+}
+
+func dialWebSocket(ctx context.Context, serverURL, token string, offerSubprotocols bool) (ReceiveTransport, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, ErrClientTokenRequired
 	}
@@ -111,12 +133,36 @@ func DialWebSocket(ctx context.Context, serverURL, token string) (ReceiveTranspo
 		return nil, err
 	}
 	config.Header.Set("Authorization", "Bearer "+token)
+	if offerSubprotocols {
+		config.Protocol = protocol.ClientSubprotocols()
+	}
 	conn, err := config.DialContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	conn.MaxPayloadBytes = protocol.MaxPayload + 16
-	return &clientWebSocketTransport{conn: conn}, nil
+	selectedProtocol := ""
+	// The client offers three protocols. x/net leaves the offered slice intact
+	// when the server selects none, so only a single value is authoritative.
+	if len(conn.Config().Protocol) == 1 {
+		selectedProtocol = conn.Config().Protocol[0]
+	}
+	return &clientWebSocketTransport{conn: conn, subprotocol: selectedProtocol}, nil
+}
+
+func sessionOpenModeForTransport(transport FrameTransport) SessionOpenMode {
+	negotiator, ok := transport.(interface{ Subprotocol() string })
+	if !ok {
+		return SessionOpenLegacy
+	}
+	switch negotiator.Subprotocol() {
+	case protocol.SubprotocolFlowControl:
+		return SessionOpenFlowControl
+	case protocol.SubprotocolOpenResult:
+		return SessionOpenStrict
+	default:
+		return SessionOpenLegacy
+	}
 }
 
 func parseClientWebSocketURL(raw string) (*url.URL, error) {
@@ -151,8 +197,16 @@ func clientReconnectDelay(base, max time.Duration, attempt int, rng *rand.Rand) 
 }
 
 type clientWebSocketTransport struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn        *websocket.Conn
+	subprotocol string
+	mu          sync.Mutex
+}
+
+func (t *clientWebSocketTransport) Subprotocol() string {
+	if t == nil {
+		return ""
+	}
+	return t.subprotocol
 }
 
 func (t *clientWebSocketTransport) Send(frame protocol.Frame) error {

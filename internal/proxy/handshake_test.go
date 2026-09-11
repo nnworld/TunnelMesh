@@ -2,10 +2,11 @@ package proxy_test
 
 import (
 	"bytes"
-
-	"github.com/tunnelmesh/tunnelmesh/internal/proxy"
 	"net"
 	"testing"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/proxy"
 )
 
 func TestParseHTTPConnect(t *testing.T) {
@@ -126,6 +127,32 @@ func TestEncodeSOCKS5Reply(t *testing.T) {
 	want := []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	if got := proxy.EncodeSOCKS5Reply(proxy.SOCKS5ReplySucceeded); !bytes.Equal(got, want) {
 		t.Fatalf("reply=%x want=%x", got, want)
+	}
+}
+
+func TestSOCKS5ReplyForResultMapsStableCodes(t *testing.T) {
+	tests := []struct {
+		code protocol.OpenResultCode
+		want proxy.SOCKS5Reply
+	}{
+		{protocol.OpenResultCodeOK, proxy.SOCKS5ReplySucceeded},
+		{protocol.OpenResultCodeForbidden, proxy.SOCKS5ReplyConnectionNotAllowed},
+		{protocol.OpenResultCodeAgentOffline, proxy.SOCKS5ReplyGeneralFailure},
+		{protocol.OpenResultCodeQueueFull, proxy.SOCKS5ReplyGeneralFailure},
+		{protocol.OpenResultCodeTimeout, proxy.SOCKS5ReplyGeneralFailure},
+		{protocol.OpenResultCodeNetworkUnreachable, proxy.SOCKS5ReplyNetworkUnreachable},
+		{protocol.OpenResultCodeHostUnreachable, proxy.SOCKS5ReplyHostUnreachable},
+		{protocol.OpenResultCodeConnectionRefused, proxy.SOCKS5ReplyConnectionRefused},
+		{protocol.OpenResultCodeUnsupportedCapability, proxy.SOCKS5ReplyCommandUnsupported},
+		{protocol.OpenResultCodeInternalError, proxy.SOCKS5ReplyGeneralFailure},
+	}
+	for _, test := range tests {
+		t.Run(string(test.code), func(t *testing.T) {
+			result := protocol.OpenResultPayload{Accepted: test.code == protocol.OpenResultCodeOK, Code: test.code}
+			if got := proxy.SOCKS5ReplyForResult(result); got != byte(test.want) {
+				t.Fatalf("reply=%#x, want %#x", byte(got), byte(test.want))
+			}
+		})
 	}
 }
 

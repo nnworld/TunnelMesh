@@ -1,8 +1,10 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -17,9 +19,16 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var ErrTransportClosed = errors.New("relay: transport closed")
+
+const (
+	relayStreamDataPrefix    = 0
+	relayStreamControlPrefix = 1
+)
 
 // BoundedTransport serializes writes and bounds queued frames, providing
 // deterministic backpressure instead of unbounded memory growth.
@@ -149,14 +158,17 @@ type RelayServer interface {
 	OpenStream(RelayOpenStreamServer) error
 	CloseAgentConnection(context.Context, CloseAgentConnectionRequest) error
 }
+
+type RelayOpenResultHandler func(context.Context, RelayOpenMetadata) (io.ReadWriteCloser, RelayOpenResult, error)
 type RelayOpenStreamServer interface {
 	Send(*wrapperspb.BytesValue) error
 	Recv() (*wrapperspb.BytesValue, error)
 	grpc.ServerStream
 }
 type relayServer struct {
-	handler      func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
-	closeHandler CloseAgentConnectionFunc
+	handler           func(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+	openResultHandler RelayOpenResultHandler
+	closeHandler      CloseAgentConnectionFunc
 }
 
 func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)) RelayServer {
@@ -165,6 +177,14 @@ func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCl
 
 func NewRelayServerWithClose(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeHandler CloseAgentConnectionFunc) RelayServer {
 	return &relayServer{handler: handler, closeHandler: closeHandler}
+}
+
+func NewRelayServerWithOpenResult(handler RelayOpenResultHandler) RelayServer {
+	return &relayServer{openResultHandler: handler}
+}
+
+func NewRelayServerWithOpenResultAndClose(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeHandler CloseAgentConnectionFunc) RelayServer {
+	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeHandler}
 }
 func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
 	s.RegisterService(&grpc.ServiceDesc{
@@ -211,20 +231,64 @@ func (r *relayServer) OpenStream(stream RelayOpenStreamServer) error {
 		return err
 	}
 	req := streamRequestFromRelayMetadata(first.GetFields())
+	if req.StrictOpen {
+		return r.openStrictStream(stream, req)
+	}
 	conn, err := r.handler(stream.Context(), req)
 	if err != nil {
 		return err
 	}
+	return r.relayStream(conn, stream)
+}
+
+func (r *relayServer) openStrictStream(stream RelayOpenStreamServer, req StreamRequest) error {
+	if r.openResultHandler == nil {
+		_ = sendRelayOpenResult(stream, openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability))
+		return nil
+	}
+	metadata := RelayOpenMetadata{Request: req, StrictOpen: true}
+	if deadline, ok := stream.Context().Deadline(); ok {
+		metadata.OpenTimeout = time.Until(deadline)
+	}
+	conn, result, err := r.openResultHandler(stream.Context(), metadata)
+	if err != nil || conn == nil || !result.Payload.Accepted {
+		if result.Payload.Code == "" || result.Payload.Accepted {
+			result.Payload = openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)
+		}
+		_ = sendRelayOpenResult(stream, result.Payload)
+		return nil
+	}
+	if err := sendRelayOpenResult(stream, result.Payload); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	return r.relayStream(conn, stream)
+}
+
+func (r *relayServer) relayStream(conn io.ReadWriteCloser, stream RelayOpenStreamServer) error {
 	defer conn.Close()
 	go func() {
 		buf := make([]byte, 32<<10)
 		for {
 			n, e := conn.Read(buf)
 			if n > 0 {
-				_ = stream.Send(&wrapperspb.BytesValue{Value: append([]byte(nil), buf[:n]...)})
+				_ = stream.Send(&wrapperspb.BytesValue{Value: relayStreamMessage(relayStreamDataPrefix, buf[:n])})
 			}
 			if e != nil {
 				return
+			}
+			if n == 0 {
+				if controlReader, ok := conn.(interface{ ReadControl() (protocol.Frame, bool) }); ok {
+					if frame, available := controlReader.ReadControl(); available {
+						encoded, err := encodeRelayControlFrame(frame)
+						if err != nil {
+							return
+						}
+						_ = stream.Send(&wrapperspb.BytesValue{Value: relayStreamMessage(relayStreamControlPrefix, encoded)})
+						continue
+					}
+				}
+				time.Sleep(time.Millisecond)
 			}
 		}
 	}()
@@ -233,10 +297,86 @@ func (r *relayServer) OpenStream(stream RelayOpenStreamServer) error {
 		if e != nil {
 			return e
 		}
-		if _, e = conn.Write(msg.Value); e != nil {
+		if len(msg.Value) == 0 {
+			return protocol.ErrInvalidFrame
+		}
+		payload := msg.Value[1:]
+		if msg.Value[0] == relayStreamControlPrefix {
+			frame, err := decodeRelayControlFrame(payload)
+			if err != nil {
+				return err
+			}
+			controlWriter, ok := conn.(interface{ WriteControl(protocol.Frame) error })
+			if !ok {
+				return protocol.ErrInvalidFrame
+			}
+			if err = controlWriter.WriteControl(frame); err != nil {
+				return err
+			}
+			continue
+		}
+		if msg.Value[0] != relayStreamDataPrefix {
+			return protocol.ErrInvalidFrame
+		}
+		if _, e = conn.Write(payload); e != nil {
 			return e
 		}
 	}
+}
+
+func relayStreamMessage(prefix byte, payload []byte) []byte {
+	message := make([]byte, 1+len(payload))
+	message[0] = prefix
+	copy(message[1:], payload)
+	return message
+}
+
+func encodeRelayControlFrame(frame protocol.Frame) ([]byte, error) {
+	var buffer bytes.Buffer
+	if err := protocol.NewEncoder(&buffer).WriteFrame(frame); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func decodeRelayControlFrame(payload []byte) (protocol.Frame, error) {
+	return protocol.NewDecoder(bytes.NewReader(payload)).ReadFrame()
+}
+
+var relayOpenResultMagic = [4]byte{'T', 'M', 'R', '1'}
+
+func encodeRelayOpenResult(payload protocol.OpenResultPayload) ([]byte, error) {
+	encoded, err := protocol.EncodeOpenResultPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > protocol.MaxOpenResultPayload {
+		return nil, protocol.ErrPayloadTooLarge
+	}
+	frame := make([]byte, 8+len(encoded))
+	copy(frame, relayOpenResultMagic[:])
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(encoded)))
+	copy(frame[8:], encoded)
+	return frame, nil
+}
+
+func decodeRelayOpenResult(frame []byte) (protocol.OpenResultPayload, error) {
+	if len(frame) < 8 || string(frame[:4]) != string(relayOpenResultMagic[:]) {
+		return protocol.OpenResultPayload{}, protocol.ErrInvalidFrame
+	}
+	size := binary.BigEndian.Uint32(frame[4:8])
+	if size > protocol.MaxOpenResultPayload || int(8+size) != len(frame) {
+		return protocol.OpenResultPayload{}, protocol.ErrPayloadTooLarge
+	}
+	return protocol.DecodeOpenResultPayload(frame[8:])
+}
+
+func sendRelayOpenResult(stream RelayOpenStreamServer, payload protocol.OpenResultPayload) error {
+	frame, err := encodeRelayOpenResult(payload)
+	if err != nil {
+		return err
+	}
+	return stream.Send(&wrapperspb.BytesValue{Value: relayStreamMessage(relayStreamDataPrefix, frame)})
 }
 
 func (r *relayServer) CloseAgentConnection(ctx context.Context, req CloseAgentConnectionRequest) error {
@@ -317,7 +457,49 @@ func (n *GRPCNodeTransport) OpenStream(ctx context.Context, req StreamRequest) (
 		_ = s.CloseSend()
 		return nil, err
 	}
-	return &grpcStreamConn{stream: s}, nil
+	return &grpcStreamConn{
+		stream: s, controlCh: make(chan protocol.Frame, 16), controlSignal: make(chan struct{}, 1),
+	}, nil
+}
+
+func (n *GRPCNodeTransport) OpenStreamResult(ctx context.Context, req StreamRequest) (io.ReadWriteCloser, RelayOpenResult, error) {
+	conn, err := n.OpenStream(ctx, req)
+	if err != nil || conn == nil {
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, err
+	}
+	if !req.StrictOpen {
+		return conn, RelayOpenResult{Payload: protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK}}, nil
+	}
+	grpcConn, ok := conn.(*grpcStreamConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+	}
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(grpcConn, header); err != nil {
+		_ = grpcConn.Close()
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+	}
+	size := binary.BigEndian.Uint32(header[4:8])
+	if string(header[:4]) != string(relayOpenResultMagic[:]) || size > protocol.MaxOpenResultPayload {
+		_ = grpcConn.Close()
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+	}
+	encoded := make([]byte, size)
+	if _, err := io.ReadFull(grpcConn, encoded); err != nil {
+		_ = grpcConn.Close()
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+	}
+	payload, err := decodeRelayOpenResult(append(header, encoded...))
+	if err != nil {
+		_ = grpcConn.Close()
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+	}
+	if !payload.Accepted {
+		_ = grpcConn.Close()
+		return nil, RelayOpenResult{Payload: payload}, nil
+	}
+	return grpcConn, RelayOpenResult{Payload: payload}, nil
 }
 
 func (n *GRPCNodeTransport) CloseAgentConnection(ctx context.Context, req CloseAgentConnectionRequest) error {
@@ -341,6 +523,8 @@ func relayStreamMetadata(req StreamRequest) map[string]any {
 		"epoch":                     req.Epoch, "stream_id": req.StreamID,
 		"target_connection_id":    req.TargetConnectionID,
 		"target_connection_epoch": req.TargetConnectionEpoch,
+		"strict_open":             req.StrictOpen,
+		"initial_window":          req.InitialWindow,
 		"protocol":                req.Protocol, "target_host": req.TargetHost,
 		"target_port": req.TargetPort, "target_scheme": req.TargetScheme,
 		"host_header": req.HostHeader, "tls_server_name": req.TLSServerName,
@@ -354,6 +538,8 @@ func streamRequestFromRelayMetadata(fields map[string]*structpb.Value) StreamReq
 		Epoch:                  int64(fields["epoch"].GetNumberValue()),
 		TargetConnectionID:     fields["target_connection_id"].GetStringValue(),
 		TargetConnectionEpoch:  int64(fields["target_connection_epoch"].GetNumberValue()),
+		StrictOpen:             fields["strict_open"].GetBoolValue(),
+		InitialWindow:          uint32(fields["initial_window"].GetNumberValue()),
 		StreamID:               uint32(fields["stream_id"].GetNumberValue()),
 		Protocol:               fields["protocol"].GetStringValue(),
 		TargetHost:             fields["target_host"].GetStringValue(),
@@ -389,9 +575,11 @@ func (n *GRPCNodeTransport) Close() error {
 }
 
 type grpcStreamConn struct {
-	stream  grpc.ClientStream
-	mu      sync.Mutex
-	pending []byte
+	stream        grpc.ClientStream
+	mu            sync.Mutex
+	pending       []byte
+	controlCh     chan protocol.Frame
+	controlSignal chan struct{}
 }
 
 func (c *grpcStreamConn) Read(p []byte) (int, error) {
@@ -406,18 +594,67 @@ func (c *grpcStreamConn) Read(p []byte) (int, error) {
 	if err := c.stream.RecvMsg(&msg); err != nil {
 		return 0, err
 	}
-	n := copy(p, msg.Value)
-	if n < len(msg.Value) {
-		c.pending = append(c.pending, msg.Value[n:]...)
+	if len(msg.Value) == 0 {
+		return 0, protocol.ErrInvalidFrame
+	}
+	if msg.Value[0] == relayStreamControlPrefix {
+		frame, err := decodeRelayControlFrame(msg.Value[1:])
+		if err != nil {
+			return 0, err
+		}
+		select {
+		case c.controlCh <- frame:
+		default:
+			return 0, protocol.ErrWindowExhausted
+		}
+		select {
+		case c.controlSignal <- struct{}{}:
+		default:
+		}
+		return 0, nil
+	}
+	if msg.Value[0] != relayStreamDataPrefix {
+		return 0, protocol.ErrInvalidFrame
+	}
+	payload := msg.Value[1:]
+	n := copy(p, payload)
+	if n < len(payload) {
+		c.pending = append(c.pending, payload[n:]...)
 	}
 	return n, nil
 }
 func (c *grpcStreamConn) Write(p []byte) (int, error) {
-	b := append([]byte(nil), p...)
+	b := relayStreamMessage(relayStreamDataPrefix, p)
 	if err := c.stream.SendMsg(&wrapperspb.BytesValue{Value: b}); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+func (c *grpcStreamConn) WriteControl(frame protocol.Frame) error {
+	if frame.Type != protocol.FrameWindowUpdate {
+		return protocol.ErrInvalidFrame
+	}
+	encoded, err := encodeRelayControlFrame(frame)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stream.SendMsg(&wrapperspb.BytesValue{Value: relayStreamMessage(relayStreamControlPrefix, encoded)})
+}
+func (c *grpcStreamConn) ReadControl() (protocol.Frame, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case frame := <-c.controlCh:
+		select {
+		case <-c.controlSignal:
+		default:
+		}
+		return frame, true
+	default:
+		return protocol.Frame{}, false
+	}
 }
 func (c *grpcStreamConn) CloseWrite() error { return c.stream.CloseSend() }
 func (c *grpcStreamConn) Close() error      { return c.CloseWrite() }

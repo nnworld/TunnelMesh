@@ -121,7 +121,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache})
 			if err != nil {
 				return err
 			}
@@ -236,10 +236,8 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
 				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
-				Factory: func(session *agent.Session, _ string) agent.SessionFrameHandler {
-					return agent.NewStreamDispatcherWithSender(agent.Dialer{}, nil, session.Send)
-				},
-				Min: cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
+				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams),
+				Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
 				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
 				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
 				Cooldown:           cfg.Agent.Connections.Cooldown,
@@ -257,6 +255,18 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), effectiveAgentID(cfg))
 			return nil
 		}),
+	}
+}
+
+func NewAgentDispatcherFactory(streams config.AgentStreamConfig) agent.ConnectionSessionFactory {
+	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
+		session.SetCapabilities(agent.AgentStreamCapabilities(streams))
+		return agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
+			MaxConcurrent:  streams.MaxConcurrentDials,
+			MaxPending:     streams.MaxPendingDials,
+			ConnectTimeout: streams.ConnectTimeout,
+			OpenTimeout:    streams.OpenTimeout,
+		}, nil)
 	}
 }
 
@@ -441,6 +451,13 @@ func clientSOCKS5ForwardCommand(opts *rootOptions) *cobra.Command {
 				Username:    username,
 				Password:    password,
 				AuthURL:     authURL,
+				RemoteValidation: client.RemoteValidationCacheConfig{
+					Endpoint:    authURL,
+					PositiveTTL: cfg.Client.RemoteValidation.PositiveTTL,
+					NegativeTTL: cfg.Client.RemoteValidation.NegativeTTL,
+					Timeout:     cfg.Client.RemoteValidation.Timeout,
+					MaxEntries:  cfg.Client.RemoteValidation.MaxEntries,
+				},
 			})
 			if err != nil {
 				return err
@@ -512,6 +529,13 @@ func clientHTTPProxyForwardCommand(opts *rootOptions) *cobra.Command {
 				Username:    username,
 				Password:    password,
 				AuthURL:     authURL,
+				RemoteValidation: client.RemoteValidationCacheConfig{
+					Endpoint:    authURL,
+					PositiveTTL: cfg.Client.RemoteValidation.PositiveTTL,
+					NegativeTTL: cfg.Client.RemoteValidation.NegativeTTL,
+					Timeout:     cfg.Client.RemoteValidation.Timeout,
+					MaxEntries:  cfg.Client.RemoteValidation.MaxEntries,
+				},
 			})
 			if err != nil {
 				return err
@@ -573,8 +597,8 @@ func configCommand(opts *rootOptions, name, short string, run func(*cobra.Comman
 		Short: short,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load(cmd.Context(), config.ConfigOptions{
-				ConfigFile:                     opts.configFile,
-				CLI:                            changedFlags(cmd, opts),
+				ConfigFile: opts.configFile,
+				CLI:        changedFlags(cmd, opts),
 				NodeIDPath: func() string {
 					if name == "run" {
 						return opts.nodeIDPath

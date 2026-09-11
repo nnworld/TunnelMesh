@@ -6,6 +6,12 @@ Server 在管理监听器暴露 `GET /metrics`、`/health/live` 和 `/health/rea
 
 导入 [统一 Dashboard](../../deploy/grafana/dashboards/tunnelmesh.json)。这是项目唯一的 Dashboard 文件，内部按 Overview、Agent、Network、Cluster、Security 五个 Row 组织全部图表。Prometheus datasource 使用 `${DS_PROMETHEUS}`。
 
+延迟和稳定性相关的视图集中在同一 Dashboard：
+
+- Agent Row：连接池扩缩容决策、Agent 连接选择、活跃连接和错误。
+- Network Row：stream 打开结果、阶段耗时、队列等待、窗口等待、backpressure、探针延迟。
+- Cluster Row：授权缓存命中率、远端校验缓存、授权 revision 和 revision 轮询结果。
+
 推荐同时加载：
 
 - `deploy/prometheus/recording-rules.yaml`

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 // StreamOpener is the client-side boundary to a server logical stream.
@@ -18,6 +20,11 @@ import (
 // transport in tests.
 type StreamOpener interface {
 	OpenStream(context.Context, StreamRequest) (io.ReadWriteCloser, error)
+}
+
+type ResultStreamOpener interface {
+	StreamOpener
+	OpenStreamResult(context.Context, StreamRequest) (io.ReadWriteCloser, protocol.OpenResultPayload, error)
 }
 
 type TCPForwardConfig struct {

@@ -107,7 +107,410 @@ func TestSessionRunSendsHeartbeatPing(t *testing.T) {
 	}
 }
 
+type blockingAgentFrameTransport struct {
+	mu          sync.Mutex
+	sent        chan protocol.Frame
+	dataStarted chan struct{}
+	release     chan struct{}
+	closed      chan struct{}
+	once        sync.Once
+}
+
+func newBlockingAgentFrameTransport() *blockingAgentFrameTransport {
+	return &blockingAgentFrameTransport{
+		sent: make(chan protocol.Frame, 4), dataStarted: make(chan struct{}),
+		release: make(chan struct{}), closed: make(chan struct{}),
+	}
+}
+
+func (t *blockingAgentFrameTransport) Send(frame protocol.Frame) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if frame.Type == protocol.FrameData {
+		t.once.Do(func() { close(t.dataStarted) })
+		select {
+		case <-t.release:
+		case <-t.closed:
+			return errors.New("transport closed")
+		}
+	}
+	select {
+	case t.sent <- frame:
+		return nil
+	case <-t.closed:
+		return errors.New("transport closed")
+	}
+}
+
+func (t *blockingAgentFrameTransport) Receive() (protocol.Frame, error) {
+	<-t.closed
+	return protocol.Frame{}, errors.New("transport closed")
+}
+
+func (t *blockingAgentFrameTransport) Close() error {
+	select {
+	case <-t.closed:
+	default:
+		close(t.closed)
+	}
+	return nil
+}
+
+func TestSessionSlowStreamDoesNotBlockControlFrame(t *testing.T) {
+	transport := newBlockingAgentFrameTransport()
+	session := NewSession(transport)
+	defer session.Close()
+
+	dataDone := make(chan error, 1)
+	go func() {
+		dataDone <- session.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 1, Payload: []byte("slow-data")})
+	}()
+	select {
+	case <-transport.dataStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow stream did not reach the transport")
+	}
+	controlDone := make(chan error, 1)
+	go func() {
+		controlDone <- session.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: []byte("pong")})
+	}()
+	select {
+	case err := <-controlDone:
+		if err != nil {
+			close(transport.release)
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		close(transport.release)
+		t.Fatal("slow stream blocked control frame")
+	}
+	close(transport.release)
+	select {
+	case err := <-dataDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow stream send did not finish")
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case frame := <-transport.sent:
+			if i == 0 && (frame.Type != protocol.FrameData || frame.StreamID != 1) {
+				t.Fatalf("first frame=%+v, want stream 1 DATA", frame)
+			}
+			if i == 1 && frame.Type != protocol.FramePong {
+				t.Fatalf("second frame=%+v, want PONG", frame)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for frame %d", i)
+		}
+	}
+}
+
+func TestSessionExposesWriterQueueWaitP95(t *testing.T) {
+	transport := newBlockingAgentFrameTransport()
+	session := NewSession(transport)
+	defer func() {
+		close(transport.release)
+		_ = session.Close()
+	}()
+
+	first := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 1, Payload: []byte("first")}
+	second := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 2, Payload: []byte("second")}
+	if err := session.Send(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Send(second); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for session.WriterQueueWaitP95() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := session.WriterQueueWaitP95(); got <= 0 {
+		t.Fatalf("WriterQueueWaitP95()=%v, want positive sample while transport is blocked", got)
+	}
+}
+
+type flowTestConn struct {
+	reads  chan []byte
+	writes chan []byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newFlowTestConn(reads ...[]byte) *flowTestConn {
+	conn := &flowTestConn{reads: make(chan []byte, len(reads)), writes: make(chan []byte, 8), closed: make(chan struct{})}
+	for _, read := range reads {
+		conn.reads <- read
+	}
+	return conn
+}
+
+func (c *flowTestConn) Read(buffer []byte) (int, error) {
+	select {
+	case payload := <-c.reads:
+		return copy(buffer, payload), nil
+	case <-c.closed:
+		return 0, io.EOF
+	}
+}
+
+func (c *flowTestConn) Write(payload []byte) (int, error) {
+	select {
+	case c.writes <- append([]byte(nil), payload...):
+		return len(payload), nil
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (c *flowTestConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestStreamDispatcherFlowControlStopsAtAdvertisedWindow(t *testing.T) {
+	conn := newFlowTestConn([]byte("0123456789abcdef"), []byte("01234567"))
+	frames := make(chan protocol.Frame, 8)
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil },
+		func(frame protocol.Frame) error { frames <- frame; return nil },
+	)
+	defer dispatcher.Close()
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 41, Window: 16, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamInstalled(t, dispatcher, 41)
+
+	select {
+	case frame := <-frames:
+		if frame.Type != protocol.FrameData || frame.StreamID != 41 || len(frame.Payload) != 16 {
+			t.Fatalf("first DATA=%+v, want 16 bytes for stream 41", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first window-sized DATA was not sent")
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("DATA exceeded advertised window: %+v", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 41, Window: 8}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		if frame.Type != protocol.FrameData || frame.StreamID != 41 || len(frame.Payload) != 8 {
+			t.Fatalf("post-update DATA=%+v, want 8 bytes for stream 41", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DATA after WINDOW_UPDATE was not sent")
+	}
+}
+
+func TestStreamDispatcherResetIgnoresTargetCloseError(t *testing.T) {
+	conn := &closeErrorConn{}
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil },
+		func(protocol.Frame) error { return nil },
+	)
+	defer dispatcher.Close()
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 51, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamInstalled(t, dispatcher, 51)
+	_ = conn.Close()
+	err = dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: 51})
+	if err != nil {
+		t.Fatalf("RESET error=%v, want stream-local cleanup only", err)
+	}
+}
+
+func TestStreamDispatcherLateWindowUpdateIsIgnored(t *testing.T) {
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return nopAgentConn{}, nil },
+		func(protocol.Frame) error { return nil },
+	)
+	defer dispatcher.Close()
+	err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 61, Window: 128})
+	if err != nil {
+		t.Fatalf("late WINDOW_UPDATE error=%v, want nil", err)
+	}
+}
+
+func TestStreamDispatcherLateResetIsIgnored(t *testing.T) {
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return nopAgentConn{}, nil },
+		func(protocol.Frame) error { return nil },
+	)
+	defer dispatcher.Close()
+	err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: 71})
+	if err != nil {
+		t.Fatalf("late RESET error=%v, want nil", err)
+	}
+}
+
+func TestStreamDispatcherLateDataAndHalfCloseAreStreamLocal(t *testing.T) {
+	sent := make(chan protocol.Frame, 2)
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return nopAgentConn{}, nil },
+		func(frame protocol.Frame) error { sent <- frame; return nil },
+	)
+	defer dispatcher.Close()
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 81, Payload: []byte("late")}); err != nil {
+		t.Fatalf("late DATA error=%v, want nil", err)
+	}
+	select {
+	case frame := <-sent:
+		if frame.Type != protocol.FrameReset || frame.StreamID != 81 {
+			t.Fatalf("late DATA response=%+v, want stream 81 RESET", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late DATA did not reset the stale stream")
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: 81}); err != nil {
+		t.Fatalf("late HALF_CLOSE error=%v, want nil", err)
+	}
+}
+
+type nopAgentConn struct{}
+
+func (nopAgentConn) Read([]byte) (int, error)  { return 0, io.EOF }
+func (nopAgentConn) Write([]byte) (int, error) { return 0, nil }
+func (nopAgentConn) Close() error              { return nil }
+
+type closeErrorConn struct{ closed bool }
+
+func (c *closeErrorConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (closeErrorConn) Write([]byte) (int, error)   { return 0, nil }
+func (c *closeErrorConn) Close() error {
+	if c.closed {
+		return errors.New("target already closed")
+	}
+	c.closed = true
+	return nil
+}
+
+func TestStreamDispatcherSendsWindowUpdateAfterTargetWrite(t *testing.T) {
+	conn := newFlowTestConn()
+	frames := make(chan protocol.Frame, 4)
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil },
+		func(frame protocol.Frame) error { frames <- frame; return nil },
+	)
+	defer dispatcher.Close()
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 42, Window: 262144, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamInstalled(t, dispatcher, 42)
+
+	data := make([]byte, 131072)
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 42, Payload: data}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case written := <-conn.writes:
+		if len(written) != len(data) {
+			t.Fatalf("target write length=%d, want %d", len(written), len(data))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("target write did not complete")
+	}
+	select {
+	case frame := <-frames:
+		if frame.Type != protocol.FrameWindowUpdate || frame.StreamID != 42 || frame.Window != 131072 {
+			t.Fatalf("WINDOW_UPDATE=%+v, want 131072 bytes for stream 42", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("threshold WINDOW_UPDATE was not sent")
+	}
+}
+
+func TestStreamDispatcherExposesLatencySignals(t *testing.T) {
+	dial := newControlledDialFunc()
+	firstRelease := make(chan struct{})
+	firstStarted := dial.stage(501, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		<-firstRelease
+		return &streamConn{read: []byte("first-byte")}, nil
+	})
+	dial.stage(502, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		return &streamConn{}, nil
+	})
+	frames := make(chan protocol.Frame, 4)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error {
+		frames <- frame
+		return nil
+	}, DialExecutorConfig{MaxConcurrent: 1, MaxPending: 1, ConnectTimeout: time.Second, OpenTimeout: time.Second}, dial.dial)
+	defer dispatcher.Close()
+
+	open := func(id uint32, port int) protocol.Frame {
+		payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: port})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: id, Payload: payload}
+	}
+	if err := dispatcher.Handle(open(51, 501)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+	if err := dispatcher.Handle(open(52, 502)); err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcher.PendingDials(); got != 1 {
+		t.Fatalf("PendingDials()=%d, want queued second dial", got)
+	}
+	if got := dispatcher.OpenP95(); got != 0 {
+		t.Fatalf("OpenP95() before completion=%v, want zero", got)
+	}
+
+	close(firstRelease)
+	waitStreamInstalled(t, dispatcher, 51)
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case frame := <-frames:
+			if frame.Type == protocol.FrameData && frame.StreamID == 51 {
+				if string(frame.Payload) != "first-byte" {
+					t.Fatalf("first DATA payload=%q", frame.Payload)
+				}
+				goto dataReceived
+			}
+		case <-deadline:
+			t.Fatal("first-byte DATA was not sent")
+		}
+	}
+dataReceived:
+	if got := dispatcher.OpenP95(); got <= 0 {
+		t.Fatalf("OpenP95()=%v, want positive sample", got)
+	}
+	if got := dispatcher.TTFBP95(); got <= 0 {
+		t.Fatalf("TTFBP95()=%v, want positive sample", got)
+	}
+}
+
 type streamConn struct {
+	mu     sync.Mutex
 	writes [][]byte
 	closed bool
 	read   []byte
@@ -210,13 +613,75 @@ func (c *streamConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 func (c *streamConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.writes = append(c.writes, append([]byte(nil), p...))
 	return len(p), nil
 }
-func (c *streamConn) Close() error { c.closed = true; return nil }
+func (c *streamConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	return nil
+}
+func (c *streamConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+func (c *streamConn) writeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.writes)
+}
+func (c *streamConn) firstWrite() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.writes) == 0 {
+		return ""
+	}
+	return string(c.writes[0])
+}
+
+func waitStreamInstalled(t *testing.T, dispatcher *StreamDispatcher, id uint32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		dispatcher.mu.Lock()
+		_, installed := dispatcher.streams[id]
+		dispatcher.mu.Unlock()
+		if installed {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	dispatcher.mu.Lock()
+	_, pending := dispatcher.pending[id]
+	dispatcher.mu.Unlock()
+	t.Fatalf("timed out waiting for stream %d installation (pending=%v)", id, pending)
+}
+
+func waitStreamFailure(t *testing.T, dispatcher *StreamDispatcher, id uint32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		dispatcher.mu.Lock()
+		_, installed := dispatcher.streams[id]
+		_, pending := dispatcher.pending[id]
+		dispatcher.mu.Unlock()
+		if !installed && !pending {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for stream %d failure", id)
+}
+
 func TestStreamDispatcherOpensAndWritesTarget(t *testing.T) {
 	conn := &streamConn{}
-	d := NewStreamDispatcher(Dialer{Policy: func(context.Context, string, string, int) error { return nil }}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil })
+	d := NewStreamDispatcher(Dialer{Policy: func(context.Context, string, string, int) error { return nil }}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) {
+		return conn, nil
+	})
 	p, _ := json.Marshal(StreamOpenPayload{Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 80})
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 7, Payload: p}); err != nil {
 		t.Fatal(err)
@@ -224,23 +689,196 @@ func TestStreamDispatcherOpensAndWritesTarget(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 7, Payload: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	if string(conn.writes[0]) != "x" {
-		t.Fatalf("writes=%q", conn.writes)
+	deadline := time.Now().Add(2 * time.Second)
+	for conn.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := conn.firstWrite(); got != "x" {
+		t.Fatalf("first write=%q", got)
+	}
+}
+
+func TestStreamDispatcherDialDoesNotBlockReadyStream(t *testing.T) {
+	dial := newControlledDialFunc()
+	dial.stage(1, nil)
+	dial.stage(2, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		return &streamConn{}, nil
+	})
+	sent := make(chan protocol.Frame, 4)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error {
+		sent <- frame
+		return nil
+	}, DialExecutorConfig{MaxConcurrent: 2, MaxPending: 2, ConnectTimeout: time.Second, OpenTimeout: time.Second}, dial.dial)
+	defer dispatcher.Close()
+	dispatcher.SetOpenResultEnabled(true)
+
+	blocked, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 1})
+	ready, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 2})
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen, StreamID: 101, Payload: blocked}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen, StreamID: 102, Payload: ready}); err != nil {
+		t.Fatal(err)
+	}
+
+	var result protocol.OpenResultPayload
+	select {
+	case frame := <-sent:
+		if frame.Type != protocol.FrameOpenResult || frame.StreamID != 102 {
+			t.Fatalf("ready stream frame=%+v, want OPEN_RESULT", frame)
+		}
+		result, _ = protocol.DecodeOpenResultPayload(frame.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("ready dial was blocked by another target dial")
+	}
+	if !result.Accepted || result.Code != protocol.OpenResultCodeOK {
+		t.Fatalf("ready result=%+v, want success", result)
+	}
+	dial.release(1)
+}
+
+func TestStreamDispatcherStrictFailureIsPerStreamOpenResult(t *testing.T) {
+	dial := newControlledDialFunc()
+	dial.stage(1, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	})
+	sent := make(chan protocol.Frame, 2)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error {
+		sent <- frame
+		return nil
+	}, DialExecutorConfig{MaxConcurrent: 1, MaxPending: 1, ConnectTimeout: time.Second, OpenTimeout: time.Second}, dial.dial)
+	defer dispatcher.Close()
+	dispatcher.SetOpenResultEnabled(true)
+	payload, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 1})
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen, StreamID: 111, Payload: payload}); err != nil {
+		t.Fatalf("stream dial failure became session error: %v", err)
+	}
+	select {
+	case frame := <-sent:
+		if frame.Type != protocol.FrameOpenResult || frame.StreamID != 111 {
+			t.Fatalf("strict failure frame=%+v, want OPEN_RESULT", frame)
+		}
+		result, _ := protocol.DecodeOpenResultPayload(frame.Payload)
+		if result.Accepted || result.Code != protocol.OpenResultCodeConnectionRefused || result.Stage != protocol.OpenResultStageConnect {
+			t.Fatalf("strict failure result=%+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for strict OPEN_RESULT")
+	}
+}
+
+func TestStreamDispatcherLegacyFailureSendsOnlyReset(t *testing.T) {
+	dial := newControlledDialFunc()
+	dial.stage(1, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	})
+	sent := make(chan protocol.Frame, 2)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error {
+		sent <- frame
+		return nil
+	}, DialExecutorConfig{MaxConcurrent: 1, MaxPending: 1, ConnectTimeout: time.Second, OpenTimeout: time.Second}, dial.dial)
+	defer dispatcher.Close()
+	payload, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 1})
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 112, Payload: payload}); err != nil {
+		t.Fatalf("legacy dial failure became session error: %v", err)
+	}
+	select {
+	case frame := <-sent:
+		if frame.Type != protocol.FrameReset || frame.StreamID != 112 {
+			t.Fatalf("legacy failure frame=%+v, want RESET", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for legacy RESET")
+	}
+}
+
+func TestStreamDispatcherTargetWriteFailureResetsOnlyCurrentStream(t *testing.T) {
+	first := &writeErrorDispatcherConn{directionalDispatcherConn: newDirectionalDispatcherConn(), err: errors.New("target write failed")}
+	second := newDirectionalDispatcherConn()
+	dial := func(_ context.Context, payload protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		if payload.TargetPort == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	sent := make(chan protocol.Frame, 4)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error {
+		sent <- frame
+		return nil
+	}, DialExecutorConfig{MaxConcurrent: 2, MaxPending: 2, ConnectTimeout: time.Second, OpenTimeout: time.Second}, dial)
+	defer dispatcher.Close()
+	dispatcher.SetOpenResultEnabled(true)
+	firstPayload, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 1})
+	secondPayload, _ := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "service.internal", TargetPort: 2})
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen, StreamID: 121, Payload: firstPayload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen, StreamID: 122, Payload: secondPayload}); err != nil {
+		t.Fatal(err)
+	}
+	seenOpenResults := map[uint32]bool{}
+	for len(seenOpenResults) != 2 {
+		select {
+		case frame := <-sent:
+			if frame.Type != protocol.FrameOpenResult || (frame.StreamID != 121 && frame.StreamID != 122) {
+				t.Fatalf("setup frame=%+v, want OPEN_RESULT", frame)
+			}
+			seenOpenResults[frame.StreamID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for both OPEN_RESULT frames, seen=%v", seenOpenResults)
+		}
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 121, Payload: []byte("request")}); err != nil {
+		t.Fatalf("target write failure became session error: %v", err)
+	}
+	select {
+	case frame := <-sent:
+		if frame.Type != protocol.FrameReset || frame.StreamID != 121 {
+			t.Fatalf("write failure frame=%+v, want current stream RESET", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for target write RESET")
+	}
+	if got := dispatcher.ActiveStreams(); got != 1 {
+		t.Fatalf("active streams=%d, want only the healthy stream", got)
+	}
+}
+
+func TestConnectionPoolHandlerEnablesOpenResultFromServerAck(t *testing.T) {
+	dispatcher := NewStreamDispatcher(Dialer{}, nil)
+	defer dispatcher.Close()
+	handler := &connectionPoolHandler{dispatcher: dispatcher}
+	ackPayload, err := protocol.EncodeAgentMetadataAckPayload(protocol.AgentMetadataAckPayload{
+		Accepted: true, Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameAgentMetadataAck, Payload: ackPayload}); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher.mu.Lock()
+	enabled := dispatcher.openResult
+	dispatcher.mu.Unlock()
+	if !enabled {
+		t.Fatal("server capability ACK did not enable strict open result")
 	}
 }
 
 func TestDefaultStreamDispatcherSupportsHTTPLogicalStreams(t *testing.T) {
 	conn := &streamConn{}
-	called := false
+	called := make(chan struct{})
 	d := NewStreamDispatcher(Dialer{HTTPStream: func(context.Context, string, int) (io.ReadWriteCloser, error) {
-		called = true
+		close(called)
 		return conn, nil
 	}}, nil)
 	p, _ := json.Marshal(StreamOpenPayload{Protocol: "http", TargetHost: "service", TargetPort: 8080})
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 12, Payload: p}); err != nil {
 		t.Fatal(err)
 	}
-	if !called {
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
 		t.Fatal("HTTP logical stream did not use the injected HTTP dialer")
 	}
 }
@@ -265,6 +903,7 @@ func TestStreamDispatcherReadsTargetBackToFrameCallback(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 8, Payload: p}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 8)
 	var got protocol.Frame
 	select {
 	case got = <-gotc:
@@ -288,6 +927,7 @@ func TestStreamDispatcherHalfCloseKeepsTargetReadSideUntilResponseEOF(t *testing
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 21, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 21)
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: 21}); err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +971,7 @@ func TestStreamDispatcherResetsHalfCloseWhenTargetLacksCloseWrite(t *testing.T) 
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 22, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 22)
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: 22}); err != nil {
 		t.Fatalf("Handle(HALF_CLOSE) error = %v, want per-stream RESET", err)
 	}
@@ -355,6 +996,7 @@ func TestStreamDispatcherMapsNonEOFReadErrorToBoundedReset(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 23, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 23)
 	conn.reads <- dispatcherReadResult{err: errors.New("private target failure")}
 	frame := <-sent
 	if frame.Type != protocol.FrameReset || frame.StreamID != 23 || len(frame.Payload) == 0 || len(frame.Payload) > 128 {
@@ -374,6 +1016,7 @@ func TestStreamDispatcherMapsTargetWriteErrorToBoundedReset(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 27, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 27)
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 27, Payload: []byte("datagram")}); err != nil {
 		t.Fatalf("Handle(DATA) error = %v, want per-stream RESET", err)
 	}
@@ -404,6 +1047,7 @@ func TestStreamDispatcherMapsTargetShortWriteToBoundedReset(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 28, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 28)
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 28, Payload: []byte("partial")}); err != nil {
 		t.Fatalf("Handle(DATA) error = %v, want per-stream RESET", err)
 	}
@@ -429,6 +1073,7 @@ func TestStreamDispatcherRejectsDataAfterInboundHalfClose(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 24, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 24)
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: 24}); err != nil {
 		t.Fatal(err)
 	}
@@ -507,13 +1152,14 @@ func TestStreamDispatcherCloseWaitsForTargetReaderExit(t *testing.T) {
 }
 
 func TestStreamDispatcherRejectsDuplicateStreamID(t *testing.T) {
-	first := &blockingStreamConn{streamConn: &streamConn{}, release: make(chan struct{})}
-	defer first.Close()
+	first := newDirectionalDispatcherConn()
 	second := &streamConn{}
 	count := 0
+	dialStarted := make(chan struct{}, 1)
 	d := NewStreamDispatcher(Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) {
 		count++
 		if count == 1 {
+			dialStarted <- struct{}{}
 			return first, nil
 		}
 		return second, nil
@@ -523,11 +1169,20 @@ func TestStreamDispatcherRejectsDuplicateStreamID(t *testing.T) {
 	if err := d.Handle(f); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Handle(f); !errors.Is(err, ErrDuplicateStream) {
-		t.Fatalf("err=%v", err)
+	select {
+	case <-dialStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stream dial did not start")
 	}
-	if first.closed || !second.closed {
-		t.Fatalf("duplicate stream lifecycle first=%v second=%v", first.closed, second.closed)
+	if err := d.Handle(f); err != nil {
+		t.Fatalf("duplicate stream became session error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("duplicate stream caused %d target dials, want 1", count)
+	}
+	waitStreamInstalled(t, d, 10)
+	if got := d.ActiveStreams(); got != 1 {
+		t.Fatalf("active streams=%d, want first stream to remain active", got)
 	}
 }
 
@@ -592,6 +1247,7 @@ func TestStreamDispatcherHTTPSUsesConfiguredHostAndSNI(t *testing.T) {
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 31, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
+	waitStreamInstalled(t, d, 31)
 	request := "GET / HTTP/1.1\r\nHost: service.internal.example.com\r\n\r\n"
 	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 31, Payload: []byte(request)}); err != nil {
 		t.Fatal(err)
@@ -642,7 +1298,14 @@ func TestStreamDispatcherHTTPSRejectsUntrustedCertificate(t *testing.T) {
 	responses := make(chan string, 1)
 	address := startAgentTLSServer(t, certificate, serverName, responses, 0)
 
-	d := NewStreamDispatcher(Dialer{Timeout: 2 * time.Second}, nil)
+	reset := make(chan protocol.Frame, 1)
+	d := NewStreamDispatcherWithSender(Dialer{Timeout: 2 * time.Second}, nil, func(frame protocol.Frame) error {
+		if frame.Type == protocol.FrameReset {
+			reset <- frame
+		}
+		return nil
+	})
+	defer d.Close()
 	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{
 		Protocol: "http", TargetHost: "127.0.0.1", TargetPort: address.Port,
 		TargetScheme: "https", TLSServerName: "service.internal.example.com",
@@ -650,7 +1313,15 @@ func TestStreamDispatcherHTTPSRejectsUntrustedCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 33, Payload: payload}); err == nil {
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 33, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-reset:
+		if frame.StreamID != 33 {
+			t.Fatalf("TLS failure reset stream=%d, want 33", frame.StreamID)
+		}
+	case <-time.After(2 * time.Second):
 		t.Fatal("HTTPS stream accepted an untrusted certificate")
 	}
 }

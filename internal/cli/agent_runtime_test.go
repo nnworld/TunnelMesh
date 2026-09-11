@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -114,6 +116,15 @@ func TestAgentRunCommandForwardsTCPUDPAndHTTPThroughRealDispatcher(t *testing.T)
 		_, registered := runtime.AgentSessions.Get("agent-cli")
 		return registered
 	}, "Agent CLI did not register a live session")
+	strictAgent := false
+	for _, session := range runtime.AgentSessions.List("agent-cli") {
+		if session.Supports(protocol.CapabilityStreamOpenResult) {
+			strictAgent = true
+		}
+	}
+	if !strictAgent {
+		t.Fatal("Agent CLI did not register stream open-result capability")
+	}
 
 	clientTransport, err := client.DialWebSocket(ctx, "ws://"+runtimeListener.Addr().String()+"/ws/client", clientToken.Secret)
 	if err != nil {
@@ -184,6 +195,27 @@ func TestAgentRunCommandForwardsTCPUDPAndHTTPThroughRealDispatcher(t *testing.T)
 	stopRuntime()
 	if err := waitError(t, runtimeDone, "Server runtime"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAgentDispatcherFactoryAdvertisesStreamCapabilities(t *testing.T) {
+	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 1)}
+	session := agent.NewSessionWithMetadata(transport, agent.NewMetadataCollector(nil))
+	factory := NewAgentDispatcherFactory(config.AgentStreamConfig{MaxConcurrentDials: 3, MaxPendingDials: 7})
+	handler := factory(session, "connection-1")
+	if handler == nil {
+		t.Fatal("factory returned no handler")
+	}
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	frame := <-transport.sent
+	payload, err := protocol.DecodeAgentMetadataPayload(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Capabilities) != 1 || payload.Capabilities[0] != protocol.CapabilityStreamOpenResult {
+		t.Fatalf("agent capabilities=%v", payload.Capabilities)
 	}
 }
 

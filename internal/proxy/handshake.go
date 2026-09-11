@@ -8,6 +8,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var (
@@ -62,6 +64,9 @@ const (
 	SOCKS5ReplySucceeded            SOCKS5Reply = 0x00
 	SOCKS5ReplyGeneralFailure       SOCKS5Reply = 0x01
 	SOCKS5ReplyConnectionNotAllowed SOCKS5Reply = 0x02
+	SOCKS5ReplyNetworkUnreachable   SOCKS5Reply = 0x03
+	SOCKS5ReplyHostUnreachable      SOCKS5Reply = 0x04
+	SOCKS5ReplyConnectionRefused    SOCKS5Reply = 0x05
 	SOCKS5ReplyCommandUnsupported   SOCKS5Reply = 0x07
 )
 
@@ -188,6 +193,27 @@ func ReadSOCKS5Request(r io.Reader) (SOCKS5Request, error) {
 
 func EncodeSOCKS5Reply(reply SOCKS5Reply) []byte {
 	return []byte{5, byte(reply), 0, 1, 0, 0, 0, 0, 0, 0}
+}
+
+// SOCKS5ReplyForResult maps the protocol's stable open result to RFC 1928
+// reply codes. Unknown values fail closed as a general failure.
+func SOCKS5ReplyForResult(result protocol.OpenResultPayload) byte {
+	switch result.Code {
+	case protocol.OpenResultCodeOK:
+		return byte(SOCKS5ReplySucceeded)
+	case protocol.OpenResultCodeForbidden:
+		return byte(SOCKS5ReplyConnectionNotAllowed)
+	case protocol.OpenResultCodeNetworkUnreachable:
+		return byte(SOCKS5ReplyNetworkUnreachable)
+	case protocol.OpenResultCodeHostUnreachable:
+		return byte(SOCKS5ReplyHostUnreachable)
+	case protocol.OpenResultCodeConnectionRefused:
+		return byte(SOCKS5ReplyConnectionRefused)
+	case protocol.OpenResultCodeUnsupportedCapability:
+		return byte(SOCKS5ReplyCommandUnsupported)
+	default:
+		return byte(SOCKS5ReplyGeneralFailure)
+	}
 }
 
 func ParseSOCKS5Connect(payload []byte) (SOCKS5Request, error) {

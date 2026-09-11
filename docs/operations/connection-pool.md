@@ -39,6 +39,24 @@ agent:
 
 Agent 只使用一个 `server_url`。多个 WebSocket 都连接该 URL；多 `server_urls` 不属于当前实现。
 
+## 负载与延迟信号
+
+连接池控制器从每个物理连接采样以下过程内信号：
+
+- 活跃 stream 数和心跳 RTT。
+- 等待执行的 pending dial 数。
+- 目标连接建立耗时 P95（open P95）。
+- 从 stream 打开到 Agent 收到首字节响应的耗时 P95（TTFB P95）。
+- Fair writer 从入队到写出的等待耗时 P95（writer queue wait P95）。
+
+默认高负载阈值为：活跃 stream `16`、队列压力 `80`、RTT `500ms`、pending dial `1`、open P95 `1s`、TTFB P95 `1s`、writer queue wait P95 `100ms`。同一信号连续两次评估超过阈值，且 Server 已通过 metadata ack 确认支持连接池、当前连接数小于 `max` 时，才会建立新物理连接。这样可以避免瞬时抖动立即扩容，也保留 `min=1,max=1` 的默认单连接行为。
+
+这些信号只用于本进程的连接池决策，不写入数据库。相关日志和指标不包含目标主机、端口、Token、用户名、密码或 stream/connection ID，避免把业务拓扑或凭据泄漏到观测系统。
+
+## 连接选择
+
+Server 新建 stream 时优先选择本节点上健康的 Agent WebSocket 连接；本节点没有健康连接时，会查询集群连接租约并回退到远端 Server 节点。候选连接按活跃 stream 数升序、健康分降序、RTT 升序排序，排序只影响性能，不会绕过 token、Agent、协议、CIDR 和端口等授权校验。已建立 stream 固定在原连接上，不会在线迁移。
+
 ## Server 节点与共享令牌
 
 `server.relay.node_token` 是 Server 节点服务令牌的唯一配置字段。管理员可以在 Tokens 页面创建：
@@ -157,6 +175,6 @@ curl -sS -X DELETE \
 ## 当前限制
 
 - 流固定在其打开时的 connection 上，不做在线迁移。
-- Agent 队列压力信号尚未从真实发送 backpressure 中采样，控制器目前主要使用活跃流数、RTT 和 Server 能力确认。
+- pending dial、open P95、TTFB P95 和 writer queue wait P95 已参与本进程扩容决策；这些内部快照当前不作为独立管理 API 字段暴露。
 - Remote relay transport 由运行时注入；当前版本不会从配置自动拨号其它 Server 节点。默认选择器优先本地连接，本地无健康连接时会查询连接注册表。
 - `max=1` 时不需要所有 Server 同时升级；`max>1` 前必须完成所有入口节点的滚动升级。

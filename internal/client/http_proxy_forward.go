@@ -21,13 +21,14 @@ const (
 )
 
 type HTTPProxyForwardConfig struct {
-	ListenAddr  string
-	AgentID     string
-	AllowRemote bool
-	AuthMode    HTTPProxyAuthMode
-	Username    string
-	Password    string
-	AuthURL     string
+	ListenAddr       string
+	AgentID          string
+	AllowRemote      bool
+	AuthMode         HTTPProxyAuthMode
+	Username         string
+	Password         string
+	AuthURL          string
+	RemoteValidation RemoteValidationCacheConfig
 }
 
 type HTTPProxyForward struct {
@@ -67,7 +68,7 @@ func NewHTTPProxyForward(opener StreamOpener, cfg HTTPProxyForwardConfig) (*HTTP
 			return nil, errors.New("client: non-loopback HTTP proxy listener requires basic auth")
 		}
 	}
-	return &HTTPProxyForward{opener: opener, cfg: cfg, validator: NewRemoteValidator(cfg.AuthURL)}, nil
+	return &HTTPProxyForward{opener: opener, cfg: cfg, validator: newForwardRemoteValidator(cfg.AuthURL, cfg.RemoteValidation)}, nil
 }
 
 func (f *HTTPProxyForward) Start(ctx context.Context) error {

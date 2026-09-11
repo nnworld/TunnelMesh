@@ -16,6 +16,7 @@ type ClientRegistration struct {
 type ClientSessionPrincipal struct {
 	ConnectionID string
 	Identity     auth.TokenIdentity
+	StrictOpen   bool
 }
 
 type StreamAuthorizer interface {

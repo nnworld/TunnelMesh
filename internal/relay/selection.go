@@ -3,6 +3,8 @@ package relay
 import (
 	"context"
 	"io"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 // AgentConnectionTarget is the transport-neutral result of connection
@@ -63,6 +65,46 @@ func (t *SelectedTransport) OpenStream(ctx context.Context, request StreamReques
 	request.NodeID = target.ServerNodeID
 	request.Epoch = target.ServerNodeEpoch
 	return t.remote.OpenStream(ctx, request)
+}
+
+func (t *SelectedTransport) OpenStreamResult(ctx context.Context, request StreamRequest) (io.ReadWriteCloser, RelayOpenResult, error) {
+	if t == nil || t.selector == nil {
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeAgentOffline)}, ErrNodeDisconnected
+	}
+	target, err := t.selector.Select(ctx, request.AgentID, request.Protocol)
+	if err != nil {
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, err
+	}
+	if target.AgentID != "" {
+		request.AgentID = target.AgentID
+	}
+	request.TargetConnectionID = target.ConnectionID
+	request.TargetConnectionEpoch = target.ConnectionEpoch
+	if target.Local {
+		if t.local == nil {
+			return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeAgentOffline)}, ErrNodeDisconnected
+		}
+		request.NodeID = ""
+		request.Epoch = 0
+		resultTransport, ok := t.local.(OpenResultTransport)
+		if !ok {
+			if request.StrictOpen {
+				return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+			}
+			conn, openErr := t.local.OpenStream(ctx, request)
+			if openErr != nil || conn == nil {
+				return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, openErr
+			}
+			return conn, RelayOpenResult{Payload: protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK}}, nil
+		}
+		return resultTransport.OpenStreamResult(ctx, request)
+	}
+	if t.remote == nil || target.ServerNodeID == "" {
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeAgentOffline)}, ErrNodeDisconnected
+	}
+	request.NodeID = target.ServerNodeID
+	request.Epoch = target.ServerNodeEpoch
+	return t.remote.OpenStreamResult(ctx, request)
 }
 
 func (t *SelectedTransport) Close() error {

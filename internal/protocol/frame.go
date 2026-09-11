@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	CurrentVersion     uint8 = 1
-	MaxPayload               = 1 << 20
-	MaxMetadataPayload       = 32 << 10
+	CurrentVersion       uint8 = 1
+	MaxPayload                 = 1 << 20
+	MaxMetadataPayload         = 32 << 10
+	MaxOpenResultPayload       = 1 << 10
 )
 
 var (
@@ -42,6 +43,7 @@ const (
 	FrameTraceStart
 	FrameTraceHop
 	FrameTraceEnd
+	FrameOpenResult
 )
 
 // Descriptive aliases keep call sites readable while retaining the wire names.
@@ -60,12 +62,14 @@ const (
 	FrameTypeTraceStart     = FrameTraceStart
 	FrameTypeTraceHop       = FrameTraceHop
 	FrameTypeTraceEnd       = FrameTraceEnd
+	FrameTypeOpenResult     = FrameOpenResult
 	FrameClose              = FrameHalfClose
 )
 
 const (
 	FlagFin uint16 = 1 << iota
 	FlagAck
+	FlagStrictOpen
 )
 
 // Frame is the versioned unit exchanged over an agent/client WebSocket.
@@ -92,6 +96,9 @@ func (f Frame) Validate() error {
 	if isMetadataFrame(f.Type) && len(f.Payload) > MaxMetadataPayload {
 		return fmt.Errorf("%w: %d", ErrPayloadTooLarge, len(f.Payload))
 	}
+	if f.Type == FrameOpenResult && len(f.Payload) > MaxOpenResultPayload {
+		return fmt.Errorf("%w: %d", ErrPayloadTooLarge, len(f.Payload))
+	}
 	if f.StreamID == 0 && f.Type != FrameGoAway && f.Type != FramePing && f.Type != FramePong && !isMetadataFrame(f.Type) && !isTraceFrame(f.Type) {
 		return ErrInvalidFrame
 	}
@@ -101,7 +108,7 @@ func (f Frame) Validate() error {
 	return nil
 }
 
-func knownFrameType(t FrameType) bool { return t >= FrameOpenStream && t <= FrameAgentMetadataAck }
+func knownFrameType(t FrameType) bool { return t >= FrameOpenStream && t <= FrameOpenResult }
 
 func isMetadataFrame(t FrameType) bool {
 	return t >= FrameAgentHello && t <= FrameAgentMetadataAck
@@ -135,6 +142,7 @@ type AgentMetadataPayload struct {
 	ReportedAt   time.Time            `json:"reported_at"`
 	Items        []AgentMetadataItem  `json:"items"`
 	Errors       []AgentMetadataError `json:"errors,omitempty"`
+	Capabilities []string             `json:"capabilities,omitempty"`
 }
 
 // AgentMetadataAckPayload is returned by the server after fencing and
@@ -148,6 +156,7 @@ type AgentMetadataAckPayload struct {
 	ConnectionPoolSupported bool                 `json:"connection_pool_supported,omitempty"`
 	MaxConnectionsPerAgent  int                  `json:"max_connections_per_agent,omitempty"`
 	Errors                  []AgentMetadataError `json:"errors,omitempty"`
+	Capabilities            []string             `json:"capabilities,omitempty"`
 }
 
 func EncodeAgentMetadataPayload(payload AgentMetadataPayload) ([]byte, error) {

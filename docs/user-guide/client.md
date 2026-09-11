@@ -284,6 +284,19 @@ tunnelmesh-client forward http-proxy \
 
 远程校验失败时，本地 HTTP 代理返回 `403 Forbidden`。请求体、响应体、用户名、密码和目标地址不会写入日志。
 
+远程校验结果有进程内缓存，SOCKS5 和 HTTP 代理使用同一组配置：
+
+```yaml
+client:
+  remote_validation:
+    positive_ttl: 15s
+    negative_ttl: 2s
+    timeout: 3s
+    max_entries: 10000
+```
+
+`2xx` 按 `positive_ttl` 缓存；非 `2xx`、超时和网络错误按 `negative_ttl` 缓存。相同协议、Agent、目标、校验 endpoint 和本地凭据的并发请求会合并为一次远程调用。缓存键中的凭据使用进程随机 HMAC 摘要，不同用户名或密码不会共享结果；用户名、密码、目标地址和 Agent ID 不会出现在日志或指标标签中。远程授权服务变更决策时，已允许的结果最多可能在 `positive_ttl` 内继续复用，需要更快收敛时应调小该值。
+
 ## 9. SOCKS5 转发
 
 `forward socks5` 在本机启动一个 SOCKS5 CONNECT 入口，浏览器或支持 SOCKS5 的工具可以按请求动态选择 Agent 侧目标：
@@ -310,6 +323,30 @@ curl --socks5-hostname 127.0.0.1:1080 \
 - 域名不在 Client 本机解析，而是透传给 Agent，由 Agent 侧完成解析和目标策略校验。
 - 默认只监听 `127.0.0.1`，不暴露到其他网卡。
 - 认证默认为 `none`，仅适合本机使用。
+
+### Strict open 和回复码
+
+Client 建立 WebSocket 时会按优先级协商以下子协议：
+
+1. `tunnelmesh.v1.open-result.flow-control`
+2. `tunnelmesh.v1.open-result`
+3. `tunnelmesh.v1`
+
+Server、Agent 和跨 Server relay 都支持 `OPEN_RESULT` 时，SOCKS5 只有在 Agent 完成目标拨号并返回 `accepted=true` 后才回复成功。目标拨号失败不会断开 Client 与 Server 的 WebSocket 会话，只会失败当前 SOCKS5 请求；其它并发请求可以继续使用。
+
+稳定错误会映射为 RFC 1928 回复码：
+
+| OpenResult code | SOCKS5 回复 |
+| --- | --- |
+| `ok` | `0x00` succeeded |
+| `forbidden` | `0x02` connection not allowed |
+| `network_unreachable` | `0x03` network unreachable |
+| `host_unreachable` | `0x04` host unreachable |
+| `connection_refused` | `0x05` connection refused |
+| `unsupported_capability` | `0x07` command not supported |
+| `agent_offline`、`queue_full`、`timeout`、`internal_error` | `0x01` general SOCKS server failure |
+
+打开超时只 reset 当前流，并返回可重试的 `timeout` 结果。旧版本 Server 没有协商子协议时，Client 会自动使用 legacy open 语义重连；Server 已协商 strict open 但 Agent 或跨 Server relay 不支持时，Client 会得到明确的 `unsupported_capability`，不会伪造 SOCKS5 成功。升级完整链路后，新连接会自动启用 strict open。
 
 如需让局域网内其他机器访问该 SOCKS5 入口，必须同时显式开启远程监听和密码认证：
 
@@ -357,6 +394,8 @@ tunnelmesh-client forward socks5 \
 - 超时或网络错误：拒绝
 
 远程校验失败时，SOCKS5 返回 `0x02`（connection not allowed）。请求体、响应体、用户名、密码和目标地址不会写入日志。
+
+SOCKS5 远程校验使用上文 `client.remote_validation` 的缓存、超时和容量配置，并与 HTTP 代理保持相同的凭据隔离与并发合并行为。
 
 ## 10. 原始 TCP 代理
 

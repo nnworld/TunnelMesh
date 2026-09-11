@@ -120,6 +120,22 @@ func TestSessionReportsHelloUpdatesAndReconnectSnapshot(t *testing.T) {
 	}
 }
 
+func TestSessionIncludesConfiguredCapabilitiesInMetadata(t *testing.T) {
+	transport := &metadataTestTransport{}
+	session := NewSessionWithMetadata(transport, NewMetadataCollector(nil))
+	session.SetCapabilities([]string{protocol.CapabilityStreamOpenResult})
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := protocol.DecodeAgentMetadataPayload(transport.sent[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Capabilities) != 1 || payload.Capabilities[0] != protocol.CapabilityStreamOpenResult {
+		t.Fatalf("hello capabilities=%v", payload.Capabilities)
+	}
+}
+
 func TestSessionMetadataStateIsSafeDuringConcurrentReportingAndReset(t *testing.T) {
 	t.Setenv("TUNNELMESH_REGION", "cn-east")
 	session := NewSessionWithMetadata(&metadataTestTransport{}, NewMetadataCollector([]config.MetadataSource{{Name: "region", Source: "env", Key: "TUNNELMESH_REGION"}}))

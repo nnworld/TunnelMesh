@@ -8,6 +8,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 func TestGRPCRelayRequiresMTLSAndBuildsConcreteAdapter(t *testing.T) {
@@ -53,6 +55,21 @@ func TestRelayEpochValidationAndNodeDisconnect(t *testing.T) {
 	r.UnregisterNode("n1")
 	if _, err := r.OpenStream(context.Background(), StreamRequest{NodeID: "n1", Epoch: 3}); !errors.Is(err, ErrNodeDisconnected) {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestRelayOpenStreamResultRejectsStrictOpenWithoutResultTransport(t *testing.T) {
+	r := NewRelayService()
+	r.RegisterNode("node-legacy", 3, &fakeNode{})
+
+	stream, result, err := r.OpenStreamResult(context.Background(), StreamRequest{
+		NodeID: "node-legacy", Epoch: 3, StrictOpen: true, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
+	})
+	if stream != nil || err != nil {
+		t.Fatalf("OpenStreamResult stream=%v err=%v, want nil stream without transport error", stream, err)
+	}
+	if result.Payload.Accepted || result.Payload.Stage != protocol.OpenResultStageRelay || result.Payload.Code != protocol.OpenResultCodeUnsupportedCapability {
+		t.Fatalf("OpenStreamResult payload=%+v, want unsupported_capability failure", result.Payload)
 	}
 }
 

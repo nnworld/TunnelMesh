@@ -125,3 +125,11 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 升级前确认 `schema_meta.version=7`、v7→v8 增量脚本存在且数据库账号可执行 `ALTER TABLE`/`UPDATE`。
 - v8 只为 `server_nodes` 增加 `name`、`enabled`、`deleted_at` 并回填名称；失败时版本不会提前推进，MySQL DDL 可能已隐式提交，确认已完成的列后可重试。
 - 回滚应用时保留 v8 新增列；如需精确恢复 Schema，使用升级前备份，不要手工删除列或修改版本号。
+
+## 授权缓存与 Schema v9
+
+- `/ready` 中 `authorization_cache` 为 unhealthy：检查 SQLite 文件或 MySQL 可用性、网络超时和数据库账号 `SELECT authorization_revision` 权限。组件错误只提示修订号源不可用，不会暴露 DSN 或完整数据库错误。
+- Token 已撤销但个别节点仍放行新流：确认所有节点使用 Schema v9 或更高版本；检查 `server.authorization_cache.revision_poll_interval` 是否被调大；观察 Prometheus 的 `tunnelmesh_authorization_revision_poll_total`。本节点创建/轮换/撤销 token 会立即失效本地缓存，其它节点依赖轮询。
+- 轮询失败超过 `max_stale_on_poll_error` 后，Server 会 fail-closed，不再使用正向缓存；负向缓存仍受 `negative_ttl` 限制。若需要立即排障，可临时设置 `server.authorization_cache.enabled=false` 并滚动重启。
+- 升级前确认 `schema_meta.version=8`、v8→v9 增量脚本存在，数据库账号可创建表并更新 `schema_meta`。
+- v9 的 `authorization_revision` 是授权缓存的一致性依据。回滚应用可保留该表；不要手工删除表、修改 revision 或回退版本号。需要精确恢复时使用升级前备份。

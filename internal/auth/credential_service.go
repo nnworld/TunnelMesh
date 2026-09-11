@@ -106,11 +106,12 @@ type CredentialService struct {
 	policies    storage.PolicyRepository
 	secretStore *SecretStore
 
-	workerCtx context.Context
-	cancel    context.CancelFunc
-	lastUsed  chan lastUsedUpdate
-	wg        sync.WaitGroup
-	closeOnce sync.Once
+	workerCtx                   context.Context
+	cancel                      context.CancelFunc
+	lastUsed                    chan lastUsedUpdate
+	authorizationChangeNotifier func()
+	wg                          sync.WaitGroup
+	closeOnce                   sync.Once
 }
 
 // SetSecretStore enables encrypted-at-rest recovery for newly issued and
@@ -119,6 +120,21 @@ type CredentialService struct {
 func (s *CredentialService) SetSecretStore(store *SecretStore) {
 	if s != nil {
 		s.secretStore = store
+	}
+}
+
+// SetAuthorizationChangeNotifier lets the runtime request an immediate cache
+// invalidation after a successful local token mutation. The database revision
+// remains the authoritative invalidation mechanism for every deployment mode.
+func (s *CredentialService) SetAuthorizationChangeNotifier(notifier func()) {
+	if s != nil {
+		s.authorizationChangeNotifier = notifier
+	}
+}
+
+func (s *CredentialService) notifyAuthorizationChange() {
+	if s != nil && s.authorizationChangeNotifier != nil {
+		s.authorizationChangeNotifier()
 	}
 }
 
@@ -235,6 +251,7 @@ func (s *CredentialService) Create(ctx context.Context, in CreateTokenInput) (Cr
 	if err := s.tokens.Create(ctx, record); err != nil {
 		return CreatedToken{}, err
 	}
+	s.notifyAuthorizationChange()
 	return createdToken(record, scope, raw), nil
 }
 
@@ -332,6 +349,7 @@ func (s *CredentialService) Rotate(ctx context.Context, id string) (CreatedToken
 	if err := s.tokens.Rotate(ctx, record.ID, replacement, now); err != nil {
 		return CreatedToken{}, err
 	}
+	s.notifyAuthorizationChange()
 	return createdToken(replacement, identity.Scope, raw), nil
 }
 
@@ -339,7 +357,11 @@ func (s *CredentialService) Revoke(ctx context.Context, id string) error {
 	if s == nil || s.tokens == nil {
 		return errors.New("service token repository is required")
 	}
-	return s.tokens.Revoke(ctx, strings.TrimSpace(id), time.Now().UTC())
+	if err := s.tokens.Revoke(ctx, strings.TrimSpace(id), time.Now().UTC()); err != nil {
+		return err
+	}
+	s.notifyAuthorizationChange()
+	return nil
 }
 
 func (s *CredentialService) requireLifecycleRepositories() error {

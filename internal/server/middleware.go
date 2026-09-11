@@ -11,6 +11,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 type principalContextKey struct{}
@@ -78,6 +79,14 @@ func clientWebSocketHandshake(security config.SecurityConfig, authenticate func(
 		authenticatedRequest.Header.Del("Authorization")
 		*r = *authenticatedRequest
 		wsConfig.Origin = origin
+		selected, _ := protocol.SelectSubprotocol(r.Header.Values("Sec-WebSocket-Protocol"))
+		if selected == "" {
+			wsConfig.Protocol = nil
+		} else {
+			wsConfig.Protocol = []string{selected}
+		}
+		principal.StrictOpen = selected == protocol.SubprotocolOpenResult || selected == protocol.SubprotocolFlowControl
+		*r = *r.WithContext(context.WithValue(r.Context(), clientPrincipalContextKey{}, principal))
 		return nil
 	}
 }

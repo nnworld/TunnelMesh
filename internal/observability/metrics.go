@@ -11,33 +11,44 @@ import (
 // Metrics owns the bounded Prometheus collectors used by runtime observers.
 // A registry is injected so tests and embedded users never mutate the global registry.
 type Metrics struct {
-	connectionsTotal         *prometheus.CounterVec
-	connectionsActive        *prometheus.GaugeVec
-	connectionStageDuration  *prometheus.HistogramVec
-	heartbeatTotal           *prometheus.CounterVec
-	heartbeatRTT             *prometheus.HistogramVec
-	bytesTotal               *prometheus.CounterVec
-	streamsActive            *prometheus.GaugeVec
-	streamsTotal             *prometheus.CounterVec
-	streamErrorsTotal        *prometheus.CounterVec
-	probeTotal               *prometheus.CounterVec
-	probeDuration            *prometheus.HistogramVec
-	registryLeaseTotal       *prometheus.CounterVec
-	relayTotal               *prometheus.CounterVec
-	agentConnections         *prometheus.GaugeVec
-	agentConnectionCapacity  *prometheus.GaugeVec
-	agentActiveStreams       *prometheus.GaugeVec
-	agentConnectionRTT       *prometheus.HistogramVec
-	agentConnectionErrors    *prometheus.CounterVec
-	agentScaleDecisions      *prometheus.CounterVec
-	agentSelection           *prometheus.CounterVec
-	storageOperationDuration *prometheus.HistogramVec
-	storageErrorsTotal       *prometheus.CounterVec
-	configReloadTotal        *prometheus.CounterVec
-	ready                    *prometheus.GaugeVec
-	activeMu                 sync.Mutex
-	activeConnections        map[string]int
-	activeStreams            map[string]int
+	connectionsTotal          *prometheus.CounterVec
+	connectionsActive         *prometheus.GaugeVec
+	connectionStageDuration   *prometheus.HistogramVec
+	heartbeatTotal            *prometheus.CounterVec
+	heartbeatRTT              *prometheus.HistogramVec
+	bytesTotal                *prometheus.CounterVec
+	streamsActive             *prometheus.GaugeVec
+	streamsTotal              *prometheus.CounterVec
+	streamErrorsTotal         *prometheus.CounterVec
+	probeTotal                *prometheus.CounterVec
+	probeDuration             *prometheus.HistogramVec
+	registryLeaseTotal        *prometheus.CounterVec
+	relayTotal                *prometheus.CounterVec
+	agentConnections          *prometheus.GaugeVec
+	agentConnectionCapacity   *prometheus.GaugeVec
+	agentActiveStreams        *prometheus.GaugeVec
+	agentConnectionRTT        *prometheus.HistogramVec
+	agentConnectionErrors     *prometheus.CounterVec
+	agentScaleDecisions       *prometheus.CounterVec
+	agentSelection            *prometheus.CounterVec
+	storageOperationDuration  *prometheus.HistogramVec
+	storageErrorsTotal        *prometheus.CounterVec
+	configReloadTotal         *prometheus.CounterVec
+	ready                     *prometheus.GaugeVec
+	streamStageDuration       *prometheus.HistogramVec
+	streamOpenTotal           *prometheus.CounterVec
+	streamQueueWait           *prometheus.HistogramVec
+	streamWindowStall         *prometheus.HistogramVec
+	streamBackpressure        *prometheus.CounterVec
+	authorizationCache        *prometheus.CounterVec
+	authorizationRevision     *prometheus.GaugeVec
+	authorizationRevisionPoll *prometheus.CounterVec
+	remoteValidationCache     *prometheus.CounterVec
+	activeMu                  sync.Mutex
+	activeConnections         map[string]int
+	activeStreams             map[string]int
+	agentConnectionStates     map[string]bool
+	agentConnectionStreams    map[string]int
 }
 
 // NewMetrics creates and registers a complete metrics set. Nil creates an isolated registry.
@@ -59,21 +70,38 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		probeDuration:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_probe_duration_seconds", Help: "Probe duration in seconds."}, []string{"probe_kind", "result", "error_class"}),
 		registryLeaseTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_registry_lease_total", Help: "Registry lease outcomes."}, []string{"operation", "result", "error_class"}),
 		relayTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_relay_total", Help: "Relay outcomes."}, []string{"result", "error_class"}),
-		agentConnections:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connections", Help: "Current Agent connections, by identity."}, []string{"agent_id", "instance_id", "connection_id"}),
+		agentConnections:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connections", Help: "Current Agent connections, by identity."}, []string{"agent_id", "instance_id"}),
 		agentConnectionCapacity:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connection_capacity", Help: "Maximum Agent connections allowed by policy."}, []string{"agent_id", "instance_id"}),
-		agentActiveStreams:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_active_streams", Help: "Active streams per Agent connection."}, []string{"agent_id", "instance_id", "connection_id"}),
-		agentConnectionRTT:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_agent_connection_rtt_seconds", Help: "Agent connection heartbeat RTT in seconds."}, []string{"agent_id", "instance_id", "connection_id"}),
-		agentConnectionErrors:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_errors_total", Help: "Agent connection errors."}, []string{"agent_id", "instance_id", "connection_id", "error_class"}),
+		agentActiveStreams:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_active_streams", Help: "Active streams per Agent identity."}, []string{"agent_id", "instance_id"}),
+		agentConnectionRTT:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_agent_connection_rtt_seconds", Help: "Agent connection heartbeat RTT in seconds."}, []string{"agent_id", "instance_id"}),
+		agentConnectionErrors:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_errors_total", Help: "Agent connection errors."}, []string{"agent_id", "instance_id", "error_class"}),
 		agentScaleDecisions:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_scale_decisions_total", Help: "Agent connection pool scale decisions."}, []string{"agent_id", "instance_id", "decision", "reason"}),
-		agentSelection:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_selection_total", Help: "Agent connection selection decisions."}, []string{"agent_id", "connection_id", "server_node_id", "scope"}),
+		agentSelection:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_selection_total", Help: "Agent connection selection decisions."}, []string{"agent_id", "server_node_id", "scope"}),
 		storageOperationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_storage_operation_duration_seconds", Help: "Storage operation duration in seconds."}, []string{"operation", "result"}),
 		storageErrorsTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_storage_errors_total", Help: "Storage errors."}, []string{"operation", "error_class"}),
 		configReloadTotal:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_config_reload_total", Help: "Configuration reload outcomes."}, []string{"result", "error_class"}),
 		ready:                    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_ready", Help: "Readiness state, one when ready."}, []string{"component"}),
-		activeConnections:        make(map[string]int),
-		activeStreams:            make(map[string]int),
+		streamStageDuration:      prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_stage_duration_seconds", Help: "Stream lifecycle stage duration in seconds."}, []string{"component", "stage", "result", "error_class", "protocol"}),
+		streamOpenTotal:          prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_open_total", Help: "Stream open outcomes by negotiated mode."}, []string{"component", "result", "error_class", "open_mode"}),
+		streamQueueWait:          prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_queue_wait_seconds", Help: "Stream queue wait in seconds."}, []string{"component", "result"}),
+		streamWindowStall:        prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_window_stall_seconds", Help: "Stream flow-control window stall duration in seconds."}, []string{"component", "result"}),
+		streamBackpressure:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_backpressure_total", Help: "Stream backpressure outcomes."}, []string{"component", "result"}),
+		authorizationCache:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_authorization_cache_requests_total", Help: "Stream authorization cache requests."}, []string{"cache", "result"}),
+		authorizationRevision: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "tunnelmesh_authorization_revision",
+				Help: "Current authorization revision generation.",
+			},
+			nil,
+		),
+		authorizationRevisionPoll: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_authorization_revision_poll_total", Help: "Authorization revision poll outcomes."}, []string{"result", "error_class"}),
+		remoteValidationCache:     prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_remote_validation_cache_requests_total", Help: "Remote validation cache requests."}, []string{"cache", "result"}),
+		activeConnections:         make(map[string]int),
+		activeStreams:             make(map[string]int),
+		agentConnectionStates:     make(map[string]bool),
+		agentConnectionStreams:    make(map[string]int),
 	}
-	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready)
+	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache)
 	return m
 }
 
@@ -180,29 +208,58 @@ func (m *Metrics) ObserveRelay(result, errorClass string) {
 }
 
 func (m *Metrics) ObserveAgentConnection(agentID, instanceID, connectionID string, active bool) {
-	value := 0.0
+	agentID, instanceID = label(agentID), label(instanceID)
+	connectionKey := agentID + "\x00" + instanceID + "\x00" + label(connectionID)
+	identityKey := agentID + "\x00" + instanceID
+	m.activeMu.Lock()
 	if active {
-		value = 1
+		m.agentConnectionStates[connectionKey] = true
+	} else if !m.agentConnectionStates[connectionKey] {
+		m.activeMu.Unlock()
+		return
+	} else {
+		delete(m.agentConnectionStates, connectionKey)
+		delete(m.agentConnectionStreams, connectionKey)
 	}
-	m.agentConnections.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Set(value)
+	count := 0
+	for key, isActive := range m.agentConnectionStates {
+		if isActive && strings.HasPrefix(key, identityKey+"\x00") {
+			count++
+		}
+	}
+	m.agentConnections.WithLabelValues(agentID, instanceID).Set(float64(count))
+	m.activeMu.Unlock()
 }
 
 func (m *Metrics) ObserveAgentConnectionError(agentID, instanceID, connectionID, errorClass string) {
-	m.agentConnectionErrors.WithLabelValues(label(agentID), label(instanceID), label(connectionID), label(errorClass)).Inc()
+	_ = connectionID
+	m.agentConnectionErrors.WithLabelValues(label(agentID), label(instanceID), label(errorClass)).Inc()
 }
 
 func (m *Metrics) ObserveAgentActiveStreams(agentID, instanceID, connectionID string, active int) {
 	if active < 0 {
 		active = 0
 	}
-	m.agentActiveStreams.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Set(float64(active))
+	agentID, instanceID = label(agentID), label(instanceID)
+	connectionKey := agentID + "\x00" + instanceID + "\x00" + label(connectionID)
+	m.activeMu.Lock()
+	m.agentConnectionStreams[connectionKey] = active
+	total := 0
+	for key, count := range m.agentConnectionStreams {
+		if strings.HasPrefix(key, agentID+"\x00"+instanceID+"\x00") {
+			total += count
+		}
+	}
+	m.agentActiveStreams.WithLabelValues(agentID, instanceID).Set(float64(total))
+	m.activeMu.Unlock()
 }
 
 func (m *Metrics) ObserveAgentConnectionRTT(agentID, instanceID, connectionID string, rtt time.Duration) {
 	if rtt < 0 {
 		rtt = 0
 	}
-	m.agentConnectionRTT.WithLabelValues(label(agentID), label(instanceID), label(connectionID)).Observe(rtt.Seconds())
+	_ = connectionID
+	m.agentConnectionRTT.WithLabelValues(label(agentID), label(instanceID)).Observe(rtt.Seconds())
 }
 
 func (m *Metrics) SetAgentConnectionCapacity(agentID, instanceID string, capacity int) {
@@ -217,7 +274,8 @@ func (m *Metrics) ObserveAgentScaleDecision(agentID, instanceID, decision, reaso
 }
 
 func (m *Metrics) ObserveAgentSelection(agentID, connectionID, serverNodeID, scope string) {
-	m.agentSelection.WithLabelValues(label(agentID), label(connectionID), label(serverNodeID), label(scope)).Inc()
+	_ = connectionID
+	m.agentSelection.WithLabelValues(label(agentID), label(serverNodeID), label(scope)).Inc()
 }
 
 func (m *Metrics) ObserveStorage(operation, result, errorClass string, duration time.Duration) {
@@ -233,6 +291,51 @@ func (m *Metrics) ObserveStorage(operation, result, errorClass string, duration 
 
 func (m *Metrics) ObserveConfigReload(result, errorClass string) {
 	m.configReloadTotal.WithLabelValues(label(result), label(errorClass)).Inc()
+}
+
+func (m *Metrics) ObserveStreamStage(component, stage, result, errorClass, protocol string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	m.streamStageDuration.WithLabelValues(label(component), label(stage), label(result), label(errorClass), NormalizeProtocol(protocol)).Observe(duration.Seconds())
+}
+
+func (m *Metrics) ObserveStreamOpen(component, result, errorClass, openMode string) {
+	m.streamOpenTotal.WithLabelValues(label(component), label(result), label(errorClass), label(openMode)).Inc()
+}
+
+func (m *Metrics) ObserveStreamQueueWait(component, result string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	m.streamQueueWait.WithLabelValues(label(component), label(result)).Observe(duration.Seconds())
+}
+
+func (m *Metrics) ObserveStreamWindowStall(component, result string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	m.streamWindowStall.WithLabelValues(label(component), label(result)).Observe(duration.Seconds())
+}
+
+func (m *Metrics) ObserveStreamBackpressure(component, result string) {
+	m.streamBackpressure.WithLabelValues(label(component), label(result)).Inc()
+}
+
+func (m *Metrics) ObserveAuthorizationCache(cache, result string) {
+	m.authorizationCache.WithLabelValues(label(cache), label(result)).Inc()
+}
+
+func (m *Metrics) SetAuthorizationRevision(revision uint64) {
+	m.authorizationRevision.WithLabelValues().Set(float64(revision))
+}
+
+func (m *Metrics) ObserveAuthorizationRevisionPoll(result, errorClass string) {
+	m.authorizationRevisionPoll.WithLabelValues(label(result), label(errorClass)).Inc()
+}
+
+func (m *Metrics) ObserveRemoteValidationCache(cache, result string) {
+	m.remoteValidationCache.WithLabelValues(label(cache), label(result)).Inc()
 }
 
 func (m *Metrics) SetReady(component string, ready bool) {

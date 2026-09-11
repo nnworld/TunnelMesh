@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	streamsession "github.com/tunnelmesh/tunnelmesh/internal/session"
 )
 
 var (
@@ -80,11 +81,7 @@ type AgentSession struct {
 	metadataCallback   MetadataCallback
 	metadataService    *AgentMetadataService
 	metadataTTL        time.Duration
-	queue              chan protocol.Frame
-	slots              chan struct{}
-	stop               chan struct{}
-	stopOnce           sync.Once
-	drain              chan chan struct{}
+	writer             *streamsession.FairFrameWriter
 	closing            bool
 }
 
@@ -174,7 +171,10 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 	if connectionEpoch == 0 {
 		connectionEpoch = req.Epoch
 	}
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), queue: make(chan protocol.Frame, m.cfg.QueueSize), slots: make(chan struct{}, m.cfg.QueueSize), stop: make(chan struct{}), drain: make(chan chan struct{})}
+	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
+		ControlQueueSize: m.cfg.QueueSize, StreamQueueBytes: 262144, QuantumBytes: 32768,
+	})
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), writer: writer}
 	m.mu.Lock()
 	agentSessions := m.sessions[req.AgentID]
 	if agentSessions == nil {
@@ -207,7 +207,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 		m.connectionOrder[req.AgentID] = append(order, connectionID)
 	}
 	m.mu.Unlock()
-	go s.writer()
+	go s.runWriter(writer)
 	if old != nil {
 		_ = old.Close()
 	}
@@ -223,6 +223,7 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 	ack := protocol.AgentMetadataAckPayload{
 		AgentID: s.AgentID, Epoch: s.Epoch, Revision: payload.Revision,
 		ConnectionPoolSupported: true, MaxConnectionsPerAgent: 64,
+		Capabilities: s.Capabilities,
 	}
 	digest := metadataDigest(payload)
 	s.metadataMu.Lock()
@@ -553,17 +554,28 @@ func (m *AgentSessionManager) Send(id string, f protocol.Frame) error {
 	if s.closed || s.closing {
 		return ErrSessionClosed
 	}
-	select {
-	case s.slots <- struct{}{}:
-	default:
+	return s.enqueue(f)
+}
+
+func (s *AgentSession) enqueue(f protocol.Frame) error {
+	if s == nil || s.writer == nil {
+		return ErrSessionClosed
+	}
+	var err error
+	if f.Type == protocol.FrameData && f.StreamID != 0 {
+		err = s.writer.EnqueueData(f.StreamID, f)
+	} else {
+		err = s.writer.EnqueueControl(f)
+	}
+	if errors.Is(err, streamsession.ErrControlQueueFull) || errors.Is(err, streamsession.ErrStreamQueueFull) {
 		return ErrBackpressure
 	}
-	select {
-	case s.queue <- f:
-		return nil
-	default:
-		<-s.slots
-		return ErrBackpressure
+	return err
+}
+
+func (s *AgentSession) runWriter(writer *streamsession.FairFrameWriter) {
+	if err := writer.Run(context.Background()); err != nil {
+		s.fail(err)
 	}
 }
 
@@ -629,24 +641,10 @@ func (m *AgentSessionManager) sendServerGeneration(id string, serverGeneration u
 		m.mu.RUnlock()
 		return ErrSessionClosed
 	}
-	select {
-	case s.slots <- struct{}{}:
-	default:
-		s.mu.RUnlock()
-		m.mu.RUnlock()
-		return ErrBackpressure
-	}
-	select {
-	case s.queue <- f:
-		s.mu.RUnlock()
-		m.mu.RUnlock()
-		return nil
-	default:
-		<-s.slots
-		s.mu.RUnlock()
-		m.mu.RUnlock()
-		return ErrBackpressure
-	}
+	err := s.enqueue(f)
+	s.mu.RUnlock()
+	m.mu.RUnlock()
+	return err
 }
 
 // SendGeneration preserves the legacy Epoch-based API. New internal callers
@@ -724,51 +722,14 @@ func (m *AgentSessionManager) goAwaySession(s *AgentSession) error {
 	// before the transport is closed and no new frames can be queued.
 	s.closing = true
 	s.mu.Unlock()
-	ack := make(chan struct{})
-	select {
-	case s.drain <- ack:
-		<-ack
-	case <-s.stop:
-		return ErrSessionClosed
-	}
+	s.writer.Drain()
 	s.mu.Lock()
 	s.closed = true
-	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
 	err := s.transport.Send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameGoAway})
+	_ = s.writer.Close()
 	_ = s.transport.Close()
 	return err
-}
-func (s *AgentSession) writer() {
-	for {
-		select {
-		case f := <-s.queue:
-			if err := s.transport.Send(f); err != nil {
-				s.fail(err)
-				<-s.slots
-				return
-			}
-			<-s.slots
-		case ack := <-s.drain:
-			for {
-				select {
-				case f := <-s.queue:
-					if err := s.transport.Send(f); err != nil {
-						s.fail(err)
-						<-s.slots
-						close(ack)
-						return
-					}
-					<-s.slots
-				default:
-					close(ack)
-					return
-				}
-			}
-		case <-s.stop:
-			return
-		}
-	}
 }
 func (s *AgentSession) fail(_ error) {
 	s.metadataMu.Lock()
@@ -779,7 +740,7 @@ func (s *AgentSession) fail(_ error) {
 	}
 	s.mu.Unlock()
 	s.metadataMu.Unlock()
-	s.stopOnce.Do(func() { close(s.stop) })
+	_ = s.writer.Close()
 	_ = s.transport.Close()
 }
 func (s *AgentSession) Close() error {
@@ -791,9 +752,9 @@ func (s *AgentSession) Close() error {
 		return nil
 	}
 	s.closed = true
-	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Unlock()
 	s.metadataMu.Unlock()
+	_ = s.writer.Close()
 	return s.transport.Close()
 }
 func (m *AgentSessionManager) Remove(id string) {

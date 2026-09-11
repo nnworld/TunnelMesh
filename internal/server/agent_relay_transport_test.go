@@ -24,6 +24,292 @@ func TestAgentRelayTransportLegacyWrappersNilReceiverFailClosed(t *testing.T) {
 	mux.FailAgentGeneration("agent", 1)
 }
 
+func TestAgentRelayTransportOpenStreamResultWaitsForStrictFailure(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-strict-open", NodeID: "node", Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	type openResult struct {
+		stream io.ReadWriteCloser
+		result relay.RelayOpenResult
+		err    error
+	}
+	resultCh := make(chan openResult, 1)
+	go func() {
+		stream, result, openErr := mux.OpenStreamResult(context.Background(), relay.StreamRequest{
+			AgentID: "agent-strict-open", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 4096,
+		})
+		resultCh <- openResult{stream: stream, result: result, err: openErr}
+	}()
+
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 || open.Window != 4096 {
+		t.Fatalf("OPEN frame = %+v, want strict OPEN_STREAM with window 4096", open)
+	}
+	select {
+	case got := <-resultCh:
+		t.Fatalf("OpenStreamResult returned before OPEN_RESULT: %+v", got)
+	default:
+	}
+
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: false, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeConnectionRefused,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.handleAgentFrameGeneration("agent-strict-open", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-resultCh:
+		if got.stream != nil || got.err != nil {
+			t.Fatalf("OpenStreamResult result = stream %v, err %v, want nil stream and nil error", got.stream, got.err)
+		}
+		if got.result.Payload.Accepted || got.result.Payload.Stage != protocol.OpenResultStageConnect ||
+			got.result.Payload.Code != protocol.OpenResultCodeConnectionRefused {
+			t.Fatalf("OpenResult = %+v, want connection_refused failure", got.result.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for strict OPEN_RESULT")
+	}
+}
+
+func TestAgentRelayTransportStrictOpenRejectsLegacyAgentWithoutSending(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	_, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-legacy-open", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	stream, result, openErr := mux.OpenStreamResult(ctx, relay.StreamRequest{
+		AgentID: "agent-legacy-open", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if stream != nil || openErr != nil || result.Payload.Accepted || result.Payload.Code != protocol.OpenResultCodeUnsupportedCapability {
+		t.Fatalf("OpenStreamResult stream=%v err=%v result=%+v, want unsupported capability", stream, openErr, result.Payload)
+	}
+	select {
+	case frame := <-agentTransport.sent:
+		t.Fatalf("legacy Agent received frame=%+v, want no strict OPEN", frame)
+	default:
+	}
+}
+
+func TestAgentRelayTransportPropagatesWindowControlFrames(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-window", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-window", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if open.Type != protocol.FrameOpenStream || open.Window != 4096 {
+		t.Fatalf("OPEN=%+v, want initial window 4096", open)
+	}
+
+	controlWriter, ok := stream.(interface{ WriteControl(protocol.Frame) error })
+	if !ok {
+		t.Fatal("relay stream does not support control writes")
+	}
+	if err := controlWriter.WriteControl(protocol.Frame{Type: protocol.FrameWindowUpdate, Window: 8}); err != nil {
+		t.Fatal(err)
+	}
+	forwarded := receiveAgentRelayFrame(t, agentTransport)
+	if forwarded.Type != protocol.FrameWindowUpdate || forwarded.StreamID != open.StreamID || forwarded.Window != 8 {
+		t.Fatalf("forwarded WINDOW_UPDATE=%+v", forwarded)
+	}
+	if err := mux.handleAgentFrameGeneration("agent-window", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: open.StreamID, Window: 16,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controlReader, ok := stream.(interface{ ReadControl() (protocol.Frame, bool) })
+	if !ok {
+		t.Fatal("relay stream does not support control reads")
+	}
+	control, ok := controlReader.ReadControl()
+	if !ok || control.Type != protocol.FrameWindowUpdate || control.Window != 16 {
+		t.Fatalf("Agent WINDOW_UPDATE control=%+v ok=%v", control, ok)
+	}
+}
+
+func TestAgentRelayTransportOpenStreamResultPropagatesStableFailureCodes(t *testing.T) {
+	tests := []struct {
+		stage protocol.OpenResultStage
+		code  protocol.OpenResultCode
+	}{
+		{protocol.OpenResultStageAuthorization, protocol.OpenResultCodeForbidden},
+		{protocol.OpenResultStageRelay, protocol.OpenResultCodeAgentOffline},
+		{protocol.OpenResultStageQueue, protocol.OpenResultCodeQueueFull},
+		{protocol.OpenResultStageRelay, protocol.OpenResultCodeTimeout},
+		{protocol.OpenResultStageDNS, protocol.OpenResultCodeNetworkUnreachable},
+		{protocol.OpenResultStageDNS, protocol.OpenResultCodeHostUnreachable},
+		{protocol.OpenResultStageConnect, protocol.OpenResultCodeConnectionRefused},
+		{protocol.OpenResultStageSelection, protocol.OpenResultCodeUnsupportedCapability},
+		{protocol.OpenResultStageProtocol, protocol.OpenResultCodeInternalError},
+	}
+	for _, test := range tests {
+		t.Run(string(test.code), func(t *testing.T) {
+			manager := NewAgentSessionManager(AgentSessionConfig{})
+			agentTransport := newFakeTransport()
+			session, err := manager.Register(context.Background(), AgentRegistration{
+				AgentID: "agent-stable", NodeID: "node", Epoch: 1,
+				Capabilities: []string{protocol.CapabilityStreamOpenResult},
+			}, agentTransport)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := NewAgentRelayTransport(manager)
+			defer mux.Close()
+			resultCh := make(chan relay.RelayOpenResult, 1)
+			go func() {
+				_, result, openErr := mux.OpenStreamResult(context.Background(), relay.StreamRequest{
+					AgentID: "agent-stable", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+				})
+				if openErr != nil {
+					t.Errorf("OpenStreamResult error = %v", openErr)
+				}
+				resultCh <- result
+			}()
+			open := receiveAgentRelayFrame(t, agentTransport)
+			payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{Accepted: false, Stage: test.stage, Code: test.code})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mux.handleAgentFrameGeneration("agent-stable", session.serverGeneration, protocol.Frame{
+				Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case result := <-resultCh:
+				if result.Payload.Accepted || result.Payload.Stage != test.stage || result.Payload.Code != test.code {
+					t.Fatalf("result=%+v, want %s/%s", result.Payload, test.stage, test.code)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for OPEN_RESULT")
+			}
+		})
+	}
+}
+
+func TestAgentRelayTransportOpenStreamResultTimeoutResetsOnlyStream(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-open-timeout", NodeID: "node", Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	}, agentTransport); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	stream, result, err := mux.OpenStreamResult(ctx, relay.StreamRequest{
+		AgentID: "agent-open-timeout", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if stream != nil || err == nil || result.Payload.Accepted || result.Payload.Code != protocol.OpenResultCodeTimeout {
+		t.Fatalf("stream=%v result=%+v err=%v, want timeout failure", stream, result.Payload, err)
+	}
+	receiveAgentRelayFrame(t, agentTransport)
+	if frame := receiveAgentRelayFrame(t, agentTransport); frame.Type != protocol.FrameReset {
+		t.Fatalf("timeout response=%+v, want RESET", frame)
+	}
+}
+
+func TestAgentRelayTransportOpenStreamResultDuplicateAndEarlyDataAreIsolated(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-open-duplicate", NodeID: "node", Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+	type openResult struct {
+		stream io.ReadWriteCloser
+		result relay.RelayOpenResult
+	}
+	resultCh := make(chan openResult, 1)
+	go func() {
+		stream, result, openErr := mux.OpenStreamResult(context.Background(), relay.StreamRequest{
+			AgentID: "agent-open-duplicate", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+		})
+		if openErr != nil {
+			t.Errorf("OpenStreamResult error = %v", openErr)
+		}
+		resultCh <- openResult{stream: stream, result: result}
+	}()
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if err := mux.handleAgentFrameGeneration("agent-open-duplicate", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: []byte("early"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.handleAgentFrameGeneration("agent-open-duplicate", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stream io.ReadWriteCloser
+	select {
+	case got := <-resultCh:
+		stream = got.stream
+		if stream == nil || !got.result.Payload.Accepted || got.result.Payload.Code != protocol.OpenResultCodeOK {
+			t.Fatalf("stream=%v result=%+v, want successful stream", stream, got.result.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful OPEN_RESULT")
+	}
+	buffer := make([]byte, len("early"))
+	if _, err := io.ReadFull(stream, buffer); err != nil || string(buffer) != "early" {
+		t.Fatalf("early data=%q err=%v", buffer, err)
+	}
+	// A duplicate terminal result must reset only this stream.
+	if err := mux.handleAgentFrameGeneration("agent-open-duplicate", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if frame := receiveAgentRelayFrame(t, agentTransport); frame.Type != protocol.FrameReset || frame.StreamID != open.StreamID {
+		t.Fatalf("duplicate result response=%+v, want stream RESET", frame)
+	}
+}
+
 func TestAgentRelayTransportAllocatesIndependentWireIDsAndFencesReconnectGeneration(t *testing.T) {
 	manager := NewAgentSessionManager(AgentSessionConfig{})
 	firstTransport := newFakeTransport()

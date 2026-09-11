@@ -13,6 +13,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	streamsession "github.com/tunnelmesh/tunnelmesh/internal/session"
 )
 
 var ErrStreamNotFound = errors.New("agent: stream not found")
@@ -20,21 +21,39 @@ var ErrDuplicateStream = errors.New("agent: duplicate stream")
 
 const agentStreamResetMessage = "stream rejected"
 
+const (
+	defaultAgentReceiveWindow         = 262144
+	defaultAgentWindowUpdateThreshold = 131072
+)
+
 type StreamOpenPayload = protocol.StreamOpenPayload
 type StreamDialFunc func(context.Context, string, string, int) (io.ReadWriteCloser, error)
 type streamPayloadDialFunc func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error)
 type FrameSender func(protocol.Frame) error
 type streamEntry struct {
-	conn       io.ReadWriteCloser
-	generation uint64
-	protocol   string
-	localHalf  bool
-	remoteHalf bool
+	conn           io.ReadWriteCloser
+	generation     uint64
+	protocol       string
+	localHalf      bool
+	remoteHalf     bool
+	sendState      *protocol.StreamState
+	receiveState   *protocol.StreamState
+	windowSignal   chan struct{}
+	flowMu         sync.Mutex
+	receiveUnacked uint32
+	openedAt       time.Time
+	ttfbRecorded   bool
+}
+type pendingStream struct {
+	cancel        context.CancelFunc
+	data          [][]byte
+	halfClosed    bool
+	strict        bool
+	initialWindow uint32
 }
 type StreamDispatcher struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
-	dial        StreamDialFunc
 	dialPayload streamPayloadDialFunc
 	streams     map[uint32]*streamEntry
 	generation  uint64
@@ -43,6 +62,10 @@ type StreamDispatcher struct {
 	metrics     *observability.Metrics
 	readers     sync.WaitGroup
 	closed      bool
+	pending     map[uint32]*pendingStream
+	executor    *DialExecutor
+	openResult  bool
+	ttfbSamples latencySamples
 }
 
 func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
@@ -59,27 +82,27 @@ func NewStreamDispatcherWithCallback(d Dialer, override StreamDialFunc, cb func(
 	return NewStreamDispatcherWithSender(d, override, sender)
 }
 func NewStreamDispatcherWithSender(d Dialer, override StreamDialFunc, sender FrameSender) *StreamDispatcher {
-	var dial StreamDialFunc
+	return NewStreamDispatcherWithConfig(d, override, sender, DialExecutorConfig{}, nil)
+}
+
+func NewStreamDispatcherWithConfig(d Dialer, override StreamDialFunc, sender FrameSender, config DialExecutorConfig, dial streamPayloadDialFunc) *StreamDispatcher {
 	var dialPayload streamPayloadDialFunc
-	if override != nil {
-		dial = override
-	} else {
+	if dial != nil {
+		dialPayload = dial
+	} else if override != nil {
+		legacyDial := override
 		dialPayload = func(ctx context.Context, payload protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
-			if payload.Protocol == "http" {
-				return d.dialHTTPStreamPayload(ctx, payload)
-			}
-			switch payload.Protocol {
-			case "tcp":
-				return d.DialTCP(ctx, payload.TargetHost, payload.TargetPort)
-			case "udp":
-				return d.DialUDP(ctx, payload.TargetHost, payload.TargetPort)
-			default:
-				return nil, errors.New("agent: unsupported stream protocol")
-			}
+			return legacyDial(ctx, payload.Protocol, payload.TargetHost, payload.TargetPort)
 		}
+	} else {
+		dialPayload = d.dialStreamPayload
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &StreamDispatcher{ctx: ctx, cancel: cancel, dial: dial, dialPayload: dialPayload, streams: make(map[uint32]*streamEntry), send: sender}
+	return &StreamDispatcher{
+		ctx: ctx, cancel: cancel, dialPayload: dialPayload,
+		streams: make(map[uint32]*streamEntry), pending: make(map[uint32]*pendingStream),
+		send: sender, executor: NewDialExecutorWithDial(config, dialPayload),
+	}
 }
 
 // SetMetrics attaches the process-scoped observer without changing the
@@ -88,6 +111,15 @@ func (d *StreamDispatcher) SetMetrics(metrics *observability.Metrics) {
 	if d != nil {
 		d.metrics = metrics
 	}
+}
+
+func (d *StreamDispatcher) SetOpenResultEnabled(enabled bool) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.openResult = enabled
+	d.mu.Unlock()
 }
 
 func (d *StreamDispatcher) Handle(f protocol.Frame) error {
@@ -103,50 +135,73 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if f.StreamID == 0 || p.TargetHost == "" || p.TargetPort < 1 || p.TargetPort > 65535 {
 			return errors.New("agent: invalid stream target")
 		}
-		var c io.ReadWriteCloser
-		var dialErr error
-		if d.dialPayload != nil {
-			c, dialErr = d.dialPayload(d.ctx, p)
-		} else {
-			c, dialErr = d.dial(d.ctx, p.Protocol, p.TargetHost, p.TargetPort)
-		}
-		if dialErr != nil {
-			if d.metrics != nil {
-				d.metrics.ObserveStream(p.Protocol, "failed", observability.NormalizeErrorClass(dialErr))
-			}
-			return dialErr
-		}
+		strictOpen := d.openResult && f.Flags&protocol.FlagStrictOpen != 0
 		d.mu.Lock()
 		if d.closed {
 			d.mu.Unlock()
-			_ = c.Close()
 			return ErrStreamNotFound
 		}
 		if _, exists := d.streams[f.StreamID]; exists {
 			d.mu.Unlock()
-			_ = c.Close()
-			return ErrDuplicateStream
+			d.rejectStreamMode(f.StreamID, DialResult{Code: protocol.OpenResultCodeInternalError, Stage: protocol.OpenResultStageProtocol}, strictOpen)
+			return nil
 		}
+		if _, exists := d.pending[f.StreamID]; exists {
+			d.mu.Unlock()
+			d.rejectStreamMode(f.StreamID, DialResult{Code: protocol.OpenResultCodeInternalError, Stage: protocol.OpenResultStageProtocol}, strictOpen)
+			return nil
+		}
+		streamCtx, cancel := context.WithCancel(d.ctx)
+		d.pending[f.StreamID] = &pendingStream{cancel: cancel, strict: strictOpen, initialWindow: f.Window}
 		d.generation++
-		entry := &streamEntry{conn: c, generation: d.generation, protocol: p.Protocol}
-		d.streams[f.StreamID] = entry
-		d.readers.Add(1)
 		d.mu.Unlock()
-		go d.readBack(f.StreamID, entry)
-		if d.metrics != nil {
-			d.metrics.ObserveStream(p.Protocol, "accepted", "")
+		request := DialRequest{Frame: f, Payload: p, Result: func(result DialResult) {
+			d.completeDial(f.StreamID, p.Protocol, result)
+		}}
+		if err := d.executor.Submit(streamCtx, request); err != nil {
+			d.removePending(f.StreamID)
+			code := protocol.OpenResultCodeInternalError
+			if errors.Is(err, ErrDialQueueFull) {
+				code = protocol.OpenResultCodeQueueFull
+			}
+			d.rejectStreamMode(f.StreamID, DialResult{Code: code, Stage: protocol.OpenResultStageQueue, Retryable: code == protocol.OpenResultCodeQueueFull}, strictOpen)
+			if d.metrics != nil {
+				d.metrics.ObserveStream(p.Protocol, "failed", observability.NormalizeErrorClass(err))
+			}
 		}
 		return nil
 	case protocol.FrameData:
 		d.mu.Lock()
 		entry, ok := d.streams[f.StreamID]
+		pending := d.pending[f.StreamID]
+		pendingOK := pending != nil
 		localHalf := ok && entry.localHalf
+		strict := pendingOK && pending.strict
 		d.mu.Unlock()
 		if !ok {
-			return ErrStreamNotFound
+			if pendingOK {
+				if strict {
+					d.cancelPending(f.StreamID)
+					_ = d.sendReset(f.StreamID)
+					return nil
+				}
+				d.mu.Lock()
+				if current, exists := d.pending[f.StreamID]; exists {
+					current.data = append(current.data, append([]byte(nil), f.Payload...))
+				}
+				d.mu.Unlock()
+				return nil
+			}
+			_ = d.sendReset(f.StreamID)
+			return nil
 		}
 		if localHalf {
 			return d.rejectAndClose(f.StreamID, entry, protocol.ErrInvalidFrame)
+		}
+		if entry.receiveState != nil {
+			if err := entry.receiveState.Handle(f); err != nil {
+				return d.rejectAndClose(f.StreamID, entry, err)
+			}
 		}
 		written, err := entry.conn.Write(f.Payload)
 		if d.metrics != nil && written > 0 {
@@ -158,48 +213,81 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if err != nil {
 			return d.rejectAndClose(f.StreamID, entry, err)
 		}
+		d.releaseReceiveWindow(f.StreamID, entry, written)
 		return nil
 	case protocol.FrameHalfClose:
 		d.mu.Lock()
 		entry, ok := d.streams[f.StreamID]
+		pending, pendingOK := d.pending[f.StreamID]
 		if !ok {
+			if pendingOK {
+				// The dial worker reads this flag in completeDial, so the
+				// pending entry must only be mutated while d.mu is held.
+				pending.halfClosed = true
+			}
 			d.mu.Unlock()
-			return ErrStreamNotFound
+			return nil
 		}
 		if entry.localHalf {
 			d.mu.Unlock()
 			return nil
 		}
-		entry.localHalf = true
-		complete := entry.remoteHalf
 		d.mu.Unlock()
-		halfCloser, ok := entry.conn.(interface{ CloseWrite() error })
-		if !ok {
-			return d.rejectAndClose(f.StreamID, entry, errors.New("agent: target stream does not support half-close"))
-		}
-		if err := halfCloser.CloseWrite(); err != nil {
+		if err := d.handleHalfClose(f.StreamID, entry); err != nil {
 			return d.rejectAndClose(f.StreamID, entry, err)
-		}
-		if complete {
-			d.mu.Lock()
-			if current, exists := d.streams[f.StreamID]; exists && current == entry {
-				delete(d.streams, f.StreamID)
-			}
-			d.mu.Unlock()
-			return entry.conn.Close()
 		}
 		return nil
 	case protocol.FrameReset:
 		d.mu.Lock()
 		entry, ok := d.streams[f.StreamID]
+		pending, pendingOK := d.pending[f.StreamID]
 		if ok {
 			delete(d.streams, f.StreamID)
 		}
+		if pendingOK {
+			delete(d.pending, f.StreamID)
+		}
+		d.mu.Unlock()
+		if !ok && !pendingOK {
+			// A RESET can follow HALF_CLOSE completion after the peer has
+			// already retired the stream. It is stale stream state, not a
+			// reason to disconnect the Agent session.
+			return nil
+		}
+		if pending != nil && pending.cancel != nil {
+			pending.cancel()
+		}
+		d.executor.Cancel(f.StreamID)
+		if entry != nil {
+			// RESET is stream-local. A target that is already closed by its
+			// reader/writer goroutine must not escalate into a session error.
+			_ = entry.conn.Close()
+		}
+		return nil
+	case protocol.FrameWindowUpdate:
+		d.mu.Lock()
+		entry, ok := d.streams[f.StreamID]
 		d.mu.Unlock()
 		if !ok {
-			return ErrStreamNotFound
+			// Window updates can arrive after the local stream was reset by
+			// backpressure. Treat the late control frame as stream-local and
+			// keep the Agent session available for other streams.
+			return nil
 		}
-		return entry.conn.Close()
+		if entry.sendState == nil {
+			return nil
+		}
+		entry.flowMu.Lock()
+		err := entry.sendState.AddSendWindow(f.Window)
+		entry.flowMu.Unlock()
+		if err != nil {
+			return d.rejectAndClose(f.StreamID, entry, err)
+		}
+		select {
+		case entry.windowSignal <- struct{}{}:
+		default:
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -216,6 +304,191 @@ func (d *StreamDispatcher) ActiveStreams() int {
 	return len(d.streams)
 }
 
+func (d *StreamDispatcher) PendingDials() int {
+	return d.executor.PendingDials()
+}
+
+func (d *StreamDispatcher) OpenP95() time.Duration {
+	return d.executor.OpenP95()
+}
+
+func (d *StreamDispatcher) TTFBP95() time.Duration {
+	return d.ttfbSamples.P95()
+}
+
+func (d *StreamDispatcher) completeDial(id uint32, proto string, result DialResult) {
+	d.mu.Lock()
+	pending, _ := d.pending[id]
+	delete(d.pending, id)
+	earlyData := [][]byte(nil)
+	halfClosed := false
+	if pending != nil {
+		earlyData = pending.data
+		halfClosed = pending.halfClosed
+	}
+	if result.Code != protocol.OpenResultCodeOK || result.Conn == nil {
+		strict := pending != nil && pending.strict
+		d.mu.Unlock()
+		if pending != nil && pending.cancel != nil {
+			pending.cancel()
+		}
+		if result.Code == protocol.OpenResultCodeOK {
+			result.Code = protocol.OpenResultCodeInternalError
+			result.Stage = protocol.OpenResultStageConnect
+		}
+		d.rejectStreamMode(id, result, strict)
+		if d.metrics != nil {
+			d.metrics.ObserveStream(proto, "failed", observability.NormalizeErrorClass(result.Err))
+		}
+		_ = strict
+		return
+	}
+	if d.closed {
+		d.mu.Unlock()
+		_ = result.Conn.Close()
+		return
+	}
+	if _, exists := d.streams[id]; exists {
+		d.mu.Unlock()
+		_ = result.Conn.Close()
+		d.rejectStream(id, DialResult{Code: protocol.OpenResultCodeInternalError, Stage: protocol.OpenResultStageProtocol})
+		return
+	}
+	d.generation++
+	entry := &streamEntry{conn: result.Conn, generation: d.generation, protocol: proto}
+	entry.openedAt = time.Now()
+	if pending != nil && pending.initialWindow > 0 {
+		if sendState, err := protocol.NewStreamState(id, pending.initialWindow); err == nil {
+			_ = sendState.OpenLocal()
+			entry.sendState = sendState
+		}
+		if receiveState, err := protocol.NewStreamState(id, defaultAgentReceiveWindow); err == nil {
+			_ = receiveState.OpenLocal()
+			entry.receiveState = receiveState
+		}
+		entry.windowSignal = make(chan struct{}, 1)
+	}
+	d.streams[id] = entry
+	d.readers.Add(1)
+	strict := pending != nil && pending.strict
+	d.mu.Unlock()
+	var openResultErr error
+	if strict {
+		openResultErr = d.sendOpenResult(id, protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK})
+	}
+	if d.metrics != nil {
+		d.metrics.ObserveStream(proto, "accepted", "")
+	}
+	for _, payload := range earlyData {
+		if _, err := entry.conn.Write(payload); err != nil {
+			_ = d.rejectAndClose(id, entry, err)
+			return
+		}
+	}
+	if halfClosed {
+		if err := d.handleHalfClose(id, entry); err != nil {
+			_ = d.rejectAndClose(id, entry, err)
+			return
+		}
+	}
+	if openResultErr != nil {
+		_ = d.rejectAndClose(id, entry, openResultErr)
+		return
+	}
+	go d.readBack(id, entry)
+}
+
+func (d *StreamDispatcher) handleHalfClose(id uint32, entry *streamEntry) error {
+	d.mu.Lock()
+	if current, exists := d.streams[id]; !exists || current != entry || entry.localHalf {
+		d.mu.Unlock()
+		return nil
+	}
+	entry.localHalf = true
+	complete := entry.remoteHalf
+	d.mu.Unlock()
+	halfCloser, ok := entry.conn.(interface{ CloseWrite() error })
+	if !ok {
+		return errors.New("agent: target stream does not support half-close")
+	}
+	if err := halfCloser.CloseWrite(); err != nil {
+		return err
+	}
+	if complete {
+		d.mu.Lock()
+		if current, exists := d.streams[id]; exists && current == entry {
+			delete(d.streams, id)
+		}
+		d.mu.Unlock()
+		return entry.conn.Close()
+	}
+	return nil
+}
+
+func (d *StreamDispatcher) rejectStream(id uint32, result DialResult) {
+	d.mu.Lock()
+	strict := d.openResult
+	d.mu.Unlock()
+	d.rejectStreamMode(id, result, strict)
+}
+
+func (d *StreamDispatcher) rejectStreamMode(id uint32, result DialResult, strict bool) {
+	if result.Stage == "" {
+		result.Stage = protocol.OpenResultStageConnect
+	}
+	if result.Code == "" {
+		result.Code = protocol.OpenResultCodeInternalError
+	}
+	if result.RetryAfter < 0 {
+		result.RetryAfter = 0
+	}
+	if strict {
+		payload := protocol.OpenResultPayload{
+			Accepted: false, Stage: result.Stage, Code: result.Code,
+			Retryable: result.Retryable, RetryAfterMS: int(result.RetryAfter.Milliseconds()),
+		}
+		_ = d.sendOpenResult(id, payload)
+		return
+	}
+	_ = d.sendReset(id)
+}
+
+func (d *StreamDispatcher) sendOpenResult(id uint32, result protocol.OpenResultPayload) error {
+	if d.send == nil {
+		return nil
+	}
+	payload, err := protocol.EncodeOpenResultPayload(result)
+	if err != nil {
+		return err
+	}
+	return d.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: id, Payload: payload})
+}
+
+func (d *StreamDispatcher) removePending(id uint32) {
+	d.mu.Lock()
+	pending, exists := d.pending[id]
+	if exists {
+		delete(d.pending, id)
+	}
+	d.mu.Unlock()
+	if pending != nil && pending.cancel != nil {
+		pending.cancel()
+	}
+}
+
+func (d *StreamDispatcher) cancelPending(id uint32) {
+	d.mu.Lock()
+	pending, exists := d.pending[id]
+	if exists {
+		delete(d.pending, id)
+	}
+	d.mu.Unlock()
+	if pending != nil && pending.cancel != nil {
+		pending.cancel()
+	}
+	d.executor.Cancel(id)
+}
+
 func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 	defer d.readers.Done()
 	bufferSize := 32 << 10
@@ -229,6 +502,14 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 			return
 		}
 		if n > 0 && d.send != nil {
+			if !entry.ttfbRecorded {
+				entry.ttfbRecorded = true
+				d.ttfbSamples.Record(time.Since(entry.openedAt))
+			}
+			if err := d.waitForSendWindow(id, entry, n); err != nil {
+				d.removeAndClose(id, entry)
+				return
+			}
 			if sendErr := d.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buf[:n]...)}); sendErr != nil {
 				d.removeAndClose(id, entry)
 				return
@@ -266,6 +547,58 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 	}
 }
 
+func (d *StreamDispatcher) waitForSendWindow(id uint32, entry *streamEntry, size int) error {
+	if entry.sendState == nil {
+		return nil
+	}
+	for {
+		entry.flowMu.Lock()
+		err := entry.sendState.ConsumeSend(uint32(size))
+		entry.flowMu.Unlock()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, protocol.ErrWindowExhausted) {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-entry.windowSignal:
+			timer.Stop()
+		case <-timer.C:
+			d.mu.Lock()
+			current, ok := d.streams[id]
+			d.mu.Unlock()
+			if !ok || current != entry {
+				return nil
+			}
+		case <-d.ctx.Done():
+			timer.Stop()
+			return d.ctx.Err()
+		}
+	}
+}
+
+func (d *StreamDispatcher) releaseReceiveWindow(id uint32, entry *streamEntry, size int) {
+	if entry.receiveState == nil || size <= 0 {
+		return
+	}
+	entry.flowMu.Lock()
+	entry.receiveUnacked += uint32(size)
+	update := uint32(0)
+	if entry.receiveUnacked >= defaultAgentWindowUpdateThreshold {
+		update = entry.receiveUnacked
+		entry.receiveUnacked = 0
+	}
+	entry.flowMu.Unlock()
+	if update == 0 {
+		return
+	}
+	if err := entry.receiveState.AddReceiveWindow(update); err == nil && d.send != nil {
+		_ = d.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: id, Window: update})
+	}
+}
+
 func (d *StreamDispatcher) sendReset(id uint32) error {
 	if d.send == nil {
 		return nil
@@ -291,6 +624,7 @@ func (d *StreamDispatcher) removeAndClose(id uint32, entry *streamEntry) {
 }
 func (d *StreamDispatcher) Close() error {
 	d.cancel()
+	executorErr := d.executor.Close()
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
@@ -309,7 +643,7 @@ func (d *StreamDispatcher) Close() error {
 		closeErr = errors.Join(closeErr, conn.Close())
 	}
 	d.readers.Wait()
-	return closeErr
+	return errors.Join(closeErr, executorErr)
 }
 
 type FrameTransport interface {
@@ -319,6 +653,7 @@ type FrameTransport interface {
 }
 type Session struct {
 	transport               FrameTransport
+	writer                  *streamsession.FairFrameWriter
 	sendMu                  sync.Mutex
 	metadataMu              sync.Mutex
 	metadataCollector       *MetadataCollector
@@ -330,6 +665,7 @@ type Session struct {
 	metadataRevision        uint64
 	metadataReported        bool
 	metadataSnapshot        MetadataSnapshot
+	metadataCapabilities    []string
 	closed                  atomic.Bool
 	BaseBackoff, MaxBackoff time.Duration
 	HeartbeatInterval       time.Duration
@@ -341,7 +677,12 @@ type Session struct {
 }
 
 func NewSession(tr FrameTransport) *Session {
-	return &Session{transport: tr, BaseBackoff: time.Second, MaxBackoff: 30 * time.Second, Rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{})
+	go func() { _ = writer.Run(context.Background()) }()
+	return &Session{
+		transport: tr, writer: writer, BaseBackoff: time.Second, MaxBackoff: 30 * time.Second,
+		Rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
 // NewSessionWithMetadata attaches an independent metadata collector. Metadata
@@ -376,6 +717,17 @@ func (s *Session) SetMetadataConnectionIdentity(agentID, nodeID, instanceID, con
 	s.metadataAgentID, s.metadataNodeID = agentID, nodeID
 	s.metadataInstanceID, s.metadataConnectionID = instanceID, connectionID
 	s.metadataEpoch = epoch
+}
+
+// SetCapabilities advertises protocol features on the next hello/update. The
+// server still returns the negotiated intersection in its metadata ACK.
+func (s *Session) SetCapabilities(capabilities []string) {
+	if s == nil {
+		return
+	}
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	s.metadataCapabilities = append([]string(nil), capabilities...)
 }
 
 // ResetMetadataReport forces the next report to be a complete hello, as is
@@ -414,12 +766,14 @@ func (s *Session) ReportMetadata(ctx context.Context) error {
 		return nil
 	}
 	s.metadataRevision++
+	capabilities := append([]string(nil), s.metadataCapabilities...)
 	payload := protocol.AgentMetadataPayload{
 		AgentID: s.metadataAgentID, NodeID: s.metadataNodeID, InstanceID: s.metadataInstanceID,
 		ConnectionID: s.metadataConnectionID, Epoch: s.metadataEpoch,
 		Revision: s.metadataRevision, ReportedAt: time.Now().UTC(),
-		Items:  make([]protocol.AgentMetadataItem, 0, len(snapshot.Fields)),
-		Errors: make([]protocol.AgentMetadataError, 0, len(snapshot.Errors)),
+		Items:        make([]protocol.AgentMetadataItem, 0, len(snapshot.Fields)),
+		Errors:       make([]protocol.AgentMetadataError, 0, len(snapshot.Errors)),
+		Capabilities: capabilities,
 	}
 	for _, field := range snapshot.Fields {
 		payload.Items = append(payload.Items, protocol.AgentMetadataItem{Name: field.Name, Source: field.Source, Value: field.Value})
@@ -435,7 +789,7 @@ func (s *Session) ReportMetadata(ctx context.Context) error {
 	if !s.metadataReported {
 		frameType = protocol.FrameAgentHello
 	}
-	if err := s.send(protocol.Frame{Version: protocol.CurrentVersion, Type: frameType, Payload: encoded}); err != nil {
+	if err := s.sendControlSync(protocol.Frame{Version: protocol.CurrentVersion, Type: frameType, Payload: encoded}); err != nil {
 		return err
 	}
 	s.metadataSnapshot = snapshot
@@ -451,6 +805,20 @@ func (s *Session) send(frame protocol.Frame) error {
 	return s.Send(frame)
 }
 
+// sendControlSync preserves the historical synchronous metadata-reporting
+// contract while still giving control frames priority over queued DATA.
+func (s *Session) sendControlSync(frame protocol.Frame) error {
+	if s == nil || s.transport == nil || s.closed.Load() {
+		return ErrAgentSessionClosed
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.closed.Load() {
+		return ErrAgentSessionClosed
+	}
+	return s.writer.EnqueueControlSync(frame)
+}
+
 // Send serializes dispatcher and session control frames on the authenticated
 // transport and rejects writes once session shutdown begins.
 func (s *Session) Send(frame protocol.Frame) error {
@@ -462,7 +830,10 @@ func (s *Session) Send(frame protocol.Frame) error {
 	if s.closed.Load() {
 		return ErrAgentSessionClosed
 	}
-	return s.transport.Send(frame)
+	if frame.Type == protocol.FrameData && frame.StreamID != 0 {
+		return s.writer.EnqueueData(frame.StreamID, frame)
+	}
+	return s.writer.EnqueueControl(frame)
 }
 
 func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) error {
@@ -555,6 +926,16 @@ func (s *Session) LastHeartbeatRTT() time.Duration {
 	}
 	return time.Duration(s.heartbeatRTTNanos.Load())
 }
+
+// WriterQueueWaitP95 exposes the bounded writer-side queue latency so the
+// connection pool can react to transport backpressure without inspecting the
+// private writer implementation.
+func (s *Session) WriterQueueWaitP95() time.Duration {
+	if s == nil || s.writer == nil {
+		return 0
+	}
+	return s.writer.WriterQueueWaitP95()
+}
 func (s *Session) Close() error {
 	if s.closed.Swap(true) {
 		return nil
@@ -564,6 +945,8 @@ func (s *Session) Close() error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	s.writer.Drain()
+	_ = s.writer.Close()
 	return s.transport.Close()
 }
 func (s *Session) ReconnectDelay(attempt int) time.Duration {

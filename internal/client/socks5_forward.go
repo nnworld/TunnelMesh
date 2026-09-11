@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/proxy"
 )
 
@@ -30,6 +31,7 @@ type SOCKS5ForwardConfig struct {
 	Username         string
 	Password         string
 	AuthURL          string
+	RemoteValidation RemoteValidationCacheConfig
 }
 
 type SOCKS5Forward struct {
@@ -76,7 +78,7 @@ func NewSOCKS5Forward(opener StreamOpener, cfg SOCKS5ForwardConfig) (*SOCKS5Forw
 	return &SOCKS5Forward{
 		opener:    opener,
 		cfg:       cfg,
-		validator: NewRemoteValidator(cfg.AuthURL),
+		validator: newForwardRemoteValidator(cfg.AuthURL, cfg.RemoteValidation),
 		active:    make(map[net.Conn]struct{}),
 	}, nil
 }
@@ -183,9 +185,13 @@ func (f *SOCKS5Forward) handleConn(local net.Conn) {
 		_, _ = local.Write(proxy.EncodeSOCKS5Reply(proxy.SOCKS5ReplyConnectionNotAllowed))
 		return
 	}
-	remote, err := f.openStream(request)
-	if err != nil {
-		_, _ = local.Write(proxy.EncodeSOCKS5Reply(proxy.SOCKS5ReplyGeneralFailure))
+	remote, result, err := f.openStreamResult(request)
+	if err != nil || remote == nil || !result.Accepted {
+		reply := proxy.SOCKS5ReplyGeneralFailure
+		if err == nil && result.Code != "" {
+			reply = proxy.SOCKS5Reply(proxy.SOCKS5ReplyForResult(result))
+		}
+		_, _ = local.Write(proxy.EncodeSOCKS5Reply(reply))
 		return
 	}
 	defer remote.Close()
@@ -232,19 +238,27 @@ func (f *SOCKS5Forward) negotiateAndAuthenticate(local net.Conn) bool {
 	return err == nil
 }
 
-func (f *SOCKS5Forward) openStream(request proxy.SOCKS5Request) (io.ReadWriteCloser, error) {
+func (f *SOCKS5Forward) openStreamResult(request proxy.SOCKS5Request) (io.ReadWriteCloser, protocol.OpenResultPayload, error) {
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if f.cfg.ConnectTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, f.cfg.ConnectTimeout)
 		defer cancel()
 	}
-	return f.opener.OpenStream(ctx, StreamRequest{
+	req := StreamRequest{
 		AgentID:    f.cfg.AgentID,
 		Protocol:   "tcp",
 		TargetHost: request.Host,
 		TargetPort: request.Port,
-	})
+	}
+	if resultOpener, ok := f.opener.(ResultStreamOpener); ok {
+		return resultOpener.OpenStreamResult(ctx, req)
+	}
+	stream, err := f.opener.OpenStream(ctx, req)
+	if err != nil || stream == nil {
+		return nil, protocol.OpenResultPayload{Accepted: false, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeInternalError}, err
+	}
+	return stream, protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK}, nil
 }
 
 func socks5CredentialsEqual(provided, expected proxy.SOCKS5Credentials) bool {

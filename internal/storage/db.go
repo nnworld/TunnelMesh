@@ -20,29 +20,30 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 8
+	SchemaVersion = 9
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
 
 type DB struct {
-	sql           *sql.DB
-	driver        string
-	users         UserRepository
-	tokens        TokenRepository
-	serviceTokens ServiceTokenRepository
-	agents        AgentRepository
-	policies      PolicyRepository
-	tunnels       TunnelRepository
-	nodes         NodeRepository
-	metadata      AgentMetadataRepository
-	runtimeStats  AgentRuntimeStatsRepository
-	probeResults  AgentProbeResultRepository
-	leases        LeaseRepository
-	audits        AuditRepository
-	idempotency   IdempotencyRepository
-	dashboard     DashboardRepository
-	metrics       *observability.Metrics
+	sql                    *sql.DB
+	driver                 string
+	users                  UserRepository
+	tokens                 TokenRepository
+	serviceTokens          ServiceTokenRepository
+	agents                 AgentRepository
+	policies               PolicyRepository
+	tunnels                TunnelRepository
+	nodes                  NodeRepository
+	metadata               AgentMetadataRepository
+	runtimeStats           AgentRuntimeStatsRepository
+	probeResults           AgentProbeResultRepository
+	leases                 LeaseRepository
+	audits                 AuditRepository
+	idempotency            IdempotencyRepository
+	dashboard              DashboardRepository
+	authorizationRevisions AuthorizationRevisionRepository
+	metrics                *observability.Metrics
 }
 
 // AccountRepositories are transaction-bound repositories used for account
@@ -264,22 +265,23 @@ func normalizeMySQLDSNTLS(dsn string, enabled bool) (string, error) {
 
 func newDB(db *sql.DB, driver string) *DB {
 	return &DB{
-		sql:           db,
-		driver:        driver,
-		users:         &userRepo{db: db, driver: driver},
-		tokens:        &tokenRepo{db: db},
-		serviceTokens: NewServiceTokenRepositoryWithDriver(db, driver),
-		agents:        &agentRepo{db: db, driver: driver},
-		policies:      &policyRepo{db},
-		tunnels:       &tunnelRepo{db},
-		nodes:         &nodeRepo{db: db, driver: driver},
-		metadata:      NewAgentMetadataRepositoryWithDriver(db, driver),
-		runtimeStats:  NewAgentRuntimeStatsRepository(db),
-		probeResults:  NewAgentProbeResultRepository(db),
-		leases:        NewLeaseRepositoryWithDriver(db, driver),
-		audits:        &auditRepo{db},
-		idempotency:   &idempotencyRepo{db},
-		dashboard:     &dashboardRepo{db: db},
+		sql:                    db,
+		driver:                 driver,
+		users:                  &userRepo{db: db, driver: driver},
+		tokens:                 &tokenRepo{db: db},
+		serviceTokens:          NewServiceTokenRepositoryWithDriver(db, driver),
+		agents:                 &agentRepo{db: db, driver: driver},
+		policies:               &policyRepo{db},
+		tunnels:                &tunnelRepo{db},
+		nodes:                  &nodeRepo{db: db, driver: driver},
+		metadata:               NewAgentMetadataRepositoryWithDriver(db, driver),
+		runtimeStats:           NewAgentRuntimeStatsRepository(db),
+		probeResults:           NewAgentProbeResultRepository(db),
+		leases:                 NewLeaseRepositoryWithDriver(db, driver),
+		audits:                 &auditRepo{db},
+		idempotency:            &idempotencyRepo{db},
+		dashboard:              &dashboardRepo{db: db},
+		authorizationRevisions: &authorizationRevisionRepo{db: db},
 	}
 }
 
@@ -331,6 +333,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			script = migrations.V7ToV8SQLite
 			if driver == DriverMySQL {
 				script = migrations.V7ToV8MySQL
+			}
+		case 8:
+			script = migrations.V8ToV9SQLite
+			if driver == DriverMySQL {
+				script = migrations.V8ToV9MySQL
 			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
@@ -398,7 +405,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases"} {
+	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
@@ -501,3 +508,6 @@ func (d *DB) Leases() LeaseRepository                   { return d.leases }
 func (d *DB) Audits() AuditRepository                   { return d.audits }
 func (d *DB) Idempotency() IdempotencyRepository        { return d.idempotency }
 func (d *DB) Dashboard() DashboardRepository            { return d.dashboard }
+func (d *DB) AuthorizationRevisions() AuthorizationRevisionRepository {
+	return d.authorizationRevisions
+}

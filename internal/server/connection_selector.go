@@ -2,11 +2,70 @@ package server
 
 import (
 	"context"
+	"errors"
+	"sort"
+	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/registry"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 )
+
+var ErrNoAgentConnections = errors.New("server: no healthy agent connections")
+
+type ConnectionSelectionPolicy uint8
+
+const (
+	SelectionLeastStreams ConnectionSelectionPolicy = iota
+	SelectionLocalPreferred
+)
+
+type AgentConnectionCandidate struct {
+	AgentID       string
+	InstanceID    string
+	ConnectionID  string
+	ServerNodeID  string
+	ActiveStreams int
+	HealthScore   int
+	RTT           time.Duration
+	Local         bool
+}
+
+// SelectAgentConnection is a pure authorization-independent ordering policy.
+// Local preference only affects performance; remote candidates remain a
+// fallback and never bypass policy or capability checks performed by callers.
+func SelectAgentConnection(policy ConnectionSelectionPolicy, currentServerNodeID string, candidates []AgentConnectionCandidate) (AgentConnectionCandidate, error) {
+	healthy := make([]AgentConnectionCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.ConnectionID != "" && candidate.HealthScore > 0 {
+			healthy = append(healthy, candidate)
+		}
+	}
+	if len(healthy) == 0 {
+		return AgentConnectionCandidate{}, ErrNoAgentConnections
+	}
+	if policy == SelectionLocalPreferred {
+		local := make([]AgentConnectionCandidate, 0, len(healthy))
+		for _, candidate := range healthy {
+			if candidate.ServerNodeID == currentServerNodeID {
+				local = append(local, candidate)
+			}
+		}
+		if len(local) > 0 {
+			healthy = local
+		}
+	}
+	sort.SliceStable(healthy, func(i, j int) bool {
+		if healthy[i].ActiveStreams != healthy[j].ActiveStreams {
+			return healthy[i].ActiveStreams < healthy[j].ActiveStreams
+		}
+		if healthy[i].HealthScore != healthy[j].HealthScore {
+			return healthy[i].HealthScore > healthy[j].HealthScore
+		}
+		return healthy[i].RTT < healthy[j].RTT
+	})
+	return healthy[0], nil
+}
 
 // AgentConnectionSelector implements locality-first, least-connections routing
 // for a logical Agent. Local WebSocket sessions are preferred; remote Server

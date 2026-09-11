@@ -99,4 +99,21 @@ func TestTunnelMeshDashboardSchema(t *testing.T) {
 			t.Errorf("variable %q is not used by any panel query", variable)
 		}
 	}
+	for _, metric := range []string{
+		"tunnelmesh_stream_stage_duration_seconds",
+		"tunnelmesh_stream_open_total",
+		"tunnelmesh_stream_queue_wait_seconds",
+		"tunnelmesh_stream_window_stall_seconds",
+		"tunnelmesh_stream_backpressure_total",
+		"tunnelmesh_authorization_cache_requests_total",
+		"tunnelmesh_authorization_revision",
+		"tunnelmesh_authorization_revision_poll_total",
+		"tunnelmesh_remote_validation_cache_requests_total",
+		"tunnelmesh_agent_connection_scale_decisions_total",
+		"tunnelmesh_agent_selection_total",
+	} {
+		if !strings.Contains(allExpr.String(), metric) {
+			t.Errorf("dashboard is missing required metric %q", metric)
+		}
+	}
 }

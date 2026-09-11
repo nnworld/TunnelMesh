@@ -23,3 +23,15 @@ func TestCapabilityNegotiationRejectsNoCommonVersion(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestStreamLatencyCapabilities(t *testing.T) {
+	if protocol.CapabilityStreamOpenResult != "stream_open_result.v1" {
+		t.Fatalf("open result capability = %q", protocol.CapabilityStreamOpenResult)
+	}
+	if protocol.CapabilityStreamFlowControl != "stream_flow_control.v1" {
+		t.Fatalf("flow control capability = %q", protocol.CapabilityStreamFlowControl)
+	}
+	if protocol.CapabilityStreamFairWriter != "stream_fair_writer.v1" {
+		t.Fatalf("fair writer capability = %q", protocol.CapabilityStreamFairWriter)
+	}
+}

@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,11 +157,19 @@ func TestPrintConfigFlatTCPBridgeFlagCanDisableBridge(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if strings.Contains(out.String(), `"enabled": true`) {
-		t.Fatalf("output = %q, flat bridge flag was ignored", out.String())
+	var printed struct {
+		Server struct {
+			TCPBridge struct {
+				Enabled bool `json:"enabled"`
+			} `json:"tcp_bridge"`
+			TCPBridgeEnabled bool `json:"tcp_bridge_enabled"`
+		} `json:"server"`
 	}
-	if !strings.Contains(out.String(), `"enabled": false`) {
-		t.Fatalf("output = %q, want disabled nested bridge value", out.String())
+	if err := json.Unmarshal(out.Bytes(), &printed); err != nil {
+		t.Fatalf("decode print-config output: %v\n%s", err, out.String())
+	}
+	if printed.Server.TCPBridge.Enabled || printed.Server.TCPBridgeEnabled {
+		t.Fatalf("flat bridge flag was ignored: %+v", printed.Server)
 	}
 }
 

@@ -91,6 +91,60 @@ func TestClientWSUsesOnlyAuthorizationAndReconnectsAfterSessionEOF(t *testing.T)
 	}
 }
 
+func TestClientWebSocketNegotiatesStrictOpenSubprotocol(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(websocket.Server{
+		Handshake: func(config *websocket.Config, request *http.Request) error {
+			selected, ok := protocol.SelectSubprotocol(request.Header.Values("Sec-WebSocket-Protocol"))
+			if !ok || selected != protocol.SubprotocolFlowControl {
+				return errors.New("flow-control subprotocol was not selected")
+			}
+			config.Protocol = []string{selected}
+			return nil
+		},
+		Handler: func(conn *websocket.Conn) { _ = conn.Close() },
+	})
+	defer server.Close()
+
+	probe, probeErr := DialWebSocket(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client", "client-secret")
+	if probeErr != nil {
+		t.Fatalf("DialWebSocket() error=%v", probeErr)
+	}
+	if negotiator, ok := probe.(interface{ Subprotocol() string }); !ok || negotiator.Subprotocol() != protocol.SubprotocolFlowControl {
+		t.Fatalf("selected subprotocol=%v, want %s", probe, protocol.SubprotocolFlowControl)
+	}
+	_ = probe.Close()
+
+	ready := make(chan *Session, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWebSocketWithOptions(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client", "client-secret", func(session *Session) error {
+			ready <- session
+			cancel()
+			return nil
+		}, WebSocketRunOptions{BaseBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond})
+	}()
+
+	select {
+	case session := <-ready:
+		if session.OpenMode() != SessionOpenFlowControl {
+			t.Fatalf("OpenMode()=%v, want flow control", session.OpenMode())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("strict subprotocol session was not established")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWebSocket() error=%v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunWebSocket did not stop")
+	}
+}
+
 func TestClientWSReconnectBackoffGrowsAcrossRepeatedDisconnects(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

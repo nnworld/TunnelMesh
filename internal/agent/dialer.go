@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -96,6 +97,22 @@ func (d Dialer) DialUDP(ctx context.Context, host string, port int) (net.Conn, e
 	nd := net.Dialer{Timeout: d.timeout()}
 	c, err := nd.DialContext(ctx, "udp", net.JoinHostPort(host, fmt.Sprint(port)))
 	return c, err
+}
+
+// dialStreamPayload keeps protocol dispatch at the agent boundary so the
+// bounded executor depends on one dial interface rather than wire details.
+func (d Dialer) dialStreamPayload(ctx context.Context, payload protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+	if payload.Protocol == "http" {
+		return d.dialHTTPStreamPayload(ctx, payload)
+	}
+	switch payload.Protocol {
+	case "tcp":
+		return d.DialTCP(ctx, payload.TargetHost, payload.TargetPort)
+	case "udp":
+		return d.DialUDP(ctx, payload.TargetHost, payload.TargetPort)
+	default:
+		return nil, errors.New("agent: unsupported stream protocol")
+	}
 }
 func (d Dialer) DoHTTP(ctx context.Context, method, url string, body io.Reader) (*http.Response, error) {
 	if method == "" {

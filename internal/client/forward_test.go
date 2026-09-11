@@ -155,6 +155,195 @@ func TestTCPForwardListenerLifecycleAndByteCopy(t *testing.T) {
 	}
 }
 
+func TestSessionOpenStreamResultWaitsForStrictOpenResult(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenStrict)
+	if session.OpenMode() != SessionOpenStrict {
+		t.Fatalf("OpenMode()=%v, want strict", session.OpenMode())
+	}
+
+	type openResult struct {
+		stream io.ReadWriteCloser
+		result protocol.OpenResultPayload
+		err    error
+	}
+	resultCh := make(chan openResult, 1)
+	go func() {
+		stream, result, err := session.OpenStreamResult(context.Background(), StreamRequest{
+			StreamID: 7, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
+		})
+		resultCh <- openResult{stream: stream, result: result, err: err}
+	}()
+
+	select {
+	case open := <-tr.sent:
+		if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 || open.StreamID != 7 {
+			t.Fatalf("OPEN frame=%+v, want strict stream 7", open)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for OPEN frame")
+	}
+	select {
+	case got := <-resultCh:
+		t.Fatalf("OpenStreamResult returned before OPEN_RESULT: %+v", got)
+	default:
+	}
+
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 7, Payload: []byte("early")}
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: 7, Payload: payload}
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.stream == nil || !got.result.Accepted || got.result.Code != protocol.OpenResultCodeOK {
+			t.Fatalf("result stream=%v result=%+v err=%v", got.stream, got.result, got.err)
+		}
+		buffer := make([]byte, len("early"))
+		if _, err := io.ReadFull(got.stream, buffer); err != nil || string(buffer) != "early" {
+			t.Fatalf("early data=%q err=%v", buffer, err)
+		}
+		_ = got.stream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful OPEN_RESULT")
+	}
+}
+
+func TestSessionOpenStreamResultFlowControlDeliversDataAfterResult(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	type openResult struct {
+		stream io.ReadWriteCloser
+		err    error
+	}
+	resultCh := make(chan openResult, 1)
+	go func() {
+		stream, _, err := session.OpenStreamResult(context.Background(), StreamRequest{
+			StreamID: 7, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
+		})
+		resultCh <- openResult{stream: stream, err: err}
+	}()
+	open := <-tr.sent
+	if open.Window == 0 {
+		t.Fatalf("OPEN window=%d, want flow-control window", open.Window)
+	}
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: 7, Payload: payload}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 7, Payload: []byte("flow-data")}
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.stream == nil {
+			t.Fatalf("result stream=%v err=%v", got.stream, got.err)
+		}
+		buffer := make([]byte, len("flow-data"))
+		if _, err := io.ReadFull(got.stream, buffer); err != nil || string(buffer) != "flow-data" {
+			t.Fatalf("data=%q err=%v, want flow-data", buffer, err)
+		}
+		_ = got.stream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful OPEN_RESULT")
+	}
+}
+
+func TestSessionOpenerOpenStreamUsesStrictResultForStrictSession(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenStrict)
+	resultCh := make(chan io.ReadWriteCloser, 1)
+	go func() {
+		stream, err := NewSessionOpener(session).OpenStream(context.Background(), StreamRequest{
+			StreamID: 13, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
+		})
+		if err != nil {
+			t.Errorf("OpenStream() error=%v", err)
+		}
+		resultCh <- stream
+	}()
+
+	open := <-tr.sent
+	if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 || open.StreamID != 13 {
+		t.Fatalf("OPEN frame=%+v, want strict stream 13", open)
+	}
+	select {
+	case stream := <-resultCh:
+		_ = stream.Close()
+		t.Fatal("OpenStream returned before OPEN_RESULT")
+	default:
+	}
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: 13, Payload: payload}
+	select {
+	case stream := <-resultCh:
+		if stream == nil {
+			t.Fatal("strict OpenStream did not return a stream")
+		}
+		_ = stream.Close()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for successful OPEN_RESULT")
+	}
+}
+
+func TestSessionOpenStreamResultTimeoutResetsOnlyCurrentStream(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 2), recv: make(chan protocol.Frame, 2), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenStrict)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	stream, result, err := session.OpenStreamResult(ctx, StreamRequest{StreamID: 9, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22})
+	if stream != nil || err == nil || result.Accepted || result.Code != protocol.OpenResultCodeTimeout || !result.Retryable {
+		t.Fatalf("stream=%v result=%+v err=%v, want retryable timeout", stream, result, err)
+	}
+	open := <-tr.sent
+	if open.Type != protocol.FrameOpenStream || open.StreamID != 9 {
+		t.Fatalf("OPEN frame=%+v, want stream 9", open)
+	}
+	if frame := <-tr.sent; frame.Type != protocol.FrameReset || frame.StreamID != 9 {
+		t.Fatalf("timeout frame=%+v, want RESET for stream 9", frame)
+	}
+}
+
+func TestSessionOpenStreamResultDuplicateResultResetsStream(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 3), recv: make(chan protocol.Frame, 3), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenStrict)
+	resultCh := make(chan io.ReadWriteCloser, 1)
+	go func() {
+		stream, result, err := session.OpenStreamResult(context.Background(), StreamRequest{StreamID: 11, AgentID: "agent-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22})
+		if err != nil || !result.Accepted {
+			t.Errorf("OpenStreamResult result=%+v err=%v", result, err)
+		}
+		resultCh <- stream
+	}()
+	open := <-tr.sent
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload}
+	stream := <-resultCh
+	if stream == nil {
+		t.Fatal("successful result did not expose stream")
+	}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload}
+	if frame := <-tr.sent; frame.Type != protocol.FrameReset || frame.StreamID != open.StreamID {
+		t.Fatalf("duplicate result frame=%+v, want stream RESET", frame)
+	}
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, protocol.ErrInvalidFrame) {
+		t.Fatalf("stream Read() after duplicate result error=%v, want ErrInvalidFrame", err)
+	}
+}
+
 type testDatagram struct {
 	mu     sync.Mutex
 	writes [][]byte

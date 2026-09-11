@@ -75,7 +75,9 @@ agent:
     cooldown: 30s
 ```
 
-同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；已建立的流固定在原连接上，不会在线迁移。`instance_id` 用于区分多个物理 Agent 进程；未配置时进程会生成并持久化一个稳定值，Linux 打包部署默认保存到 `/var/lib/tunnelmesh-agent/agent-instance-id`。运维细节见[逻辑 Agent 连接池运维指南](../operations/connection-pool.md)。
+同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；本节点没有健康连接时会回退到远端 Server 节点，已建立的流固定在原连接上，不会在线迁移。
+
+连接池会持续采样 pending dial、open P95、TTFB P95、writer queue wait P95、活跃流数和 RTT。信号连续两次超过默认阈值且 Server 确认支持连接池时才会扩容；这些信号不包含目标地址、Token 或凭据。`instance_id` 用于区分多个物理 Agent 进程；未配置时进程会生成并持久化一个稳定值，Linux 打包部署默认保存到 `/var/lib/tunnelmesh-agent/agent-instance-id`。运维细节见[逻辑 Agent 连接池运维指南](../operations/connection-pool.md)。
 
 ## 4. Agent 提供的能力
 

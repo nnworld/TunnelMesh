@@ -137,12 +137,15 @@ func TestMetricsAgentConnectionPoolFamilies(t *testing.T) {
 	metrics := NewMetrics(reg)
 	metrics.ObserveAgentConnection("agent", "instance", "connection", false)
 	metrics.ObserveAgentConnection("agent", "instance", "connection", true)
+	metrics.ObserveAgentConnection("agent", "instance", "connection-2", true)
 	metrics.ObserveAgentConnectionError("agent", "instance", "connection", "timeout")
 	metrics.ObserveAgentActiveStreams("agent", "instance", "connection", 3)
+	metrics.ObserveAgentActiveStreams("agent", "instance", "connection-2", 4)
 	metrics.ObserveAgentConnectionRTT("agent", "instance", "connection", 20*time.Millisecond)
 	metrics.SetAgentConnectionCapacity("agent", "instance", 8)
 	metrics.ObserveAgentScaleDecision("agent", "instance", "scale-up", "high-active-streams")
 	metrics.ObserveAgentSelection("agent", "connection", "server", "local")
+	metrics.ObserveAgentSelection("agent", "connection-2", "server", "local")
 
 	families, err := reg.Gather()
 	if err != nil {
@@ -165,7 +168,72 @@ func TestMetricsAgentConnectionPoolFamilies(t *testing.T) {
 			t.Fatalf("missing metric family %s", name)
 		}
 	}
-	if got := testutil.ToFloat64(metrics.agentConnectionErrors.WithLabelValues("agent", "instance", "connection", "timeout")); got != 1 {
+	if got := testutil.ToFloat64(metrics.agentConnectionErrors.WithLabelValues("agent", "instance", "timeout")); got != 1 {
 		t.Fatalf("connection error count = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.agentConnections.WithLabelValues("agent", "instance")); got != 2 {
+		t.Fatalf("agent connection count = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(metrics.agentActiveStreams.WithLabelValues("agent", "instance")); got != 7 {
+		t.Fatalf("agent active streams = %v, want 7", got)
+	}
+	if got := testutil.ToFloat64(metrics.agentSelection.WithLabelValues("agent", "server", "local")); got != 2 {
+		t.Fatalf("agent selection count = %v, want 2", got)
+	}
+	for _, family := range families {
+		if family.GetName() != "tunnelmesh_agent_selection_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, labelPair := range metric.GetLabel() {
+				if labelPair.GetName() == "connection_id" {
+					t.Fatal("agent selection metric must not use connection_id label")
+				}
+			}
+		}
+	}
+}
+
+func TestMetricsStreamLatencyAndCacheFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewMetrics(reg)
+	metrics.ObserveStreamStage("server", "authorization", "success", "", "tcp", 15*time.Millisecond)
+	metrics.ObserveStreamOpen("client", "success", "", "strict")
+	metrics.ObserveStreamQueueWait("agent", "success", 2*time.Millisecond)
+	metrics.ObserveStreamWindowStall("client", "timeout", 5*time.Millisecond)
+	metrics.ObserveStreamBackpressure("server", "reset")
+	metrics.ObserveAuthorizationCache("hit", "allow")
+	metrics.SetAuthorizationRevision(42)
+	metrics.ObserveAuthorizationRevisionPoll("success", "")
+	metrics.ObserveRemoteValidationCache("miss", "allow")
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, family := range families {
+		names[family.GetName()] = true
+	}
+	for _, name := range []string{
+		"tunnelmesh_stream_stage_duration_seconds",
+		"tunnelmesh_stream_open_total",
+		"tunnelmesh_stream_queue_wait_seconds",
+		"tunnelmesh_stream_window_stall_seconds",
+		"tunnelmesh_stream_backpressure_total",
+		"tunnelmesh_authorization_cache_requests_total",
+		"tunnelmesh_authorization_revision",
+		"tunnelmesh_authorization_revision_poll_total",
+		"tunnelmesh_remote_validation_cache_requests_total",
+	} {
+		if !names[name] {
+			t.Fatalf("missing metric family %s", name)
+		}
+	}
+	if got := testutil.ToFloat64(metrics.streamOpenTotal.WithLabelValues("client", "success", "", "strict")); got != 1 {
+		t.Fatalf("strict stream open count = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.authorizationRevision.WithLabelValues()); got != 42 {
+		t.Fatalf("authorization revision = %v, want 42", got)
 	}
 }

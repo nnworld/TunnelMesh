@@ -15,6 +15,7 @@ import (
 	"golang.org/x/net/websocket"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -108,6 +109,423 @@ func TestClientWSRouteIsExactAndRejectsWrongCredentialTypesBeforeUpgrade(t *test
 	_ = conn.Close()
 	if status != http.StatusSwitchingProtocols {
 		t.Fatalf("valid client status = %d, want %d", status, http.StatusSwitchingProtocols)
+	}
+}
+
+func TestClientWebSocketHandshakeSelectsSubprotocol(t *testing.T) {
+	tests := []struct {
+		name     string
+		offered  []string
+		selected string
+	}{
+		{name: "modern", offered: protocol.ClientSubprotocols(), selected: protocol.SubprotocolFlowControl},
+		{name: "open result only", offered: []string{protocol.SubprotocolOpenResult}, selected: protocol.SubprotocolOpenResult},
+		{name: "legacy", offered: []string{protocol.SubprotocolLegacy}, selected: protocol.SubprotocolLegacy},
+		{name: "missing", selected: ""},
+		{name: "unsupported", offered: []string{"private.v9"}, selected: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodGet, "ws://server.example/ws/client", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Origin", "https://tunnel.example.com")
+			request.Header.Set("Authorization", "Bearer client-secret")
+			for _, offered := range test.offered {
+				request.Header.Add("Sec-WebSocket-Protocol", offered)
+			}
+			wsConfig := &websocket.Config{Protocol: test.offered}
+			handshake := clientWebSocketHandshake(config.SecurityConfig{AllowedOrigins: []string{"https://tunnel.example.com"}}, func(context.Context, string) (ClientSessionPrincipal, error) {
+				return ClientSessionPrincipal{ConnectionID: "connection", StrictOpen: test.selected == protocol.SubprotocolOpenResult || test.selected == protocol.SubprotocolFlowControl}, nil
+			})
+			if err := handshake(wsConfig, request); err != nil {
+				t.Fatal(err)
+			}
+			if len(test.selected) == 0 {
+				if len(wsConfig.Protocol) != 0 {
+					t.Fatalf("selected protocols=%v, want none", wsConfig.Protocol)
+				}
+				return
+			}
+			if len(wsConfig.Protocol) != 1 || wsConfig.Protocol[0] != test.selected {
+				t.Fatalf("selected protocols=%v, want %s", wsConfig.Protocol, test.selected)
+			}
+		})
+	}
+}
+
+func TestServeClientSessionStrictOpenDoesNotBlockPing(t *testing.T) {
+	transport := newChannelClientTransport()
+	inner := &blockingAuthorizeTransport{blockAgent: "agent", release: make(chan struct{})}
+	service := NewClientStreamService(inner, inner, ClientStreamServiceConfig{MaxConcurrentOpens: 1, MaxPendingOpens: 1, OpenTimeout: time.Second}, nil)
+	defer service.Close()
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveClientSessionWithService(context.Background(), strictPrincipal(), transport, inner, inner, maxClientOpenAttempts, nil, service)
+	}()
+	transport.receive <- protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: protocol.FlagStrictOpen,
+		StreamID: 7, Payload: payload,
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("ping")}
+	pong := receiveChannelClientFrame(t, transport)
+	if pong.Type != protocol.FramePong || string(pong.Payload) != "ping" {
+		t.Fatalf("PING response=%+v, want PONG", pong)
+	}
+	close(inner.release)
+	result := receiveChannelClientFrame(t, transport)
+	if result.Type != protocol.FrameOpenResult || result.StreamID != 7 {
+		t.Fatalf("open response=%+v, want OPEN_RESULT", result)
+	}
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeClientSessionLegacyOpenUsesLegacyPathOnStrictConnection(t *testing.T) {
+	transport := newChannelClientTransport()
+	opener := &recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)}
+	authorizer := streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil })
+	service := NewClientStreamService(authorizer, opener, ClientStreamServiceConfig{MaxConcurrentOpens: 1, MaxPendingOpens: 1, OpenTimeout: time.Second}, nil)
+	defer service.Close()
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveClientSessionWithService(context.Background(), strictPrincipal(), transport, authorizer, opener, maxClientOpenAttempts, nil, service)
+	}()
+	transport.receive <- protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 17, Payload: payload,
+	}
+	select {
+	case request := <-opener.opened:
+		if request.StreamID != 17 || request.StrictOpen {
+			t.Fatalf("legacy request=%+v, want non-strict stream 17", request)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("legacy OPEN did not use the legacy relay path")
+	}
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingClientFrameTransport struct {
+	mu          sync.Mutex
+	sent        chan protocol.Frame
+	receive     chan protocol.Frame
+	firstData   chan struct{}
+	firstStream chan uint32
+	release     chan struct{}
+	closed      chan struct{}
+	once        sync.Once
+}
+
+func newBlockingClientFrameTransport() *blockingClientFrameTransport {
+	return &blockingClientFrameTransport{
+		sent: make(chan protocol.Frame, 8), receive: make(chan protocol.Frame, 8),
+		firstData: make(chan struct{}), firstStream: make(chan uint32, 1),
+		release: make(chan struct{}), closed: make(chan struct{}),
+	}
+}
+
+func (t *blockingClientFrameTransport) Send(frame protocol.Frame) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if frame.Type == protocol.FrameData && t.firstData != nil {
+		t.once.Do(func() { close(t.firstData) })
+		t.firstStream <- frame.StreamID
+		select {
+		case <-t.release:
+		case <-t.closed:
+			return errors.New("transport closed")
+		}
+	}
+	select {
+	case t.sent <- frame:
+		return nil
+	case <-t.closed:
+		return errors.New("transport closed")
+	}
+}
+
+func (t *blockingClientFrameTransport) Receive() (protocol.Frame, error) {
+	select {
+	case frame, ok := <-t.receive:
+		if !ok {
+			return protocol.Frame{}, io.EOF
+		}
+		return frame, nil
+	case <-t.closed:
+		return protocol.Frame{}, io.EOF
+	}
+}
+
+func (t *blockingClientFrameTransport) Close() error {
+	select {
+	case <-t.closed:
+	default:
+		close(t.closed)
+	}
+	return nil
+}
+
+func TestServeClientSessionPrioritizesControlOverSecondRelayStream(t *testing.T) {
+	transport := newBlockingClientFrameTransport()
+	opener := &queuedNodeTransport{
+		connections: []io.ReadWriteCloser{newSingleReadBlockingConn("slow-data"), newSingleReadBlockingConn("fast-data")},
+		opened:      make(chan relay.StreamRequest, 2),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(
+			context.Background(), ClientSessionPrincipal{ConnectionID: "connection-fair-writer"},
+			transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener,
+		)
+	}()
+	defer func() {
+		close(transport.receive)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("session did not stop")
+		}
+	}()
+
+	for _, streamID := range []uint32{1, 2} {
+		payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: streamID, Payload: payload}
+	}
+	select {
+	case <-transport.firstData:
+	case <-time.After(time.Second):
+		t.Fatal("first relay DATA did not reach transport")
+	}
+	time.Sleep(50 * time.Millisecond)
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("ping")}
+	time.Sleep(20 * time.Millisecond)
+	close(transport.release)
+
+	firstStream := <-transport.firstStream
+	secondStream := uint32(3 - firstStream)
+	want := []struct {
+		frameType protocol.FrameType
+		streamID  uint32
+	}{
+		{protocol.FrameData, firstStream},
+		{protocol.FramePong, 0},
+		{protocol.FrameData, secondStream},
+	}
+	for i, expected := range want {
+		select {
+		case frame := <-transport.sent:
+			if frame.Type != expected.frameType || frame.StreamID != expected.streamID {
+				t.Fatalf("frame %d=%+v, want type=%d stream=%d", i, frame, expected.frameType, expected.streamID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for frame %d", i)
+		}
+	}
+}
+
+func TestServeClientSessionPropagatesInitialWindowToRelay(t *testing.T) {
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := newScriptedClientTransport(protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 15, Window: 4096, Payload: payload,
+	})
+	opener := &recordingNodeTransport{opened: make(chan relay.StreamRequest, 1)}
+	if err := ServeClientSession(
+		context.Background(), ClientSessionPrincipal{ConnectionID: "connection-window"},
+		transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener,
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-opener.opened:
+		if request.InitialWindow != 4096 {
+			t.Fatalf("relay InitialWindow=%d, want 4096", request.InitialWindow)
+		}
+	default:
+		t.Fatal("relay OPEN was not requested")
+	}
+}
+
+type controlRelayConn struct {
+	reads             chan readResult
+	controls          chan protocol.Frame
+	agentControls     chan protocol.Frame
+	agentControlReady chan struct{}
+	closed            chan struct{}
+	closeOnce         sync.Once
+}
+
+func newControlRelayConn() *controlRelayConn {
+	return &controlRelayConn{
+		reads: make(chan readResult, 4), controls: make(chan protocol.Frame, 4),
+		agentControls: make(chan protocol.Frame, 4), agentControlReady: make(chan struct{}, 1), closed: make(chan struct{}),
+	}
+}
+
+func (c *controlRelayConn) Read(buffer []byte) (int, error) {
+	select {
+	case result := <-c.reads:
+		return copy(buffer, result.payload), result.err
+	case <-c.agentControlReady:
+		return 0, nil
+	case <-c.closed:
+		return 0, io.EOF
+	}
+}
+
+func (*controlRelayConn) Write([]byte) (int, error) { return 0, nil }
+func (*controlRelayConn) CloseWrite() error         { return nil }
+func (c *controlRelayConn) WriteControl(frame protocol.Frame) error {
+	select {
+	case c.controls <- frame:
+		return nil
+	case <-c.closed:
+		return io.ErrClosedPipe
+	}
+}
+func (c *controlRelayConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *controlRelayConn) ReadControl() (protocol.Frame, bool) {
+	select {
+	case frame := <-c.agentControls:
+		select {
+		case <-c.agentControlReady:
+		default:
+		}
+		return frame, true
+	default:
+		return protocol.Frame{}, false
+	}
+}
+
+func (c *controlRelayConn) sendAgentControl(frame protocol.Frame) {
+	c.agentControls <- frame
+	c.agentControlReady <- struct{}{}
+}
+
+type controlRelayOpener struct {
+	conn   *controlRelayConn
+	opened chan relay.StreamRequest
+}
+
+func (o *controlRelayOpener) OpenStream(context.Context, relay.StreamRequest) (io.ReadWriteCloser, error) {
+	o.opened <- relay.StreamRequest{}
+	return o.conn, nil
+}
+func (*controlRelayOpener) Close() error { return nil }
+
+func TestServeClientSessionRelayHonorsClientWindow(t *testing.T) {
+	transport := newChannelClientTransport()
+	conn := newControlRelayConn()
+	conn.reads <- readResult{payload: []byte("0123456789abcdef")}
+	conn.reads <- readResult{payload: []byte("01234567")}
+	opener := &controlRelayOpener{conn: conn, opened: make(chan relay.StreamRequest, 1)}
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(
+			context.Background(), ClientSessionPrincipal{ConnectionID: "connection-relay-window"},
+			transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener,
+		)
+	}()
+	defer func() {
+		close(transport.receive)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("session did not stop")
+		}
+	}()
+
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 16, Window: 16, Payload: payload}
+	<-opener.opened
+	if frame := receiveChannelClientFrame(t, transport); frame.Type != protocol.FrameData || frame.StreamID != 16 || len(frame.Payload) != 16 {
+		t.Fatalf("first DATA=%+v, want 16 bytes for stream 16", frame)
+	}
+	select {
+	case frame := <-transport.sent:
+		t.Fatalf("relay exceeded client window: %+v", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 16, Window: 8}
+	select {
+	case control := <-conn.controls:
+		if control.Type != protocol.FrameWindowUpdate || control.Window != 8 {
+			t.Fatalf("forwarded control=%+v, want WINDOW_UPDATE 8", control)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WINDOW_UPDATE was not forwarded to relay")
+	}
+	if frame := receiveChannelClientFrame(t, transport); frame.Type != protocol.FrameData || frame.StreamID != 16 || len(frame.Payload) != 8 {
+		t.Fatalf("post-update DATA=%+v, want 8 bytes for stream 16", frame)
+	}
+}
+
+func TestServeClientSessionForwardsAgentWindowUpdate(t *testing.T) {
+	transport := newChannelClientTransport()
+	conn := newControlRelayConn()
+	opener := &controlRelayOpener{conn: conn, opened: make(chan relay.StreamRequest, 1)}
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(
+			context.Background(), ClientSessionPrincipal{ConnectionID: "connection-agent-window"},
+			transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener,
+		)
+	}()
+	defer func() {
+		close(transport.receive)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("session did not stop")
+		}
+	}()
+
+	payload, err := protocol.EncodeStreamOpenPayload(openRequest("agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 17, Window: 262144, Payload: payload}
+	<-opener.opened
+	conn.sendAgentControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, Window: 16})
+	frame := receiveChannelClientFrame(t, transport)
+	if frame.Type != protocol.FrameWindowUpdate || frame.StreamID != 17 || frame.Window != 16 {
+		t.Fatalf("Agent WINDOW_UPDATE=%+v, want stream 17 window 16", frame)
 	}
 }
 
@@ -611,6 +1029,32 @@ func (c *singlePayloadConn) Read(buffer []byte) (int, error) {
 func (c *singlePayloadConn) Write(payload []byte) (int, error) { return len(payload), nil }
 func (c *singlePayloadConn) CloseWrite() error                 { return nil }
 func (c *singlePayloadConn) Close() error {
+	c.once.Do(func() { close(c.release) })
+	return nil
+}
+
+type singleReadBlockingConn struct {
+	payload []byte
+	release chan struct{}
+	once    sync.Once
+}
+
+func newSingleReadBlockingConn(payload string) *singleReadBlockingConn {
+	return &singleReadBlockingConn{payload: []byte(payload), release: make(chan struct{})}
+}
+
+func (c *singleReadBlockingConn) Read(buffer []byte) (int, error) {
+	if len(c.payload) > 0 {
+		n := copy(buffer, c.payload)
+		c.payload = c.payload[n:]
+		return n, nil
+	}
+	<-c.release
+	return 0, io.EOF
+}
+func (*singleReadBlockingConn) Write([]byte) (int, error) { return 0, nil }
+func (*singleReadBlockingConn) CloseWrite() error         { return nil }
+func (c *singleReadBlockingConn) Close() error {
 	c.once.Do(func() { close(c.release) })
 	return nil
 }

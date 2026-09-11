@@ -415,6 +415,25 @@ func TestHTTPProxyForwardRemoteValidationAllows(t *testing.T) {
 	}
 }
 
+func TestHTTPProxyForwardUsesRemoteValidationCacheConfig(t *testing.T) {
+	config := RemoteValidationCacheConfig{
+		Endpoint: "http://auth.internal/validate", PositiveTTL: 11 * time.Second,
+		NegativeTTL: 12 * time.Second, Timeout: 13 * time.Second, MaxEntries: 14,
+	}
+	fwd, err := NewHTTPProxyForward(openerFunc(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return nil, io.EOF
+	}), HTTPProxyForwardConfig{
+		ListenAddr: "127.0.0.1:0", AgentID: "agent-a", AuthURL: config.Endpoint, RemoteValidation: config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fwd.Close()
+	if fwd.validator.config != config {
+		t.Fatalf("remote validation config=%+v, want %+v", fwd.validator.config, config)
+	}
+}
+
 func TestHTTPProxyForwardRemoteValidationDenies(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

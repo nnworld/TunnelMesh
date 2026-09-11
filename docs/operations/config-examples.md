@@ -27,6 +27,19 @@ server:
     enabled: true
     path: /ws/tcp
     max_bytes: 65536
+  stream:
+    max_concurrent_opens: 256
+    max_pending_opens: 1024
+    initial_window: 262144
+    window_update_threshold: 131072
+    max_frame_payload: 32768
+  authorization_cache:
+    enabled: true
+    local_positive_ttl: 5s
+    negative_ttl: 3s
+    revision_poll_interval: 2s
+    max_stale_on_poll_error: 5s
+    max_entries: 100000
 
 security:
   allowed_hosts:
@@ -134,6 +147,20 @@ server:
     server_name: relay.internal.example.com
     # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入；留空会导致 check-config 失败。
     node_token: ""
+  # MySQL 集群可用较长正向缓存；共享 revision 保证权限变更快速失效。
+  stream:
+    max_concurrent_opens: 256
+    max_pending_opens: 1024
+    initial_window: 262144
+    window_update_threshold: 131072
+    max_frame_payload: 32768
+  authorization_cache:
+    enabled: true
+    cluster_positive_ttl: 5m
+    negative_ttl: 3s
+    revision_poll_interval: 2s
+    max_stale_on_poll_error: 5s
+    max_entries: 100000
 
 security:
   # 管理 API 和 WebSocket Host 白名单；动态 HTTP 路由由路由表匹配。
@@ -199,6 +226,12 @@ agent:
   connections:
     min: 1
     max: 1
+  streams:
+    max_concurrent_dials: 32
+    max_pending_dials: 128
+    connect_timeout: 5s
+    open_timeout: 8s
+    inbound_buffer_bytes: 262144
   # token 由 TUNNELMESH_AGENT_TOKEN 注入。
   metadata:
     - name: device_id
@@ -225,6 +258,14 @@ mode: local
 
 client:
   server_url: wss://tunnel.example.com/ws/client
+  stream:
+    open_timeout: 8s
+    inbound_buffer_bytes: 262144
+  remote_validation:
+    positive_ttl: 15s
+    negative_ttl: 2s
+    timeout: 3s
+    max_entries: 10000
   # token 由 TUNNELMESH_CLIENT_TOKEN 注入。
   tunnels:
     - name: postgres

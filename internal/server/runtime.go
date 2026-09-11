@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -53,29 +54,33 @@ type RuntimeConfig struct {
 	ConnectionSelector relay.ConnectionSelector
 	ConnectionRegistry registry.NodeRegistry
 	RemoteRelay        *relay.RelayService
+	Stream             config.ServerStreamConfig
+	AuthorizationCache config.AuthorizationCacheConfig
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
 // and authenticated Agent WebSocket handlers. The caller owns DB lifecycle.
 type ServerRuntime struct {
-	DB                    *storage.DB
-	AgentSessions         *AgentSessionManager
-	AgentConnectionLeases *AgentConnectionLeaseController
-	ClientSessions        *ClientSessionManager
-	API                   *API
-	Auth                  *auth.AuthService
-	Credentials           *auth.CredentialService
-	ClientAuthorizer      StreamAuthorizer
-	ClientTransport       relay.NodeTransport
-	LocalAgentRelay       *AgentRelayTransport
-	managedRoutes         *ManagedRouteHandler
-	serverNodeLifecycle   *ServerNodeLifecycle
-	relayServer           *grpc.Server
-	relayListener         net.Listener
-	config                RuntimeConfig
-	metricsRegistry       *prometheus.Registry
-	metrics               *observability.Metrics
-	closed                atomic.Bool
+	DB                        *storage.DB
+	AgentSessions             *AgentSessionManager
+	AgentConnectionLeases     *AgentConnectionLeaseController
+	ClientSessions            *ClientSessionManager
+	API                       *API
+	Auth                      *auth.AuthService
+	Credentials               *auth.CredentialService
+	ClientAuthorizer          StreamAuthorizer
+	ClientTransport           relay.NodeTransport
+	ClientStreamService       *ClientStreamService
+	LocalAgentRelay           *AgentRelayTransport
+	managedRoutes             *ManagedRouteHandler
+	serverNodeLifecycle       *ServerNodeLifecycle
+	relayServer               *grpc.Server
+	relayListener             net.Listener
+	config                    RuntimeConfig
+	metricsRegistry           *prometheus.Registry
+	metrics                   *observability.Metrics
+	authorizationCacheCleanup func() error
+	closed                    atomic.Bool
 }
 
 // NewServerRuntime creates the server runtime with durable Agent metadata
@@ -119,7 +124,11 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: NewClientSessionManager(), API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
 	var serverNodeLifecycle *ServerNodeLifecycle
+	var authorizationCacheCleanup func() error
 	closeStartup := func() {
+		if authorizationCacheCleanup != nil {
+			_ = authorizationCacheCleanup()
+		}
 		if serverNodeLifecycle != nil {
 			_ = serverNodeLifecycle.Close()
 		}
@@ -148,9 +157,36 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	runtime.metricsRegistry = registry
 	runtime.metrics = observability.NewMetrics(registry)
+	if runtimeConfig.AuthorizationCache.Enabled {
+		positiveTTL := runtimeConfig.AuthorizationCache.LocalPositiveTTL
+		if db.Driver() == storage.DriverMySQL {
+			positiveTTL = runtimeConfig.AuthorizationCache.ClusterPositiveTTL
+		}
+		cachedAuthorizer, cleanup, err := NewCachingStreamAuthorizer(runtime.ClientAuthorizer, db.AuthorizationRevisions(), AuthorizationCacheConfig{
+			Enabled: true, PositiveTTL: positiveTTL, NegativeTTL: runtimeConfig.AuthorizationCache.NegativeTTL,
+			RevisionPollInterval: runtimeConfig.AuthorizationCache.RevisionPollInterval,
+			MaxStaleOnPollError:  runtimeConfig.AuthorizationCache.MaxStaleOnPollError,
+			MaxEntries:           runtimeConfig.AuthorizationCache.MaxEntries,
+		}, runtime.metrics)
+		if err != nil {
+			closeStartup()
+			return nil, fmt.Errorf("server runtime: authorization cache: %w", err)
+		}
+		runtime.ClientAuthorizer = cachedAuthorizer
+		runtime.authorizationCacheCleanup = cleanup
+		authorizationCacheCleanup = cleanup
+		if notifier, ok := cachedAuthorizer.(interface{ NotifyAuthorizationChange() }); ok {
+			credentialService.SetAuthorizationChangeNotifier(notifier.NotifyAuthorizationChange)
+		}
+	}
 	if selector, ok := connectionSelector.(*AgentConnectionSelector); ok {
 		selector.SetMetrics(runtime.metrics)
 	}
+	runtime.ClientStreamService = NewClientStreamService(runtime.ClientAuthorizer, runtime.ClientTransport, ClientStreamServiceConfig{
+		MaxConcurrentOpens: runtimeConfig.Stream.MaxConcurrentOpens,
+		MaxPendingOpens:    runtimeConfig.Stream.MaxPendingOpens,
+		OpenTimeout:        clientOpenTimeoutFromConfig(runtimeConfig.Stream),
+	}, runtime.metrics)
 	if runtimeConfig.Relay.Enabled {
 		if strings.TrimSpace(runtimeConfig.NodeID) == "" {
 			closeStartup()
@@ -175,7 +211,13 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 			serverOptions = append(serverOptions, grpc.Creds(credentials.NewTLS(tlsConfig)))
 		}
 		runtime.relayServer = grpc.NewServer(serverOptions...)
-		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithClose(localAgentRelay.OpenStream, runtime.closeAgentConnection))
+		relay.RegisterRelayServer(runtime.relayServer, relay.NewRelayServerWithOpenResultAndClose(
+			func(ctx context.Context, metadata relay.RelayOpenMetadata) (io.ReadWriteCloser, relay.RelayOpenResult, error) {
+				return localAgentRelay.OpenStreamResult(ctx, metadata.Request)
+			},
+			localAgentRelay.OpenStream,
+			runtime.closeAgentConnection,
+		))
 	}
 	runtime.Credentials = credentialService
 	return runtime, nil
@@ -188,7 +230,10 @@ func (r *ServerRuntime) Close() error {
 		return nil
 	}
 	r.closed.Store(true)
-	var relayErr, credentialErr, serverNodeErr error
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr error
+	if r.authorizationCacheCleanup != nil {
+		authorizationCacheErr = r.authorizationCacheCleanup()
+	}
 	if r.serverNodeLifecycle != nil {
 		serverNodeErr = r.serverNodeLifecycle.Close()
 	}
@@ -204,7 +249,10 @@ func (r *ServerRuntime) Close() error {
 	if r.Credentials != nil {
 		credentialErr = r.Credentials.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr)
+	if r.ClientStreamService != nil {
+		_ = r.ClientStreamService.Close()
+	}
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr)
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The
@@ -293,6 +341,17 @@ func (r *ServerRuntime) Ready(ctx context.Context) []ComponentStatus {
 	if r.config.Relay.Enabled {
 		components = append(components, ComponentStatus{Name: "relay", Healthy: r.relayListener != nil})
 	}
+	if r.config.AuthorizationCache.Enabled {
+		healthy := true
+		if health, ok := r.ClientAuthorizer.(interface{ Unhealthy() bool }); ok {
+			healthy = !health.Unhealthy()
+		}
+		cacheComponent := ComponentStatus{Name: "authorization_cache", Healthy: healthy}
+		if !healthy {
+			cacheComponent.Error = "authorization revision source is unavailable"
+		}
+		components = append(components, cacheComponent)
+	}
 	ready := true
 	for _, component := range components {
 		if !component.Healthy {
@@ -344,6 +403,12 @@ func newClientConnectionID() (string, error) {
 	return "client_" + hex.EncodeToString(entropy[:]), nil
 }
 
+func clientOpenTimeoutFromConfig(stream config.ServerStreamConfig) time.Duration {
+	// The wire open timeout is not configurable separately in this release;
+	// a bounded default keeps strict opens from pinning futures forever.
+	return 8 * time.Second
+}
+
 func (r *ServerRuntime) serveClientWS(conn *websocket.Conn) {
 	ctx := context.Background()
 	if conn.Request() != nil {
@@ -366,7 +431,7 @@ func (r *ServerRuntime) serveClientWS(conn *websocket.Conn) {
 			r.metrics.ObserveConnection("server", "client", "closed", "")
 		}
 	}()
-	_ = serveClientSessionWithMetrics(ctx, principal, transport, r.ClientAuthorizer, r.ClientTransport, maxClientOpenAttempts, r.metrics)
+	_ = serveClientSessionWithService(ctx, principal, transport, r.ClientAuthorizer, r.ClientTransport, maxClientOpenAttempts, r.metrics, r.ClientStreamService)
 }
 
 func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
@@ -421,6 +486,7 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 		AgentID: payload.AgentID, NodeID: payload.NodeID, Epoch: payload.Epoch,
 		InstanceID: payload.InstanceID, ConnectionID: payload.ConnectionID,
 		ConnectionEpoch: payload.Epoch, TokenID: tokenID,
+		Capabilities: payload.Capabilities,
 	}
 	if r.LocalAgentRelay == nil {
 		_ = transport.Close()

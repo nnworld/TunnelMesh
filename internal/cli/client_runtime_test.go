@@ -20,7 +20,7 @@ func TestClientProxyUsesAuthenticatedSessionAndStdio(t *testing.T) {
 	var gotURL, gotToken string
 	runClientWebSocket = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error) error {
 		gotURL, gotToken = serverURL, token
-		session := client.NewSession(transport)
+		session := client.NewSessionWithOpenMode(transport, client.SessionOpenStrict)
 		return onReady(session)
 	}
 
@@ -44,6 +44,13 @@ func TestClientProxyUsesAuthenticatedSessionAndStdio(t *testing.T) {
 	if payload.AgentID != "agent-a" || payload.Protocol != "tcp" || payload.TargetHost != "10.0.0.8" || payload.TargetPort != 22 {
 		t.Fatalf("OPEN payload = %+v", payload)
 	}
+	resultPayload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.incoming <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: resultPayload}
 	data := <-transport.sent
 	if data.Type != protocol.FrameData || string(data.Payload) != "request" {
 		t.Fatalf("DATA frame = %+v", data)

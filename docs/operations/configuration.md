@@ -100,6 +100,62 @@ agent:
 
 `max` 大于 1 前必须完成所有入口 Server 的滚动升级。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
+## Stream 延迟与授权缓存
+
+SOCKS5、HTTP 代理和 TCP 转发的打开行为由 capability 协商决定。旧版本链路继续使用 legacy 乐观打开；Client、Server 和 Agent 都支持 `stream_open_result.v1` 时，Agent 完成目标连接后才返回成功。
+
+Server 默认配置：
+
+```yaml
+server:
+  stream:
+    max_concurrent_opens: 256
+    max_pending_opens: 1024
+    initial_window: 262144
+    window_update_threshold: 131072
+    max_frame_payload: 32768
+  authorization_cache:
+    enabled: true
+    local_positive_ttl: 5s
+    cluster_positive_ttl: 5m
+    negative_ttl: 3s
+    revision_poll_interval: 2s
+    max_stale_on_poll_error: 5s
+    max_entries: 100000
+```
+
+`authorization_cache` 使用数据库中的共享授权修订号失效。SQLite 正向缓存默认 5 秒；MySQL 集群默认 5 分钟，并通过 2 秒修订号轮询保证权限变更尽快生效。轮询失败超过 `max_stale_on_poll_error` 后缓存 fail-closed，新请求会回源数据库。所有 Token、用户、Agent 和策略变更必须与修订号更新处于同一数据库事务。
+
+本节点创建、轮换或撤销 service token 时会立即通知本地缓存，因此本节点新流通常无需等待轮询周期。其它节点、直接数据库写入和旧版本节点仍依赖 revision 轮询。`/ready` 中的 `authorization_cache` 组件表示修订号源是否健康；轮询失败会让该组件变为 unhealthy，并在超过容忍时间后停止使用正向缓存。需要逐请求回源时可将 `authorization_cache.enabled` 设为 `false`，该配置只影响缓存，不会降低认证和授权检查强度。
+
+Agent 默认使用有界拨号执行器，单个慢目标不会阻塞同一 WebSocket 上的其它 Stream：
+
+```yaml
+agent:
+  streams:
+    max_concurrent_dials: 32
+    max_pending_dials: 128
+    connect_timeout: 5s
+    open_timeout: 8s
+    inbound_buffer_bytes: 262144
+```
+
+Client 默认等待严格打开结果并限制入站缓冲：
+
+```yaml
+client:
+  stream:
+    open_timeout: 8s
+    inbound_buffer_bytes: 262144
+  remote_validation:
+    positive_ttl: 15s
+    negative_ttl: 2s
+    timeout: 3s
+    max_entries: 10000
+```
+
+`remote_validation` 只缓存外部校验的 allow/deny 决策，不缓存凭据或目标响应体；同键并发请求会合并。生产环境优先调小 `cluster_positive_ttl` 和 `remote_validation.positive_ttl`，在权限收敛速度和数据库/外部校验压力之间取得平衡。
+
 ## 管理员凭据
 
 首次初始化数据库后，在同一数据库配置下创建管理员：

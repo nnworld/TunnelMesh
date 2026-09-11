@@ -109,20 +109,111 @@ func TestAgentSessionRegistrationNegotiatesAndHeartbeats(t *testing.T) {
 }
 func TestAgentSessionGoAwayAndBackpressure(t *testing.T) {
 	m := NewAgentSessionManager(AgentSessionConfig{QueueSize: 1})
-	tr := newFakeTransport()
+	tr := newGatedTransport()
+	tr.gate = make(chan struct{})
 	_, _ = m.Register(context.Background(), AgentRegistration{AgentID: "a", NodeID: "n", Epoch: 1}, tr)
+	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-tr.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start sending the first frame")
+	}
 	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("got %v", err)
 	}
+	close(tr.gate)
 	if err := m.GoAway("a"); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Send("a", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func TestAgentSessionWriterPrioritizesControlAndFairStreams(t *testing.T) {
+	tr := newGatedTransport()
+	tr.gate = make(chan struct{})
+	m := NewAgentSessionManager(AgentSessionConfig{QueueSize: 8})
+	_, err := m.Register(context.Background(), AgentRegistration{AgentID: "fair", NodeID: "node", Epoch: 1}, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := func(streamID uint32) protocol.Frame {
+		return protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: streamID, Payload: []byte("data")}
+	}
+	if err := m.Send("fair", data(1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-tr.started:
+	case <-time.After(time.Second):
+		t.Fatal("first stream frame did not reach the transport writer")
+	}
+	if err := m.Send("fair", data(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send("fair", data(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send("fair", protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing}); err != nil {
+		t.Fatal(err)
+	}
+	close(tr.gate)
+
+	deadline := time.After(time.Second)
+	want := []struct {
+		streamID  uint32
+		frameType protocol.FrameType
+	}{
+		{1, protocol.FrameData},
+		{0, protocol.FramePing},
+		{2, protocol.FrameData},
+		{1, protocol.FrameData},
+	}
+	for _, expected := range want {
+		select {
+		case frame := <-tr.sent:
+			if frame.StreamID != expected.streamID || frame.Type != expected.frameType {
+				t.Fatalf("frame=%+v, want stream=%d type=%d", frame, expected.streamID, expected.frameType)
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for stream=%d type=%d", expected.streamID, expected.frameType)
+		}
+	}
+	_ = m.GoAway("fair")
+}
+
+type gatedTransport struct {
+	sent    chan protocol.Frame
+	gate    chan struct{}
+	closed  chan struct{}
+	started chan struct{}
+	once    sync.Once
+}
+
+func newGatedTransport() *gatedTransport {
+	return &gatedTransport{sent: make(chan protocol.Frame, 16), started: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (t *gatedTransport) Send(frame protocol.Frame) error {
+	t.once.Do(func() { close(t.started) })
+	<-t.gate
+	t.sent <- frame
+	return nil
+}
+
+func (t *gatedTransport) Close() error {
+	select {
+	case <-t.closed:
+	default:
+		close(t.closed)
+	}
+	return nil
 }
 func TestClientSessionOpenLocalRouting(t *testing.T) {
 	c := NewClientSessionManager()

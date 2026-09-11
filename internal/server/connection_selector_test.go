@@ -86,6 +86,70 @@ func TestAgentConnectionSelectorPrefersHealthyLeastLoadedLocalConnection(t *test
 	}
 }
 
+func TestSelectAgentConnectionLocalPreferred(t *testing.T) {
+	got, err := SelectAgentConnection(SelectionLocalPreferred, "server-local", []AgentConnectionCandidate{
+		{AgentID: "agent", InstanceID: "instance", ConnectionID: "remote", ServerNodeID: "server-remote", ActiveStreams: 1, HealthScore: 100, RTT: time.Millisecond},
+		{AgentID: "agent", InstanceID: "instance", ConnectionID: "local", ServerNodeID: "server-local", ActiveStreams: 9, HealthScore: 90, RTT: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConnectionID != "local" {
+		t.Fatalf("selected=%+v, want healthy local connection", got)
+	}
+}
+
+func TestSelectAgentConnectionFallsBackToHealthyRemote(t *testing.T) {
+	got, err := SelectAgentConnection(SelectionLocalPreferred, "server-local", []AgentConnectionCandidate{
+		{AgentID: "agent", ConnectionID: "unhealthy-local", ServerNodeID: "server-local", ActiveStreams: 1, HealthScore: 0},
+		{AgentID: "agent", ConnectionID: "remote", ServerNodeID: "server-remote", ActiveStreams: 2, HealthScore: 80, RTT: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConnectionID != "remote" {
+		t.Fatalf("selected=%+v, want healthy remote fallback", got)
+	}
+}
+
+func TestSelectAgentConnectionUsesLeastStreamsAndTieBreaks(t *testing.T) {
+	got, err := SelectAgentConnection(SelectionLeastStreams, "server-local", []AgentConnectionCandidate{
+		{AgentID: "agent", ConnectionID: "more-streams", ServerNodeID: "server-local", ActiveStreams: 3, HealthScore: 100},
+		{AgentID: "agent", ConnectionID: "least-streams", ServerNodeID: "server-remote", ActiveStreams: 1, HealthScore: 90, RTT: time.Millisecond},
+		{AgentID: "agent", ConnectionID: "same-streams", ServerNodeID: "server-remote", ActiveStreams: 1, HealthScore: 80, RTT: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConnectionID != "least-streams" {
+		t.Fatalf("selected=%+v, want least streams then higher health", got)
+	}
+}
+
+func TestSelectAgentConnectionRejectsUnhealthyAndEmptyCandidates(t *testing.T) {
+	if _, err := SelectAgentConnection(SelectionLocalPreferred, "server-local", nil); !errors.Is(err, ErrNoAgentConnections) {
+		t.Fatalf("empty error=%v, want ErrNoAgentConnections", err)
+	}
+	if _, err := SelectAgentConnection(SelectionLocalPreferred, "server-local", []AgentConnectionCandidate{
+		{AgentID: "agent", ConnectionID: "local", ServerNodeID: "server-local", HealthScore: 0},
+	}); !errors.Is(err, ErrNoAgentConnections) {
+		t.Fatalf("unhealthy error=%v, want ErrNoAgentConnections", err)
+	}
+}
+
+func TestSelectAgentConnectionEqualCandidatesPreservesInputOrder(t *testing.T) {
+	got, err := SelectAgentConnection(SelectionLocalPreferred, "server-local", []AgentConnectionCandidate{
+		{AgentID: "agent", ConnectionID: "first", ServerNodeID: "server-local", ActiveStreams: 2, HealthScore: 90, RTT: time.Millisecond},
+		{AgentID: "agent", ConnectionID: "second", ServerNodeID: "server-local", ActiveStreams: 2, HealthScore: 90, RTT: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConnectionID != "first" {
+		t.Fatalf("selected=%+v, want stable first candidate", got)
+	}
+}
+
 func TestAgentConnectionSelectorFallsBackToRemote(t *testing.T) {
 	manager := NewAgentSessionManager(AgentSessionConfig{})
 	closed, err := manager.Register(context.Background(), AgentRegistration{

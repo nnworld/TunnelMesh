@@ -42,6 +42,62 @@ func TestMySQLV6ToV7ConnectionLeaseMigrationUsesCompatibleDDL(t *testing.T) {
 	}
 }
 
+func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
+	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
+	}
+	raw, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.PingContext(context.Background()); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("prepare MySQL schema: %v", err)
+	}
+	statements := []string{
+		`DROP TABLE IF EXISTS authorization_revision`,
+		`UPDATE schema_meta SET version=8 WHERE id=1`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.ExecContext(context.Background(), statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v8 schema: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+			t.Errorf("restore MySQL schema: %v", err)
+		}
+		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+			t.Errorf("restore MySQL schema version: %v", err)
+		}
+		if err := raw.Close(); err != nil {
+			t.Errorf("close MySQL schema test database: %v", err)
+		}
+	})
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenMySQL(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v8 to v9: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	revision, err := db.AuthorizationRevisions().Current(context.Background())
+	if err != nil || revision != 1 {
+		t.Fatalf("authorization revision = %d, err = %v, want 1", revision, err)
+	}
+}
+
 func TestMySQLAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {

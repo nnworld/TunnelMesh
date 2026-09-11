@@ -106,6 +106,104 @@ func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestLoadStreamLatencyDefaults(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantServerStream := config.ServerStreamConfig{
+		MaxConcurrentOpens: 256, MaxPendingOpens: 1024,
+		InitialWindow: 262144, WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
+	}
+	if cfg.Server.Stream != wantServerStream {
+		t.Fatalf("Server.Stream = %+v, want %+v", cfg.Server.Stream, wantServerStream)
+	}
+	wantAuthCache := config.AuthorizationCacheConfig{
+		Enabled: true, LocalPositiveTTL: 5 * time.Second, ClusterPositiveTTL: 5 * time.Minute,
+		NegativeTTL: 3 * time.Second, RevisionPollInterval: 2 * time.Second,
+		MaxStaleOnPollError: 5 * time.Second, MaxEntries: 100000,
+	}
+	if cfg.Server.AuthorizationCache != wantAuthCache {
+		t.Fatalf("Server.AuthorizationCache = %+v, want %+v", cfg.Server.AuthorizationCache, wantAuthCache)
+	}
+	wantAgentStreams := config.AgentStreamConfig{
+		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+	}
+	if cfg.Agent.Streams != wantAgentStreams {
+		t.Fatalf("Agent.Streams = %+v, want %+v", cfg.Agent.Streams, wantAgentStreams)
+	}
+	wantClientStream := config.ClientStreamConfig{OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144}
+	if cfg.Client.Stream != wantClientStream {
+		t.Fatalf("Client.Stream = %+v, want %+v", cfg.Client.Stream, wantClientStream)
+	}
+	wantRemoteValidation := config.RemoteValidationConfig{
+		PositiveTTL: 15 * time.Second, NegativeTTL: 2 * time.Second,
+		Timeout: 3 * time.Second, MaxEntries: 10000,
+	}
+	if cfg.Client.RemoteValidation != wantRemoteValidation {
+		t.Fatalf("Client.RemoteValidation = %+v, want %+v", cfg.Client.RemoteValidation, wantRemoteValidation)
+	}
+}
+
+func applyStreamLatencyDefaults(cfg *config.Config) {
+	cfg.Server.Stream = config.ServerStreamConfig{
+		MaxConcurrentOpens: 256, MaxPendingOpens: 1024, InitialWindow: 262144,
+		WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
+	}
+	cfg.Server.AuthorizationCache = config.AuthorizationCacheConfig{
+		Enabled: true, LocalPositiveTTL: 5 * time.Second, ClusterPositiveTTL: 5 * time.Minute,
+		NegativeTTL: 3 * time.Second, RevisionPollInterval: 2 * time.Second,
+		MaxStaleOnPollError: 5 * time.Second, MaxEntries: 100000,
+	}
+	cfg.Agent.Streams = config.AgentStreamConfig{
+		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+	}
+	cfg.Client.Stream = config.ClientStreamConfig{OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144}
+	cfg.Client.RemoteValidation = config.RemoteValidationConfig{
+		PositiveTTL: 15 * time.Second, NegativeTTL: 2 * time.Second,
+		Timeout: 3 * time.Second, MaxEntries: 10000,
+	}
+}
+
+func TestValidateStreamLatencyLimits(t *testing.T) {
+	base, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "server concurrent opens", edit: func(c *config.Config) { c.Server.Stream.MaxConcurrentOpens = 0 }, want: "server stream max concurrent opens must be positive"},
+		{name: "server pending opens", edit: func(c *config.Config) { c.Server.Stream.MaxPendingOpens = -1 }, want: "server stream max pending opens must be positive"},
+		{name: "server initial window", edit: func(c *config.Config) { c.Server.Stream.InitialWindow = 0 }, want: "server stream initial window must be positive"},
+		{name: "server window threshold", edit: func(c *config.Config) { c.Server.Stream.WindowUpdateThreshold = 262145 }, want: "server stream window update threshold must be positive and no greater than the initial window"},
+		{name: "server frame payload", edit: func(c *config.Config) { c.Server.Stream.MaxFramePayload = 1<<20 + 1 }, want: "server stream max frame payload must be positive and no greater than 1048576"},
+		{name: "auth cache positive ttl", edit: func(c *config.Config) { c.Server.AuthorizationCache.LocalPositiveTTL = 0 }, want: "authorization cache local positive TTL must be positive"},
+		{name: "auth cache entries", edit: func(c *config.Config) { c.Server.AuthorizationCache.MaxEntries = 0 }, want: "authorization cache max entries must be positive"},
+		{name: "agent concurrent dials", edit: func(c *config.Config) { c.Agent.Streams.MaxConcurrentDials = 0 }, want: "agent stream max concurrent dials must be positive"},
+		{name: "agent pending dials", edit: func(c *config.Config) { c.Agent.Streams.MaxPendingDials = -1 }, want: "agent stream max pending dials must be positive"},
+		{name: "agent connect timeout", edit: func(c *config.Config) { c.Agent.Streams.ConnectTimeout = 0 }, want: "agent stream connect timeout must be positive"},
+		{name: "agent inbound buffer", edit: func(c *config.Config) { c.Agent.Streams.InboundBufferBytes = -1 }, want: "agent stream inbound buffer bytes must be positive"},
+		{name: "client open timeout", edit: func(c *config.Config) { c.Client.Stream.OpenTimeout = 0 }, want: "client stream open timeout must be positive"},
+		{name: "remote validation ttl", edit: func(c *config.Config) { c.Client.RemoteValidation.PositiveTTL = -time.Second }, want: "remote validation positive TTL must be positive"},
+		{name: "remote validation entries", edit: func(c *config.Config) { c.Client.RemoteValidation.MaxEntries = 0 }, want: "remote validation max entries must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			err := config.Validate(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadGeneratesStableAgentInstanceID(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent-instance-id")
@@ -234,6 +332,7 @@ func TestValidateAllowsClusterWithoutExplicitNodeID(t *testing.T) {
 		Storage:  config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "user:pass@tcp(db:3306)/tunnelmesh"}},
 		Registry: config.RegistryConfig{Type: config.RegistryDatabase},
 	}
+	applyStreamLatencyDefaults(&cfg)
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v, want generated node identity to be allowed", err)
 	}
@@ -283,6 +382,7 @@ func TestValidateAllowsClusterWithoutMySQLTLS(t *testing.T) {
 		Registry: config.RegistryConfig{Type: config.RegistryDatabase},
 		Node:     config.NodeConfig{ID: "server-1"},
 	}
+	applyStreamLatencyDefaults(&cfg)
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v, want nil when MySQL TLS is disabled", err)
 	}
@@ -687,6 +787,7 @@ func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *test
 		t.Fatalf("Validate() error = %v, want absolute paths and node token failures", err)
 	}
 	cfg.Server.Relay.CA, cfg.Server.Relay.Cert, cfg.Server.Relay.Key, cfg.Server.Relay.NodeToken = "/ca.pem", "/cert.pem", "/key.pem", "secret"
+	applyStreamLatencyDefaults(&cfg)
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("Validate(valid relay) error = %v", err)
 	}
@@ -699,6 +800,7 @@ func TestValidateRelayRequiresClusterIdentityTokenAndAbsoluteTLSMaterial(t *test
 
 func TestValidateRelayRequiresAdvertisedEndpoint(t *testing.T) {
 	cfg := config.Config{Mode: config.ModeCluster, Node: config.NodeConfig{ID: "node-a"}, Storage: config.StorageConfig{Driver: config.StorageMySQL, MySQL: config.MySQLConfig{DSN: "mysql://db", TLS: true}}, Registry: config.RegistryConfig{Type: config.RegistryDatabase}, Server: config.ServerConfig{Relay: config.RelayConfig{Enabled: true, Listen: ":9443", Endpoint: "relay.example:9443", CA: "/ca.pem", Cert: "/cert.pem", Key: "/key.pem", ServerName: "relay.local", NodeToken: "secret"}}}
+	applyStreamLatencyDefaults(&cfg)
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("Validate(valid relay) error = %v", err)
 	}
@@ -761,11 +863,13 @@ func TestValidateRelayRejectsPartialTLSMaterial(t *testing.T) {
 	}
 
 	plaintext := base
+	applyStreamLatencyDefaults(&plaintext)
 	if err := config.Validate(plaintext); err != nil {
 		t.Fatalf("Validate(plaintext relay) error = %v", err)
 	}
 
 	disabled := base
+	applyStreamLatencyDefaults(&disabled)
 	disabled.Server.Relay.Enabled = false
 	disabled.Server.Relay.Listen = ""
 	disabled.Server.Relay.Endpoint = ""

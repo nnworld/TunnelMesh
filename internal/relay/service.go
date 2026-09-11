@@ -5,6 +5,9 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 var (
@@ -25,6 +28,8 @@ type StreamRequest struct {
 	TargetConnectionID    string
 	TargetConnectionEpoch int64
 	StreamID              uint32
+	StrictOpen            bool
+	InitialWindow         uint32
 	Protocol              string
 	TargetHost            string
 	TargetPort            int
@@ -32,6 +37,21 @@ type StreamRequest struct {
 	HostHeader            string
 	TLSServerName         string
 	Metadata              []byte
+}
+
+// RelayOpenMetadata carries the relay-neutral opening contract. StrictOpen is
+// duplicated from Request so adapters can expose negotiated semantics without
+// making callers inspect transport-specific fields.
+type RelayOpenMetadata struct {
+	Request     StreamRequest
+	StrictOpen  bool
+	OpenTimeout time.Duration
+}
+
+// RelayOpenResult is the terminal result of a strict stream open. The payload
+// is deliberately bounded by protocol.MaxOpenResultPayload.
+type RelayOpenResult struct {
+	Payload protocol.OpenResultPayload
 }
 
 // CloseAgentConnectionRequest is the inter-server control message for closing
@@ -48,6 +68,13 @@ type CloseAgentConnectionFunc func(context.Context, CloseAgentConnectionRequest)
 type NodeTransport interface {
 	OpenStream(context.Context, StreamRequest) (io.ReadWriteCloser, error)
 	Close() error
+}
+
+// OpenResultTransport is an optional capability for transports that can
+// distinguish terminal open failures from a successfully created byte stream.
+type OpenResultTransport interface {
+	NodeTransport
+	OpenStreamResult(context.Context, StreamRequest) (io.ReadWriteCloser, RelayOpenResult, error)
 }
 type nodeEntry struct {
 	epoch     int64
@@ -111,4 +138,46 @@ func (r *RelayService) OpenStream(ctx context.Context, req StreamRequest) (io.Re
 	conn, err := e.transport.OpenStream(ctx, req)
 	r.mu.RUnlock()
 	return conn, err
+}
+
+func (r *RelayService) OpenStreamResult(ctx context.Context, req StreamRequest) (io.ReadWriteCloser, RelayOpenResult, error) {
+	tr, err := r.transport(req)
+	if err != nil {
+		return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeAgentOffline)}, err
+	}
+	resultTransport, ok := tr.(OpenResultTransport)
+	if !ok {
+		if req.StrictOpen {
+			return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeUnsupportedCapability)}, nil
+		}
+		conn, openErr := tr.OpenStream(ctx, req)
+		if openErr != nil || conn == nil {
+			return nil, RelayOpenResult{Payload: openResultFailure(protocol.OpenResultStageRelay, protocol.OpenResultCodeInternalError)}, openErr
+		}
+		return conn, RelayOpenResult{Payload: protocol.OpenResultPayload{Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK}}, nil
+	}
+	return resultTransport.OpenStreamResult(ctx, req)
+}
+
+func (r *RelayService) transport(req StreamRequest) (NodeTransport, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if req.NodeID == "" {
+		if r.local == nil {
+			return nil, ErrNodeDisconnected
+		}
+		return r.local, nil
+	}
+	entry, ok := r.nodes[req.NodeID]
+	if !ok {
+		return nil, ErrNodeDisconnected
+	}
+	if req.Epoch != entry.epoch {
+		return nil, ErrEpoch
+	}
+	return entry.transport, nil
+}
+
+func openResultFailure(stage protocol.OpenResultStage, code protocol.OpenResultCode) protocol.OpenResultPayload {
+	return protocol.OpenResultPayload{Accepted: false, Stage: stage, Code: code, Retryable: code == protocol.OpenResultCodeQueueFull || code == protocol.OpenResultCodeTimeout}
 }

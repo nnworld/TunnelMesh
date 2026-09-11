@@ -27,6 +27,7 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/registry"
+	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
@@ -118,6 +119,131 @@ func TestNewServerRuntimeStartsPlaintextRelayWhenCertificatesOmitted(t *testing.
 	}
 }
 
+func TestServerRuntimeRelayPropagatesStrictOpenResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-strict-relay?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
+		NodeID: "server-strict-relay",
+		Relay: config.RelayConfig{
+			Enabled: true, Listen: "127.0.0.1:0", Endpoint: "127.0.0.1:9443", NodeToken: "secret",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpListener.Close()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- runtime.ServeListener(ctx, httpListener) }()
+
+	agentTransport := newFakeTransport()
+	agentSession, err := runtime.AgentSessions.Register(ctx, AgentRegistration{
+		AgentID: "agent-runtime", NodeID: "server-strict-relay", Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := db.Nodes().Get(ctx, "server-strict-relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "runtime-strict-owner", "password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := auth.NewCredentialService(db)
+	defer credentials.Close()
+	nodeToken, err := credentials.Create(ctx, auth.CreateTokenInput{
+		Type: storage.TokenTypeServerNode, OwnerUserID: owner.ID,
+		Scope: auth.TokenScope{ServerNodeIDs: []string{"server-strict-relay"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := relay.DialAuthenticatedGRPCNode(ctx, runtime.relayListener.Addr().String(), "server-strict-relay", node.Epoch, nodeToken.Secret, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	type openResult struct {
+		stream io.ReadWriteCloser
+		result relay.RelayOpenResult
+		err    error
+	}
+	resultCh := make(chan openResult, 1)
+	go func() {
+		stream, result, openErr := client.OpenStreamResult(ctx, relay.StreamRequest{
+			NodeID: "server-strict-relay", Epoch: node.Epoch, AgentID: "agent-runtime",
+			StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+		})
+		resultCh <- openResult{stream: stream, result: result, err: openErr}
+	}()
+
+	var open protocol.Frame
+	select {
+	case open = <-agentTransport.sent:
+	case got := <-resultCh:
+		t.Fatalf("relay returned before Agent OPEN frame: stream=%v result=%+v err=%v", got.stream, got.result.Payload, got.err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Agent OPEN frame")
+	}
+	if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 {
+		t.Fatalf("Agent OPEN frame = %+v, want strict OPEN_STREAM", open)
+	}
+	payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+		Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.LocalAgentRelay.handleAgentFrameGeneration("agent-runtime", agentSession.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: open.StreamID, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.stream == nil || !got.result.Payload.Accepted || got.result.Payload.Code != protocol.OpenResultCodeOK {
+			t.Fatalf("relay result stream=%v result=%+v err=%v", got.stream, got.result.Payload, got.err)
+		}
+		if err := runtime.LocalAgentRelay.handleAgentFrameGeneration("agent-runtime", agentSession.serverGeneration, protocol.Frame{
+			Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: []byte("relay-data"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, len("relay-data"))
+		if _, err := io.ReadFull(got.stream, buffer); err != nil || string(buffer) != "relay-data" {
+			t.Fatalf("relay data=%q err=%v", buffer, err)
+		}
+		_ = got.stream.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for strict relay result")
+	}
+	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not stop after context cancellation")
+	}
+}
+
 func TestNewServerRuntimeRejectsPartialRelayTLSMaterial(t *testing.T) {
 	db, err := storage.OpenSQLite(context.Background(), "file:runtime-partial-relay-tls?mode=memory&cache=shared")
 	if err != nil {
@@ -185,6 +311,146 @@ func TestNewServerRuntimeWiresAgentMetadataPersistence(t *testing.T) {
 	if err != nil || metadata.AgentID != "agent-runtime" || metadata.NodeID != "node-runtime" {
 		t.Fatalf("metadata=%+v err=%v", metadata, err)
 	}
+}
+
+func TestNewServerRuntimeWiresAuthorizationCacheAndReadiness(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-authorization-cache?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheConfig := config.AuthorizationCacheConfig{
+		Enabled: true, LocalPositiveTTL: 5 * time.Second, ClusterPositiveTTL: 5 * time.Minute,
+		NegativeTTL: 3 * time.Second, RevisionPollInterval: time.Millisecond,
+		MaxStaleOnPollError: 5 * time.Second, MaxEntries: 100,
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{AuthorizationCache: cacheConfig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := runtime.ClientAuthorizer.(*cachingStreamAuthorizer)
+	if !ok {
+		t.Fatalf("client authorizer type=%T, want caching stream authorizer", runtime.ClientAuthorizer)
+	}
+	if wrapper.config.PositiveTTL != cacheConfig.LocalPositiveTTL {
+		t.Fatalf("SQLite positive TTL=%v, want %v", wrapper.config.PositiveTTL, cacheConfig.LocalPositiveTTL)
+	}
+	if status := findComponent(runtime.Ready(ctx), "authorization_cache"); status == nil || !status.Healthy {
+		t.Fatalf("authorization cache readiness=%+v, want healthy", status)
+	}
+
+	called := false
+	originalCleanup := runtime.authorizationCacheCleanup
+	runtime.authorizationCacheCleanup = func() error {
+		called = true
+		return originalCleanup()
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("runtime Close did not stop the authorization cache poller")
+	}
+}
+
+func TestServerRuntimeAuthorizationCacheReadinessFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-authorization-cache-unhealthy?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{AuthorizationCache: config.AuthorizationCacheConfig{
+		Enabled: true, LocalPositiveTTL: time.Minute, ClusterPositiveTTL: 5 * time.Minute,
+		NegativeTTL: time.Second, RevisionPollInterval: time.Millisecond,
+		MaxStaleOnPollError: time.Second, MaxEntries: 16,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := runtime.ClientAuthorizer.(*cachingStreamAuthorizer)
+	if !ok {
+		t.Fatalf("client authorizer type=%T, want caching stream authorizer", runtime.ClientAuthorizer)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !wrapper.Unhealthy() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !wrapper.Unhealthy() {
+		t.Fatal("authorization cache did not report an unhealthy revision source")
+	}
+	status := findComponent(runtime.Ready(ctx), "authorization_cache")
+	if status == nil || status.Healthy {
+		t.Fatalf("authorization cache readiness=%+v, want unhealthy", status)
+	}
+}
+
+func TestServerRuntimeAuthorizationCacheRevocationBlocksNewStreams(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-authorization-revocation?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{AuthorizationCache: config.AuthorizationCacheConfig{
+		Enabled: true, LocalPositiveTTL: time.Minute, ClusterPositiveTTL: 5 * time.Minute,
+		NegativeTTL: time.Second, RevisionPollInterval: time.Millisecond,
+		MaxStaleOnPollError: time.Second, MaxEntries: 16,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	owner, err := runtime.Auth.CreateUser(ctx, "authorization-cache-owner", "password", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Agents().Create(ctx, storage.Agent{ID: "authorization-cache-agent", Name: "agent", OwnerUserID: owner.ID, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Policies().Create(ctx, storage.AgentPolicy{ID: "authorization-cache-policy", AgentID: "authorization-cache-agent", TargetHost: "10.0.0.8", TargetPort: 22, Protocol: "tcp", AllowedCIDRs: "10.0.0.0/24", AllowedPorts: "22"}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := runtime.Credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := runtime.Credentials.ValidateAs(ctx, created.Secret, storage.TokenTypeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := ClientSessionPrincipal{ConnectionID: "authorization-cache-connection", Identity: identity}
+	request := protocol.StreamOpenPayload{AgentID: "authorization-cache-agent", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22}
+	if err := runtime.ClientAuthorizer.Authorize(ctx, principal, request); err != nil {
+		t.Fatalf("Authorize before revoke error=%v", err)
+	}
+	if err := runtime.Credentials.Revoke(ctx, created.TokenID); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	var revokedErr error
+	for time.Now().Before(deadline) {
+		revokedErr = runtime.ClientAuthorizer.Authorize(ctx, principal, request)
+		if errors.Is(revokedErr, auth.ErrForbidden) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Authorize after revoke error=%v, want forbidden", revokedErr)
+}
+
+func findComponent(components []ComponentStatus, name string) *ComponentStatus {
+	for i := range components {
+		if components[i].Name == name {
+			return &components[i]
+		}
+	}
+	return nil
 }
 
 func TestAgentWebSocketRouteIsExact(t *testing.T) {

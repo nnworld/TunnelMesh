@@ -114,14 +114,34 @@ type NodeConfig struct {
 }
 
 type ServerConfig struct {
-	HTTPAddr         string          `mapstructure:"http_addr" json:"http_addr" yaml:"http_addr"`
-	HTTPSAddr        string          `mapstructure:"https_addr" json:"https_addr" yaml:"https_addr"`
-	AgentWSAddr      string          `mapstructure:"agent_ws_addr" json:"agent_ws_addr" yaml:"agent_ws_addr"`
-	ClientWSAddr     string          `mapstructure:"client_ws_addr" json:"client_ws_addr" yaml:"client_ws_addr"`
-	DynamicSuffix    string          `mapstructure:"dynamic_suffix" json:"dynamic_suffix" yaml:"dynamic_suffix"`
-	TCPBridge        TCPBridgeConfig `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
-	TCPBridgeEnabled bool            `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
-	Relay            RelayConfig     `mapstructure:"relay" json:"relay" yaml:"relay"`
+	HTTPAddr           string                   `mapstructure:"http_addr" json:"http_addr" yaml:"http_addr"`
+	HTTPSAddr          string                   `mapstructure:"https_addr" json:"https_addr" yaml:"https_addr"`
+	AgentWSAddr        string                   `mapstructure:"agent_ws_addr" json:"agent_ws_addr" yaml:"agent_ws_addr"`
+	ClientWSAddr       string                   `mapstructure:"client_ws_addr" json:"client_ws_addr" yaml:"client_ws_addr"`
+	DynamicSuffix      string                   `mapstructure:"dynamic_suffix" json:"dynamic_suffix" yaml:"dynamic_suffix"`
+	TCPBridge          TCPBridgeConfig          `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
+	TCPBridgeEnabled   bool                     `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
+	Relay              RelayConfig              `mapstructure:"relay" json:"relay" yaml:"relay"`
+	Stream             ServerStreamConfig       `mapstructure:"stream" json:"stream" yaml:"stream"`
+	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
+}
+
+type ServerStreamConfig struct {
+	MaxConcurrentOpens    int `mapstructure:"max_concurrent_opens" json:"max_concurrent_opens" yaml:"max_concurrent_opens"`
+	MaxPendingOpens       int `mapstructure:"max_pending_opens" json:"max_pending_opens" yaml:"max_pending_opens"`
+	InitialWindow         int `mapstructure:"initial_window" json:"initial_window" yaml:"initial_window"`
+	WindowUpdateThreshold int `mapstructure:"window_update_threshold" json:"window_update_threshold" yaml:"window_update_threshold"`
+	MaxFramePayload       int `mapstructure:"max_frame_payload" json:"max_frame_payload" yaml:"max_frame_payload"`
+}
+
+type AuthorizationCacheConfig struct {
+	Enabled              bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	LocalPositiveTTL     time.Duration `mapstructure:"local_positive_ttl" json:"local_positive_ttl" yaml:"local_positive_ttl"`
+	ClusterPositiveTTL   time.Duration `mapstructure:"cluster_positive_ttl" json:"cluster_positive_ttl" yaml:"cluster_positive_ttl"`
+	NegativeTTL          time.Duration `mapstructure:"negative_ttl" json:"negative_ttl" yaml:"negative_ttl"`
+	RevisionPollInterval time.Duration `mapstructure:"revision_poll_interval" json:"revision_poll_interval" yaml:"revision_poll_interval"`
+	MaxStaleOnPollError  time.Duration `mapstructure:"max_stale_on_poll_error" json:"max_stale_on_poll_error" yaml:"max_stale_on_poll_error"`
+	MaxEntries           int           `mapstructure:"max_entries" json:"max_entries" yaml:"max_entries"`
 }
 
 type TCPBridgeConfig struct {
@@ -163,7 +183,16 @@ type AgentConfig struct {
 	InstanceID  string                `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
 	Token       string                `mapstructure:"token" json:"-" yaml:"-"`
 	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
+	Streams     AgentStreamConfig     `mapstructure:"streams" json:"streams" yaml:"streams"`
 	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+}
+
+type AgentStreamConfig struct {
+	MaxConcurrentDials int           `mapstructure:"max_concurrent_dials" json:"max_concurrent_dials" yaml:"max_concurrent_dials"`
+	MaxPendingDials    int           `mapstructure:"max_pending_dials" json:"max_pending_dials" yaml:"max_pending_dials"`
+	ConnectTimeout     time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
+	OpenTimeout        time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
+	InboundBufferBytes int           `mapstructure:"inbound_buffer_bytes" json:"inbound_buffer_bytes" yaml:"inbound_buffer_bytes"`
 }
 
 type AgentConnectionConfig struct {
@@ -191,9 +220,23 @@ const (
 )
 
 type ClientConfig struct {
-	ServerURL string         `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
-	Token     string         `mapstructure:"token" json:"-" yaml:"-"`
-	Tunnels   []TunnelConfig `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
+	ServerURL        string                 `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	Token            string                 `mapstructure:"token" json:"-" yaml:"-"`
+	Tunnels          []TunnelConfig         `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
+	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
+	RemoteValidation RemoteValidationConfig `mapstructure:"remote_validation" json:"remote_validation" yaml:"remote_validation"`
+}
+
+type ClientStreamConfig struct {
+	OpenTimeout        time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
+	InboundBufferBytes int           `mapstructure:"inbound_buffer_bytes" json:"inbound_buffer_bytes" yaml:"inbound_buffer_bytes"`
+}
+
+type RemoteValidationConfig struct {
+	PositiveTTL time.Duration `mapstructure:"positive_ttl" json:"positive_ttl" yaml:"positive_ttl"`
+	NegativeTTL time.Duration `mapstructure:"negative_ttl" json:"negative_ttl" yaml:"negative_ttl"`
+	Timeout     time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
+	MaxEntries  int           `mapstructure:"max_entries" json:"max_entries" yaml:"max_entries"`
 }
 
 // TunnelConfig describes a client tunnel loaded from a configuration file.
@@ -358,39 +401,62 @@ func hasKey(source any, want string) bool {
 
 func setDefaults(v *viper.Viper) {
 	defaults := map[string]any{
-		"mode":                                    ModeLocal,
-		"storage.driver":                          StorageSQLite,
-		"storage.sqlite.path":                     "tunnelmesh.db",
-		"storage.auto_init":                       true,
-		"storage.mysql.tls":                       false,
-		"registry.type":                           RegistryDatabase,
-		"registry.endpoints":                      []string{},
-		"server.http_addr":                        ":80",
-		"server.https_addr":                       ":443",
-		"server.agent_ws_addr":                    ":443",
-		"server.client_ws_addr":                   ":443",
-		"server.dynamic_suffix":                   "apps.example.com",
-		"server.tcp_bridge.enabled":               true,
-		"server.tcp_bridge.path":                  "/ws/tcp",
-		"server.tcp_bridge.max_bytes":             int64(64 << 10),
-		"server.relay.enabled":                    false,
-		"server.relay.listen":                     "",
-		"server.relay.endpoint":                   "",
-		"server.relay.ca":                         "",
-		"server.relay.cert":                       "",
-		"server.relay.key":                        "",
-		"server.relay.server_name":                "",
-		"security.allowed_hosts":                  []string{},
-		"security.allowed_origins":                []string{},
-		"security.allow_legacy_connection_tokens": false,
-		"tls.enabled":                             false,
-		"tls.min_version":                         "1.2",
-		"agent.connections.min":                   1,
-		"agent.connections.max":                   1,
-		"agent.connections.high_watermark":        16,
-		"agent.connections.low_watermark":         2,
-		"agent.connections.evaluation_interval":   10 * time.Second,
-		"agent.connections.cooldown":              30 * time.Second,
+		"mode":                                               ModeLocal,
+		"storage.driver":                                     StorageSQLite,
+		"storage.sqlite.path":                                "tunnelmesh.db",
+		"storage.auto_init":                                  true,
+		"storage.mysql.tls":                                  false,
+		"registry.type":                                      RegistryDatabase,
+		"registry.endpoints":                                 []string{},
+		"server.http_addr":                                   ":80",
+		"server.https_addr":                                  ":443",
+		"server.agent_ws_addr":                               ":443",
+		"server.client_ws_addr":                              ":443",
+		"server.dynamic_suffix":                              "apps.example.com",
+		"server.tcp_bridge.enabled":                          true,
+		"server.tcp_bridge.path":                             "/ws/tcp",
+		"server.tcp_bridge.max_bytes":                        int64(64 << 10),
+		"server.relay.enabled":                               false,
+		"server.relay.listen":                                "",
+		"server.relay.endpoint":                              "",
+		"server.relay.ca":                                    "",
+		"server.relay.cert":                                  "",
+		"server.relay.key":                                   "",
+		"server.relay.server_name":                           "",
+		"server.stream.max_concurrent_opens":                 256,
+		"server.stream.max_pending_opens":                    1024,
+		"server.stream.initial_window":                       262144,
+		"server.stream.window_update_threshold":              131072,
+		"server.stream.max_frame_payload":                    32768,
+		"server.authorization_cache.enabled":                 true,
+		"server.authorization_cache.local_positive_ttl":      5 * time.Second,
+		"server.authorization_cache.cluster_positive_ttl":    5 * time.Minute,
+		"server.authorization_cache.negative_ttl":            3 * time.Second,
+		"server.authorization_cache.revision_poll_interval":  2 * time.Second,
+		"server.authorization_cache.max_stale_on_poll_error": 5 * time.Second,
+		"server.authorization_cache.max_entries":             100000,
+		"security.allowed_hosts":                             []string{},
+		"security.allowed_origins":                           []string{},
+		"security.allow_legacy_connection_tokens":            false,
+		"tls.enabled":                                        false,
+		"tls.min_version":                                    "1.2",
+		"agent.connections.min":                              1,
+		"agent.connections.max":                              1,
+		"agent.connections.high_watermark":                   16,
+		"agent.connections.low_watermark":                    2,
+		"agent.connections.evaluation_interval":              10 * time.Second,
+		"agent.connections.cooldown":                         30 * time.Second,
+		"agent.streams.max_concurrent_dials":                 32,
+		"agent.streams.max_pending_dials":                    128,
+		"agent.streams.connect_timeout":                      5 * time.Second,
+		"agent.streams.open_timeout":                         8 * time.Second,
+		"agent.streams.inbound_buffer_bytes":                 262144,
+		"client.stream.open_timeout":                         8 * time.Second,
+		"client.stream.inbound_buffer_bytes":                 262144,
+		"client.remote_validation.positive_ttl":              15 * time.Second,
+		"client.remote_validation.negative_ttl":              2 * time.Second,
+		"client.remote_validation.timeout":                   3 * time.Second,
+		"client.remote_validation.max_entries":               10000,
 	}
 	for key, value := range defaults {
 		v.SetDefault(key, value)
@@ -409,6 +475,7 @@ func bindEnvironment(v *viper.Viper) {
 		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
+		"server.authorization_cache.enabled",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.token",
 	}
 	for _, key := range keys {
@@ -418,6 +485,11 @@ func bindEnvironment(v *viper.Viper) {
 
 func Validate(cfg Config) error {
 	var problems []string
+	problems = append(problems, validateServerStream(cfg.Server.Stream)...)
+	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
+	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
+	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
+	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
 	problems = append(problems, validateSecurity(cfg.Security)...)
 	problems = append(problems, validateTLS(cfg.TLS)...)
@@ -470,6 +542,100 @@ func Validate(cfg Config) error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func validateServerStream(cfg ServerStreamConfig) []string {
+	var problems []string
+	if cfg.MaxConcurrentOpens <= 0 {
+		problems = append(problems, "server stream max concurrent opens must be positive")
+	}
+	if cfg.MaxPendingOpens <= 0 {
+		problems = append(problems, "server stream max pending opens must be positive")
+	}
+	if cfg.InitialWindow <= 0 {
+		problems = append(problems, "server stream initial window must be positive")
+	}
+	if cfg.WindowUpdateThreshold <= 0 || cfg.WindowUpdateThreshold > cfg.InitialWindow {
+		problems = append(problems, "server stream window update threshold must be positive and no greater than the initial window")
+	}
+	if cfg.MaxFramePayload <= 0 || cfg.MaxFramePayload > 1<<20 {
+		problems = append(problems, "server stream max frame payload must be positive and no greater than 1048576")
+	}
+	return problems
+}
+
+func validateAuthorizationCache(cfg AuthorizationCacheConfig) []string {
+	var problems []string
+	if !cfg.Enabled {
+		return problems
+	}
+	if cfg.LocalPositiveTTL <= 0 {
+		problems = append(problems, "authorization cache local positive TTL must be positive")
+	}
+	if cfg.ClusterPositiveTTL <= 0 {
+		problems = append(problems, "authorization cache cluster positive TTL must be positive")
+	}
+	if cfg.NegativeTTL <= 0 {
+		problems = append(problems, "authorization cache negative TTL must be positive")
+	}
+	if cfg.RevisionPollInterval <= 0 {
+		problems = append(problems, "authorization cache revision poll interval must be positive")
+	}
+	if cfg.MaxStaleOnPollError <= 0 {
+		problems = append(problems, "authorization cache max stale on poll error must be positive")
+	}
+	if cfg.MaxEntries <= 0 {
+		problems = append(problems, "authorization cache max entries must be positive")
+	}
+	return problems
+}
+
+func validateAgentStreams(cfg AgentStreamConfig) []string {
+	var problems []string
+	if cfg.MaxConcurrentDials <= 0 {
+		problems = append(problems, "agent stream max concurrent dials must be positive")
+	}
+	if cfg.MaxPendingDials <= 0 {
+		problems = append(problems, "agent stream max pending dials must be positive")
+	}
+	if cfg.ConnectTimeout <= 0 {
+		problems = append(problems, "agent stream connect timeout must be positive")
+	}
+	if cfg.OpenTimeout <= 0 {
+		problems = append(problems, "agent stream open timeout must be positive")
+	}
+	if cfg.InboundBufferBytes <= 0 {
+		problems = append(problems, "agent stream inbound buffer bytes must be positive")
+	}
+	return problems
+}
+
+func validateClientStreams(cfg ClientStreamConfig) []string {
+	var problems []string
+	if cfg.OpenTimeout <= 0 {
+		problems = append(problems, "client stream open timeout must be positive")
+	}
+	if cfg.InboundBufferBytes <= 0 {
+		problems = append(problems, "client stream inbound buffer bytes must be positive")
+	}
+	return problems
+}
+
+func validateRemoteValidation(cfg RemoteValidationConfig) []string {
+	var problems []string
+	if cfg.PositiveTTL <= 0 {
+		problems = append(problems, "remote validation positive TTL must be positive")
+	}
+	if cfg.NegativeTTL <= 0 {
+		problems = append(problems, "remote validation negative TTL must be positive")
+	}
+	if cfg.Timeout <= 0 {
+		problems = append(problems, "remote validation timeout must be positive")
+	}
+	if cfg.MaxEntries <= 0 {
+		problems = append(problems, "remote validation max entries must be positive")
+	}
+	return problems
 }
 
 func validateAgentConnections(c AgentConnectionConfig) []string {

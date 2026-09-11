@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,15 @@ func TestMetadataControlFramesRoundTripWithoutChangingStreamTypes(t *testing.T) 
 	}
 	if got.AgentID != payload.AgentID || got.Epoch != payload.Epoch || got.Revision != payload.Revision || got.Items[0].Value != "cn-east" {
 		t.Fatalf("payload=%+v", got)
+	}
+}
+
+func TestOpenResultFrameExtendsWireTypesWithoutRenumbering(t *testing.T) {
+	if FrameTraceStart != 12 || FrameTraceHop != 13 || FrameTraceEnd != 14 || FrameOpenResult != 15 {
+		t.Fatalf(
+			"wire frame values changed: trace_start=%d trace_hop=%d trace_end=%d open_result=%d",
+			FrameTraceStart, FrameTraceHop, FrameTraceEnd, FrameOpenResult,
+		)
 	}
 }
 
@@ -93,6 +103,29 @@ func TestAgentMetadataAckAdvertisesConnectionPool(t *testing.T) {
 	}
 	if !got.ConnectionPoolSupported || got.MaxConnectionsPerAgent != 8 {
 		t.Fatalf("connection pool ack = %+v", got)
+	}
+}
+
+func TestAgentMetadataCapabilitiesRemainOptional(t *testing.T) {
+	payload := AgentMetadataPayload{AgentID: "agent-a", NodeID: "node-a", Epoch: 1, Revision: 1, Capabilities: []string{CapabilityStreamOpenResult}}
+	encoded, err := EncodeAgentMetadataPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeAgentMetadataPayload(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != CapabilityStreamOpenResult {
+		t.Fatalf("capabilities = %v", got.Capabilities)
+	}
+
+	legacy, err := DecodeAgentMetadataPayload([]byte(`{"agent_id":"agent-a","node_id":"node-a","epoch":1,"revision":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Capabilities) != 0 {
+		t.Fatalf("legacy capabilities = %v", legacy.Capabilities)
 	}
 }
 
@@ -250,6 +283,40 @@ func TestStreamWindowUpdateRejectedAfterTerminalState(t *testing.T) {
 	}
 	if reset.SendWindow() != before {
 		t.Fatalf("reset window changed: %d -> %d", before, reset.SendWindow())
+	}
+}
+
+func TestStreamWindowOverflowOverSendAndZeroUpdateAreRejected(t *testing.T) {
+	s, err := NewStreamState(4, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OpenLocal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddSendWindow(math.MaxUint32); err == nil {
+		t.Fatal("send window overflow was accepted")
+	}
+	if got := s.SendWindow(); got != 10 {
+		t.Fatalf("send window after overflow=%d, want 10", got)
+	}
+	if err := s.AddReceiveWindow(math.MaxUint32); err == nil {
+		t.Fatal("receive window overflow was accepted")
+	}
+	if got := s.ReceiveWindow(); got != 10 {
+		t.Fatalf("receive window after overflow=%d, want 10", got)
+	}
+	if err := s.ConsumeSend(11); !errors.Is(err, ErrWindowExhausted) {
+		t.Fatalf("over-send error=%v, want ErrWindowExhausted", err)
+	}
+	if got := s.SendWindow(); got != 10 {
+		t.Fatalf("send window after over-send=%d, want 10", got)
+	}
+	if err := s.Handle(Frame{Version: CurrentVersion, Type: FrameWindowUpdate, StreamID: 4, Window: 0}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("zero update error=%v, want ErrInvalidFrame", err)
+	}
+	if got := s.SendWindow(); got != 10 {
+		t.Fatalf("send window after zero update=%d, want 10", got)
 	}
 }
 

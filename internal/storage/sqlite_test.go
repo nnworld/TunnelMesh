@@ -115,7 +115,7 @@ func TestSQLiteAutoInitDisabledRejectsMissingRuntimeMetadataTable(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,?); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`, SchemaVersion); err != nil {
+	if _, err := raw.Exec(`CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO schema_meta(id,version) VALUES (1,?); CREATE TABLE authorization_revision (id INTEGER PRIMARY KEY, revision BIGINT UNSIGNED NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE agents (id TEXT PRIMARY KEY)`, SchemaVersion); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -350,6 +350,65 @@ func TestSQLiteV7ToV8ServerNodeManagementMigration(t *testing.T) {
 	}
 	if node.Name != "legacy-server" || !node.Enabled || node.DeletedAt != nil {
 		t.Fatalf("migrated node = %+v, want managed defaults", node)
+	}
+}
+
+func TestSQLiteV8ToV9AuthorizationRevisionMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v8-to-v9.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	statements := []string{
+		`DROP TABLE IF EXISTS authorization_revision`,
+		`UPDATE schema_meta SET version=8 WHERE id=1`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v8 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v8 to v9: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	revision, err := db.AuthorizationRevisions().Current(context.Background())
+	if err != nil || revision != 1 {
+		t.Fatalf("authorization revision = %d, err = %v, want 1", revision, err)
+	}
+}
+
+func TestAuthorizationRevisionCurrentInitializesToOne(t *testing.T) {
+	db := newTestDB(t)
+	revision, err := db.AuthorizationRevisions().Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 {
+		t.Fatalf("authorization revision = %d, want 1", revision)
+	}
+}
+
+func TestAuthorizationRevisionMissingRowFails(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.SQL().Exec(`DELETE FROM authorization_revision WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AuthorizationRevisions().Current(context.Background()); err == nil {
+		t.Fatal("missing authorization revision row must fail closed")
 	}
 }
 

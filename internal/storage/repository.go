@@ -172,6 +172,10 @@ type IdempotencyRepository interface {
 	Delete(context.Context, string) error
 }
 
+type AuthorizationRevisionRepository interface {
+	Current(context.Context) (uint64, error)
+}
+
 // AtomicIdempotencyRepository is an optional stronger contract used by the
 // HTTP API when the backing store supports compare-and-set key claiming.
 type AtomicIdempotencyRepository interface {
@@ -393,6 +397,34 @@ type transactionStarter interface {
 	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
 }
 
+// withAuthorizationRevision commits an authorization-fact mutation and its
+// cache revision as one database transaction. Transaction-bound repositories
+// bump the same transaction so callers can safely compose multiple writes.
+func withAuthorizationRevision(ctx context.Context, db dbExecutor, operation func(dbExecutor) error) error {
+	if tx, ok := db.(*sql.Tx); ok {
+		if err := operation(tx); err != nil {
+			return err
+		}
+		return bumpAuthorizationRevision(ctx, tx)
+	}
+	starter, ok := db.(transactionStarter)
+	if !ok {
+		return fmt.Errorf("storage: authorization revision requires a transaction-capable executor")
+	}
+	tx, err := starter.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := operation(tx); err != nil {
+		return err
+	}
+	if err := bumpAuthorizationRevision(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 type userRepo struct {
 	db        dbExecutor
 	driver    string
@@ -439,12 +471,16 @@ func (r *userRepo) Update(ctx context.Context, v User) error {
 	if v.UpdatedAt.IsZero() {
 		v.UpdatedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,deleted_at=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.UpdatedAt), v.ID)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE users SET username=?,role=?,password_hash=?,disabled=?,deleted_at=?,updated_at=? WHERE id=?`, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.UpdatedAt), v.ID)
+		return checkAffected(res, err)
+	})
 }
 func (r *userRepo) Delete(ctx context.Context, id string) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
+		return checkAffected(res, err)
+	})
 }
 func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[User], error) {
 	cursor, limit = pageArgs(cursor, limit)
@@ -650,7 +686,9 @@ type serviceTokenRepo struct {
 }
 
 func (r *serviceTokenRepo) Create(ctx context.Context, v ServiceToken) error {
-	return createServiceToken(ctx, r.db, v)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		return createServiceToken(ctx, exec, v)
+	})
 }
 
 func createServiceToken(ctx context.Context, db dbExecutor, v ServiceToken) error {
@@ -731,43 +769,36 @@ func (r *serviceTokenRepo) List(ctx context.Context, filter ServiceTokenFilter, 
 
 func (r *serviceTokenRepo) Revoke(ctx context.Context, id string, when time.Time) error {
 	when = timeOrNow(when)
-	res, err := r.db.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, tm(when), tm(when), id)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected > 0 {
-		return nil
-	}
-	record, err := r.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if record.RevokedAt != nil {
-		return ErrServiceTokenRevoked
-	}
-	return fmt.Errorf("revoke service token %q made no state transition", id)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at IS NULL`, tm(when), tm(when), id)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected > 0 {
+			return nil
+		}
+		var revoked sql.NullString
+		if err := exec.QueryRowContext(ctx, `SELECT revoked_at FROM service_tokens WHERE id=?`, id).Scan(&revoked); err != nil {
+			return err
+		}
+		if parseTM(revoked) != nil {
+			return ErrServiceTokenRevoked
+		}
+		return fmt.Errorf("revoke service token %q made no state transition", id)
+	})
 }
 
 // UpdateExpiration only changes the lifecycle deadline. Revoked and already
 // expired credentials are rejected so an update cannot resurrect them.
 func (r *serviceTokenRepo) UpdateExpiration(ctx context.Context, id string, expiresAt *time.Time, when time.Time) error {
 	when = timeOrNow(when)
-	if r.starter == nil {
-		return updateServiceTokenExpiration(ctx, r.db, r.driver, id, expiresAt, when)
-	}
-	tx, err := r.starter.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := updateServiceTokenExpiration(ctx, tx, r.driver, id, expiresAt, when); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		return updateServiceTokenExpiration(ctx, exec, r.driver, id, expiresAt, when)
+	})
 }
 
 func updateServiceTokenExpiration(ctx context.Context, db dbExecutor, driver, id string, expiresAt *time.Time, when time.Time) error {
@@ -782,18 +813,9 @@ func updateServiceTokenExpiration(ctx context.Context, db dbExecutor, driver, id
 // facts. The service is responsible for merging and validating the new scope.
 func (r *serviceTokenRepo) UpdateScope(ctx context.Context, id string, scope string, when time.Time) error {
 	when = timeOrNow(when)
-	if r.starter == nil {
-		return updateServiceTokenScope(ctx, r.db, r.driver, id, scope, when)
-	}
-	tx, err := r.starter.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := updateServiceTokenScope(ctx, tx, r.driver, id, scope, when); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		return updateServiceTokenScope(ctx, exec, r.driver, id, scope, when)
+	})
 }
 
 func updateServiceTokenScope(ctx context.Context, db dbExecutor, driver, id, scope string, when time.Time) error {
@@ -836,18 +858,9 @@ func (r *serviceTokenRepo) MarkSecretRead(ctx context.Context, id string, when t
 
 func (r *serviceTokenRepo) Rotate(ctx context.Context, oldID string, replacement ServiceToken, when time.Time) error {
 	when = timeOrNow(when)
-	if r.starter == nil {
-		return rotateServiceToken(ctx, r.db, r.driver, oldID, replacement, when)
-	}
-	tx, err := r.starter.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := rotateServiceToken(ctx, tx, r.driver, oldID, replacement, when); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		return rotateServiceToken(ctx, exec, r.driver, oldID, replacement, when)
+	})
 }
 
 func rotateServiceToken(ctx context.Context, db dbExecutor, driver, oldID string, replacement ServiceToken, when time.Time) error {
@@ -934,8 +947,10 @@ func (r *agentRepo) Create(ctx context.Context, v Agent) error {
 	if v.Capabilities == "" {
 		v.Capabilities = "{}"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO agents(id,name,owner_user_id,capabilities,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, v.ID, v.Name, v.OwnerUserID, v.Capabilities, boolInt(v.Enabled), tm(v.CreatedAt), tm(v.UpdatedAt))
-	return err
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		_, err := exec.ExecContext(ctx, `INSERT INTO agents(id,name,owner_user_id,capabilities,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, v.ID, v.Name, v.OwnerUserID, v.Capabilities, boolInt(v.Enabled), tm(v.CreatedAt), tm(v.UpdatedAt))
+		return err
+	})
 }
 func (r *agentRepo) Get(ctx context.Context, id string) (Agent, error) {
 	var v Agent
@@ -953,12 +968,16 @@ func (r *agentRepo) Update(ctx context.Context, v Agent) error {
 	if v.UpdatedAt.IsZero() {
 		v.UpdatedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE agents SET name=?,owner_user_id=?,capabilities=?,enabled=?,updated_at=? WHERE id=?`, v.Name, v.OwnerUserID, v.Capabilities, boolInt(v.Enabled), tm(v.UpdatedAt), v.ID)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE agents SET name=?,owner_user_id=?,capabilities=?,enabled=?,updated_at=? WHERE id=?`, v.Name, v.OwnerUserID, v.Capabilities, boolInt(v.Enabled), tm(v.UpdatedAt), v.ID)
+		return checkAffected(res, err)
+	})
 }
 func (r *agentRepo) Delete(ctx context.Context, id string) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id)
+		return checkAffected(res, err)
+	})
 }
 func (r *agentRepo) List(ctx context.Context, cursor string, limit int) (Page[Agent], error) {
 	cursor, limit = pageArgs(cursor, limit)
@@ -1015,8 +1034,10 @@ func (r *policyRepo) Create(ctx context.Context, v AgentPolicy) error {
 	if v.AllowedPorts == "" {
 		v.AllowedPorts = "[]"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO agent_policies(id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, v.ID, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.CreatedAt), tm(v.UpdatedAt))
-	return err
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		_, err := exec.ExecContext(ctx, `INSERT INTO agent_policies(id,agent_id,target_host,target_port,protocol,allowed_cidrs,allowed_ports,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, v.ID, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.CreatedAt), tm(v.UpdatedAt))
+		return err
+	})
 }
 func (r *policyRepo) Get(ctx context.Context, id string) (AgentPolicy, error) {
 	var v AgentPolicy
@@ -1030,12 +1051,16 @@ func (r *policyRepo) Update(ctx context.Context, v AgentPolicy) error {
 	if v.UpdatedAt.IsZero() {
 		v.UpdatedAt = time.Now().UTC()
 	}
-	res, err := r.db.ExecContext(ctx, `UPDATE agent_policies SET agent_id=?,target_host=?,target_port=?,protocol=?,allowed_cidrs=?,allowed_ports=?,updated_at=? WHERE id=?`, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.UpdatedAt), v.ID)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE agent_policies SET agent_id=?,target_host=?,target_port=?,protocol=?,allowed_cidrs=?,allowed_ports=?,updated_at=? WHERE id=?`, v.AgentID, v.TargetHost, v.TargetPort, v.Protocol, v.AllowedCIDRs, v.AllowedPorts, tm(v.UpdatedAt), v.ID)
+		return checkAffected(res, err)
+	})
 }
 func (r *policyRepo) Delete(ctx context.Context, id string) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM agent_policies WHERE id=?`, id)
-	return checkAffected(res, err)
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `DELETE FROM agent_policies WHERE id=?`, id)
+		return checkAffected(res, err)
+	})
 }
 func (r *policyRepo) ListByAgent(ctx context.Context, agentID, cursor string, limit int) (Page[AgentPolicy], error) {
 	cursor, limit = pageArgs(cursor, limit)

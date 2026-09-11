@@ -8,6 +8,12 @@ import (
 
 var ErrNoCommonVersion = errors.New("protocol: no common version")
 
+const (
+	CapabilityStreamOpenResult  = "stream_open_result.v1"
+	CapabilityStreamFlowControl = "stream_flow_control.v1"
+	CapabilityStreamFairWriter  = "stream_fair_writer.v1"
+)
+
 type CapabilityHello struct {
 	Versions []uint8  `json:"versions"`
 	Features []string `json:"features"`
