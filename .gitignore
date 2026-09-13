@@ -8,3 +8,4 @@ coverage/
 *.log
 .idea/
 internal/server/web_dist/*
+.DS_Store

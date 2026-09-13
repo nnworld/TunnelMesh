@@ -29,6 +29,20 @@ if ! command -v tar >/dev/null 2>&1; then
   exit 1
 fi
 
+# tunnelmesh-server embeds internal/server/web_dist at compile time. A clean
+# checkout has no such directory at all (it is gitignored), and a release host
+# may still hold the previous bundle, so refuse to build instead of shipping a
+# binary with no admin UI or with last release's UI.
+WEB_DIST_DIR="$ROOT_DIR/internal/server/web_dist"
+if [[ ! -f "$WEB_DIST_DIR/index.html" ]]; then
+  echo "internal/server/web_dist/index.html is missing; run: cd web && npm run build" >&2
+  exit 1
+fi
+if [[ -f "$ROOT_DIR/web/dist/index.html" ]] && ! diff -qr "$ROOT_DIR/web/dist" "$WEB_DIST_DIR" >/dev/null 2>&1; then
+  echo "internal/server/web_dist is stale relative to web/dist; run: cd web && npm run build" >&2
+  exit 1
+fi
+
 mkdir -p "$OUTPUT_DIR"
 : > "$OUTPUT_DIR/SHA256SUMS"
 
