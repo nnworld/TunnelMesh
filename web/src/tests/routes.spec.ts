@@ -39,7 +39,7 @@ describe('admin routes', () => {
 
     await createRoute({
       agentId: 'agent-1',
-      domain: 'tm-git.claw.qihoo.net',
+      domain: 'tm-git.example.com',
       pathPrefix: '/',
       protocol: 'http',
       targetHost: '127.0.0.1',
@@ -56,7 +56,7 @@ describe('admin routes', () => {
     expect(new Headers(init?.headers).get('Idempotency-Key')).toBe('route-git-001')
     expect(init?.body).toBe(JSON.stringify({
       agentId: 'agent-1',
-      domain: 'tm-git.claw.qihoo.net',
+      domain: 'tm-git.example.com',
       pathPrefix: '/',
       protocol: 'http',
       targetHost: '127.0.0.1',
@@ -73,7 +73,7 @@ describe('admin routes', () => {
 
     await updateRoute('route/one', {
       agentId: 'agent-2',
-      domain: 'after.claw.qihoo.net',
+      domain: 'after.example.com',
       pathPrefix: '/git',
       protocol: 'websocket',
       targetHost: '127.0.0.1',
@@ -89,7 +89,7 @@ describe('admin routes', () => {
     expect(init?.method).toBe('PATCH')
     expect(init?.body).toBe(JSON.stringify({
       agentId: 'agent-2',
-      domain: 'after.claw.qihoo.net',
+      domain: 'after.example.com',
       pathPrefix: '/git',
       protocol: 'websocket',
       targetHost: '127.0.0.1',

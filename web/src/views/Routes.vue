@@ -52,7 +52,7 @@
           </el-select>
         </el-form-item>
         <el-form-item :label="t('routes.domain')">
-          <el-input v-model="form.domain" placeholder="tm-git.claw.qihoo.net" />
+          <el-input v-model="form.domain" placeholder="tm-git.example.com" />
           <div class="field-help">{{ t('routes.domainHelp') }}</div>
         </el-form-item>
         <el-form-item :label="t('routes.path')">

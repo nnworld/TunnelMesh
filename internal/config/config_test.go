@@ -516,7 +516,7 @@ func TestValidateRejectsInvalidSOCKS5TunnelConfiguration(t *testing.T) {
 func TestLoadAndValidateDynamicRouteSuffix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tunnelmesh.yaml")
-	if err := os.WriteFile(path, []byte("server:\n  dynamic_suffix: claw.qihoo.net\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("server:\n  dynamic_suffix: apps.example.com\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -524,8 +524,8 @@ func TestLoadAndValidateDynamicRouteSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Server.DynamicSuffix != "claw.qihoo.net" {
-		t.Fatalf("Server.DynamicSuffix = %q, want %q", cfg.Server.DynamicSuffix, "claw.qihoo.net")
+	if cfg.Server.DynamicSuffix != "apps.example.com" {
+		t.Fatalf("Server.DynamicSuffix = %q, want %q", cfg.Server.DynamicSuffix, "apps.example.com")
 	}
 	if err := config.Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v", err)

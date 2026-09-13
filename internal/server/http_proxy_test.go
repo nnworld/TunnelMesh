@@ -35,10 +35,10 @@ func TestHTTPProxyHandler(t *testing.T) {
 }
 
 func TestHTTPProxyHandlerMarksDynamicAgentIDCaseInsensitive(t *testing.T) {
-	routes := routing.NewRouteResolver(nil, routing.WithDynamicSuffix("claw.qihoo.net"))
+	routes := routing.NewRouteResolver(nil, routing.WithDynamicSuffix("apps.example.com"))
 	opener := &recordingProxyOpener{conn: &scriptedConn{read: strings.NewReader("")}}
 	h := NewHTTPProxyHandler(routes, opener)
-	request := httptest.NewRequest(http.MethodGet, "http://agent-tfjxvxtpivp8knxb-127-0-0-1-3000.claw.qihoo.net/", nil)
+	request := httptest.NewRequest(http.MethodGet, "http://agent-tfjxvxtpivp8knxb-127-0-0-1-3000.apps.example.com/", nil)
 
 	h.ServeHTTP(httptest.NewRecorder(), request)
 

@@ -526,7 +526,7 @@ func TestServerRuntimeRoutesManagedHostBeforeSPAFallback(t *testing.T) {
 	}
 
 	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{
-		DynamicSuffix: "claw.qihoo.net",
+		DynamicSuffix: "apps.example.com",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -538,8 +538,8 @@ func TestServerRuntimeRoutesManagedHostBeforeSPAFallback(t *testing.T) {
 		host string
 	}{
 		{name: "explicit database route", host: "app.example.test"},
-		{name: "dynamic route", host: "agent-explicit-10-0-0-8-3000.claw.qihoo.net"},
-		{name: "dynamic agent-local route", host: "agent-explicit-127-0-0-1-3000.claw.qihoo.net"},
+		{name: "dynamic route", host: "agent-explicit-10-0-0-8-3000.apps.example.com"},
+		{name: "dynamic agent-local route", host: "agent-explicit-127-0-0-1-3000.apps.example.com"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
