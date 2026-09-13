@@ -2,6 +2,8 @@
 
 TunnelMesh 三端共用同一配置模型，但每个进程只使用与自身职责相关的配置段。配置优先级为：命令行参数 > 环境变量 > 配置文件 > 默认值。YAML 不展开 `${VAR}`，密码、Token 和密钥应通过环境变量或 Secret Manager 注入。
 
+Server 只监听 `server.http_addr` 一个地址，管理 API、Web 后台、`/ws/agent`、`/ws/client`、`/ws/webssh/<session-id>`、`/ws/tcp` 和动态 HTTP 路由共用它；是否在同一个监听器上启用 TLS 由 `tls.enabled` 决定。`server.https_addr`、`server.agent_ws_addr`、`server.client_ws_addr` 仍会被加载但不会建立额外监听器，属于历史遗留键，示例中不再出现。
+
 ## Server：单机 SQLite
 
 适合单节点部署。若 systemd 使用 `tunnelmesh` 用户运行，需保证 `/var/lib/tunnelmesh` 对该用户可写。
@@ -54,6 +56,12 @@ security:
     - tunnel.example.com
   allowed_origins:
     - https://tunnel.example.com
+  # Deprecated: 仅在存量 Agent 尚未换发 service token 的迁移窗口临时开启。
+  allow_legacy_connection_tokens: false
+
+# 后台“发行管理”页展示的仓库，格式 owner/name，无命令行参数。
+downloads:
+  github_repository: nnworld/TunnelMesh
 
 tls:
   enabled: false
@@ -183,8 +191,15 @@ security:
   allowed_hosts:
     - tunnel.example.com
   # Agent/Client 连接 wss://tunnel.example.com 时发送该 Origin。
+  # 启用 WebSSH/SFTP 时还必须包含管理后台的精确 Origin。
   allowed_origins:
     - https://tunnel.example.com
+
+# 后台“发行管理”页展示的仓库，格式 owner/name。
+# 内网镜像可改为 mirror-owner/TunnelMesh，或用
+# TUNNELMESH_DOWNLOADS_GITHUB_REPOSITORY 覆盖（该键没有命令行参数）。
+downloads:
+  github_repository: nnworld/TunnelMesh
 
 # 公网 TLS 已由 Nginx 终止，这里保持关闭。
 # 若 Server 直接暴露 HTTPS，需同时提供 cert_file 和 key_file。

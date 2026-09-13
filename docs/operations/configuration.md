@@ -17,6 +17,34 @@ tunnelmesh-server --mode local --storage.driver sqlite --storage.auto_init=true 
 
 Server、Agent 和 Client 的完整 YAML 可参考[三端配置文件示例](config-examples.md)。
 
+## 监听地址与 TLS
+
+Server 只监听一个地址：`server.http_addr`。管理 API、Web 后台、Agent WebSocket（`/ws/agent`）、Client WebSocket（`/ws/client`）、WebSSH（`/ws/webssh/<session-id>`）、TCP bridge（`/ws/tcp`）和动态 HTTP 路由都复用该监听器。是否加密由 `tls` 段决定，作用在同一个监听器上：
+
+```yaml
+server:
+  # 反向代理终止 HTTPS 时使用非特权端口，例如 127.0.0.1:8080。
+  http_addr: 127.0.0.1:8080
+
+tls:
+  # Server 直接对公网提供 HTTPS 时设为 true，并同时给出证书和私钥。
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  # 只接受 1.2 或 1.3。
+  min_version: "1.2"
+```
+
+`tls.enabled: true` 但缺少 `cert_file`/`key_file`，或 `min_version` 不是 `1.2`/`1.3`，`run` 会直接失败而不是降级为明文。生产部署推荐由 Nginx/Caddy 终止公网 TLS，Server 保持 `tls.enabled: false` 并只监听 loopback。
+
+以下键仍被配置加载器接受，但当前版本不会建立额外监听器，属于历史遗留，不要依赖它们：
+
+- `server.https_addr`
+- `server.agent_ws_addr`
+- `server.client_ws_addr`
+
+`server.tcp_bridge_enabled` 是 `server.tcp_bridge.enabled` 的扁平兼容写法，只在配置文件中生效；命令行、环境变量或 `Set` 覆盖中任一处出现规范键或扁平键时，扁平别名不再二次应用。环境变量两种写法都映射到 `TUNNELMESH_SERVER_TCP_BRIDGE_ENABLED`。
+
 ## 本地模式示例
 
 ```yaml
@@ -29,13 +57,14 @@ storage:
 registry:
   type: database
 server:
-  http_addr: :80
-  https_addr: :443
+  # 单监听器；对公网直接提供 HTTPS 时改为 :443 并开启 tls.enabled。
+  http_addr: 127.0.0.1:8080
   # 动态托管域名格式：<agent-id>-<a>-<b>-<c>-<d>-<port>.<dynamic_suffix>
   dynamic_suffix: apps.example.com
   tcp_bridge:
     enabled: true
     path: /ws/tcp
+    max_bytes: 65536
   webssh:
     enabled: true
     ticket_ttl: 30s
@@ -44,6 +73,18 @@ server:
     open_timeout: 10s
     idle_timeout: 5m
     max_message_bytes: 65536
+
+# 后台“发行管理”页展示的 GitHub 发行仓库，格式固定为 owner/name。
+downloads:
+  github_repository: nnworld/TunnelMesh
+
+security:
+  # 管理 API 与 WebSocket 的 Host 白名单；留空表示不限制。
+  allowed_hosts: []
+  # 浏览器 Origin 白名单；开启 WebSSH/SFTP 时必须包含后台精确 Origin。
+  allowed_origins: []
+  # Deprecated: 仅用于迁移期兼容旧管理 token 连接 Agent，计划在 v0.3.0 移除。
+  allow_legacy_connection_tokens: false
 ```
 
 ```bash
@@ -152,7 +193,7 @@ Agent 保持一个 `server_url`，但可以复用同一个逻辑 Agent 身份建
 
 ```yaml
 agent:
-  server_url: wss://tunnel.example.com/ws/agent/v1
+  server_url: wss://tunnel.example.com/ws/agent
   id: agent-devbox
   connections:
     min: 1
@@ -220,6 +261,38 @@ client:
 ```
 
 `remote_validation` 只缓存外部校验的 allow/deny 决策，不缓存凭据或目标响应体；同键并发请求会合并。生产环境优先调小 `cluster_positive_ttl` 和 `remote_validation.positive_ttl`，在权限收敛速度和数据库/外部校验压力之间取得平衡。
+
+## 安全白名单与兼容开关
+
+```yaml
+security:
+  # 管理 API 与 WebSocket 的 Host 精确白名单；空列表表示不限制。不支持通配符。
+  allowed_hosts:
+    - tunnel.example.com
+  # 浏览器 Origin 精确白名单；空列表表示不限制。不支持通配符。
+  allowed_origins:
+    - https://tunnel.example.com
+  # Deprecated: 迁移期开关，计划在 v0.3.0 移除。
+  allow_legacy_connection_tokens: false
+```
+
+`allowed_hosts` 按 `Host` 头精确匹配，动态托管域名由路由表匹配 `server.dynamic_suffix`，不需要写进白名单。`allowed_origins` 按规范化后的 Origin 精确匹配；Agent 连接 `wss://tunnel.example.com/ws/agent` 时发送 `https://tunnel.example.com`，Client 连接 `wss://tunnel.example.com/ws/client` 时发送 `https://tunnel.example.com`，启用 WebSSH/SFTP 时还必须包含管理后台的精确 Origin，否则握手直接被拒绝。
+
+WebSocket 握手始终要求请求带且只带一个合法 `Origin` 头，与白名单是否为空无关；用 `websocat` 等工具直连时必须显式指定 `-H 'Origin: https://tunnel.example.com'`。
+
+`allow_legacy_connection_tokens` 是唯一的例外开关：Agent 连接默认只接受 `agent` 类型 service token。设为 `true` 时旧版管理登录 token 也可用于运维接管，该路径写入弃用审计日志，并且计划在 v0.3.0 移除。仅在有存量 Agent 尚未换发 service token 的迁移窗口内临时开启，迁移完成后必须改回 `false`。Client 连接不受该开关影响。
+
+## 发行下载源
+
+管理后台“发行管理”页展示的仓库地址来自 `downloads.github_repository`：
+
+```yaml
+downloads:
+  # 格式固定为 owner/name，默认 nnworld/TunnelMesh。
+  github_repository: nnworld/TunnelMesh
+```
+
+该键没有对应的命令行参数，只能通过配置文件或环境变量 `TUNNELMESH_DOWNLOADS_GITHUB_REPOSITORY` 覆盖。使用 GitHub Enterprise 或内部镜像时改成对应的 `owner/name`；格式非法（缺少 `/`、包含多个 `/`、空 owner 或 name、含空格或 `?#@` 等字符）时 `check-config` 会失败。发行包命名由发布契约生成，不由该配置决定；Server 只展示下载信息和 SHA256 校验和，不代理 GitHub 凭据，也不缓存发行文件。发布流程见[二进制发行](../deployment/binary-release.md)。
 
 ## 管理员凭据
 
