@@ -31,6 +31,7 @@ FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 ARG APP=server
 LABEL org.opencontainers.image.title="TunnelMesh" \
       org.opencontainers.image.description="Authenticated TCP/UDP/HTTP tunnel platform" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/nnworld/TunnelMesh"
 
 WORKDIR /var/lib/tunnelmesh

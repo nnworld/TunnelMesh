@@ -90,6 +90,16 @@ for target in "${targets[@]}"; do
     (cd "$ROOT_DIR" && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="$LDFLAGS" -o "$output" "./cmd/$binary")
   done
   cp "$ROOT_DIR/README.md" "$stage/README.md"
+  # Apache-2.0 4(a) requires the license text to accompany every distributed
+  # copy, and 4(d) requires the NOTICE. Release archives are distributions, so
+  # both ship in every platform archive next to the README.
+  for legal in LICENSE NOTICE; do
+    if [[ ! -f "$ROOT_DIR/$legal" ]]; then
+      echo "$legal is missing from the repository root; refusing to build an unlicensed release archive" >&2
+      exit 1
+    fi
+    cp "$ROOT_DIR/$legal" "$stage/$legal"
+  done
   cp -R "$ROOT_DIR/docs" "$stage/docs"
   mkdir -p "$stage/deploy"
   cp -R "$ROOT_DIR/deploy/install" "$stage/deploy/install"
@@ -104,6 +114,10 @@ for target in "${targets[@]}"; do
       cp -R "$ROOT_DIR/deploy/windows" "$stage/deploy/windows"
       ;;
   esac
+  # deploy/*/..._test.go are repository consistency checks, not install
+  # artifacts: they need the Go module to run, and an operator's archive has no
+  # go.mod. Ship the scripts and service templates only.
+  find "$stage/deploy" -name '*_test.go' -type f -delete
   base="tunnelmesh-${VERSION}-${goos}-${goarch}"
   platform="${goos}-${goarch}"
   platforms+=("\"${goos}/${goarch}\"")

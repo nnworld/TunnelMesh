@@ -1,0 +1,26 @@
+TunnelMesh
+Copyright 2026 The TunnelMesh Authors
+
+This product includes software developed at
+https://github.com/nnworld/TunnelMesh.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-----------------------------------------------------------------------
+Third-party components
+-----------------------------------------------------------------------
+
+The Go binaries link against third-party modules declared in go.mod and
+go.sum, and the admin console bundles third-party packages declared in
+web/package.json and web/package-lock.json. Each remains under its own
+license; nothing in this NOTICE alters those terms.
+
+The admin console also embeds browser-side SSH, SFTP, and ZMODEM protocol
+implementations. Those libraries run entirely in the user's browser; the
+server only forwards bytes and never stores or parses SSH credentials,
+terminal output, or SFTP file contents.
+
+Release archives produced by scripts/build-release.sh contain only the
+compiled binaries, the install assets under deploy/, and documentation.
+They never contain configuration files, tokens, passwords, DSNs,
+certificates, private keys, databases, or logs.

@@ -51,7 +51,7 @@ tunnelmesh-vMAJOR.MINOR.PATCH-PLATFORM.ARCHIVE
 - `SHA256SUMS`；
 - `manifest.json`。
 
-`manifest.json` 记录版本、主版本、Commit、UTC 构建时间、Schema 版本、三个二进制、六个平台和资产清单。当前 Schema 版本为 11。
+`manifest.json` 记录版本、主版本、Commit、UTC 构建时间、Schema 版本、三个二进制、六个平台和资产清单。其中 `schemaVersion` 不是打包脚本自己的常量，而是构建时从 `internal/storage/db.go` 的 `SchemaVersion` 读取，因此永远与二进制内的实际 Schema 版本一致；当前值为 13。
 
 在 Release 目录内校验：
 
@@ -86,7 +86,11 @@ DWARF 调试信息，不触碰嵌入数据。
 
 安装脚本只安装二进制和进程管理配置，不自动生成业务配置，也不会覆盖已有配置和数据。
 
-Linux 归档包含 `deploy/systemd`，macOS 归档包含 `deploy/macos`，Windows 归档包含 `deploy/windows`。所有归档都包含三个二进制、安装脚本和文档。
+Linux 归档包含 `deploy/systemd`，macOS 归档包含 `deploy/macos`，Windows 归档包含 `deploy/windows`。所有归档都包含三个二进制、安装脚本、`README.md`、`docs/`、`LICENSE` 和 `NOTICE`。
+
+`LICENSE` 与 `NOTICE` 必须随每个归档分发：项目采用 Apache License 2.0，其 4(a) 要求随作品附带
+许可文本，4(d) 要求附带 NOTICE。`scripts/build-release.sh` 会在仓库根目录缺少这两个文件时直接
+失败，而不是产出一个缺少许可声明的归档。
 
 ## 回滚
 
