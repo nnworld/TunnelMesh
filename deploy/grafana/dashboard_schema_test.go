@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,139 @@ type panel struct {
 		Expr string `json:"expr"`
 	} `json:"targets"`
 	Panels []panel `json:"panels"`
+}
+
+// variableLabels binds every query-backed dashboard variable to the Prometheus
+// label it must enumerate. A variable that enumerates one label while panels
+// filter another renders empty series; the failure stays invisible while the
+// default "All" selection expands to .*, so it only surfaces once an operator
+// picks a concrete value.
+//
+// cluster and node_id are deployment-side labels: no TunnelMesh metric carries
+// them, they are injected by the Prometheus scrape config so that every series
+// from a Server target can be scoped per cluster and per node. component and
+// agent_id are emitted by the application itself.
+var variableLabels = map[string]string{
+	"cluster":   "cluster",
+	"node_id":   "node_id",
+	"component": "component",
+	"agent_id":  "agent_id",
+}
+
+// labelValuesQuery matches label_values(<metric>, <label>).
+var labelValuesQuery = regexp.MustCompile(`^label_values\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$`)
+
+// variableSelector matches a PromQL label matcher bound to a dashboard
+// variable, for example component=~"$component" or agent_id="$agent_id".
+var variableSelector = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*=~?\s*"\$([a-zA-Z_][a-zA-Z0-9_]*)"`)
+
+func TestTunnelMeshDashboardVariablesMatchFilteredLabels(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("dashboards", "tunnelmesh.json"))
+	if err != nil {
+		t.Fatalf("read dashboard: %v", err)
+	}
+	var dashboard struct {
+		Panels     []panel `json:"panels"`
+		Templating struct {
+			List []struct {
+				Name  string `json:"name"`
+				Type  string `json:"type"`
+				Query string `json:"query"`
+			} `json:"list"`
+		} `json:"templating"`
+	}
+	if err := json.Unmarshal(b, &dashboard); err != nil {
+		t.Fatalf("decode dashboard JSON: %v", err)
+	}
+
+	queries := map[string]string{}
+	for _, variable := range dashboard.Templating.List {
+		queries[variable.Name] = strings.TrimSpace(variable.Query)
+	}
+	for name, wantLabel := range variableLabels {
+		query, ok := queries[name]
+		if !ok {
+			t.Errorf("missing dashboard variable %q", name)
+			continue
+		}
+		match := labelValuesQuery.FindStringSubmatch(query)
+		if match == nil {
+			t.Errorf("variable %q query %q must be label_values(<metric>, %s)", name, query, wantLabel)
+			continue
+		}
+		if match[2] != wantLabel {
+			t.Errorf("variable %q enumerates label %q, want %q", name, match[2], wantLabel)
+		}
+	}
+
+	exprs := map[string][]string{}
+	var collect func([]panel)
+	collect = func(panels []panel) {
+		for _, item := range panels {
+			for _, target := range item.Targets {
+				exprs[item.Title] = append(exprs[item.Title], target.Expr)
+			}
+			collect(item.Panels)
+		}
+	}
+	collect(dashboard.Panels)
+
+	for title, list := range exprs {
+		for _, expr := range list {
+			for _, match := range variableSelector.FindAllStringSubmatch(expr, -1) {
+				label, name := match[1], match[2]
+				wantLabel, ok := variableLabels[name]
+				if !ok {
+					continue
+				}
+				if label != wantLabel {
+					t.Errorf("panel %q filters label %q by $%s, which enumerates %q: %s", title, label, name, wantLabel, expr)
+				}
+			}
+		}
+	}
+}
+
+// TestPrometheusExampleInjectsDashboardScopeLabels guards the cross-artifact
+// contract behind $cluster and $node_id: no TunnelMesh metric carries those
+// labels, so the dashboard can only scope by them when the scrape config
+// injects them per target. Dropping them from the example silently degrades
+// every node-scoped panel back to a cluster-wide aggregate.
+func TestPrometheusExampleInjectsDashboardScopeLabels(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "prometheus", "prometheus.yml.example"))
+	if err != nil {
+		t.Fatalf("read prometheus example: %v", err)
+	}
+	injected := map[string]bool{}
+	inLabels := false
+	labelsIndent := 0
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		trimmed := strings.TrimSpace(line)
+		if inLabels && indent <= labelsIndent {
+			inLabels = false
+		}
+		if trimmed == "labels:" {
+			inLabels, labelsIndent = true, indent
+			continue
+		}
+		if inLabels && indent > labelsIndent {
+			if key, _, found := strings.Cut(trimmed, ":"); found {
+				injected[strings.TrimSpace(key)] = true
+			}
+		}
+	}
+	for _, label := range []string{"cluster", "node_id"} {
+		if !injected[label] {
+			t.Errorf("prometheus.yml.example must inject the %q target label required by the dashboard scope variables", label)
+		}
+	}
 }
 
 func TestTunnelMeshDashboardSchema(t *testing.T) {
@@ -57,7 +191,7 @@ func TestTunnelMeshDashboardSchema(t *testing.T) {
 			t.Fatalf("missing row %q", row)
 		}
 	}
-	for _, variable := range []string{"cluster", "node_id", "agent_id"} {
+	for _, variable := range []string{"cluster", "component", "node_id", "agent_id"} {
 		found := false
 		for _, item := range dashboard.Templating.List {
 			if item.Name == variable {
@@ -94,7 +228,7 @@ func TestTunnelMeshDashboardSchema(t *testing.T) {
 		}
 	}
 	validatePanels(dashboard.Panels)
-	for _, variable := range []string{"cluster", "node_id", "agent_id"} {
+	for _, variable := range []string{"cluster", "component", "node_id", "agent_id"} {
 		if !strings.Contains(allExpr.String(), "$"+variable) {
 			t.Errorf("variable %q is not used by any panel query", variable)
 		}

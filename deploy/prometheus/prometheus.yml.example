@@ -1,16 +1,78 @@
+# TunnelMesh Prometheus 抓取起点配置。
+#
+# 事实前提：只有 Server 暴露 /metrics、/health/live 和 /health/ready；Agent 与
+# Client 没有本地 metrics 端点，它们的运行观测通过协议上报给 Server 后由 Server
+# 输出，因此不要为 Agent/Client 单独配置 scrape job。
+#
+# 校验：
+#   promtool check config deploy/prometheus/prometheus.yml.example
+#   promtool check rules deploy/prometheus/recording-rules.yaml deploy/prometheus/alert-rules.yaml
+#
+# 容器部署时把本目录挂载进 Prometheus：
+#   - ./deploy/prometheus:/etc/prometheus/tunnelmesh:ro
+
 global:
   scrape_interval: 15s
+  scrape_timeout: 10s
   evaluation_interval: 15s
+  external_labels:
+    # 多集群联邦或远端写入时用于区分来源；单集群可保留 local。
+    cluster: local
 
 rule_files:
   - /etc/prometheus/tunnelmesh/recording-rules.yaml
   - /etc/prometheus/tunnelmesh/alert-rules.yaml
 
 scrape_configs:
-  - job_name: tunnelmesh
+  # 单节点（本地模式）：Server 通常只监听明文 HTTP，/metrics 必须限制在内网，
+  # 公网入口只通过 Nginx 暴露 /health/live 与 /health/ready。
+  - job_name: tunnelmesh-server
     metrics_path: /metrics
     scheme: http
     static_configs:
       - targets: ["tunnelmesh-server:8080"]
         labels:
+          # cluster 与 node_id 不是应用自身输出的标签，只能由 Prometheus 侧注入。
+          # node_id 必须与 server.node.id / TUNNELMESH_NODE_ID 完全一致，否则
+          # Dashboard 的 Cluster Row 与按节点聚合的查询无法对齐。
           cluster: local
+          node_id: server-1
+
+  # 集群模式：为每个 Server 节点单独列出 target，并逐节点标注 node_id。
+  # 取消注释后请删除上面的单节点 job，避免同一实例被抓取两次。
+  #
+  # - job_name: tunnelmesh-server-cluster
+  #   metrics_path: /metrics
+  #   scheme: https
+  #   tls_config:
+  #     ca_file: /etc/prometheus/certs/tunnelmesh-ca.pem
+  #     server_name: tunnel.example.com
+  #     min_version: TLS12
+  #   # 仅当 /metrics 位于需要认证的管理入口之后才使用；推荐用 Nginx 按来源
+  #   # 网段放行 /metrics，避免把 token 下发到 Prometheus。
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /etc/prometheus/secrets/tunnelmesh-metrics.token
+  #   static_configs:
+  #     - targets: ["server-1.tunnel.example.com:443"]
+  #       labels:
+  #         cluster: prod
+  #         node_id: server-1
+  #     - targets: ["server-2.tunnel.example.com:443"]
+  #       labels:
+  #         cluster: prod
+  #         node_id: server-2
+
+  # 抓取 Prometheus 自身，便于区分“TunnelMesh 指标缺失”与“Prometheus 故障”。
+  # TunnelMeshMetricsMissing 告警依赖 absent(tunnelmesh_ready)。
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+# 重要：不要在 labels 里覆盖应用自身输出的标签名。默认 honor_labels: false，
+# 同名 target label 会把指标原标签改写成 exported_*，直接让 recording-rules.yaml
+# 与 alert-rules.yaml 中依赖这些标签的表达式失效。应用已使用的标签名：
+#   component, mode, result, error_class, stage, direction, protocol,
+#   probe_kind, operation, cache, scope, decision, reason,
+#   agent_id, instance_id, server_node_id
+# 允许注入的只有 cluster 与 node_id 这类部署侧标签。
