@@ -84,6 +84,8 @@
 | `docs/user-guide/managed-http-route.md` | Modify | 交叉引用：`http-proxy` 不是反代路由 |
 | `docs/development/testing.md`、`docs/development/README.md` | Modify | 验证层级表与索引补 proxy-entry 端到端冒烟 |
 | `README.md`、`README.zh-CN.md` | Modify | 能力清单、Edge 部署链接、用户指南索引 |
+| Go 测试文件（`internal/proxyentry/{route,identity,acl,auth,target,errors}_test.go`、`internal/server/{proxy_entry,proxy_entry_absolute,proxy_entry_listener,proxy_entry_routes,api_proxy_route,credential_api,credential_service}_test.go`、`internal/storage/credential_repository_test.go`、`internal/config/config_test.go`、`internal/observability/metrics_proxy_entry_test.go`） | Create/Modify | TDD 红灯测试；精确清单见各任务的 `**Files:**` 列表，此处只为文件总览完整性列出 |
+| `docs/pull-requests/README.md`、`docs/superpowers/plans/README.md`、`docs/superpowers/specs/README.md`、`docs/architecture/adr/README.md` | Regenerate | `python3 scripts/gen_doc_index.py` 生成的索引，Task 15 Step 12 统一重生成并验证幂等，不手工编辑 |
 
 ---
 
@@ -5623,6 +5625,8 @@ cd web && npm test -- --run && npm run build && cd .. && ./scripts/verify-web-em
 ```
 
 Expected: 全部通过；`gofmt -l` 与 `git diff --check` 无输出；`node test/e2e/proxy-entry/run.mjs` 打印 SKIP 并以 0 退出。有 docker 的环境再执行一次 `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs`，并把结果写进 PR 记录的 Test Evidence。
+
+`promtool` 与 docker 都是可选依赖，缺失不算门禁失败：`promtool` 未安装时按 Step 5 的说明改用 `python3 -c "import yaml,sys; yaml.safe_load(open('deploy/prometheus/alert-rules.yaml'))"` 校验 YAML 语法；docker 缺失时 E2E 保持 SKIP。两者都必须在 PR 记录的 Test Evidence 里写成“未执行 + 原因”，不得写成已通过。`go test -race ./...` 与 `go test ./... -count=1` 是硬性门禁，不允许跳过。
 
 - [ ] **Step 15: 验收对照与 spec 偏差回写**
 
