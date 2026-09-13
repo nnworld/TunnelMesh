@@ -178,6 +178,8 @@ npm run build
 
 架构、协议、配置、部署、用户使用、SSH/websocat、故障排查和管理员恢复流程必须有对应文档。重大设计变化写 ADR，说明背景、决策、替代方案和迁移影响。
 
+`docs/` 的目录职责、命名约定、索引维护和时点记录不可改写原则见 `docs/development/documentation.md`。实施计划、设计规格、PR 记录和 ADR 的目录索引由 `scripts/gen_doc_index.py` 生成，禁止手工编辑；新增或改名记录后必须重新生成索引，并保证 `docs/README.md` 的分类索引不出现无入口指向的孤儿文档。
+
 ## Git 规范
 
 - 默认分支：`main`。

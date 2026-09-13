@@ -1,65 +1,303 @@
 # TunnelMesh
 
-TunnelMesh is a Go platform for authenticated Agent tunnels, controlled Agent
-metadata, local TCP/UDP/HTTP forwarding, managed HTTP/HTTPS/WebSocket routes,
-and TCP-over-WebSocket SSH access. Public Server exposure remains HTTP/HTTPS;
-public UDP is not supported.
+[![Release](https://img.shields.io/github/v/release/nnworld/TunnelMesh?label=release)](https://github.com/nnworld/TunnelMesh/releases)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows-informational)](docs/deployment/binary-release.md)
 
-The repository ships three commands:
+**English** | [简体中文](README.zh-CN.md)
 
-- `tunnelmesh-server` — public API, routing, and tunnel coordination server.
-- `tunnelmesh-agent` — outbound Agent connection and target dialer.
-- `tunnelmesh-client` — local forwarding and user-facing tunnel client.
+TunnelMesh is a self-hosted tunnel and service-proxy platform written in Go. Agents inside a private
+network dial out over TLS WebSocket; the Server authenticates them, enforces route and target policy,
+and exposes the result as managed HTTP/HTTPS/WebSocket routes, local client forwards, or a browser
+SSH/SFTP console. Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
+
+> Detailed user, deployment, operations, and protocol documentation is maintained in Chinese under
+> [docs/README.md](docs/README.md).
+
+## Contents
+
+- [Components](#components)
+- [Feature highlights](#feature-highlights)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Client capabilities](#client-capabilities)
+- [Deployment](#deployment)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Releases](#releases)
+- [Security model](#security-model)
+- [Repository layout](#repository-layout)
+- [Project rules](#project-rules)
+
+## Components
+
+| Binary | Runs on | Responsibility | Guide |
+| --- | --- | --- | --- |
+| `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay | [Server admin](docs/user-guide/server-admin.md) |
+| `tunnelmesh-agent` | Private network or target host | Outbound TLS WebSocket to the Server, dials internal TCP/UDP/HTTP targets, reports allowlisted metadata | [Agent](docs/user-guide/agent.md) |
+| `tunnelmesh-client` | User workstation | Local forwards (TCP/UDP/HTTP/SOCKS5/HTTP proxy), route publishing, stdio TCP proxy for SSH | [Client](docs/user-guide/client.md) |
+
+## Feature highlights
+
+**Tunnels and forwarding**
+
+- `forward tcp|udp|http` — a local port reaches an internal service; UDP preserves datagram boundaries and per-source associations.
+- `forward socks5` and `forward http-proxy` — browse or proxy into the internal network from a local proxy endpoint.
+- `run` — starts every configured entry point in one process over a per-Agent WebSocket connection pool.
+
+**Publishing and ingress**
+
+- `publish http` — exposes an internal service through a managed explicit route or wildcard domain, with HTTPS and WebSocket upgrade.
+- TCP-over-WebSocket bridge (`/ws/tcp`) carries raw TCP for `ssh -o ProxyCommand` and `websocat`.
+
+**Browser SSH/SFTP (WebSSH)**
+
+- Terminal and SFTP file browser inside the admin console; SSH authentication happens in the browser, the Server only relays encrypted bytes over a one-time ticket.
+- Host-key SHA-256 fingerprint confirmation, ZMODEM `rz`/`sz` transfers, and three-tier backpressure for large files.
+- Optional encrypted-at-rest credentials (AES-256-GCM) enable one-click authentication without echoing secrets.
+
+**Control plane**
+
+- Vue 3 + Element Plus admin console with i18n, RBAC roles, scoped service tokens, Agent policy, cursor-paginated APIs, and a structured audit log.
+- Sensitive operations (token reveal, logical traceroute with internal details) require explicit confirmation headers and are audited.
+
+**Scale and availability**
+
+- Stateless Servers: SQLite for local mode, MySQL for cluster mode, with MySQL lease or etcd registration and epoch fencing.
+- Inter-node relay over mTLS (or plaintext inside a controlled network), stream flow control, GOAWAY/drain, idempotency keys, and a bounded-staleness authorization cache.
+
+**Observability and diagnostics**
+
+- Prometheus metrics, `/health/live`, `/health/ready`, a bundled Grafana dashboard, alert and recording rules, and W3C `traceparent` propagation.
+- Logical traceroute across Client → Server → Agent → target, plus TCP/HTTP/UDP network probes.
+
+## Architecture
+
+```
+public internet                                       private network
+───────────────────────────────────────────────────────────────────────────
+Browser · curl · ssh ProxyCommand
+   │ HTTPS / WSS
+   ▼
+┌─────────────────────────────────────────────┐
+│ SERVER — edge + control plane               │
+│  · HTTP/HTTPS/WS ingress, route resolution  │
+│  · /api/v1 + embedded admin SPA (WebSSH)    │
+│  · sessions, streams, policy, audit         │
+│  · SQLite │ MySQL + lease / etcd registry   │
+└───▲──────────────────────────────▲──────────┘
+    │ TLS WebSocket /ws/agent      │ TLS WebSocket /ws/client
+    │                              │
+┌───┴──────────────┐        ┌──────┴───────────┐
+│ AGENT            │        │ CLIENT           │
+│ private network  │        │ user host        │
+└───┬──────────────┘        └──────┬───────────┘
+    │ TCP / UDP / HTTP             │ local :port · SOCKS5 · HTTP proxy
+    ▼                              ▼
+internal services            local applications / ssh
+```
+
+Server nodes in cluster mode additionally talk to each other over an authenticated relay
+(mTLS by default) so a Client attached to any node can reach an Agent attached to another.
+Requests always follow Handler → Service → Repository; the database is the only authoritative
+source for management data. See [architecture overview](docs/architecture/overview.md) and
+[cluster architecture](docs/architecture/cluster.md).
+
+## Quick start
+
+### Install
+
+Download a prebuilt archive for Linux, macOS, or Windows from
+[GitHub Releases](https://github.com/nnworld/TunnelMesh/releases), or build from source
+(Go 1.23+, Node.js 22):
+
+```sh
+git clone https://github.com/nnworld/TunnelMesh.git
+cd TunnelMesh
+cd web && npm ci && npm run build && cd ..   # generates the embedded admin console
+make build                                   # builds ./cmd/... into the three binaries
+```
+
+`internal/server/web_dist/` is generated, not committed, and `npm run build` syncs it. Without
+that directory `go build ./cmd/...` fails on `//go:embed all:web_dist`. Container builds do the
+SPA step inside the Dockerfile, so no manual step is needed there.
+
+### 1. Start the Server (local mode, SQLite)
+
+```yaml
+# server.yaml
+mode: local
+storage:
+  driver: sqlite
+  auto_init: true
+  sqlite:
+    path: ./tunnelmesh.db
+server:
+  http_addr: 127.0.0.1:8080
+  dynamic_suffix: apps.example.com
+```
+
+```sh
+tunnelmesh-server --config server.yaml check-config
+tunnelmesh-server --config server.yaml admin bootstrap   # prints the one-time admin password
+tunnelmesh-server --config server.yaml run
+```
+
+Open the console at `http://127.0.0.1:8080/` and sign in with the bootstrap credentials. If the
+output is lost, recover with `tunnelmesh-server --config server.yaml admin regenerate-credentials --confirm`.
+Production deployments should terminate TLS in Nginx and set `security.allowed_hosts` /
+`security.allowed_origins`.
+
+### 2. Connect an Agent
+
+Create the Agent and a scoped connection token in the console, then run it on the internal host:
+
+```sh
+export TUNNELMESH_AGENT_TOKEN=<token from the console>
+tunnelmesh-agent --config agent.yaml check-config
+tunnelmesh-agent --config agent.yaml run
+```
+
+```yaml
+# agent.yaml
+mode: local
+agent:
+  id: agent-01
+  server_url: ws://127.0.0.1:8080/ws/agent   # wss://tunnel.example.com/ws/agent in production
+```
+
+Agents only read metadata from explicit `file` or `env` allowlist entries and never execute
+arbitrary commands. Target hosts, ports, and CIDRs are constrained by Server-side Agent policy
+and re-validated on the Agent before every dial.
+
+### 3. Forward or publish
+
+```sh
+export TUNNELMESH_CLIENT_SERVER_URL=ws://127.0.0.1:8080/ws/client
+export TUNNELMESH_CLIENT_TOKEN=<client token from the console>
+
+# local port -> internal service
+tunnelmesh-client forward tcp --listen 127.0.0.1:15432 \
+  --agent agent-01 --target-host db.internal --target-port 5432
+
+# raw TCP over stdin/stdout, for ssh ProxyCommand and websocat
+tunnelmesh-client proxy tcp --agent agent-01 --target-host ssh.internal --target-port 22
+```
+
+Managed HTTP routes (explicit or wildcard domains) are created in the console and are covered by
+[managed HTTP routes](docs/user-guide/managed-http-route.md) and
+[SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md).
+
+### Docker
+
+```sh
+docker compose -f docker-compose.local.yml up --build      # Server + Agent, SQLite
+docker compose -f docker-compose.cluster.yml up --build    # two Servers + MySQL
+make docker-build                                          # three tagged images
+```
+
+## Client capabilities
+
+| Command | Protocol | Direction | Notes |
+| --- | --- | --- | --- |
+| `forward tcp` | TCP | local listen → internal service | ordered byte stream |
+| `forward udp` | UDP | local listen → internal service | datagram boundaries, per-source association |
+| `forward http` | HTTP | local listen → internal HTTP service | includes WebSocket upgrade |
+| `forward socks5` | SOCKS5 CONNECT | local listen → internal services | `--auth password`, `--allow-remote`, optional remote validation URL |
+| `forward http-proxy` | HTTP proxy | local listen → internal services | standard forward-proxy entry point |
+| `publish http` | HTTP/HTTPS/WS | Server public ingress → internal service | managed or wildcard route |
+| `proxy tcp` | TCP | stdin/stdout ↔ internal service | `ssh -o ProxyCommand`, `websocat` |
+| `run` | all of the above | configured entry points | one process, per-Agent connection pool |
+| `status` / `stop` / `tunnel status` / `tunnel stop` | — | local control | inspect or stop configured tunnels |
+
+Public UDP is not supported: UDP only flows from the user side into the internal network through
+`forward udp`. Full flag reference: [client usage](docs/user-guide/client.md).
+
+## Deployment
+
+| Mode | Storage | Registry | Use case |
+| --- | --- | --- | --- |
+| `local` | SQLite | — | single node, evaluation, small deployments |
+| `cluster` | MySQL | MySQL lease (default) or etcd | horizontally scaled, multi-node relay |
+
+- Containers: [Docker deployment](docs/deployment/docker.md), [docker-compose.local.yml](docker-compose.local.yml), [docker-compose.cluster.yml](docker-compose.cluster.yml)
+- Services: [systemd](docs/deployment/linux-systemd.md), [launchd](docs/deployment/macos-launchd.md), [Windows Service](docs/deployment/windows-service.md)
+- Edge: [Nginx/WSS reverse proxy](docs/deployment/nginx.md), [frontend build and hosting](docs/deployment/frontend.md)
+- Cluster: [relay mTLS certificates](docs/operations/relay-mtls.md), [Agent connection pool](docs/operations/connection-pool.md)
+- Monitoring: [observability and Grafana](docs/operations/observability.md); Prometheus config, rules, and the Grafana dashboard ship in [deploy/](deploy/README.md)
+
+## Documentation
+
+Full index: [docs/README.md](docs/README.md).
+
+**User guides**
+
+- [Client usage](docs/user-guide/client.md) — forwards, SOCKS5, publishing, `proxy tcp`
+- [Agent usage](docs/user-guide/agent.md) — registration, connection pool, metadata allowlist
+- [Server admin console](docs/user-guide/server-admin.md) — Agents, routes, tokens, audit, WebSSH/SFTP, releases
+- [Managed HTTP routes](docs/user-guide/managed-http-route.md) — explicit and wildcard domains, HTTPS
+- [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md) — `ProxyCommand` and `websocat`
+
+**Operations**
+
+- [Configuration reference](docs/operations/configuration.md), [Server/Agent/Client examples](docs/operations/config-examples.md), [client protocol and pool examples](docs/operations/client-configuration-examples.md)
+- [Schema upgrades and rollback](docs/operations/schema-upgrades.md), migrations in [migrations](migrations)
+- [Logging](docs/operations/logging.md), [network probes](docs/operations/network-probes.md), [SLO](docs/operations/slo.md), [capacity and load tests](docs/operations/capacity.md)
+- [Troubleshooting](docs/operations/troubleshooting.md), [completeness checklist](docs/operations/completeness-checklist.md)
+
+**Architecture and protocol**
+
+- [Architecture overview](docs/architecture/overview.md), [cluster architecture](docs/architecture/cluster.md), [ADR index](docs/architecture/adr/README.md)
+- [WebSocket protocol](docs/protocol/websocket.md), [proxy protocol modules](docs/protocol/proxy-modules.md)
+- [OpenAPI](docs/api/openapi.yaml)
+
+**Development and change records**
+
+- [Development docs](docs/development/README.md), [testing and verification](docs/development/testing.md), [documentation conventions](docs/development/documentation.md)
+- [Implementation plan index](docs/superpowers/plans/README.md), [design spec index](docs/superpowers/specs/README.md), [PR record index](docs/pull-requests/README.md)
 
 ## Development
 
-The default local mode uses SQLite and keeps runtime state external to the
-process so commands can be scaled horizontally. Configuration and storage
-features are added incrementally by the implementation plan in
-`docs/superpowers/plans/`.
+Prerequisites: Go 1.23+, Node.js 22 + npm for `web/`, Docker for image builds, and Chrome plus
+`lrzsz` for the WebSSH end-to-end test.
 
-Common checks:
+| Task | Command |
+| --- | --- |
+| Build binaries | `make build` |
+| Unit and integration tests | `make test` (`go test ./...`) |
+| Race detector | `make race` (`go test -race ./...`) |
+| Static analysis | `make lint` (`go vet ./...`) |
+| Admin console | `make web-build` (`cd web && npm run build`) |
+| Container images | `make docker-build` |
+| Release archives | `make release VERSION=v1.2.3` |
+
+Verification expected before a pull request:
 
 ```sh
-make test
-make race
-make lint
-make build
-make web-build
+go test ./... -count=1
+go test -race ./... -timeout 30m     # internal/server needs more than the default 10m package timeout
+go vet ./...
+git diff --check
+cd web && npm test -- --run && npm run build
+./scripts/verify-web-embed.sh        # embedded assets match web/dist
+node test/e2e/webssh/run.mjs         # browser E2E, see test/e2e/webssh/README.md
 ```
 
-The project rules are maintained in [AGENTS.md](AGENTS.md); `CLAUDE.md` is a
-compatibility pointer to that single source of truth.
-
-## User and deployment help
-
-- [Documentation index](docs/README.md)
-- [Client usage](docs/user-guide/client.md)
-- [Agent usage](docs/user-guide/agent.md)
-- [Server admin guide](docs/user-guide/server-admin.md)
-- [Managed HTTP routes](docs/user-guide/managed-http-route.md)
-- [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md)
-- [Docker deployment](docs/deployment/docker.md)
-- [Frontend build and deployment](docs/deployment/frontend.md)
-- [Nginx/WSS configuration](docs/deployment/nginx.md)
-- [Cross-platform binary releases](docs/deployment/binary-release.md)
-- [Configuration](docs/operations/configuration.md)
-- [Server / Agent / Client configuration examples](docs/operations/config-examples.md)
-- [Observability and unified Grafana dashboard](docs/operations/observability.md)
-- [Network probes](docs/operations/network-probes.md)
-- [Logging](docs/operations/logging.md)
-- [Troubleshooting](docs/operations/troubleshooting.md)
+Work follows TDD: a failing test first, then the minimal implementation. Non-trivial features,
+interface changes, schema changes, and cross-module refactors need an implementation plan in
+`docs/superpowers/plans/` and a PR record in `docs/pull-requests/` before merging. Rationale for
+each check, including the `-race` timeout and the embedded-asset verification, is documented in
+[testing and verification](docs/development/testing.md).
 
 ## Releases
 
-Prebuilt Linux, macOS, and Windows archives are published to
-[GitHub Releases](https://github.com/nnworld/TunnelMesh/releases). Every
-release includes all three binaries, platform service templates,
-`SHA256SUMS`, and a `manifest.json` with the current Schema version. Tags use
-immutable `vMAJOR.MINOR.PATCH` versions; mutable major or minor tags are not
-published.
+Prebuilt Linux, macOS, and Windows archives (amd64 and arm64) are published to
+[GitHub Releases](https://github.com/nnworld/TunnelMesh/releases). Every release includes all three
+binaries, platform service templates, `SHA256SUMS`, and a `manifest.json` carrying the current
+Schema version. Tags use immutable `vMAJOR.MINOR.PATCH` versions; mutable major or minor tags are
+not published. Packaging details: [binary release](docs/deployment/binary-release.md).
 
-Build the three container variants with:
+Build the three container variants locally with:
 
 ```sh
 docker build --build-arg APP=server -t tunnelmesh:server .
@@ -67,8 +305,55 @@ docker build --build-arg APP=agent -t tunnelmesh:agent .
 docker build --build-arg APP=client -t tunnelmesh:client .
 ```
 
-The client supports `forward tcp`, `forward udp`, `forward http`, `publish
-http`, and `proxy tcp`. Agents only read metadata from explicit `file` or `env`
-allowlist entries; they do not execute arbitrary commands. SSH public-key or
-`ssh-agent` authentication remains on the target host, and remote command exit
-codes are returned by SSH itself.
+## Security model
+
+- Passwords use Argon2id; service tokens are stored as hashes, with optional AES-256-GCM ciphertext kept only to satisfy an explicit admin reveal.
+- Token reveal requires `X-Token-Reveal-Confirm`, an `Idempotency-Key`, `acknowledgeRisk=true`, returns `Cache-Control: no-store`, and writes an audit record.
+- All authorization is enforced server-side; client-supplied owner, Agent, or role values are never trusted.
+- Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
+- Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
+- Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes.
+- Deliberately not implemented: ICMP, TUN/L2 VPN, P2P NAT traversal, and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `cmd/` | process entry points for the three binaries |
+| `internal/cli/` | flags, config loading, subcommands |
+| `internal/config/` | config model, defaults, precedence |
+| `internal/auth/` | users, tokens, Argon2id, RBAC, admin recovery |
+| `internal/storage/` | database access, DDL bootstrap, migrations, repositories |
+| `internal/registry/` | MySQL lease, etcd discovery, epoch fencing |
+| `internal/protocol/` | WebSocket frames, capability negotiation, stream state machine, UDP association, traceroute |
+| `internal/session/`, `internal/relay/` | sessions, cross-node relay, stream lifecycle |
+| `internal/routing/`, `internal/server/` | route resolution, HTTP/WS/TCP ingress, management API |
+| `internal/client/`, `internal/agent/` | client forwarding, Agent sessions, internal service dialing |
+| `internal/proxy/` | HTTP CONNECT, SOCKS5, PROXY protocol v2 handshake parsing |
+| `internal/observability/` | Prometheus metrics, structured events, `traceparent` propagation |
+| `internal/metadata/` | shared metadata allowlist contract for Agent and Client |
+| `internal/build/` | version, commit, and build-time stamping |
+| `internal/e2e/` | in-process Go end-to-end tests across Server, Agent, and Client |
+| `migrations/` | full DDL (`ddl.sql`) and immutable incremental upgrade scripts |
+| `web/` | Vue 3 + TypeScript admin console; production build is embedded by the Server |
+| `deploy/` | ready-to-use artifacts: systemd units, launchd/WinSW templates, installer scripts, Prometheus config and rules, Grafana dashboard; see [deploy/README.md](deploy/README.md) |
+| `docs/` | architecture, protocol, deployment, operations, and user documentation |
+| `scripts/` | release packaging, embedded-asset verification, relay certificate issuance, doc index generation |
+| `test/e2e/` | browser end-to-end tests |
+
+## Project rules
+
+[AGENTS.md](AGENTS.md) is the single source of truth for architecture constraints, layering,
+database and migration policy, API conventions, verification requirements, and Git rules;
+`CLAUDE.md` is a compatibility pointer to it. Commits are not created automatically: `commit`,
+`push`, and `merge` require explicit authorization and a green verification run first.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE) for copyright
+and third-party attribution.
+
+Third-party Go modules are declared in [go.mod](go.mod) and admin console packages in
+[web/package.json](web/package.json); each remains under its own license. Release archives
+produced by `scripts/build-release.sh` always include `LICENSE` and `NOTICE`, and the build fails
+if either is missing.

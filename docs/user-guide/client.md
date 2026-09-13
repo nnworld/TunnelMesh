@@ -9,7 +9,7 @@
 ```yaml
 mode: local
 client:
-  server_url: wss://tunnel.example.com/client
+  server_url: wss://tunnel.example.com/ws/client
 ```
 
 使用配置文件执行登录命令时会自动加载并校验配置：
@@ -22,7 +22,7 @@ tunnelmesh-client --config tunnelmesh.yaml login
 
 ```bash
 export TUNNELMESH_MODE=local
-export TUNNELMESH_CLIENT_SERVER_URL=wss://tunnel.example.com/client
+export TUNNELMESH_CLIENT_SERVER_URL=wss://tunnel.example.com/ws/client
 ```
 
 ## 2. 登录和查看 Agent
@@ -531,7 +531,7 @@ tunnelmesh-client stop
 ```yaml
 mode: local
 client:
-  server_url: wss://tunnel.example.com/client
+  server_url: wss://tunnel.example.com/ws/client
   connections:
     min: 1
     max: 4

@@ -17,7 +17,7 @@
 
 ```yaml
 agent:
-  server_url: wss://tunnel.example.com/ws/agent/v1
+  server_url: wss://tunnel.example.com/ws/agent
   id: agent-devbox
   connections:
     min: 1

@@ -7,7 +7,7 @@
 ```yaml
 mode: local
 agent:
-  server_url: wss://tunnel.example.com/ws/agent/v1
+  server_url: wss://tunnel.example.com/ws/agent
   id: agent-devbox
 # token is injected through the environment/Secret manager, not committed here
 ```
@@ -16,7 +16,7 @@ agent:
 
 ```bash
 export TUNNELMESH_MODE=local
-export TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1
+export TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent
 export TUNNELMESH_AGENT_ID=agent-devbox
 export TUNNELMESH_AGENT_TOKEN='api-token-from-secret-manager'
 ```
@@ -54,7 +54,7 @@ tunnelmesh-agent --config agent.yaml run
 
 ```yaml
 agent:
-  server_url: wss://tunnel.example.com/ws/agent/v1
+  server_url: wss://tunnel.example.com/ws/agent
   id: agent-devbox
   instance_id: agent-devbox-host-a
   connections:
@@ -96,7 +96,7 @@ Agent 只读取配置中明确列出的文件字段或环境变量，不会扫�
 
 ```yaml
 agent:
-  server_url: wss://tunnel.example.com/ws/agent/v1
+  server_url: wss://tunnel.example.com/ws/agent
   id: agent-devbox
   metadata:
     - name: device_id
@@ -139,7 +139,7 @@ Token 还必须属于该 Agent 的 owner；被禁用或不存在的 Agent ID 会
 docker build --build-arg APP=agent -t tunnelmesh:agent .
 docker run --rm \
   -e TUNNELMESH_MODE=local \
-  -e TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent/v1 \
+  -e TUNNELMESH_AGENT_SERVER_URL=wss://tunnel.example.com/ws/agent \
   -e TUNNELMESH_AGENT_ID=agent-devbox \
   tunnelmesh:agent run
 ```
@@ -155,7 +155,7 @@ Agent 容器通常不需要暴露端口。它只需要出站访问 Server 和目
 ### Agent 一直离线
 
 - 用 `curl` 或 TLS 工具确认 Server 的 443 可达。
-- 检查 WSS 路径是否为 `/ws/agent/v1`，以及反向代理是否透传 Upgrade。
+- 检查 WSS 路径是否为 `/ws/agent`，以及反向代理是否透传 Upgrade。
 - 检查证书的域名、系统时间和 CA 信任链。
 - 检查 Agent ID 是否与另一台在线主机重复。
 - 查看 Server 的 Agent lease、heartbeat 和认证日志。
