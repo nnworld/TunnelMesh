@@ -6,7 +6,7 @@ import router from '../router'
 describe('admin routes', () => {
   it('defines login and managed resources', () => {
     const paths = router.getRoutes().map(route => route.path)
-    expect(paths).toEqual(expect.arrayContaining(['/login', '/', '/agents', '/routes', '/tunnels', '/audit-logs']))
+    expect(paths).toEqual(expect.arrayContaining(['/login', '/', '/agents', '/routes', '/tunnels', '/audit-logs', '/credentials', '/remote-servers']))
   })
 
   it('defines an authenticated agent detail route', () => {
@@ -177,7 +177,7 @@ describe('admin routes', () => {
   it('keeps route pages lazy-loaded for smaller first-screen bundles', () => {
     const source = readFileSync('src/router.ts', 'utf8')
     expect(source).not.toMatch(/^import (Login|Dashboard|Agents|AgentDetail|Routes|Tunnels|AuditLogs|Tokens|Users|AccountSecurity) from/m)
-    for (const view of ['Login', 'Dashboard', 'Agents', 'AgentDetail', 'Routes', 'Tunnels', 'AuditLogs', 'Tokens', 'Users', 'AccountSecurity']) {
+    for (const view of ['Login', 'Dashboard', 'Agents', 'AgentDetail', 'Routes', 'Tunnels', 'AuditLogs', 'Tokens', 'Users', 'AccountSecurity', 'Credentials', 'RemoteServers']) {
       expect(source).toContain(`const ${view} = () => import('./views/${view}.vue')`)
     }
   })

@@ -14,6 +14,6 @@
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; background: var(--tm-bg); }
 button, input { font: inherit; }
-.tm-page { display: grid; gap: 16px; }
+.tm-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .tm-card { background: var(--tm-surface); border: 1px solid var(--tm-border); border-radius: 8px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }

@@ -109,7 +109,7 @@ onMounted(load)
 </script>
 
 <style scoped>
-.release { display:grid; gap:22px; }
+.release { display:grid; grid-template-columns:minmax(0,1fr); gap:22px; }
 .release-summary { display:grid; grid-template-columns:minmax(190px,.75fr) 1.5fr; gap:20px; align-items:start; padding:18px; border:1px solid var(--tm-border); border-radius:12px; background:linear-gradient(135deg,#f7fbff 0%,#eef7ff 100%); }
 .release-summary p { margin:0 0 5px; color:var(--tm-muted); font-size:12px; letter-spacing:.08em; text-transform:uppercase; }
 .release-summary h2 { margin:0; font-size:30px; line-height:1.15; }

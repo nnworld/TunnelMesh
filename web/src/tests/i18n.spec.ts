@@ -41,6 +41,22 @@ describe('locale preferences', () => {
   })
 
   it('keeps locale message keys structurally identical', () => {
-    expect(Object.keys(zhCN).sort()).toEqual(Object.keys(enUS).sort())
+    expect(messageKeys(zhCN)).toEqual(messageKeys(enUS))
+  })
+
+  it('defines complete credentials and remote-server message trees', () => {
+    for (const locale of [zhCN, enUS]) {
+      expect(Object.keys(locale.credentials).sort()).toContainEqual('privateKeyWarning')
+      for (const key of [
+        'title', 'description', 'refresh', 'query', 'keyword', 'agent', 'status', 'all', 'enabled', 'disabled', 'deleted',
+        'name', 'host', 'port', 'username', 'credential', 'actions', 'detail', 'edit', 'ssh', 'delete', 'restore',
+        'empty', 'loadFailed', 'operationFailed', 'sshTitle', 'password', 'connect', 'cancel', 'agentOffline',
+      ]) expect(Object.keys(locale.remoteServers).sort(), key).toContainEqual(key)
+    }
   })
 })
+
+function messageKeys(value: unknown, prefix = ''): string[] {
+  if (typeof value !== 'object' || value === null) return [prefix]
+  return Object.entries(value).flatMap(([key, nested]) => messageKeys(nested, prefix ? `${prefix}.${key}` : key)).sort()
+}

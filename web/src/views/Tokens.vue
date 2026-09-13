@@ -1,5 +1,5 @@
 <template>
-  <section class="tokens-page">
+  <section class="tm-page tokens-page">
     <PageHeader :title="t('tokens.title')" :description="t('tokens.description')"><el-button type="primary" @click="openCreate">{{t('tokens.create')}}</el-button></PageHeader>
 
     <div class="tm-card table-card">
@@ -264,11 +264,10 @@ onMounted(() => { void reload(); void loadAgents(); if (auth.isAdmin) void loadS
 </script>
 
 <style scoped>
-.tokens-page { display: grid; gap: 16px; }
 .table-card { padding: 16px; }
 .toolbar { display: flex; gap: 12px; margin-bottom: 18px; }
 .pager { display: flex; justify-content: center; padding: 18px 0 4px; }
 .field-help { margin-top: 4px; color: var(--tm-muted); font-size: 12px; }
-.scope-list { display: grid; gap: 6px; }
+.scope-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
 .scope-list span { display: inline-block; min-width: 120px; color: var(--tm-muted); }
 </style>

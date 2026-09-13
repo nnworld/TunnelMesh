@@ -14,7 +14,17 @@ describe('application shell', () => {
     const downloads = router.getRoutes().find(route => route.path === '/downloads')
     const shell = readFileSync('src/layouts/AppShell.vue', 'utf8')
     expect(downloads?.meta.admin).toBe(true)
-    expect(shell).toContain("auth.isAdmin ? [['/downloads'")
+    expect(shell).toContain("auth.isAdmin ? [['/servers', 'navigation.servers'], ['/users', 'navigation.users'], ['/audit-logs', 'navigation.audits'], ['/downloads', 'navigation.downloads']]")
+  })
+
+  it('renames the downloads menu entry to release management and keeps it last', () => {
+    const shell = readFileSync('src/layouts/AppShell.vue', 'utf8')
+    const zh = readFileSync('src/i18n/messages/zh-CN.ts', 'utf8')
+    const en = readFileSync('src/i18n/messages/en-US.ts', 'utf8')
+    const adminBlock = shell.slice(shell.indexOf('auth.isAdmin ? ['))
+    expect(adminBlock.indexOf("'/downloads'")).toBeGreaterThan(adminBlock.indexOf("'/audit-logs'"))
+    expect(zh).toContain("downloads: '发行管理'")
+    expect(en).toContain("downloads: 'Releases'")
   })
 
   it('contains the responsive mesh navigation shell', () => {
@@ -31,6 +41,17 @@ describe('application shell', () => {
     expect(shell).toContain("'/downloads'")
     expect(router).toContain("path:'/clients'")
     expect(router).toContain("path:'/downloads'")
+  })
+
+  it('contains remote server and credential navigation entries', () => {
+    const shell = readFileSync('src/layouts/AppShell.vue', 'utf8')
+    const router = readFileSync('src/router.ts', 'utf8')
+    expect(shell).toContain("'/remote-servers'")
+    expect(shell).toContain("'/credentials'")
+    expect(shell).toContain('navigation.remoteServers')
+    expect(shell).toContain('navigation.credentials')
+    expect(router).toContain("path:'/remote-servers'")
+    expect(router).toContain("path:'/credentials'")
   })
 
   it('clients page contains filter, summary, table, and detail surface', () => {

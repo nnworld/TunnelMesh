@@ -370,10 +370,13 @@ export function closeClientConnection(clientInstanceId: string, connectionId: st
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers)
-  headers.set('Accept', 'application/json')
-  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const headers: Record<string, string> = {}
+  if (init.headers instanceof Headers) init.headers.forEach((value, key) => { headers[key] = value })
+  else if (Array.isArray(init.headers)) for (const [key, value] of init.headers) headers[key] = value
+  else if (init.headers) Object.assign(headers, init.headers)
+  headers.Accept = 'application/json'
+  if (init.body && !Object.keys(headers).some(key => key.toLowerCase() === 'content-type')) headers['Content-Type'] = 'application/json'
+  if (token && !Object.keys(headers).some(key => key.toLowerCase() === 'authorization')) headers.Authorization = `Bearer ${token}`
   const response = await fetch(`/api/v1${path}`, {...init, headers})
   const payload = await response.json().catch(() => ({msg: response.statusText}))
   if (!response.ok) {

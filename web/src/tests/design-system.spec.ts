@@ -33,6 +33,17 @@ describe('frontend design-system contracts', () => {
     ])
   })
 
+  it('imports programmatic element-plus styles that templates never reference', () => {
+    const source = readFileSync('src/main.ts', 'utf8')
+    expect(source).toContain('element-plus/es/components/message-box/style/css')
+    expect(source).toContain('element-plus/es/components/message/style/css')
+  })
+
+  it('constrains page grids so wide tables scroll inside their card', () => {
+    const css = readFileSync('src/styles/tokens.css', 'utf8')
+    expect(css).toContain('.tm-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }')
+  })
+
   it('preserves HTTP and domain error identifiers in API errors', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false, status: 400,
