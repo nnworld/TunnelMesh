@@ -135,6 +135,17 @@ type ServerConfig struct {
 	Relay              RelayConfig              `mapstructure:"relay" json:"relay" yaml:"relay"`
 	Stream             ServerStreamConfig       `mapstructure:"stream" json:"stream" yaml:"stream"`
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
+	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
+}
+
+type WebSSHConfig struct {
+	Enabled               bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	TicketTTL             time.Duration `mapstructure:"ticket_ttl" json:"ticket_ttl" yaml:"ticket_ttl"`
+	SessionTTL            time.Duration `mapstructure:"session_ttl" json:"session_ttl" yaml:"session_ttl"`
+	MaxActiveSessionsUser int           `mapstructure:"max_active_sessions_per_user" json:"max_active_sessions_per_user" yaml:"max_active_sessions_per_user"`
+	OpenTimeout           time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
+	IdleTimeout           time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	MaxMessageBytes       int           `mapstructure:"max_message_bytes" json:"max_message_bytes" yaml:"max_message_bytes"`
 }
 
 type ServerStreamConfig struct {
@@ -460,6 +471,13 @@ func setDefaults(v *viper.Viper) {
 		"server.authorization_cache.revision_poll_interval":  2 * time.Second,
 		"server.authorization_cache.max_stale_on_poll_error": 5 * time.Second,
 		"server.authorization_cache.max_entries":             100000,
+		"server.webssh.enabled":                              true,
+		"server.webssh.ticket_ttl":                           30 * time.Second,
+		"server.webssh.session_ttl":                          8 * time.Hour,
+		"server.webssh.max_active_sessions_per_user":         5,
+		"server.webssh.open_timeout":                         10 * time.Second,
+		"server.webssh.idle_timeout":                         5 * time.Minute,
+		"server.webssh.max_message_bytes":                    64 << 10,
 		"security.allowed_hosts":                             []string{},
 		"security.allowed_origins":                           []string{},
 		"security.allow_legacy_connection_tokens":            false,
@@ -508,6 +526,7 @@ func bindEnvironment(v *viper.Viper) {
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
 		"server.authorization_cache.enabled",
+		"server.webssh.enabled", "server.webssh.ticket_ttl", "server.webssh.session_ttl", "server.webssh.max_active_sessions_per_user", "server.webssh.open_timeout", "server.webssh.idle_timeout", "server.webssh.max_message_bytes",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
@@ -520,6 +539,7 @@ func Validate(cfg Config) error {
 	var problems []string
 	problems = append(problems, validateServerStream(cfg.Server.Stream)...)
 	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
+	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
@@ -611,6 +631,32 @@ func validateServerStream(cfg ServerStreamConfig) []string {
 	}
 	if cfg.MaxFramePayload <= 0 || cfg.MaxFramePayload > 1<<20 {
 		problems = append(problems, "server stream max frame payload must be positive and no greater than 1048576")
+	}
+	return problems
+}
+
+func validateWebSSH(cfg WebSSHConfig) []string {
+	var problems []string
+	if !cfg.Enabled {
+		return problems
+	}
+	if cfg.TicketTTL <= 0 || cfg.TicketTTL > 10*time.Minute {
+		problems = append(problems, "server webssh ticket TTL must be between 1s and 10m")
+	}
+	if cfg.SessionTTL <= 0 || cfg.SessionTTL > 24*time.Hour {
+		problems = append(problems, "server webssh session TTL must be between 1s and 24h")
+	}
+	if cfg.MaxActiveSessionsUser <= 0 || cfg.MaxActiveSessionsUser > 100 {
+		problems = append(problems, "server webssh max active sessions per user must be between 1 and 100")
+	}
+	if cfg.OpenTimeout <= 0 || cfg.OpenTimeout > time.Minute {
+		problems = append(problems, "server webssh open timeout must be between 1s and 1m")
+	}
+	if cfg.IdleTimeout <= 0 || cfg.IdleTimeout > time.Hour {
+		problems = append(problems, "server webssh idle timeout must be between 1s and 1h")
+	}
+	if cfg.MaxMessageBytes <= 0 || cfg.MaxMessageBytes > 1<<20 {
+		problems = append(problems, "server webssh max message bytes must be between 1 and 1048576")
 	}
 	return problems
 }

@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 11
+	SchemaVersion = 13
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -45,6 +45,9 @@ type DB struct {
 	authorizationRevisions AuthorizationRevisionRepository
 	clientInstances        ClientInstanceRepository
 	clientConnections      ClientConnectionRepository
+	credentials            CredentialRepository
+	remoteServers          RemoteServerRepository
+	webSSHSessions         WebSSHSessionRepository
 	metrics                *observability.Metrics
 }
 
@@ -286,6 +289,9 @@ func newDB(db *sql.DB, driver string) *DB {
 		authorizationRevisions: &authorizationRevisionRepo{db: db},
 		clientInstances:        NewClientInstanceRepositoryWithDriver(db, driver),
 		clientConnections:      NewClientConnectionRepositoryWithDriver(db, driver),
+		credentials:            NewCredentialRepository(db),
+		remoteServers:          NewRemoteServerRepository(db),
+		webSSHSessions:         NewWebSSHSessionRepository(db),
 	}
 }
 
@@ -352,6 +358,16 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			script = migrations.V10ToV11SQLite
 			if driver == DriverMySQL {
 				script = migrations.V10ToV11MySQL
+			}
+		case 11:
+			script = migrations.V11ToV12SQLite
+			if driver == DriverMySQL {
+				script = migrations.V11ToV12MySQL
+			}
+		case 12:
+			script = migrations.V12ToV13SQLite
+			if driver == DriverMySQL {
+				script = migrations.V12ToV13MySQL
 			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
@@ -525,6 +541,13 @@ func (d *DB) Dashboard() DashboardRepository            { return d.dashboard }
 func (d *DB) ClientInstances() ClientInstanceRepository { return d.clientInstances }
 func (d *DB) ClientConnections() ClientConnectionRepository {
 	return d.clientConnections
+}
+func (d *DB) Credentials() CredentialRepository { return d.credentials }
+func (d *DB) RemoteServers() RemoteServerRepository {
+	return d.remoteServers
+}
+func (d *DB) WebSSHSessions() WebSSHSessionRepository {
+	return d.webSSHSessions
 }
 func (d *DB) AuthorizationRevisions() AuthorizationRevisionRepository {
 	return d.authorizationRevisions

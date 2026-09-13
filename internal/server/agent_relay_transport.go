@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
@@ -117,9 +118,21 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 	stream := &agentRelayStream{
 		transport: t, agentID: agentID, connectionID: session.ConnectionID,
 		connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration,
-		wireID: uint32(allocator.next), readCh: make(chan []byte, 16), controlCh: make(chan protocol.Frame, 16), done: make(chan struct{}),
-		controlSignal: make(chan struct{}, 1),
+		wireID: uint32(allocator.next), controlCh: make(chan protocol.Frame, 16), done: make(chan struct{}),
+		controlSignal: make(chan struct{}, 1), dataSignal: make(chan struct{}, 1),
 	}
+	window := request.InitialWindow
+	if window == 0 {
+		// A zero window means "unlimited" to the Agent, which lets a fast peer
+		// overflow the inbound buffer. Advertise the default credit instead.
+		window = protocol.DefaultServerReceiveWindow
+	}
+	stream.receiveBudget = int(window)
+	if sendState, stateErr := protocol.NewStreamState(stream.wireID, protocol.DefaultAgentReceiveWindow); stateErr == nil {
+		_ = sendState.OpenLocal()
+		stream.sendState = sendState
+	}
+	stream.windowSignal = make(chan struct{}, 1)
 	if request.StrictOpen {
 		stream.strictOpen = true
 		stream.openResult = make(chan protocol.OpenResultPayload, 1)
@@ -130,7 +143,7 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 	if request.StrictOpen {
 		openFlags |= protocol.FlagStrictOpen
 	}
-	openFrame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: openFlags, StreamID: stream.wireID, Window: request.InitialWindow, Payload: payload}
+	openFrame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, Flags: openFlags, StreamID: stream.wireID, Window: window, Payload: payload}
 	if err := t.manager.sendServerGeneration(stream.agentID, stream.serverGeneration, openFrame); err != nil {
 		t.detach(stream)
 		stream.fail(err)
@@ -233,6 +246,16 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 			delete(t.streams, key)
 		}
 	case protocol.FrameWindowUpdate:
+		// Credit the Server's send window first so a blocked Write resumes even
+		// when no consumer ever drains controlCh.
+		if stream.sendState != nil {
+			if windowErr := stream.sendState.AddSendWindow(frame.Window); windowErr == nil {
+				select {
+				case stream.windowSignal <- struct{}{}:
+				default:
+				}
+			}
+		}
 		select {
 		case stream.controlCh <- frame:
 			select {
@@ -240,9 +263,11 @@ func (t *AgentRelayTransport) handleAgentFrameGeneration(agentID string, serverG
 			default:
 			}
 		default:
-			delete(t.streams, key)
-			stream.fail(protocol.ErrWindowExhausted)
-			resetStream = true
+			// Best-effort mirror only. The authoritative credit was applied to
+			// sendState above, and the WebSSH/SFTP consumer never polls
+			// ReadControl, so a full mirror queue must not kill an otherwise
+			// healthy bulk upload: it used to fail the stream with
+			// ErrWindowExhausted once more than cap(controlCh) updates arrived.
 		}
 	case protocol.FrameReset:
 		delete(t.streams, key)
@@ -364,20 +389,43 @@ type agentRelayStream struct {
 	connectionEpoch  int64
 	serverGeneration uint64
 	wireID           uint32
-	readCh           chan []byte
 	controlCh        chan protocol.Frame
 	controlSignal    chan struct{}
-	openResult       chan protocol.OpenResultPayload
-	done             chan struct{}
-	doneOnce         sync.Once
-	closeOnce        sync.Once
-	openResultOnce   sync.Once
-	strictOpen       bool
-	mu               sync.Mutex
-	readBuf          []byte
-	err              error
-	localHalf        bool
-	remoteHalf       bool
+	// dataSignal wakes a blocked Read after inbound bytes are appended. It is a
+	// wake token rather than a byte channel because the receive window is
+	// accounted in bytes: slotting the buffer by frame count let a peer that
+	// stayed inside its window with many small frames overflow it and take a
+	// fatal RESET mid-transfer.
+	dataSignal     chan struct{}
+	openResult     chan protocol.OpenResultPayload
+	done           chan struct{}
+	doneOnce       sync.Once
+	closeOnce      sync.Once
+	openResultOnce sync.Once
+	strictOpen     bool
+	mu             sync.Mutex
+	readBuf        []byte
+	// receiveBudget is the inbound byte budget and equals the window advertised
+	// in OPEN_STREAM. Credit is only returned after Read consumes bytes, so a
+	// window-respecting peer can never exceed it.
+	receiveBudget int
+	// readPos is the consumed prefix of readBuf. Tracking it keeps Read
+	// O(bytes returned): compacting on every Read made a consumer that reads in
+	// small chunks re-memmove the whole tail per call, which is quadratic and
+	// showed up as a 150 s package under `-race`.
+	readPos    int
+	err        error
+	localHalf  bool
+	remoteHalf bool
+	// sendState mirrors the credit the Agent grants for Server-to-Agent DATA.
+	// The Agent enforces it unconditionally, so the Server must consume it or
+	// a bulk upload resets the stream mid-transfer.
+	sendState *protocol.StreamState
+	// receiveUnacked accumulates bytes handed to Read until a WINDOW_UPDATE is
+	// owed to the Agent; without it the Agent's send window never refills and
+	// a bulk download stalls the relay into a fatal backpressure error.
+	receiveUnacked uint32
+	windowSignal   chan struct{}
 }
 
 func (s *agentRelayStream) deliverOpenResult(payload protocol.OpenResultPayload) bool {
@@ -402,21 +450,26 @@ func (s *agentRelayStream) Read(buffer []byte) (int, error) {
 	}
 	for {
 		s.mu.Lock()
-		if len(s.readBuf) > 0 {
-			n := copy(buffer, s.readBuf)
-			s.readBuf = s.readBuf[n:]
+		if pending := len(s.readBuf) - s.readPos; pending > 0 {
+			n := copy(buffer, s.readBuf[s.readPos:])
+			s.readPos += n
+			if s.readPos == len(s.readBuf) {
+				// Hand the whole buffer back; the next enqueue starts fresh.
+				s.readBuf = nil
+				s.readPos = 0
+			}
 			s.mu.Unlock()
+			s.releaseReceiveWindow(n)
 			return n, nil
 		}
-		s.mu.Unlock()
+		// Clear a stale wake token while still holding the lock: enqueue appends
+		// under the same lock, so no byte can land between this drain and the
+		// blocking wait below.
 		select {
-		case payload := <-s.readCh:
-			s.mu.Lock()
-			s.readBuf = append(s.readBuf, payload...)
-			s.mu.Unlock()
-			continue
+		case <-s.dataSignal:
 		default:
 		}
+		s.mu.Unlock()
 		select {
 		case <-s.controlSignal:
 			return 0, nil
@@ -429,10 +482,7 @@ func (s *agentRelayStream) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 		select {
-		case payload := <-s.readCh:
-			s.mu.Lock()
-			s.readBuf = append(s.readBuf, payload...)
-			s.mu.Unlock()
+		case <-s.dataSignal:
 		case <-s.done:
 		}
 	}
@@ -445,22 +495,110 @@ func (s *agentRelayStream) Write(payload []byte) (int, error) {
 	if len(payload) > protocol.MaxPayload {
 		return 0, protocol.ErrPayloadTooLarge
 	}
-	s.mu.Lock()
-	if (s.err != nil && !errors.Is(s.err, io.EOF)) || s.localHalf {
-		err := s.err
-		if err == nil {
-			err = io.ErrClosedPipe
+	// The Agent enforces its receive window with a stream RESET, so sending
+	// beyond the credited window is not an option: wait for WINDOW_UPDATE
+	// credit instead and let the pressure propagate to the caller.
+	sent := 0
+	for sent < len(payload) {
+		chunk, err := s.consumeSendWindow(len(payload) - sent)
+		if err != nil {
+			if sent > 0 {
+				return sent, err
+			}
+			return 0, err
 		}
+		frame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.wireID, Payload: append([]byte(nil), payload[sent:sent+chunk]...)}
+		if err := s.transport.manager.sendServerGeneration(s.agentID, s.serverGeneration, frame); err != nil {
+			s.transport.detach(s)
+			s.fail(err)
+			return sent, err
+		}
+		sent += chunk
+	}
+	return sent, nil
+}
+
+// consumeSendWindow reserves up to `remaining` bytes of Agent-granted credit,
+// blocking while the window is empty. It never holds the stream lock while
+// waiting, so inbound WINDOW_UPDATE frames keep flowing.
+func (s *agentRelayStream) consumeSendWindow(remaining int) (int, error) {
+	for {
+		s.mu.Lock()
+		if (s.err != nil && !errors.Is(s.err, io.EOF)) || s.localHalf {
+			err := s.err
+			if err == nil {
+				err = io.ErrClosedPipe
+			}
+			s.mu.Unlock()
+			return 0, err
+		}
+		state := s.sendState
 		s.mu.Unlock()
-		return 0, err
+		if state == nil {
+			return remaining, nil
+		}
+		want := uint32(remaining)
+		if want > protocol.MaxStreamFrame {
+			want = protocol.MaxStreamFrame
+		}
+		if err := state.ConsumeSend(want); err == nil {
+			return int(want), nil
+		} else if !errors.Is(err, protocol.ErrWindowExhausted) {
+			return 0, err
+		}
+		// Partial credit is still usable: a 40 KiB write may proceed as a
+		// 32 KiB frame now and the remainder after the next WINDOW_UPDATE.
+		if available := state.SendWindow(); available > 0 {
+			if available < want {
+				want = available
+			}
+			if err := state.ConsumeSend(want); err == nil {
+				return int(want), nil
+			} else if !errors.Is(err, protocol.ErrWindowExhausted) {
+				return 0, err
+			}
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-s.windowSignal:
+			timer.Stop()
+		case <-timer.C:
+		case <-s.done:
+			timer.Stop()
+			s.mu.Lock()
+			err := s.err
+			s.mu.Unlock()
+			if err == nil {
+				err = io.ErrClosedPipe
+			}
+			return 0, err
+		}
+	}
+}
+
+// releaseReceiveWindow returns credit to the Agent once the consumer has
+// actually read bytes, which is what unblocks a throttled `sz` on the peer.
+func (s *agentRelayStream) releaseReceiveWindow(consumed int) {
+	if consumed <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.err != nil {
+		s.mu.Unlock()
+		return
+	}
+	s.receiveUnacked += uint32(consumed)
+	update := uint32(0)
+	if s.receiveUnacked >= protocol.DefaultWindowUpdateThreshold {
+		update = s.receiveUnacked
+		s.receiveUnacked = 0
 	}
 	s.mu.Unlock()
-	if err := s.transport.manager.sendServerGeneration(s.agentID, s.serverGeneration, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.wireID, Payload: append([]byte(nil), payload...)}); err != nil {
-		s.transport.detach(s)
-		s.fail(err)
-		return 0, err
+	if update == 0 {
+		return
 	}
-	return len(payload), nil
+	// Best-effort: a failed control write fails the stream elsewhere.
+	_ = s.WriteControl(protocol.Frame{Type: protocol.FrameWindowUpdate, Window: update})
 }
 
 func (s *agentRelayStream) WriteControl(frame protocol.Frame) error {
@@ -539,12 +677,33 @@ func (s *agentRelayStream) enqueue(payload []byte) error {
 	if s.err != nil {
 		return s.err
 	}
-	select {
-	case s.readCh <- append([]byte(nil), payload...):
-		return nil
-	default:
+	budget := s.receiveBudget
+	if budget <= 0 {
+		budget = protocol.DefaultServerReceiveWindow
+	}
+	if s.readPos > 0 {
+		// Drop the consumed prefix before appending: otherwise a stream that
+		// alternates small reads and inbound frames grows readBuf without bound
+		// while the accounted bytes stay inside the window.
+		remaining := copy(s.readBuf, s.readBuf[s.readPos:])
+		s.readBuf = s.readBuf[:remaining]
+		s.readPos = 0
+	}
+	if len(s.readBuf)+len(payload) > budget {
+		// Unreachable for a peer that honours the OPEN_STREAM window, because
+		// credit is released only after Read consumed the bytes. Retained as a
+		// guard so a window-ignoring peer fails one stream, not the process.
 		return relay.ErrBackpressure
 	}
+	if len(payload) == 0 {
+		return nil
+	}
+	s.readBuf = append(s.readBuf, payload...)
+	select {
+	case s.dataSignal <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (s *agentRelayStream) remoteHalfClose() bool {

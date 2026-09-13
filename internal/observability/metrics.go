@@ -44,6 +44,12 @@ type Metrics struct {
 	authorizationRevision     *prometheus.GaugeVec
 	authorizationRevisionPoll *prometheus.CounterVec
 	remoteValidationCache     *prometheus.CounterVec
+	websshSessionsActive      *prometheus.GaugeVec
+	websshTicketsCreatedTotal *prometheus.CounterVec
+	websshTicketReuseTotal    *prometheus.CounterVec
+	websshStreamErrorsTotal   *prometheus.CounterVec
+	websshStreamDuration      *prometheus.HistogramVec
+	websshBytesTotal          *prometheus.CounterVec
 	activeMu                  sync.Mutex
 	activeConnections         map[string]int
 	activeStreams             map[string]int
@@ -96,12 +102,30 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		),
 		authorizationRevisionPoll: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_authorization_revision_poll_total", Help: "Authorization revision poll outcomes."}, []string{"result", "error_class"}),
 		remoteValidationCache:     prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_remote_validation_cache_requests_total", Help: "Remote validation cache requests."}, []string{"cache", "result"}),
-		activeConnections:         make(map[string]int),
-		activeStreams:             make(map[string]int),
-		agentConnectionStates:     make(map[string]bool),
-		agentConnectionStreams:    make(map[string]int),
+		websshSessionsActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tunnelmesh_webssh_sessions_active", Help: "Current active browser WebSSH sessions.",
+		}, nil),
+		websshTicketsCreatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_webssh_tickets_created_total", Help: "Total WebSSH one-time tickets created.",
+		}, nil),
+		websshTicketReuseTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_webssh_ticket_reuse_total", Help: "Total rejected WebSSH ticket authentication attempts.",
+		}, []string{"reason"}),
+		websshStreamErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_webssh_streams_errors_total", Help: "Total WebSSH stream terminal errors.",
+		}, []string{"error_class"}),
+		websshStreamDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "tunnelmesh_webssh_stream_duration_seconds", Help: "WebSSH stream duration in seconds.",
+		}, nil),
+		websshBytesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_webssh_bytes_total", Help: "Total bytes transferred by browser WebSSH sessions.",
+		}, []string{"direction"}),
+		activeConnections:      make(map[string]int),
+		activeStreams:          make(map[string]int),
+		agentConnectionStates:  make(map[string]bool),
+		agentConnectionStreams: make(map[string]int),
 	}
-	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache)
+	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
 	return m
 }
 
@@ -344,4 +368,36 @@ func (m *Metrics) SetReady(component string, ready bool) {
 		value = 1
 	}
 	m.ready.WithLabelValues(label(component)).Set(value)
+}
+
+func (m *Metrics) SetWebSSHActiveSessions(active int) {
+	if active < 0 {
+		active = 0
+	}
+	m.websshSessionsActive.WithLabelValues().Set(float64(active))
+}
+
+func (m *Metrics) ObserveWebSSHTicketCreated() {
+	m.websshTicketsCreatedTotal.WithLabelValues().Inc()
+}
+
+func (m *Metrics) ObserveWebSSHTicketReuse(reason string) {
+	m.websshTicketReuseTotal.WithLabelValues(label(reason)).Inc()
+}
+
+func (m *Metrics) ObserveWebSSHStreamError(errorClass string) {
+	m.websshStreamErrorsTotal.WithLabelValues(label(errorClass)).Inc()
+}
+
+func (m *Metrics) ObserveWebSSHStreamDuration(duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	m.websshStreamDuration.WithLabelValues().Observe(duration.Seconds())
+}
+
+func (m *Metrics) ObserveWebSSHBytes(direction string, n int64) {
+	if n > 0 {
+		m.websshBytesTotal.WithLabelValues(label(direction)).Add(float64(n))
+	}
 }

@@ -75,7 +75,15 @@ type CloseClientConnectionRequest struct {
 	RequestedByNodeID string
 }
 
+// CloseWebSSHConnectionRequest is the inter-server control message for one
+// browser WebSSH session owned by a Server process.
+type CloseWebSSHConnectionRequest struct {
+	SessionID         string
+	RequestedByNodeID string
+}
+
 type CloseClientConnectionFunc func(context.Context, CloseClientConnectionRequest) error
+type CloseWebSSHConnectionFunc func(context.Context, CloseWebSSHConnectionRequest) error
 type NodeTransport interface {
 	OpenStream(context.Context, StreamRequest) (io.ReadWriteCloser, error)
 	Close() error

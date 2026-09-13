@@ -73,6 +73,38 @@ type ServiceTokenSecretRepository interface {
 	MarkSecretRead(context.Context, string, time.Time) error
 }
 
+type CredentialRepository interface {
+	Create(context.Context, Credential) (Credential, error)
+	Get(context.Context, string) (Credential, error)
+	Update(context.Context, Credential) error
+	Delete(context.Context, string, time.Time) error
+	Restore(context.Context, string) error
+	List(context.Context, CredentialFilter, string, int) (Page[Credential], error)
+}
+
+type RemoteServerRepository interface {
+	Create(context.Context, RemoteServer) (RemoteServer, error)
+	Get(context.Context, string) (RemoteServer, error)
+	Update(context.Context, RemoteServer) error
+	Delete(context.Context, string, time.Time) error
+	Restore(context.Context, string) error
+	List(context.Context, RemoteServerFilter, string, int) (Page[RemoteServer], error)
+	UpdateConnectionResult(context.Context, string, string, string, time.Time) error
+}
+
+type WebSSHSessionRepository interface {
+	Create(context.Context, WebSSHSession) (WebSSHSession, error)
+	Get(context.Context, string) (WebSSHSession, error)
+	ConsumeTicket(context.Context, string, string, time.Time) (WebSSHSession, error)
+	Close(context.Context, string, string, time.Time) error
+	CountActiveByOwner(context.Context, string, time.Time) (int, error)
+	ListActiveByOwner(context.Context, string, time.Time) ([]WebSSHSession, error)
+	ListActivePage(context.Context, string, time.Time, string, int) (Page[WebSSHSession], error)
+	ExpirePending(context.Context, time.Time) (int64, error)
+	CloseExpiredActive(context.Context, time.Time) (int64, error)
+	CloseActiveByNode(context.Context, string, time.Time, string) (int64, error)
+}
+
 var ErrServiceTokenRevoked = errors.New("service token is already revoked")
 var ErrServiceTokenExpired = errors.New("service token is already expired")
 

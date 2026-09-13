@@ -22,8 +22,10 @@ var ErrDuplicateStream = errors.New("agent: duplicate stream")
 const agentStreamResetMessage = "stream rejected"
 
 const (
-	defaultAgentReceiveWindow         = 262144
-	defaultAgentWindowUpdateThreshold = 131072
+	// The credit contract lives in internal/protocol so the Server relay and
+	// the Agent dispatcher can never drift apart.
+	defaultAgentReceiveWindow         = protocol.DefaultAgentReceiveWindow
+	defaultAgentWindowUpdateThreshold = protocol.DefaultWindowUpdateThreshold
 )
 
 type StreamOpenPayload = protocol.StreamOpenPayload

@@ -132,6 +132,57 @@ func TestMetricsClusterFamilies(t *testing.T) {
 	}
 }
 
+func TestWebSSHMetricsFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := NewMetrics(reg)
+	metrics.SetWebSSHActiveSessions(2)
+	metrics.ObserveWebSSHTicketCreated()
+	metrics.ObserveWebSSHTicketReuse("expired")
+	metrics.ObserveWebSSHStreamError("invalid_message")
+	metrics.ObserveWebSSHStreamDuration(1250 * time.Millisecond)
+	metrics.ObserveWebSSHBytes("upload", 128)
+	metrics.ObserveWebSSHBytes("download", 256)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, family := range families {
+		names[family.GetName()] = true
+	}
+	for _, name := range []string{
+		"tunnelmesh_webssh_sessions_active",
+		"tunnelmesh_webssh_tickets_created_total",
+		"tunnelmesh_webssh_ticket_reuse_total",
+		"tunnelmesh_webssh_streams_errors_total",
+		"tunnelmesh_webssh_stream_duration_seconds",
+		"tunnelmesh_webssh_bytes_total",
+	} {
+		if !names[name] {
+			t.Fatalf("missing metric family %s", name)
+		}
+	}
+	if got := testutil.ToFloat64(metrics.websshSessionsActive.WithLabelValues()); got != 2 {
+		t.Fatalf("active sessions = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.websshTicketsCreatedTotal.WithLabelValues()); got != 1 {
+		t.Fatalf("tickets created = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.websshTicketReuseTotal.WithLabelValues("expired")); got != 1 {
+		t.Fatalf("ticket reuse = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.websshStreamErrorsTotal.WithLabelValues("invalid_message")); got != 1 {
+		t.Fatalf("stream errors = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.websshBytesTotal.WithLabelValues("upload")); got != 128 {
+		t.Fatalf("upload bytes = %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.websshBytesTotal.WithLabelValues("download")); got != 256 {
+		t.Fatalf("download bytes = %v", got)
+	}
+}
+
 func TestMetricsAgentConnectionPoolFamilies(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	metrics := NewMetrics(reg)

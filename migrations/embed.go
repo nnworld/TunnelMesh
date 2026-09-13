@@ -44,3 +44,15 @@ var V10ToV11MySQL string
 
 //go:embed incremental/v0010_to_v0011/sqlite.sql
 var V10ToV11SQLite string
+
+//go:embed incremental/v0011_to_v0012/mysql.sql
+var V11ToV12MySQL string
+
+//go:embed incremental/v0011_to_v0012/sqlite.sql
+var V11ToV12SQLite string
+
+//go:embed incremental/v0012_to_v0013/mysql.sql
+var V12ToV13MySQL string
+
+//go:embed incremental/v0012_to_v0013/sqlite.sql
+var V12ToV13SQLite string

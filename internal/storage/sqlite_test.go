@@ -494,6 +494,50 @@ func TestSQLiteV10ToV11ClientObservabilityMigration(t *testing.T) {
 	}
 }
 
+func TestSQLiteV11ToV12WebSSHMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v11-to-v12.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE credentials`,
+		`DROP TABLE remote_servers`,
+		`DROP TABLE webssh_sessions`,
+		// The full DDL never writes a schema_meta row, so the version must be
+		// inserted explicitly; an UPDATE would affect zero rows and silently
+		// skip the whole migration chain.
+		`DELETE FROM schema_meta WHERE id=1`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,11)`,
+	} {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v11 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v11 to v12: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	for _, table := range []string{"credentials", "remote_servers", "webssh_sessions"} {
+		if err := db.SQL().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(new(int)); err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+	}
+}
+
 func TestAuthorizationRevisionCurrentInitializesToOne(t *testing.T) {
 	db := newTestDB(t)
 	revision, err := db.AuthorizationRevisions().Current(context.Background())
@@ -552,4 +596,70 @@ func TestLeaseRepositoryPublicConstructorPropagatesMySQLDriver(t *testing.T) {
 	if impl.driver != DriverMySQL {
 		t.Fatalf("lease driver = %q, want %q", impl.driver, DriverMySQL)
 	}
+}
+func TestSQLiteV12ToV13CredentialSecretMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v12-to-v13.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	// Rebuild credentials without the secret columns to emulate a v12
+	// database, keeping one row so the migration must preserve data.
+	for _, statement := range []string{
+		`DELETE FROM credentials`,
+		`DROP TABLE credentials`,
+		`CREATE TABLE credentials (
+		    id VARBINARY(255) PRIMARY KEY,
+		    owner_user_id VARBINARY(255) NOT NULL,
+		    name VARCHAR(255) NOT NULL,
+		    credential_type VARCHAR(32) NOT NULL,
+		    public_key TEXT NOT NULL,
+		    fingerprint VARBINARY(255) NOT NULL,
+		    enabled INTEGER NOT NULL DEFAULT 1,
+		    deleted_at VARCHAR(32),
+		    created_at TEXT NOT NULL,
+		    updated_at VARCHAR(32) NOT NULL
+		)`,
+		`INSERT INTO credentials(id,owner_user_id,name,credential_type,public_key,fingerprint,enabled,created_at,updated_at)
+		 VALUES('credential-legacy','user-a','legacy','ssh_public_key','ssh-ed25519 AAAATEST','SHA256:test',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+		// Same reason as the v11 test above: schema_meta has no row after the
+		// full DDL, so insert the source version to exercise v12 -> v13.
+		`DELETE FROM schema_meta WHERE id=1`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,12)`,
+	} {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v12 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v12 to v13: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	credential, err := db.Credentials().Get(context.Background(), "credential-legacy")
+	if err != nil {
+		t.Fatalf("legacy credential after migration: %v", err)
+	}
+	if credential.Name != "legacy" || credential.HasSecret() {
+		t.Fatalf("legacy credential = %+v, want preserved row without secret", credential)
+	}
+	// A second open must be a no-op: the migration is retry-safe and the
+	// duplicate-column guard keeps an already migrated database working.
+	db2, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("reopen migrated database: %v", err)
+	}
+	db2.Close()
 }

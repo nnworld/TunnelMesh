@@ -25,31 +25,35 @@ import (
 // storage interfaces so the handler remains usable with SQLite, MySQL, and
 // small in-memory fakes in tests.
 type API struct {
-	DB                 *storage.DB
-	Auth               *auth.AuthService
-	users              storage.UserRepository
-	agents             storage.AgentRepository
-	policies           storage.PolicyRepository
-	tunnels            storage.TunnelRepository
-	audits             storage.AuditRepository
-	idem               storage.IdempotencyRepository
-	dashboard          storage.DashboardRepository
-	routeMu            sync.Mutex
-	service            *apiService
-	tokenService       *TokenService
-	accounts           *auth.AccountService
-	serverNodes        *ServerNodeService
-	traceroute         *TracerouteService
-	probeService       *ProbeService
-	agentSessions      *AgentSessionManager
-	localAgentRelay    *AgentRelayTransport
-	clusterConnections AgentConnectionLister
-	connectionCloser   AgentConnectionCloseService
-	clientInstances    storage.ClientInstanceRepository
-	clientConnections  storage.ClientConnectionRepository
-	clientCloser       ClientConnectionCloseService
-	localNodeID        string
-	downloads          config.DownloadsConfig
+	DB                  *storage.DB
+	Auth                *auth.AuthService
+	users               storage.UserRepository
+	agents              storage.AgentRepository
+	policies            storage.PolicyRepository
+	tunnels             storage.TunnelRepository
+	audits              storage.AuditRepository
+	idem                storage.IdempotencyRepository
+	dashboard           storage.DashboardRepository
+	routeMu             sync.Mutex
+	service             *apiService
+	tokenService        *TokenService
+	accounts            *auth.AccountService
+	serverNodes         *ServerNodeService
+	traceroute          *TracerouteService
+	probeService        *ProbeService
+	agentSessions       *AgentSessionManager
+	localAgentRelay     *AgentRelayTransport
+	clusterConnections  AgentConnectionLister
+	connectionCloser    AgentConnectionCloseService
+	clientInstances     storage.ClientInstanceRepository
+	clientConnections   storage.ClientConnectionRepository
+	clientCloser        ClientConnectionCloseService
+	credentialService   *CredentialService
+	remoteServerService *RemoteServerService
+	websshService       *WebSSHSessionService
+	websshCloser        WebSSHConnectionCloseService
+	localNodeID         string
+	downloads           config.DownloadsConfig
 }
 
 // apiService is the application layer between HTTP handlers and storage. It
@@ -82,6 +86,13 @@ func NewAPI(db *storage.DB, authService *auth.AuthService) *API {
 		a.probeService = NewProbeService(db)
 		a.clientInstances = db.ClientInstances()
 		a.clientConnections = db.ClientConnections()
+		a.credentialService = NewCredentialService(db.Credentials(), db.Agents(), db.Audits())
+		a.remoteServerService = NewRemoteServerService(db.RemoteServers(), db.Credentials(), db.Agents(), db.Policies(), db.Audits(), db.Leases())
+		a.websshService = NewWebSSHSessionService(db.WebSSHSessions(), db.RemoteServers(), db.Credentials(), db.Agents(), db.Leases(), db.Audits(), "local")
+		// Auto-authentication needs owner-scoped secret decryption; when no
+		// encryption key is configured the resolver stays available but returns
+		// no secret, so sessions degrade to the manual password prompt.
+		a.websshService.SetCredentialSecrets(a.credentialService)
 	}
 	return a
 }
@@ -95,6 +106,28 @@ func (a *API) SetAgentConnections(sessions *AgentSessionManager, relay *AgentRel
 	}
 	a.agentSessions = sessions
 	a.localAgentRelay = relay
+}
+
+// SetWebSSHConnectionCloser installs the process/cluster connection closer.
+// It is optional so API-level tests and embedders can operate without a live
+// broker while still exercising durable session semantics.
+func (a *API) SetWebSSHConnectionCloser(closer WebSSHConnectionCloseService) {
+	if a == nil {
+		return
+	}
+	a.websshCloser = closer
+}
+
+// SetWebSSHLocalNodeID propagates the runtime node identity into ticket
+// creation so cluster ownership is recorded before a browser connects.
+func (a *API) SetWebSSHLocalNodeID(localNodeID string) {
+	if a == nil {
+		return
+	}
+	a.localNodeID = strings.TrimSpace(localNodeID)
+	if a.websshService != nil {
+		a.websshService.SetLocalNodeID(localNodeID)
+	}
 }
 
 func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentRequest) (storage.Agent, error) {
@@ -279,6 +312,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch parts[0] {
+	case "credentials":
+		a.handleCredentials(w, r, p, parts[1:])
+	case "remote-servers":
+		a.handleRemoteServers(w, r, p, parts[1:])
 	case "agents":
 		a.handleAgents(w, r, p, parts[1:])
 	case "routes", "tunnels":
@@ -303,6 +340,28 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleDashboard(w, r, p, parts[1:])
 	case "traces":
 		a.handleTraces(w, r, p, parts[1:])
+	case "ssh-sessions":
+		if len(parts) == 1 {
+			if r.Method == http.MethodGet {
+				a.listWebSSHSessions(w, r, p)
+				return
+			}
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if len(parts) == 2 && parts[0] == "ssh-sessions" && parts[1] != "" {
+			sessionID := parts[1]
+			switch r.Method {
+			case http.MethodGet:
+				a.getWebSSHSession(w, r, p, sessionID)
+			case http.MethodDelete:
+				a.closeWebSSHSession(w, r, p, sessionID)
+			default:
+				writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			}
+			return
+		}
+		writeAPIError(w, http.StatusNotFound, "not found")
 	default:
 		writeAPIError(w, http.StatusNotFound, "not found")
 	}

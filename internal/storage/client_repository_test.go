@@ -119,9 +119,9 @@ func TestClientConnectionRegisterDefaultsTimestampsAndHealth(t *testing.T) {
 	}
 }
 
-func TestSchemaVersionIs11(t *testing.T) {
-	if SchemaVersion != 11 {
-		t.Fatalf("SchemaVersion = %d, want 11", SchemaVersion)
+func TestSchemaVersionIs13(t *testing.T) {
+	if SchemaVersion != 13 {
+		t.Fatalf("SchemaVersion = %d, want 13", SchemaVersion)
 	}
 }
 

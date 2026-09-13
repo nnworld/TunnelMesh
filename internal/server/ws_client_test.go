@@ -846,8 +846,9 @@ func TestServeClientSessionWithoutObservabilityAcceptsAuthenticatedClient(t *tes
 	if err != nil {
 		t.Fatalf("ServeClientSession() error = %v", err)
 	}
-	if len(transport.sent) != 1 || transport.sent[0].Type != protocol.FramePong {
-		t.Fatalf("responses = %#v, want one PONG", transport.sent)
+	sent := transport.sentFrames()
+	if len(sent) != 1 || sent[0].Type != protocol.FramePong {
+		t.Fatalf("responses = %#v, want one PONG", sent)
 	}
 }
 
@@ -865,7 +866,7 @@ func TestServeClientSessionResetsStreamAfterShortRelayWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := transport.resetCount(); got != 1 {
+	if got := waitForResetCount(t, transport, 1); got != 1 {
 		t.Fatalf("RESET count = %d, want 1 after partial relay write", got)
 	}
 }
@@ -1024,15 +1025,16 @@ func TestServeClientSessionCapsUniqueOpenAttemptsBeforePayloadDecode(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(transport.sent) != 4 {
-		t.Fatalf("sent frame count = %d, want three RESETs and one GOAWAY", len(transport.sent))
+	sent := transport.sentFrames()
+	if len(sent) != 4 {
+		t.Fatalf("sent frame count = %d, want three RESETs and one GOAWAY", len(sent))
 	}
-	for i, frame := range transport.sent[:3] {
+	for i, frame := range sent[:3] {
 		if frame.Type != protocol.FrameReset {
 			t.Fatalf("frame %d = %+v, want RESET", i, frame)
 		}
 	}
-	terminal := transport.sent[3]
+	terminal := sent[3]
 	if terminal.Type != protocol.FrameGoAway || terminal.StreamID != 0 || len(terminal.Payload) == 0 || len(terminal.Payload) > 128 {
 		t.Fatalf("terminal frame = %+v, want bounded GOAWAY", terminal)
 	}
@@ -1088,6 +1090,7 @@ func (c *shortWriteConn) Close() error {
 }
 
 type scriptedClientTransport struct {
+	mu      sync.Mutex
 	receive []protocol.Frame
 	sent    []protocol.Frame
 }
@@ -1234,20 +1237,48 @@ func (t *scriptedClientTransport) Receive() (protocol.Frame, error) {
 }
 
 func (t *scriptedClientTransport) Send(frame protocol.Frame) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.sent = append(t.sent, frame)
 	return nil
 }
 
 func (t *scriptedClientTransport) Close() error { return nil }
 
+// sentFrames 返回已发送帧的快照；writer goroutine 与测试 goroutine 并发访问
+// sent，直接读切片是数据竞争。
+func (t *scriptedClientTransport) sentFrames() []protocol.Frame {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]protocol.Frame(nil), t.sent...)
+}
+
 func (t *scriptedClientTransport) resetCount() int {
 	count := 0
-	for _, frame := range t.sent {
+	for _, frame := range t.sentFrames() {
 		if frame.Type == protocol.FrameReset {
 			count++
 		}
 	}
 	return count
+}
+
+// waitForResetCount 有界轮询 RESET 数量。relay pump goroutine 可能在
+// ServeClientSession 因 EOF 返回并完成 writer Drain 之后才把 RESET 入队，
+// 因此“返回后立即断言”依赖了实现并不保证的顺序，会在满负载下偶发失败。
+func waitForResetCount(t *testing.T, transport *scriptedClientTransport, want int) int {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := transport.resetCount(); got >= want {
+			return got
+		}
+		select {
+		case <-deadline:
+			return transport.resetCount()
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
 }
 
 func startClientWSTestRuntime(t *testing.T, db *storage.DB) (*ServerRuntime, string, func()) {

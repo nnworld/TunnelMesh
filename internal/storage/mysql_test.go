@@ -62,6 +62,86 @@ func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T
 	}
 }
 
+func TestMySQLV11ToV12WebSSHMigrationsAreAdjacent(t *testing.T) {
+	if SchemaVersion != 13 {
+		t.Fatalf("SchemaVersion = %d, want 13", SchemaVersion)
+	}
+	if !strings.Contains(migrations.V11ToV12SQLite, "CREATE TABLE IF NOT EXISTS credentials") {
+		t.Fatal("SQLite migration lacks credentials")
+	}
+	if !strings.Contains(migrations.V11ToV12MySQL, "CREATE TABLE IF NOT EXISTS remote_servers") {
+		t.Fatal("MySQL migration lacks remote_servers")
+	}
+	if !strings.Contains(migrations.V11ToV12MySQL, "CREATE TABLE IF NOT EXISTS webssh_sessions") {
+		t.Fatal("MySQL migration lacks webssh_sessions")
+	}
+	ddlStart := strings.Index(migrations.DDL, "CREATE TABLE IF NOT EXISTS credentials")
+	if ddlStart < 0 {
+		t.Fatal("full DDL lacks credentials")
+	}
+	ddlEnd := strings.Index(migrations.DDL[ddlStart:], "CREATE TABLE IF NOT EXISTS agent_runtime_stats")
+	if ddlEnd < 0 {
+		t.Fatal("full DDL lacks the schema section following WebSSH tables")
+	}
+	ddlSection := migrations.DDL[ddlStart : ddlStart+ddlEnd]
+	for _, script := range []string{migrations.V11ToV12MySQL, ddlSection} {
+		for _, fragment := range []string{
+			"deleted_at VARCHAR(32),",
+			"updated_at VARCHAR(32) NOT NULL",
+			"ticket_expires_at VARCHAR(32) NOT NULL,",
+			"expires_at VARCHAR(32) NOT NULL,",
+		} {
+			if !strings.Contains(script, fragment) {
+				t.Fatalf("schema must use index-compatible timestamp type; missing %q", fragment)
+			}
+		}
+		for _, forbidden := range []string{
+			"deleted_at TEXT,",
+			"updated_at TEXT NOT NULL,",
+			"ticket_expires_at TEXT NOT NULL,",
+			"expires_at TEXT NOT NULL,",
+		} {
+			if strings.Contains(script, forbidden) {
+				t.Fatalf("schema uses TEXT for an indexed timestamp; forbidden %q", forbidden)
+			}
+		}
+	}
+	for _, fragment := range []string{
+		"ALTER TABLE credentials MODIFY COLUMN deleted_at VARCHAR(32), MODIFY COLUMN updated_at VARCHAR(32) NOT NULL;",
+		"ALTER TABLE remote_servers MODIFY COLUMN deleted_at VARCHAR(32), MODIFY COLUMN updated_at VARCHAR(32) NOT NULL;",
+		"ALTER TABLE webssh_sessions MODIFY COLUMN ticket_expires_at VARCHAR(32) NOT NULL, MODIFY COLUMN expires_at VARCHAR(32) NOT NULL;",
+	} {
+		if !strings.Contains(migrations.V11ToV12MySQL, fragment) {
+			t.Fatalf("MySQL migration must repair a partially applied TEXT table; missing %q", fragment)
+		}
+	}
+}
+
+// The credential secret columns must exist in both dialects as nullable adds:
+// SQLite cannot modify a column, so the migration may only append, and a
+// partially applied retry must be tolerated by the duplicate-column guard.
+func TestMySQLV12ToV13CredentialSecretMigrationIsAdjacent(t *testing.T) {
+	for _, column := range []string{"secret_ciphertext", "secret_nonce", "secret_key_id", "secret_version"} {
+		if !strings.Contains(migrations.V12ToV13MySQL, column) {
+			t.Fatalf("MySQL v12 to v13 migration lacks %s", column)
+		}
+		if !strings.Contains(migrations.V12ToV13SQLite, "ADD COLUMN "+column) {
+			t.Fatalf("SQLite v12 to v13 migration lacks ADD COLUMN %s", column)
+		}
+	}
+	for _, script := range []string{migrations.V12ToV13MySQL, migrations.V12ToV13SQLite} {
+		for _, forbidden := range []string{"DROP COLUMN", "MODIFY COLUMN", "NOT NULL"} {
+			if strings.Contains(script, forbidden) {
+				t.Fatalf("credential secret migration must only add nullable columns; found %q", forbidden)
+			}
+		}
+	}
+	ddlStart := strings.Index(migrations.DDL, "secret_ciphertext TEXT,")
+	if ddlStart < 0 {
+		t.Fatal("full DDL lacks the credential secret columns")
+	}
+}
+
 func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {

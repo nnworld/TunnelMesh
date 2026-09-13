@@ -54,6 +54,23 @@ func waitActiveConnections(t *testing.T, controller *ConnectionController, want 
 	t.Fatalf("active connections=%d, want %d", controller.Snapshot().Active, want)
 }
 
+// waitConnectionStarts polls until the supervisor has launched at least `want`
+// connection attempts. A restart is scheduled by supervise's own backoff, so a
+// fixed sleep in the caller races the retry and flakes under load; the snapshot
+// Active count cannot be used either because it is 1 from the moment the
+// connection is registered, before the first Runner call.
+func waitConnectionStarts(t *testing.T, runner *recordingConnectionRunner, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runner.count() >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("connection restarts=%d, want at least %d", runner.count(), want)
+}
+
 func TestConnectionControllerScalesWithHysteresis(t *testing.T) {
 	runner := newRecordingConnectionRunner()
 	metricsRegistry := prometheus.NewRegistry()
@@ -124,9 +141,7 @@ func TestConnectionControllerRequiresServerAckAndRestartsFailedConnection(t *tes
 		t.Fatalf("active connections=%d, want 1 without Server ack", active)
 	}
 	waitActiveConnections(t, controller, 1)
-	if runner.count() < 2 {
-		t.Fatalf("connection restarts=%d, want at least 2", runner.count())
-	}
+	waitConnectionStarts(t, runner, 2)
 }
 
 func TestConnectionControllerTracksLatencySignals(t *testing.T) {

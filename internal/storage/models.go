@@ -72,6 +72,124 @@ type Agent struct {
 	UpdatedAt    time.Time
 }
 
+// CredentialStatus controls whether management list queries expose an active
+// or logically deleted credential.
+type CredentialStatus string
+
+const (
+	CredentialStatusActive  CredentialStatus = "active"
+	CredentialStatusDeleted CredentialStatus = "deleted"
+	CredentialStatusAll     CredentialStatus = "all"
+)
+
+// CredentialType is an allowlist for future credential formats. WebSSH only
+// accepts SSH public keys in the current version.
+type CredentialType string
+
+const CredentialTypeSSHPublicKey CredentialType = "ssh_public_key"
+
+// CredentialTypePassword stores an operator-provided password as an encrypted
+// secret blob so WebSSH can authenticate without prompting the user. The
+// plaintext never lives in this struct.
+const CredentialTypePassword CredentialType = "password"
+
+// Credential stores a public key only. Browser-side private-key extraction
+// must never send private material to the Server.
+type Credential struct {
+	ID          string
+	OwnerUserID string
+	Name        string
+	Type        CredentialType
+	PublicKey   string
+	Fingerprint string
+	// SecretCiphertext, SecretNonce and SecretKeyID are base64-encoded
+	// AES-GCM values wrapping one JSON payload (password and/or private key
+	// plus passphrase). Empty for credentials without a stored secret.
+	SecretCiphertext string
+	SecretNonce      string
+	SecretKeyID      string
+	SecretVersion    int
+	Enabled          bool
+	DeletedAt        *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// Secret columns are base64-encoded AES-GCM material managed by
+// auth.SecretStore, mirroring ServiceToken. A zero SecretCiphertext means the
+// credential stores no secret and therefore cannot auto-authenticate.
+func (c Credential) HasSecret() bool { return c.SecretCiphertext != "" }
+
+type CredentialFilter struct {
+	OwnerUserID string
+	Type        CredentialType
+	Status      CredentialStatus
+	Keyword     string
+}
+
+type RemoteServerStatus string
+
+const (
+	RemoteServerStatusEnabled  RemoteServerStatus = "enabled"
+	RemoteServerStatusDisabled RemoteServerStatus = "disabled"
+	RemoteServerStatusDeleted  RemoteServerStatus = "deleted"
+	RemoteServerStatusAll      RemoteServerStatus = "all"
+)
+
+// RemoteServer is the durable management record used to create a WebSSH
+// session. It contains no SSH password or private key.
+type RemoteServer struct {
+	ID              string
+	OwnerUserID     string
+	Name            string
+	Host            string
+	Port            int
+	DefaultUsername string
+	CredentialID    string
+	AgentID         string
+	Enabled         bool
+	DeletedAt       *time.Time
+	LastConnectedAt *time.Time
+	LastResult      string
+	LastErrorClass  string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+type RemoteServerFilter struct {
+	OwnerUserID string
+	AgentID     string
+	Status      RemoteServerStatus
+	Keyword     string
+}
+
+type WebSSHSessionStatus string
+
+const (
+	WebSSHSessionPending WebSSHSessionStatus = "pending"
+	WebSSHSessionActive  WebSSHSessionStatus = "active"
+	WebSSHSessionClosed  WebSSHSessionStatus = "closed"
+	WebSSHSessionExpired WebSSHSessionStatus = "expired"
+)
+
+// WebSSHSession owns the one-time browser WebSocket ticket. TicketHash is a
+// SHA-256 digest and must never contain the raw ticket value.
+type WebSSHSession struct {
+	ID              string
+	OwnerUserID     string
+	RemoteServerID  string
+	AgentID         string
+	OwnerNodeID     string
+	TicketHash      string
+	TicketExpiresAt time.Time
+	Status          WebSSHSessionStatus
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	ConnectedAt     *time.Time
+	ClosedAt        *time.Time
+	CloseReason     string
+}
+
 type AgentPolicy struct {
 	ID           string
 	AgentID      string

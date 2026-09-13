@@ -90,6 +90,17 @@ func (f *fakeTransport) Close() error {
 	return nil
 }
 
+// tryReceive drains one queued frame without blocking, for assertions that no
+// RESET was emitted.
+func (f *fakeTransport) tryReceive() (protocol.Frame, bool) {
+	select {
+	case frame := <-f.sent:
+		return frame, true
+	default:
+		return protocol.Frame{}, false
+	}
+}
+
 func TestAgentSessionRegistrationNegotiatesAndHeartbeats(t *testing.T) {
 	m := NewAgentSessionManager(AgentSessionConfig{SupportedCapabilities: []string{"tcp", "udp"}})
 	tr := newFakeTransport()

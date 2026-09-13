@@ -57,6 +57,7 @@ type RuntimeConfig struct {
 	Stream             config.ServerStreamConfig
 	AuthorizationCache config.AuthorizationCacheConfig
 	Downloads          config.DownloadsConfig
+	WebSSH             config.WebSSHConfig
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
@@ -75,6 +76,7 @@ type ServerRuntime struct {
 	ClientTransport             relay.NodeTransport
 	ClientStreamService         *ClientStreamService
 	LocalAgentRelay             *AgentRelayTransport
+	WebSSHBroker                *WebSSHBroker
 	managedRoutes               *ManagedRouteHandler
 	serverNodeLifecycle         *ServerNodeLifecycle
 	relayServer                 *grpc.Server
@@ -82,7 +84,11 @@ type ServerRuntime struct {
 	clientMetadataSweeper       *ClientMetadataSweeper
 	clientMetadataSweeperCancel context.CancelFunc
 	clientMetadataSweeperDone   chan error
+	websshSweeper               *WebSSHSweeper
+	websshSweeperCancel         context.CancelFunc
+	websshSweeperDone           chan error
 	config                      RuntimeConfig
+	WebSSHEnabled               bool
 	metricsRegistry             *prometheus.Registry
 	metrics                     *observability.Metrics
 	authorizationCacheCleanup   func() error
@@ -132,6 +138,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
 	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: clientSessions, ClientConnectionLeases: clientConnectionLeases, ClientObservability: clientObservability, API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error
@@ -159,6 +166,27 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		}
 		return client, nil
 	}
+	// WebSSH uses the same authenticated transport as Agent/Client cluster
+	// close controls. The broker is initialized here so relay control handlers
+	// can always find the process-local owner registry.
+	runtime.WebSSHEnabled = runtimeConfig.WebSSH.Enabled
+	runtime.API.websshService.SetLimits(WebSSHSessionLimits{
+		TicketTTL: runtimeConfig.WebSSH.TicketTTL, SessionTTL: runtimeConfig.WebSSH.SessionTTL,
+		MaxActivePerUser: runtimeConfig.WebSSH.MaxActiveSessionsUser, OpenTimeout: runtimeConfig.WebSSH.OpenTimeout,
+		IdleTimeout: runtimeConfig.WebSSH.IdleTimeout,
+	})
+	runtime.WebSSHBroker = NewWebSSHBroker(WebSSHBrokerDeps{
+		Sessions:        runtime.API.websshService,
+		Opener:          clientTransport,
+		Upgrade:         newXNetWebSSHUpgrader(runtimeConfig.Security, runtimeConfig.WebSSH.MaxMessageBytes),
+		Security:        runtimeConfig.Security,
+		MaxMessageBytes: runtimeConfig.WebSSH.MaxMessageBytes,
+	})
+	webSSHDialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (WebSSHConnectionRelayClient, error) {
+		return runtime.DialRelayNode(ctx, endpoint, epoch)
+	}
+	webSSHConnectionCloser := NewClusterWebSSHConnectionCloseService(db.WebSSHSessions(), db.Nodes(), runtime.WebSSHBroker, serverNodeID, webSSHDialRelayNode)
+	runtime.API.SetWebSSHConnectionCloser(webSSHConnectionCloser)
 	connectionCloser := NewClusterAgentConnectionCloseService(connectionRegistry, agentConnectionLeases, serverNodeID, dialRelayNode)
 	runtime.API.SetClusterAgentConnections(connectionRegistry, connectionCloser, serverNodeID)
 	clientDialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (ClientConnectionRelayClient, error) {
@@ -172,6 +200,20 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	runtime.metricsRegistry = registry
 	runtime.metrics = observability.NewMetrics(registry)
+	runtime.WebSSHBroker.deps.Metrics = runtime.metrics
+	runtime.API.websshService.SetMetrics(runtime.metrics)
+	if runtimeConfig.WebSSH.Enabled {
+		// Sessions persisted by a previous process of this node can never be
+		// served again; close them before new tickets are issued so they do
+		// not consume the per-user active-session quota.
+		closed, err := runtime.API.websshService.CloseStaleLocalSessions(context.Background(), time.Now().UTC(), "node_restarted")
+		if err != nil {
+			return nil, fmt.Errorf("server runtime: close stale webssh sessions: %w", err)
+		}
+		if closed > 0 {
+			slog.Info("webssh_stale_sessions_closed", "count", closed, "node_id", serverNodeID)
+		}
+	}
 	if runtimeConfig.AuthorizationCache.Enabled {
 		positiveTTL := runtimeConfig.AuthorizationCache.LocalPositiveTTL
 		if db.Driver() == storage.DriverMySQL {
@@ -234,6 +276,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 			localAgentRelay.OpenStream,
 			runtime.closeAgentConnection,
 			runtime.closeClientConnection,
+			runtime.closeWebSSHConnection,
 		))
 	}
 	runtime.Credentials = credentialService
@@ -243,6 +286,13 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	runtime.clientMetadataSweeperDone = make(chan error, 1)
 	go func() {
 		runtime.clientMetadataSweeperDone <- runtime.clientMetadataSweeper.Run(sweeperCtx)
+	}()
+	runtime.websshSweeper = NewWebSSHSweeper(db.WebSSHSessions(), DefaultWebSSHSweepInterval)
+	webSSHSweeperCtx, stopWebSSHSweeper := context.WithCancel(context.Background())
+	runtime.websshSweeperCancel = stopWebSSHSweeper
+	runtime.websshSweeperDone = make(chan error, 1)
+	go func() {
+		runtime.websshSweeperDone <- runtime.websshSweeper.Run(webSSHSweeperCtx)
 	}()
 	return runtime, nil
 }
@@ -254,13 +304,24 @@ func (r *ServerRuntime) Close() error {
 		return nil
 	}
 	r.closed.Store(true)
-	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr error
+	if r.WebSSHBroker != nil {
+		r.WebSSHBroker.CloseAll()
+	}
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr error
 	if r.clientMetadataSweeperCancel != nil {
 		r.clientMetadataSweeperCancel()
 		if err := <-r.clientMetadataSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
 			clientMetadataSweeperErr = err
 		}
 		r.clientMetadataSweeperCancel = nil
+	}
+	if r.websshSweeperCancel != nil {
+		r.websshSweeperCancel()
+		if err := <-r.websshSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
+			webSSHSweeperErr = err
+		}
+		r.websshSweeperCancel = nil
+		r.websshSweeperDone = nil
 	}
 	if r.authorizationCacheCleanup != nil {
 		authorizationCacheErr = r.authorizationCacheCleanup()
@@ -283,7 +344,7 @@ func (r *ServerRuntime) Close() error {
 	if r.ClientStreamService != nil {
 		_ = r.ClientStreamService.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr)
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The
@@ -334,6 +395,31 @@ func (r *ServerRuntime) closeClientConnection(ctx context.Context, req relay.Clo
 	return nil
 }
 
+// closeWebSSHConnection is the authenticated inter-Server control handler for
+// browser WebSSH process state. Durable session state is closed by the
+// originating node before this RPC is issued.
+func (r *ServerRuntime) closeWebSSHConnection(ctx context.Context, req relay.CloseWebSSHConnectionRequest) error {
+	if r == nil || r.WebSSHBroker == nil {
+		return status.Error(codes.Unimplemented, "webssh close control is not configured")
+	}
+	if !r.WebSSHEnabled {
+		return status.Error(codes.Unimplemented, "webssh is disabled")
+	}
+	principal, ok := relay.ServerNodePrincipalFromContext(ctx)
+	if !ok || principal.NodeID != req.RequestedByNodeID {
+		return status.Error(codes.PermissionDenied, "relay webssh close caller identity is denied")
+	}
+	if err := r.WebSSHBroker.CloseLocal(req.SessionID); err != nil {
+		switch {
+		case errors.Is(err, ErrWebSSHBrokerClosed):
+			return status.Error(codes.NotFound, "webssh session is not active locally")
+		default:
+			return status.Error(codes.Internal, "webssh connection close failed")
+		}
+	}
+	return nil
+}
+
 // DialRelayNode is the authenticated production client path for a cluster
 // relay. It intentionally has no unauthenticated fallback.
 func (r *ServerRuntime) DialRelayNode(ctx context.Context, endpoint string, epoch int64) (*relay.GRPCNodeTransport, error) {
@@ -364,7 +450,11 @@ func (r *ServerRuntime) Handler() http.Handler {
 		return http.NotFoundHandler()
 	}
 	health := NewHealthHandler(r, promhttp.HandlerFor(r.metricsRegistry, promhttp.HandlerOpts{}))
-	return NewWebHandlerWithManagedRoutes(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, r.managedRoutes)
+	var webSSH http.Handler
+	if r.WebSSHEnabled {
+		webSSH = r.WebSSHBroker
+	}
+	return NewWebHandlerWithManagedRoutes(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, webSSH, r.managedRoutes)
 }
 
 // Live reports process responsiveness and intentionally performs no I/O.

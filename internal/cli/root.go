@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/tunnelmesh/tunnelmesh/internal/agent"
@@ -66,6 +67,13 @@ type rootOptions struct {
 	relayKey                    string
 	relayServerName             string
 	relayNodeToken              string
+	webSSHEnabled               bool
+	webSSHTicketTTL             time.Duration
+	webSSHSessionTTL            time.Duration
+	webSSHMaxActiveSessionsUser int
+	webSSHOpenTimeout           time.Duration
+	webSSHIdleTimeout           time.Duration
+	webSSHMaxMessageBytes       int
 	clientServerURL             string
 	clientToken                 string
 }
@@ -110,6 +118,13 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	flags.StringVar(&opts.relayKey, "server.relay.key", "", "server-node relay private key file")
 	flags.StringVar(&opts.relayServerName, "server.relay.server_name", "", "server-node relay TLS server name")
 	flags.StringVar(&opts.relayNodeToken, "server.relay.node_token", "", "server-node relay token")
+	flags.BoolVar(&opts.webSSHEnabled, "server.webssh.enabled", false, "enable browser WebSSH/SFTP sessions")
+	flags.DurationVar(&opts.webSSHTicketTTL, "server.webssh.ticket_ttl", 0, "WebSSH one-time ticket lifetime")
+	flags.DurationVar(&opts.webSSHSessionTTL, "server.webssh.session_ttl", 0, "maximum WebSSH session lifetime")
+	flags.IntVar(&opts.webSSHMaxActiveSessionsUser, "server.webssh.max_active_sessions_per_user", 0, "maximum active WebSSH sessions per user")
+	flags.DurationVar(&opts.webSSHOpenTimeout, "server.webssh.open_timeout", 0, "WebSSH Agent relay open timeout")
+	flags.DurationVar(&opts.webSSHIdleTimeout, "server.webssh.idle_timeout", 0, "WebSSH browser idle timeout")
+	flags.IntVar(&opts.webSSHMaxMessageBytes, "server.webssh.max_message_bytes", 0, "maximum WebSSH WebSocket message size")
 	flags.StringVar(&opts.clientServerURL, "client.server_url", "", "Client WebSocket URL")
 	flags.StringVar(&opts.clientToken, "client.token", "", "Client bearer token")
 	root.AddCommand(factory(opts)...)
@@ -124,7 +139,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH})
 			if err != nil {
 				return err
 			}
@@ -703,6 +718,27 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 	}
 	if flags.Changed("server.relay.node_token") {
 		values["server.relay.node_token"] = opts.relayNodeToken
+	}
+	if flags.Changed("server.webssh.enabled") {
+		values["server.webssh.enabled"] = opts.webSSHEnabled
+	}
+	if flags.Changed("server.webssh.ticket_ttl") {
+		values["server.webssh.ticket_ttl"] = opts.webSSHTicketTTL
+	}
+	if flags.Changed("server.webssh.session_ttl") {
+		values["server.webssh.session_ttl"] = opts.webSSHSessionTTL
+	}
+	if flags.Changed("server.webssh.max_active_sessions_per_user") {
+		values["server.webssh.max_active_sessions_per_user"] = opts.webSSHMaxActiveSessionsUser
+	}
+	if flags.Changed("server.webssh.open_timeout") {
+		values["server.webssh.open_timeout"] = opts.webSSHOpenTimeout
+	}
+	if flags.Changed("server.webssh.idle_timeout") {
+		values["server.webssh.idle_timeout"] = opts.webSSHIdleTimeout
+	}
+	if flags.Changed("server.webssh.max_message_bytes") {
+		values["server.webssh.max_message_bytes"] = opts.webSSHMaxMessageBytes
 	}
 	if flags.Changed("client.server_url") {
 		values["client.server_url"] = opts.clientServerURL

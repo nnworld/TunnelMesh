@@ -158,6 +158,7 @@ type RelayServer interface {
 	OpenStream(RelayOpenStreamServer) error
 	CloseAgentConnection(context.Context, CloseAgentConnectionRequest) error
 	CloseClientConnection(context.Context, CloseClientConnectionRequest) error
+	CloseWebSSHConnection(context.Context, CloseWebSSHConnectionRequest) error
 }
 
 type RelayOpenResultHandler func(context.Context, RelayOpenMetadata) (io.ReadWriteCloser, RelayOpenResult, error)
@@ -171,6 +172,7 @@ type relayServer struct {
 	openResultHandler  RelayOpenResultHandler
 	closeHandler       CloseAgentConnectionFunc
 	clientCloseHandler CloseClientConnectionFunc
+	websshCloseHandler CloseWebSSHConnectionFunc
 }
 
 func NewRelayServer(handler func(context.Context, StreamRequest) (io.ReadWriteCloser, error)) RelayServer {
@@ -188,8 +190,8 @@ func NewRelayServerWithOpenResult(handler RelayOpenResultHandler) RelayServer {
 func NewRelayServerWithOpenResultAndClose(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeHandler CloseAgentConnectionFunc) RelayServer {
 	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeHandler}
 }
-func NewRelayServerWithControls(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeAgentHandler CloseAgentConnectionFunc, closeClientHandler CloseClientConnectionFunc) RelayServer {
-	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeAgentHandler, clientCloseHandler: closeClientHandler}
+func NewRelayServerWithControls(handler RelayOpenResultHandler, legacyHandler func(context.Context, StreamRequest) (io.ReadWriteCloser, error), closeAgentHandler CloseAgentConnectionFunc, closeClientHandler CloseClientConnectionFunc, websshCloseHandler CloseWebSSHConnectionFunc) RelayServer {
+	return &relayServer{openResultHandler: handler, handler: legacyHandler, closeHandler: closeAgentHandler, clientCloseHandler: closeClientHandler, websshCloseHandler: websshCloseHandler}
 }
 func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
 	s.RegisterService(&grpc.ServiceDesc{
@@ -197,6 +199,7 @@ func RegisterRelayServer(s grpc.ServiceRegistrar, srv RelayServer) {
 		Methods: []grpc.MethodDesc{
 			{MethodName: "CloseAgentConnection", Handler: relayCloseAgentConnectionHandler},
 			{MethodName: "CloseClientConnection", Handler: relayCloseClientConnectionHandler},
+			{MethodName: "CloseWebSSHConnection", Handler: relayCloseWebSSHConnectionHandler},
 		},
 		Streams: []grpc.StreamDesc{{StreamName: "OpenStream", Handler: relayOpenStreamHandler, ServerStreams: true, ClientStreams: true}},
 	}, srv)
@@ -214,6 +217,22 @@ func relayCloseClientConnectionHandler(srv interface{}, ctx context.Context, dec
 	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tunnelmesh.relay.v1.Relay/CloseClientConnection"}
 	handler := func(ctx context.Context, request interface{}) (interface{}, error) {
 		return nil, srv.(RelayServer).CloseClientConnection(ctx, request.(CloseClientConnectionRequest))
+	}
+	return interceptor(ctx, req, info, handler)
+}
+
+func relayCloseWebSSHConnectionHandler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(structpb.Struct)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	req := closeWebSSHConnectionRequestFromMetadata(in.GetFields())
+	if interceptor == nil {
+		return nil, srv.(RelayServer).CloseWebSSHConnection(ctx, req)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/tunnelmesh.relay.v1.Relay/CloseWebSSHConnection"}
+	handler := func(ctx context.Context, request interface{}) (interface{}, error) {
+		return nil, srv.(RelayServer).CloseWebSSHConnection(ctx, request.(CloseWebSSHConnectionRequest))
 	}
 	return interceptor(ctx, req, info, handler)
 }
@@ -427,6 +446,18 @@ func (r *relayServer) CloseClientConnection(ctx context.Context, req CloseClient
 	return r.clientCloseHandler(closeCtx, req)
 }
 
+func (r *relayServer) CloseWebSSHConnection(ctx context.Context, req CloseWebSSHConnectionRequest) error {
+	if r.websshCloseHandler == nil {
+		return status.Error(codes.Unimplemented, "relay webssh close control is not configured")
+	}
+	if req.SessionID == "" || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay webssh close request is invalid")
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return r.websshCloseHandler(closeCtx, req)
+}
+
 var relayStreamDesc = &grpc.StreamDesc{StreamName: "OpenStream", ServerStreams: true, ClientStreams: true}
 
 func DialGRPCNode(ctx context.Context, endpoint string, cfg *tls.Config) (*GRPCNodeTransport, error) {
@@ -566,6 +597,20 @@ func (n *GRPCNodeTransport) CloseClientConnection(ctx context.Context, req Close
 	return n.conn.Invoke(ctx, "/tunnelmesh.relay.v1.Relay/CloseClientConnection", msg, &emptypb.Empty{})
 }
 
+func (n *GRPCNodeTransport) CloseWebSSHConnection(ctx context.Context, req CloseWebSSHConnectionRequest) error {
+	if n == nil || n.conn == nil {
+		return ErrNodeDisconnected
+	}
+	if req.SessionID == "" || req.RequestedByNodeID == "" {
+		return status.Error(codes.InvalidArgument, "relay webssh close request is invalid")
+	}
+	msg, err := structpb.NewStruct(closeWebSSHConnectionMetadata(req))
+	if err != nil {
+		return err
+	}
+	return n.conn.Invoke(ctx, "/tunnelmesh.relay.v1.Relay/CloseWebSSHConnection", msg, &emptypb.Empty{})
+}
+
 func relayStreamMetadata(req StreamRequest) map[string]any {
 	return map[string]any{
 		"node_id": req.NodeID, "agent_id": req.AgentID,
@@ -623,6 +668,17 @@ func closeClientConnectionMetadata(req CloseClientConnectionRequest) map[string]
 		"connection_id":        req.ConnectionID,
 		"connection_epoch":     req.ConnectionEpoch,
 		"requested_by_node_id": req.RequestedByNodeID,
+	}
+}
+
+func closeWebSSHConnectionMetadata(req CloseWebSSHConnectionRequest) map[string]any {
+	return map[string]any{"session_id": req.SessionID, "requested_by_node_id": req.RequestedByNodeID}
+}
+
+func closeWebSSHConnectionRequestFromMetadata(fields map[string]*structpb.Value) CloseWebSSHConnectionRequest {
+	return CloseWebSSHConnectionRequest{
+		SessionID:         fields["session_id"].GetStringValue(),
+		RequestedByNodeID: fields["requested_by_node_id"].GetStringValue(),
 	}
 }
 

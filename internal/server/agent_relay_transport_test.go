@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -777,5 +778,275 @@ func receiveAgentRelayFrame(t *testing.T, transport *fakeTransport) protocol.Fra
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for Agent relay frame")
 		return protocol.Frame{}
+	}
+}
+
+func TestAgentRelayStreamAdvertisesDefaultWindowAndReleasesItOnRead(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-window-default", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	// Server-originated opens must advertise a receive window: without one the
+	// Agent sends unbounded and overflows the inbound frame buffer.
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-window-default", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if open.Type != protocol.FrameOpenStream || open.Window != protocol.DefaultServerReceiveWindow {
+		t.Fatalf("OPEN=%+v, want window %d", open, protocol.DefaultServerReceiveWindow)
+	}
+
+	payload := make([]byte, protocol.MaxStreamFrame)
+	for i := 0; i < 4; i++ {
+		if err := mux.handleAgentFrameGeneration("agent-window-default", session.serverGeneration, protocol.Frame{
+			Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buffer := make([]byte, protocol.MaxStreamFrame)
+	for i := 0; i < 4; i++ {
+		n, readErr := stream.Read(buffer)
+		if readErr != nil || n != len(buffer) {
+			t.Fatalf("Read=%d,%v want %d,nil", n, readErr, len(buffer))
+		}
+	}
+	update := receiveAgentRelayFrame(t, agentTransport)
+	if update.Type != protocol.FrameWindowUpdate || update.StreamID != open.StreamID || update.Window < protocol.DefaultWindowUpdateThreshold {
+		t.Fatalf("WINDOW_UPDATE=%+v, want at least %d bytes released", update, protocol.DefaultWindowUpdateThreshold)
+	}
+}
+
+func TestAgentRelayStreamWriteBlocksOnAgentSendWindowAndResumesOnUpdate(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-send-window", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-send-window", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := receiveAgentRelayFrame(t, agentTransport)
+
+	// Exhaust the credit the Agent grants by default.
+	full := make([]byte, protocol.DefaultAgentReceiveWindow)
+	if _, err := stream.Write(full); err != nil {
+		t.Fatalf("Write within window failed: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := stream.Write([]byte("x"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Write beyond the Agent window returned %v, want it to block", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if err := mux.handleAgentFrameGeneration("agent-send-window", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: open.StreamID, Window: 4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("blocked Write after WINDOW_UPDATE: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Write did not resume after WINDOW_UPDATE")
+	}
+}
+
+func TestAgentRelayStreamCloseWakesBlockedWrite(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-send-window-close", NodeID: "node", Epoch: 1}, agentTransport); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-send-window-close", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiveAgentRelayFrame(t, agentTransport)
+	if _, err := stream.Write(make([]byte, protocol.DefaultAgentReceiveWindow)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := stream.Write([]byte("x"))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("blocked Write succeeded after Close, want error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Write did not wake on Close")
+	}
+}
+
+// TestAgentRelayStreamAcceptsManySmallFramesWithinWindow guards the byte/slot
+// unit mismatch: the receive window is accounted in bytes, so a peer that
+// stays inside its window using many small DATA frames must never be reset.
+func TestAgentRelayStreamAcceptsManySmallFramesWithinWindow(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-small-frames", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-small-frames", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+
+	// Drain control traffic in the background so WINDOW_UPDATE bookkeeping does
+	// not stall, and record any RESET the relay emits.
+	var resetSeen atomic.Bool
+	stopDrain := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case frame := <-agentTransport.sent:
+				if frame.Type == protocol.FrameReset {
+					resetSeen.Store(true)
+				}
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stopDrain)
+		<-drainDone
+	}()
+
+	const frameSize = 1024
+	frames := int(protocol.DefaultServerReceiveWindow/frameSize) - 1
+	for i := 0; i < frames; i++ {
+		payload := make([]byte, frameSize)
+		for j := range payload {
+			payload[j] = byte(i)
+		}
+		if err := mux.handleAgentFrameGeneration("agent-small-frames", session.serverGeneration, protocol.Frame{
+			Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: open.StreamID, Payload: payload,
+		}); err != nil {
+			t.Fatalf("frame %d rejected: %v", i, err)
+		}
+	}
+
+	// A consumer draining in chunks smaller than a frame must still see every
+	// byte intact and in order. The odd size keeps partial-frame boundaries in
+	// play without turning the assertion itself into a benchmark.
+	got := make([]byte, 0, frames*frameSize)
+	small := make([]byte, 63)
+	for len(got) < frames*frameSize {
+		n, readErr := stream.Read(small)
+		if readErr != nil {
+			t.Fatalf("Read after %d bytes: %v", len(got), readErr)
+		}
+		if n == 0 {
+			t.Fatalf("Read returned 0,nil after %d bytes", len(got))
+		}
+		got = append(got, small[:n]...)
+	}
+	for i := 0; i < frames; i++ {
+		for j := 0; j < frameSize; j++ {
+			if got[i*frameSize+j] != byte(i) {
+				t.Fatalf("byte %d = %d, want %d", i*frameSize+j, got[i*frameSize+j], byte(i))
+			}
+		}
+	}
+	if resetSeen.Load() {
+		t.Fatal("relay emitted RESET for a peer that stayed inside its receive window")
+	}
+}
+
+// TestAgentRelayStreamSurvivesUndrainedWindowUpdates guards the bulk-upload
+// kill switch: WINDOW_UPDATE credit is applied to the send state before the
+// frame is mirrored into controlCh, and the WebSSH/SFTP consumer never polls
+// ReadControl. Failing the stream when that mirror queue filled turned every
+// upload larger than the control queue into a dead channel.
+func TestAgentRelayStreamSurvivesUndrainedWindowUpdates(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-window-flood", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager)
+	defer mux.Close()
+
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-window-flood", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+
+	// More updates than the control queue can hold, with nobody draining it.
+	updates := 40
+	for i := 0; i < updates; i++ {
+		if err := mux.handleAgentFrameGeneration("agent-window-flood", session.serverGeneration, protocol.Frame{
+			Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: open.StreamID, Window: 1024,
+		}); err != nil {
+			t.Fatalf("WINDOW_UPDATE %d rejected: %v", i, err)
+		}
+	}
+
+	// The stream must still be writable: the credit is authoritative, the
+	// mirrored frame is not.
+	payload := make([]byte, 4096)
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("Write after %d undrained WINDOW_UPDATEs: %v", updates, err)
+	}
+	for {
+		frame, ok := agentTransport.tryReceive()
+		if !ok {
+			break
+		}
+		if frame.Type == protocol.FrameReset {
+			t.Fatalf("unexpected RESET after undrained WINDOW_UPDATE flood: %+v", frame)
+		}
 	}
 }

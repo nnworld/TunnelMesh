@@ -256,6 +256,174 @@ paths:
   /api/v1/routes:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Managed routes}}}
     post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}, '409': {description: Duplicate route}}}
+  /api/v1/credentials:
+    get:
+      summary: List SSH credentials visible to the caller
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: type, in: query, schema: {type: string, enum: [ssh_public_key, password]}}
+        - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}}
+        - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialPageEnvelope'}}}}
+        '400': {description: Invalid filter}
+        '401': {description: Unauthenticated}
+    post:
+      summary: Create an SSH credential (public key or password)
+      description: A `password` credential requires `secret.password`; an `ssh_public_key` credential requires `publicKey` and may optionally store `secret.privateKey` plus `secret.passphrase` for browser auto-authentication. Secrets are sealed with AES-256-GCM. The response reports `hasSecret` only and never echoes the submitted material.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialCreateRequest'}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}
+        '400': {description: Invalid public key, secret shape or fields}
+        '401': {description: Unauthenticated}
+        '409': {description: Idempotency conflict}
+        '503': {description: A secret was supplied but TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured; nothing is stored}
+  /api/v1/credentials/{credentialId}:
+    parameters:
+      - {name: credentialId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read one credential
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Credential, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+    put:
+      summary: Replace an SSH credential
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialCreateRequest'}}}}
+      responses: {'200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}, '400': {description: Invalid fields}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}, '503': {description: A secret was supplied but TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured}}
+    patch:
+      summary: Update supplied credential fields
+      description: Omitted fields keep their stored value; an omitted or empty `secret` keeps the stored secret, while changing `type` clears it.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialPatchRequest'}}}}
+      responses: {'200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}, '400': {description: Invalid fields}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}, '503': {description: A secret was supplied but TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured}}
+    delete:
+      summary: Logically delete a credential
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Deleted, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+  /api/v1/credentials/{credentialId}/restore:
+    parameters:
+      - {name: credentialId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Restore a logically deleted credential
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Restored, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+  /api/v1/credentials/extract-ssh-public-key:
+    post:
+      summary: Extract an SSH public key from an uploaded private key
+      description: One-time in-memory parse. The private key and passphrase are never persisted, logged, or relayed. Responses are never cached.
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ExtractSSHPublicKeyRequest'}
+      responses:
+        '200':
+          description: Extracted public key
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ExtractSSHPublicKeyEnvelope'}}}
+        '400': {description: Invalid private key}
+        '401': {description: Unauthenticated}
+  /api/v1/remote-servers:
+    get:
+      summary: List managed remote servers visible to the caller
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: agentId, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [enabled, disabled, deleted, all], default: enabled}}
+        - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerPageEnvelope'}}}}
+        '400': {description: Invalid filter}
+        '401': {description: Unauthenticated}
+    post:
+      summary: Create a managed remote server record
+      description: Stores only connection metadata. Passwords and private keys are never accepted or persisted.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerCreateRequest'}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}
+        '400': {description: Invalid fields or Agent policy denied the target}
+        '401': {description: Unauthenticated}
+        '403': {description: Forbidden}
+        '409': {description: Idempotency conflict}
+  /api/v1/remote-servers/{serverId}:
+    parameters:
+      - {name: serverId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read one managed remote server
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Remote server, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+    put:
+      summary: Replace a managed remote server
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerCreateRequest'}}}}
+      responses: {'200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}, '400': {description: Invalid fields}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+    patch:
+      summary: Update supplied remote-server fields
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerPatchRequest'}}}}
+      responses: {'200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}, '400': {description: Invalid fields}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+    delete:
+      summary: Logically delete a managed remote server
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Deleted, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+  /api/v1/remote-servers/{serverId}/restore:
+    parameters:
+      - {name: serverId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Restore a logically deleted remote server
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Restored, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+  /api/v1/remote-servers/{serverId}/ssh-sessions:
+    parameters:
+      - {name: serverId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Create a one-time browser WebSSH/SFTP ticket
+      description: Returns a single-use ticket for the browser WebSocket. The Server brokers encrypted bytes only and never receives or stores terminal output or SFTP file content. When the bound credential stores a secret and the caller owns it, the response additionally carries a one-time `auth` payload so the browser can authenticate without prompting; that payload is attached after the idempotency record is written, so a replay returns the ticket without any secret. Responses that may contain `auth` carry a `Cache-Control` value of `no-store` and are audited as `credential.revealed` (credential id only). When no usable secret exists the `auth` field is omitted and the console falls back to the manual password dialog.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/WebSSHSessionCreateRequest'}}}}
+      responses:
+        '201': {description: One-time ticket, content: {application/json: {schema: {$ref: '#/components/schemas/WebSSHTicketEnvelope'}}}}
+        '400': {description: Invalid username or credential}
+        '401': {description: Unauthenticated}
+        '403': {description: Forbidden}
+        '404': {description: Remote server not found}
+        '409': {description: Idempotency conflict or active-session limit reached}
+  /api/v1/ssh-sessions:
+    get:
+      summary: List the caller's own active browser SSH sessions
+      description: Lets a user release a stuck active-session quota from the console without database access. Only sessions owned by the caller are returned, and administrators also see only their own sessions. Closed and expired sessions are omitted; history remains in the audit log.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/WebSSHSessionPageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+  /api/v1/ssh-sessions/{sessionId}:
+    parameters:
+      - {name: sessionId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read one browser SSH session
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Session, content: {application/json: {schema: {$ref: '#/components/schemas/WebSSHSessionEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}}
+    delete:
+      summary: Close one browser SSH session
+      description: Closes the process-local or cluster-owned WebSocket bridge and records a durable closed state. This API never exposes SSH bytes or credentials.
+      security: [{bearerAuth: []}]
+      responses: {'200': {description: Closed session, content: {application/json: {schema: {$ref: '#/components/schemas/WebSSHSessionEnvelope'}}}}, '401': {description: Unauthenticated}, '403': {description: Forbidden}, '404': {description: Not found}, '503': {description: Owning Server node is unavailable}}
   /api/v1/routes/{routeId}:
     parameters: [{name: routeId, in: path, required: true, schema: {type: string}}]
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Route}}}
@@ -484,6 +652,217 @@ components:
     PasswordChangeRequest: {type: object, additionalProperties: false, required: [currentPassword, newPassword], properties: {currentPassword: {type: string, format: password}, newPassword: {type: string, format: password, minLength: 12, maxLength: 128}}}
     UserCreateRequest: {type: object, additionalProperties: false, required: [username], properties: {username: {type: string, minLength: 3, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$'}}}
     UserStatusRequest: {type: object, additionalProperties: false, required: [disabled], properties: {disabled: {type: boolean}}}
+    CredentialCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        type: {type: string, enum: [ssh_public_key, password], default: ssh_public_key}
+        publicKey: {type: string, minLength: 20, maxLength: 16384, description: OpenSSH public-key line; required for ssh_public_key, must be omitted for password. Private-key material is rejected.}
+        enabled: {type: boolean, default: true}
+        secret: {$ref: '#/components/schemas/CredentialSecretInput'}
+    CredentialSecretInput:
+      type: object
+      additionalProperties: false
+      description: Write-only authentication secret. Sealed with AES-256-GCM before it reaches storage and never rendered back by any read API. Omit or send an empty object to keep the stored secret unchanged; changing `type` clears it.
+      properties:
+        password: {type: string, format: password, maxLength: 4096, description: Required for a password credential; rejected for ssh_public_key}
+        privateKey: {type: string, format: password, maxLength: 65536, description: Optional for ssh_public_key; enables browser auto-authentication. Rejected for a password credential.}
+        passphrase: {type: string, format: password, maxLength: 1024, description: Requires privateKey}
+    ExtractSSHPublicKeyRequest:
+      type: object
+      additionalProperties: false
+      required: [privateKey]
+      properties:
+        privateKey: {type: string, format: password, maxLength: 65536, description: Private key parsed once in server memory and never persisted}
+        passphrase: {type: string, format: password, maxLength: 1024}
+    ExtractSSHPublicKey:
+      type: object
+      additionalProperties: false
+      required: [publicKey, fingerprint]
+      properties:
+        publicKey: {type: string}
+        fingerprint: {type: string}
+    ExtractSSHPublicKeyEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/ExtractSSHPublicKey'}}
+    CredentialPatchRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        type: {type: string, enum: [ssh_public_key, password]}
+        publicKey: {type: string, minLength: 20, maxLength: 16384}
+        enabled: {type: boolean}
+        secret: {$ref: '#/components/schemas/CredentialSecretInput'}
+    Credential:
+      type: object
+      additionalProperties: false
+      required: [id, ownerUserId, name, type, publicKey, fingerprint, enabled, hasSecret, status, createdAt, updatedAt]
+      properties:
+        id: {type: string}
+        ownerUserId: {type: string}
+        name: {type: string}
+        type: {type: string, enum: [ssh_public_key, password]}
+        publicKey: {type: string, description: Empty for a password credential}
+        fingerprint: {type: string, description: Empty for a password credential}
+        enabled: {type: boolean}
+        hasSecret: {type: boolean, description: True when an encrypted authentication secret is stored. Neither the ciphertext, nonce, key id nor plaintext is ever returned.}
+        status: {type: string, enum: [active, deleted]}
+        deletedAt: {type: string, format: date-time, nullable: true}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    CredentialEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/Credential'}}
+    CredentialPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Credential'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    CredentialPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/CredentialPage'}}
+    RemoteServerCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, host, port, defaultUsername, agentId]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        host: {type: string, minLength: 1, maxLength: 255}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        defaultUsername: {type: string, minLength: 1, maxLength: 255}
+        credentialId: {type: string, description: Optional SSH public-key credential owned by the caller}
+        agentId: {type: string}
+        enabled: {type: boolean, default: true}
+    RemoteServerPatchRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        host: {type: string, minLength: 1, maxLength: 255}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        defaultUsername: {type: string, minLength: 1, maxLength: 255}
+        credentialId: {type: string}
+        agentId: {type: string}
+        enabled: {type: boolean}
+    RemoteServer:
+      type: object
+      additionalProperties: false
+      required: [id, ownerUserId, name, host, port, defaultUsername, agentId, enabled, status, createdAt, updatedAt]
+      properties:
+        id: {type: string}
+        ownerUserId: {type: string}
+        name: {type: string}
+        host: {type: string}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        defaultUsername: {type: string}
+        credentialId: {type: string, nullable: true}
+        agentId: {type: string}
+        agentName: {type: string, nullable: true, description: Display name joined from the enabled Agent}
+        credentialName: {type: string, nullable: true, description: Display name joined from the selected SSH public-key credential}
+        credentialType: {type: string, nullable: true, enum: [ssh_public_key, password], description: Type of the bound credential; null when no credential is bound}
+        credentialHasSecret: {type: boolean, nullable: true, description: True when the bound credential can auto-authenticate the browser session; null when no credential is bound}
+        agentOnline: {type: boolean, nullable: true, description: True when the Agent has an active lease; null when lease state is unavailable}
+        enabled: {type: boolean}
+        status: {type: string, enum: [enabled, disabled, deleted]}
+        lastConnectedAt: {type: string, format: date-time, nullable: true}
+        lastResult: {type: string}
+        lastErrorClass: {type: string}
+        deletedAt: {type: string, format: date-time, nullable: true}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    RemoteServerEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/RemoteServer'}}
+    RemoteServerPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/RemoteServer'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    RemoteServerPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/RemoteServerPage'}}
+    WebSSHSessionCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [username]
+      properties:
+        username: {type: string, minLength: 1, maxLength: 255}
+        credentialId: {type: string, description: Optional SSH public-key credential used by the browser client}
+    WebSSHTicket:
+      type: object
+      additionalProperties: false
+      required: [sessionId, ticket, websocketPath]
+      properties:
+        sessionId: {type: string}
+        ticket: {type: string, description: One-time ticket; never logged or returned again}
+        websocketPath: {type: string, description: Binary WebSocket path excluding the ticket query}
+        auth: {$ref: '#/components/schemas/WebSSHAuth'}
+    WebSSHAuth:
+      type: object
+      additionalProperties: false
+      required: [kind, credentialId]
+      description: One-time decrypted authentication material for the credential owner. Held in browser memory only, never persisted by the Server, never logged, and absent from idempotent replays.
+      properties:
+        kind: {type: string, enum: [password, private_key], description: Which field the browser must use for libssh2 authentication}
+        credentialId: {type: string}
+        password: {type: string, format: password, description: Present when kind=password}
+        privateKey: {type: string, format: password, description: Present when kind=private_key}
+        passphrase: {type: string, format: password, description: Present when the stored private key is passphrase-protected}
+    WebSSHTicketEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/WebSSHTicket'}}
+    WebSSHSession:
+      type: object
+      additionalProperties: false
+      required: [id, remoteServerId, agentId, status, createdAt, expiresAt]
+      properties:
+        id: {type: string}
+        remoteServerId: {type: string}
+        agentId: {type: string}
+        status: {type: string, enum: [pending, active, closed, expired]}
+        createdAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        connectedAt: {type: string, format: date-time, nullable: true}
+        closedAt: {type: string, format: date-time, nullable: true}
+        closeReason: {type: string}
+    WebSSHSessionEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/WebSSHSession'}}
+    WebSSHSessionPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/WebSSHSession'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    WebSSHSessionPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/WebSSHSessionPage'}}
     AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
     AgentMetadataEnvelope:
       allOf:

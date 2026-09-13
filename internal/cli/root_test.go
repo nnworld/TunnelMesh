@@ -63,6 +63,48 @@ func TestServerAdminExposesCredentialRegeneration(t *testing.T) {
 	}
 }
 
+func TestServerRootExposesWebSSHConfigurationFlags(t *testing.T) {
+	root := cli.NewServerRoot()
+	args := []string{
+		"print-config",
+		"--server.webssh.enabled=false",
+		"--server.webssh.ticket_ttl=45s",
+		"--server.webssh.session_ttl=12h",
+		"--server.webssh.max_active_sessions_per_user=7",
+		"--server.webssh.open_timeout=15s",
+		"--server.webssh.idle_timeout=2m",
+		"--server.webssh.max_message_bytes=131072",
+	}
+	root.SetArgs(args)
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var printed struct {
+		Server struct {
+			WebSSH struct {
+				Enabled               bool          `json:"enabled"`
+				TicketTTL             time.Duration `json:"ticket_ttl"`
+				SessionTTL            time.Duration `json:"session_ttl"`
+				MaxActiveSessionsUser int           `json:"max_active_sessions_per_user"`
+				OpenTimeout           time.Duration `json:"open_timeout"`
+				IdleTimeout           time.Duration `json:"idle_timeout"`
+				MaxMessageBytes       int           `json:"max_message_bytes"`
+			} `json:"webssh"`
+		} `json:"server"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &printed); err != nil {
+		t.Fatalf("unmarshal printed config: %v output=%s", err, output.String())
+	}
+	got := printed.Server.WebSSH
+	if got.Enabled || got.TicketTTL != 45*time.Second || got.SessionTTL != 12*time.Hour || got.MaxActiveSessionsUser != 7 ||
+		got.OpenTimeout != 15*time.Second || got.IdleTimeout != 2*time.Minute || got.MaxMessageBytes != 131072 {
+		t.Fatalf("webssh config = %+v", got)
+	}
+}
+
 func TestServerAdminExposesBootstrap(t *testing.T) {
 	root := cli.NewServerRoot()
 	admin := findCommand(root, "admin")

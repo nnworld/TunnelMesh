@@ -20,7 +20,7 @@ func TestAccountMigrationV5ToV6SQLite(t *testing.T) {
 	}
 	defer raw.Close()
 
-	legacyDDL := strings.ReplaceAll(migrations.DDL, "    deleted_at VARCHAR(32),\n", "")
+	legacyDDL := strings.ReplaceAll(migrations.DDL, "    disabled INTEGER NOT NULL DEFAULT 0,\n    deleted_at VARCHAR(32),\n", "    disabled INTEGER NOT NULL DEFAULT 0,\n")
 	legacyDDL = strings.ReplaceAll(legacyDDL, "CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);\n", "")
 	if _, err := raw.Exec(legacyDDL); err != nil {
 		t.Fatalf("create v5 schema: %v", err)
@@ -54,7 +54,7 @@ func TestAccountMigrationDoesNotAdvanceVersionForWrongExistingIndex(t *testing.T
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	legacyDDL := strings.ReplaceAll(migrations.DDL, "    deleted_at VARCHAR(32),\n", "")
+	legacyDDL := strings.ReplaceAll(migrations.DDL, "    disabled INTEGER NOT NULL DEFAULT 0,\n    deleted_at VARCHAR(32),\n", "    disabled INTEGER NOT NULL DEFAULT 0,\n")
 	legacyDDL = strings.ReplaceAll(legacyDDL, "CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);\n", "")
 	if _, err := raw.Exec(legacyDDL); err != nil {
 		t.Fatal(err)
