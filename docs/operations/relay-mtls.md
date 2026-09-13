@@ -20,6 +20,42 @@ mTLS 模式下，relay 会同时校验：
 
 明文模式省略传输层证书校验，但仍执行第 4 项。它不提供传输加密，也无法用证书证明节点身份；只能在网络 ACL、主机安全和审计边界都已受控的环境使用。
 
+## 使用脚本签发
+
+下面的第 1–8 节是逐步的手工流程，用于理解每个字段为什么必须这样填，以及在签发机上接入自己的
+Secret Manager。日常签发直接用脚本，它执行的就是同一套 openssl 命令和同一组扩展要求：
+
+```bash
+# 节点 ID 必须等于 node.id / TUNNELMESH_NODE_ID，会原样写入证书 SAN。
+# node.id 是自动生成的时候，先执行 init-node-id 再签发。
+./scripts/gen-relay-certs.sh --server-name relay.internal.example.com \
+  server-1 server-2
+```
+
+输出布局（`deploy/certs/` 已 gitignore）：
+
+| 路径 | 内容 | 权限 | 分发范围 |
+| --- | --- | --- | --- |
+| `relay/relay-ca.pem` | CA 证书 | 0644 | 所有 Server 节点 |
+| `relay/<node-id>/relay.pem` | 节点证书 | 0644 | 仅该节点 |
+| `relay/<node-id>/relay-key.pem` | 节点私钥 | 0600 | 仅该节点 |
+| `private/relay-ca-key.pem` | CA 私钥 | 0600，目录 0700 | 只留在签发机 |
+
+CA 私钥刻意放在 `relay/` 之外，这样只挂载自己节点目录的容器读不到它。脚本行为：
+
+- 已存在的 CA 一律复用，新增节点直接重跑并追加节点 ID 即可；
+- 节点证书已存在时跳过，`--force` 只重签命令行上列出的节点，绝不替换 CA；
+- 发现 CA 证书与私钥只剩其一时直接失败，避免用错 CA 签发；
+- 每张证书签发后立即 `openssl verify`，并校验 SAN 同时包含节点 ID 和共同 `server_name`，
+  不满足就失败退出，而不是等到 Server 启动才报错；
+- 节点 ID 必须是小写 DNS label，否则不能作为 `subjectAltName=DNS:` 值，脚本会拒绝。
+
+轮换 CA 属于第 10 节的手工流程，脚本不提供该能力：删除 CA 会让所有已签发节点证书失效。
+
+脚本只在签发机本地生成材料，不负责分发。把证书和私钥安装到目标节点时仍按第 6 节设置属主与
+权限：CA 与节点证书 `0644` 可读，节点私钥 `root:tunnelmesh` 且 `0640`，因为 systemd 单元以
+`User=tunnelmesh`/`Group=tunnelmesh` 运行并在 `ProtectSystem=strict` 下只读取这些路径。
+
 ## 1. 创建证书目录
 
 以下命令在运维机上执行，实际路径可按部署调整：
