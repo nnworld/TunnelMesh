@@ -13,8 +13,11 @@ services:
       TUNNELMESH_STORAGE_SQLITE_PATH: /var/lib/tunnelmesh/tunnelmesh.db
       TUNNELMESH_STORAGE_AUTO_INIT: "true"
     ports:
+      # Server 只有一个监听器（server.http_addr，容器内默认 :80）。
+      # 需要 443 时设置 TUNNELMESH_TLS_ENABLED=true 并挂载证书，
+      # 同时追加 TUNNELMESH_TLS_CERT_FILE / TUNNELMESH_TLS_KEY_FILE 和
+      # 对应的只读 volume；否则映射 443 不会有进程监听。
       - "80:80"
-      - "443:443"
     volumes:
       - tunnelmesh-server-data:/var/lib/tunnelmesh
     restart: unless-stopped
@@ -29,7 +32,7 @@ services:
     command: ["run"]
     environment:
       TUNNELMESH_MODE: local
-      TUNNELMESH_AGENT_SERVER_URL: ${TUNNELMESH_AGENT_SERVER_URL:-wss://server/agent}
+      TUNNELMESH_AGENT_SERVER_URL: ${TUNNELMESH_AGENT_SERVER_URL:-ws://server/ws/agent}
       TUNNELMESH_AGENT_ID: ${TUNNELMESH_AGENT_ID:-}
     depends_on:
       - server
@@ -46,7 +49,8 @@ services:
     command: ["login"]
     environment:
       TUNNELMESH_MODE: local
-      TUNNELMESH_CLIENT_SERVER_URL: ${TUNNELMESH_CLIENT_SERVER_URL:-https://localhost}
+      # Compose 网络内通过服务名解析；localhost 指向 client 容器自身。
+      TUNNELMESH_CLIENT_SERVER_URL: ${TUNNELMESH_CLIENT_SERVER_URL:-ws://server/ws/client}
     depends_on:
       - server
     stdin_open: true

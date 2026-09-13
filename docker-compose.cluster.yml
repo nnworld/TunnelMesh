@@ -28,11 +28,34 @@ services:
       TUNNELMESH_NODE_ID: server-1
       TUNNELMESH_REGISTRY_TYPE: ${TUNNELMESH_REGISTRY_TYPE:-database}
       TUNNELMESH_REGISTRY_ENDPOINTS: ${TUNNELMESH_REGISTRY_ENDPOINTS:-}
+      # 跨节点 relay。不开启时两个 Server 各自独立，Agent 连到没有目标路由的
+      # 节点就无法访问另一节点上的 Agent。
+      # 首次启动需先建 server_node token，见 docs/deployment/docker.md 的引导顺序。
+      TUNNELMESH_SERVER_RELAY_ENABLED: ${TUNNELMESH_SERVER_RELAY_ENABLED:-true}
+      # 只在 Compose 网络内可达，不要发布到宿主机。
+      TUNNELMESH_SERVER_RELAY_LISTEN: 0.0.0.0:9443
+      # 其它节点访问本节点的地址，必须用 Compose 服务名，不能写 127.0.0.1。
+      TUNNELMESH_SERVER_RELAY_ENDPOINT: server-1:9443
+      # server_node 类型 service token（fleet token 或显式节点允许列表）。
+      # 留空且 relay 开启时 check-config 直接失败，不会静默降级。
+      TUNNELMESH_SERVER_RELAY_NODE_TOKEN: ${TUNNELMESH_SERVER_RELAY_NODE_TOKEN:-}
+      # mTLS 材料由 scripts/gen-relay-certs.sh 生成。CA 只挂证书不挂私钥，
+      # 每个节点只能读到自己的证书和私钥。
+      # 改为明文 relay（仅限受控内网）：把下面四个变量导出为空字符串。
+      TUNNELMESH_SERVER_RELAY_CA: ${TUNNELMESH_SERVER_RELAY_CA:-/run/secrets/relay/relay-ca.pem}
+      TUNNELMESH_SERVER_RELAY_CERT: ${TUNNELMESH_SERVER_RELAY_CERT:-/run/secrets/relay/node/relay.pem}
+      TUNNELMESH_SERVER_RELAY_KEY: ${TUNNELMESH_SERVER_RELAY_KEY:-/run/secrets/relay/node/relay-key.pem}
+      # 所有节点必须一致，且写入每张节点证书的 SAN。
+      TUNNELMESH_SERVER_RELAY_SERVER_NAME: ${TUNNELMESH_SERVER_RELAY_SERVER_NAME:-relay.tunnelmesh.internal}
     ports:
+      # Server 只有一个监听器（server.http_addr，容器内默认 :80）。公网 HTTPS/WSS
+      # 由反向代理终止；要让 Server 自己终止 TLS，需设置 TUNNELMESH_TLS_ENABLED=true、
+      # 挂载证书并配置 TUNNELMESH_TLS_CERT_FILE / TUNNELMESH_TLS_KEY_FILE，再映射 443。
       - "80:80"
-      - "443:443"
     volumes:
       - ./deploy/certs/mysql-ca.pem:/run/secrets/mysql-ca.pem:ro
+      - ./deploy/certs/relay/relay-ca.pem:/run/secrets/relay/relay-ca.pem:ro
+      - ./deploy/certs/relay/server-1:/run/secrets/relay/node:ro
     depends_on:
       - mysql
     restart: unless-stopped
@@ -48,11 +71,13 @@ services:
     environment:
       <<: *server-environment
       TUNNELMESH_NODE_ID: server-2
+      TUNNELMESH_SERVER_RELAY_ENDPOINT: server-2:9443
     ports:
       - "8080:80"
-      - "8443:443"
     volumes:
       - ./deploy/certs/mysql-ca.pem:/run/secrets/mysql-ca.pem:ro
+      - ./deploy/certs/relay/relay-ca.pem:/run/secrets/relay/relay-ca.pem:ro
+      - ./deploy/certs/relay/server-2:/run/secrets/relay/node:ro
     depends_on:
       - mysql
     restart: unless-stopped
