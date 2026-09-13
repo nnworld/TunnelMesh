@@ -142,3 +142,109 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 轮询失败超过 `max_stale_on_poll_error` 后，Server 会 fail-closed，不再使用正向缓存；负向缓存仍受 `negative_ttl` 限制。若需要立即排障，可临时设置 `server.authorization_cache.enabled=false` 并滚动重启。
 - 升级前确认 `schema_meta.version=8`、v8→v9 增量脚本存在，数据库账号可创建表并更新 `schema_meta`。
 - v9 的 `authorization_revision` 是授权缓存的一致性依据。回滚应用可保留该表；不要手工删除表、修改 revision 或回退版本号。需要精确恢复时使用升级前备份。
+
+## WebSSH 大文件传输中断
+
+- 症状：终端里执行 `sz <几 MB 文件>` 传到一半就断，页面显示“远端会话已结束 / 远端退出码：0”，浏览器没有下载到文件；或 `rz` 选完文件后远端报 `removed.` 且终端出现乱码。
+- 根因是链路上某一跳没有把背压传回发送方，快的一端打爆了慢的一端的缓冲区，随后中继把该 stream `RESET`，SSH 通道随之 EOF。退出码 0 是 SSH 通道被本地关闭的假象，不是远端真的退出。
+- 判别方法：
+  - 终端上方出现红色告警 `SSH 通道异常中断（本地 WebSocket 传输失败）` → 浏览器侧 WebSocket 失败（网络切换、反代超时、发送缓冲耗尽）。
+  - Server 日志出现 `relay: backpressure` 或 `protocol: window exhausted` → 中继接收/发送窗口被超额，通常是 Server 与 Agent 版本不一致（一端不懂窗口协商）。
+  - 页面显示真实的 `远端退出码：N`（N≠0）→ 远端程序自己失败，例如磁盘满、`sz` 参数错误。
+- 处理：
+  1. 确认 Server 与 Agent 是同一版本；流控窗口是内置协议约定，混版本必然失败。
+  2. 经 Nginx 反代时确认 `/ws/webssh/` 关闭了 `proxy_buffering` 且 `proxy_read_timeout` 足够长，见 [Nginx/WSS 推荐配置](../deployment/nginx.md)。
+  3. 终端乱码是 pty 回显了传输中的协议字节，`reset` 或 `stty sane` 即可恢复，不代表会话损坏。
+  4. 超大文件优先用 SFTP 页面传输：ZMODEM 接收方向会在浏览器内存中缓冲整个文件后才触发下载。
+- 流控默认额度与三层背压说明见[大文件传输与通道流控](../user-guide/server-admin.md#大文件传输与通道流控)，均为内置行为，没有可调参数。
+- 复现与回归验证：`node test/e2e/webssh/run.mjs`（4 MiB 下载 + 1.5 MiB 上传，逐字节校验），详见 [WebSSH 浏览器端到端测试](../../test/e2e/webssh/README.md)。
+
+## WebSFTP 上传失败
+
+- 症状：SFTP 页面上传文件后弹出红色 `文件传输失败`，或上传中途提示 `SFTP 通道已关闭`；目标主机上文件已创建但被截断，落盘大小常见停在 768 KiB 或 2 MiB 附近。
+- 两种提示对应两类原因，排查时先看提示文案：
+  - `文件传输失败`：浏览器侧 `libssh2_sftp_write` 只消费了部分字节。SSH 会话是非阻塞的，短写返回的是“已写入字节数”而不是 `EAGAIN`，旧实现把它当致命错误直接失败。现已按 `pointer + written` 循环补写剩余字节，连续 5 秒零进度才判定停滞并抛错。
+  - `SFTP 通道已关闭`：Server 侧中继 stream 被判死。入站 WINDOW_UPDATE 除了给发送窗口加额度，还会镜像进容量 16 的 control 队列供 `ReadControl` 使用，而 WebSSH/SFTP 桥接只调用 `Read`、从不消费 control 队列；上传累计超过 16 次窗口更新即溢出并以 `protocol: flow-control window exhausted` 失败整条流。镜像现已改为尽力而为（队列满则丢弃，权威额度保存在发送窗口里），回归测试为 `TestAgentRelayStreamSurvivesUndrainedWindowUpdates`。
+- 判别方法：
+  - 截断点固定且与窗口额度相关（实测复现时消耗约 16 × 128 KiB ≈ 2 MiB 额度后 stream 被杀，sshd 落盘滞后，磁盘上只剩 768 KiB）→ 中继 stream 死亡，确认 Server 与 Agent 都已包含该修复。
+  - 失败大小随机，且浏览器控制台或页面出现 `SFTP write stalled after N of M bytes` → 通道真的卡住（网络中断、Agent 离线、Nginx 超时），按上一节的链路排查。
+  - 只有上传失败、下载正常 → 属于本节问题；下载方向的额度走 `WriteControl`，不经过 control 镜像队列，因此不受影响。
+  - 报错是 SFTP 状态码（permission denied、no space left）→ 目标目录权限或磁盘问题，与通道无关。
+- 处理：
+  1. Server、Agent、Web 产物必须同版本发布。中继修复只在 Server 侧，只刷新前端 bundle 无效；只升级 Server 也不会修复浏览器的短写截断。
+  2. 大文件优先用 SFTP 而不是终端 `rz`：SFTP 分块写入不会在浏览器内存里缓冲整个文件。
+  3. 经 Nginx 反代时同样需要 `/ws/webssh/` 关闭 `proxy_buffering`，见 [Nginx/WSS 推荐配置](../deployment/nginx.md)。
+- 复现与回归验证：`node test/e2e/webssh/run.mjs` 中的 `SFTP upload writes the file byte-for-byte` 检查（默认 3 MiB，可用 `TM_E2E_SFTP_UPLOAD_BYTES` 调整，逐字节 sha256 校验），详见 [WebSSH 浏览器端到端测试](../../test/e2e/webssh/README.md)。
+
+## ZMODEM 在真实网络上报 ZRPOS / OO 错误
+
+- 症状（任一）：
+  - `rz` 上传时弹 `ZMODEM 传输失败：Unhandled header: ZRPOS`，随后 `Peer aborted session`，终端出现大段乱码（内容正是正在上传的文件）。
+  - `sz` 下载完成后敲回车弹 `ZMODEM 传输失败：PROTOCOL: Only thing after ZFIN should be “OO” (79,79), not: 27,93,…`，终端停在空行，看似卡死。
+  - 传输面板的进度长时间停在某个百分比且无报错（例如 291 KiB / 17.2 MiB）：浏览器回送的 ZACK 被插队写破坏后，lrzsz 会暂停发送等待合法 ZACK，直到自身超时。与上面两种报错同根因。
+  - `sz` 卡住几十秒后整页变成“SSH 通道已关闭”空态：卡住是上述暂停，而旧前端把出站写失败（5 秒零进度停滞保护）连带关闭了整条通道；新版本只中止传输并保留终端。
+  - 本机或同机房测试一切正常，只在真实网络、经 Nginx WSS 反代的链路上出现。
+- 根因是浏览器侧同一条 SSH 通道上存在多个并发出站写入（ZMODEM 的同步回调是 fire-and-forget）。通道窗口紧张时 libssh2 只消费部分字节，部分写的续写被另一个写者插队，对端收到坏帧：`rz` CRC 失败回 `ZRPOS`，`sz` 收不到合法收尾直接退出、不发 `OO`。错误里的 `27,93` 是 ESC ]，即 shell 的 OSC 标题序列——提示符跑到了本该是 `OO` 的位置。
+- 进度事件洪泛是卡住的诱因之一：progress 原先每个 ZDATA 子包触发一次（17 MiB 文件约上万个 Vue 更新与进度条重绘），主线程被占用时 ZACK 写出被推迟，`sz` 随即暂停。现在按 64 KiB 字节步进或 500 ms 安静间隔上报，首个子包无条件上报。
+- “通道被关闭”是次生缺陷：`toPeer` 的写失败 catch 曾无条件关闭通道。现在传输仍活跃时只本地中止传输（`abortLocal`，不向已坏的管道发 ZABORT）并弹 `ZMODEM 传输失败：…`；通道是否真的死亡由读循环裁决（EOF 会给出正常结束态），写路径不再越权关通道。
+- 终端停空行是次生缺陷：协议抛错时解析器缓冲区里的提示符字节曾随会话一起被丢弃。现在这些字节会回放给终端，报错横幅出现的同时提示符立即恢复。
+- 处理：
+  1. 升级 Web 前端 bundle 与嵌入它的 Server 二进制到包含单写者闸门的版本；Server/Agent 无需改配置。
+  2. 进度卡死请先确认线上 bundle 是否已包含单写者闸门（该修复只在前端）：旧 bundle 上卡进度、`ZRPOS`、`OO` 报错是同一缺陷的三种表现。
+  3. 终端乱码是 lrzsz 中止后对未消费在途字节的 pty 回显，属 lrzsz 固有行为；传输不再异常中止后自然消失，已出现的乱码用 `reset` 或 `stty sane` 恢复。
+  4. 升级后仍出现 `ZRPOS` 或进度卡死，说明链路存在真实丢包或中间层缓冲，按 [Nginx/WSS 推荐配置](../deployment/nginx.md) 检查 `/ws/webssh/` 的 `proxy_buffering` 与超时设置，并保留 Server 日志与浏览器控制台输出用于定位。
+  5. 遇到“卡住后通道关闭”请先升级前端：新版本下该序列只中止传输、保留终端，`sz` 自身超时退出后提示符会回来；若通道确实已死，读循环会随后给出正常结束态而不是静默悬挂。
+- 回归验证：交错不变式由 `never interleaves concurrent shell writes when libssh2 consumes partially` 与 `never interleaves an SFTP write with a concurrent SFTP request` 两个单元测试固化。该缺陷在 localhost E2E 中不可复现（通道窗口从不紧张），**不要用 E2E 绿作为已修复的依据**。
+
+## ZMODEM 传输结束后终端不回显、同一条错误反复弹出
+
+- 症状（成组出现）：
+  - `sz` 传输结束后终端不再回显，敲回车没有任何输出，看似卡死；页面顶部堆叠多条**完全相同**的 `ZMODEM 传输失败：PROTOCOL: Only thing after ZFIN should be “OO” (79,79), not: …`，敲一次回车多一条。
+  - 文件其实已经下载完成（浏览器下载目录里字节完整），但页面报了失败。
+  - 大文件（几十 MiB 以上）`sz` 在传输中途被本地中止，弹出 `ZMODEM 传输失败：SSH shell write stalled after N of M bytes`，进度面板消失，终端仍在但传输没了。
+- 与上一节的区别：上一节是并发写插队造成对端收到坏帧（`ZRPOS`、乱码、对端中止），本节是**解析器状态没有随会话一起释放**与**停滞期限对大文件过严**，两者可以叠加出现。判别要点是错误文案：`Only thing after ZFIN` 反复出现且终端完全静默 → 本节；`ZRPOS`/`Peer aborted session` 且终端有大段乱码 → 上一节。
+- 根因一（横幅堆叠 + 终端静默）：vendored `zmodem.js` 的 `Sentry.consume()` 只要内部 `_zsession` 非空就把所有输入投喂给它，而 `_zsession` 只由会话自身的 `session_end` 事件清空。`_consume_first()` 在 `_got_ZFIN` 后收到非 `OO` 字节时是直接 `throw`，`session_end` 永不触发，库也没有公开的复位入口。于是会话虽然在桥接里被置空，Sentry 仍持有那个死会话：之后每个字节都被再次投喂、再次抛出，既产生新横幅又永远到不了终端。
+- 根因二（把已完成的传输报成失败）：ZMODEM 的 `ZFIN` 只在 `ZEOF` 之后交换、`OO` 只在 `ZFIN` 之后打印。能触发这个 throw 说明文件字节早已全部 spool 完、`completed` 已上报、浏览器已存盘，缺的只是对端的两个字节收尾。它属收尾噪声，不是传输失败。
+- 根因三（大文件中途被中止）：大文件传输期间浏览器回送的 ZACK 会在出站方向堆积数兆字节，lrzsz 在等待重传确认时暂停读取，通道窗口收紧后协议写出现零进度；旧的 5 秒停滞保护把这个合法暂停判成死链路并抛错，`toPeer` 的处置策略随即本地中止传输。
+- 现在的行为：
+  - 协议抛错后桥接**重建 Sentry 实例**（`abort()`、`abortLocal()` 同样重建），终端立即恢复普通回显，同一条错误不再重复上报。
+  - `receive` 会话在 `_got_ZFIN` 之后抛错时按已完成处理：直接发 `ended` 收起面板、把解析器缓冲区里的提示符回放给终端，并保留吃掉晚到 `OO` 的逻辑，不弹任何错误。传输中途抛错仍然照常报 `error`。
+  - ZMODEM 协议写不再继承 5 秒停滞期限（`write(data, { stallLimitMs: 0 })`），按键写的默认期限不变。同时 `close()` 不再排在写闸门之后，否则一个无期限的停滞写者会让 `closeTerminal()` 永久悬挂并泄漏 libssh2 句柄。
+- 处理：
+  1. 这三项修复全部只在前端 bundle：必须 `npm run build` + `rsync` 到 `internal/server/web_dist/` 后重建 Server 二进制。只替换二进制不重建嵌入产物等于没有发布。
+  2. 若仍看到 `SSH shell write stalled after …`，先确认线上 bundle 是否包含停滞豁免（在产物中检索 `stallLimitMs`）；旧 bundle 上“大文件中途被中止”是必然结果。
+  3. 豁免只覆盖零进度等待，不覆盖真实错误：隧道断开时 libssh2 返回负值错误码，仍会抛错并按“传输活跃则中止传输、保留终端”的既有策略处置，通道是否真的死亡由读循环裁决。
+  4. 传输结束后若终端仍有残留乱码，是 lrzsz 对未消费在途字节的 pty 回显，`reset` 或 `stty sane` 恢复。
+- 回归验证：`reports a finished receive as ended when the peer skips the OO trailer`、`returns to plain terminal passthrough after the parser session dies`、`parses shell output normally after abortLocal`、`waits for window credit without a deadline when the stall limit is disabled`、`still reports a stalled shell write once the default deadline passes` 五个单元测试固化；E2E 的 `transfer panel closes and the prompt returns` 覆盖“传输完成 → 面板收起 → 提示符回归且控制台洁净”。
+
+## sz 下载中偶现“SSH 通道已关闭”空态
+
+- 症状：大文件 `sz` 下载过程中或刚结束时，页面突然变成“已断开 / SSH 通道已关闭”空态；没有红色传输告警，也没有“远端会话已结束 / 远端退出码”提示；浏览器下载目录里的文件可能已经完整。
+- 判别：该空态的渲染条件是本地 `closeTerminal()` 且读循环从未报告远端退出。传输期间按键被丢弃、协议写失败只中止传输不关通道，因此空态只可能来自浏览器侧把“拥塞”误判成“死亡”：
+  - 传输尾部出站窗口拥塞，传输结束瞬间的按键写零进度达到旧判定窗口（5 秒）即抛错并关闭会话；
+  - 或传输已结束、但一条仍在等窗口额度的协议写随后拒绝，旧逻辑在“传输非活跃”分支直接关闭会话。
+  若页面带红色 `SSH 通道异常中断（本地 WebSocket 传输失败）` 告警或“远端退出码”，则不是本节问题，按 [WebSSH 大文件传输中断](#webssh-大文件传输中断) 排查。
+- 根因：浏览器侧“通道已死”的判定窗口曾是 5 秒零进度（shell 写与 SFTP 写共用），而大文件传输的尾部拥塞 routinely 超过这个量级；同时第十五轮让协议写无期限等待窗口额度，传输结束后的迟到拒绝也会走到关会话分支。Server 侧唯一的时间型判定 `server.webssh.idle_timeout` 默认 5 分钟，不是本问题来源。
+- 现在的行为：
+  - “通道已死”的判定窗口提高到 30 秒零进度（shell 写与 SFTP 写共用）。真正死掉的隧道通常由 WebSocket 关闭或读循环 EOF 更早给出结束态，30 秒只是兜底上限。
+  - 传输结束后的迟到协议写拒绝不再关闭会话；通道存活性归读循环与按键路径裁决。
+- 处理：
+  1. 该修复只在前端 bundle：`npm run build` + `rsync` 到 `internal/server/web_dist/` 后重建 Server 二进制；只换二进制不重建嵌入产物等于没有发布。
+  2. Server 侧无需改配置；若曾为排查问题把 `server.webssh.idle_timeout` 调小，请恢复默认 5m 或保证不小于传输最久暂停时间。
+  3. 经 Nginx 反代时仍按 [Nginx/WSS 推荐配置](../deployment/nginx.md) 关闭 `/ws/webssh/` 的 `proxy_buffering` 并放宽读写超时，避免中间层先于 30 秒窗口断开连接。
+  4. 行为变化知会：死隧道的写路径兜底 surfaced 从 5 秒变为 30 秒；期间终端可能短暂无回显，属预期。
+- 回归验证：`only reports a stalled shell write after thirty seconds of zero progress`、`fails an SFTP write only after thirty seconds of zero progress` 两个单元测试（20 秒不报、35/36 秒报），以及源码断言 `fails the transfer instead of the channel when a protocol write fails`（`toPeer` 片段不得包含 `closeTerminal()`）。
+
+## 管理后台打开是 Nginx / OpenResty 欢迎页
+
+- 症状：访问管理后台域名返回 “Welcome to OpenResty!”（或 Nginx 默认页），但 `/api/v1/…` 接口和 WebSocket 可能依旧正常；刷新前端路由（如 `/remote-servers`）同样是欢迎页。
+- 根因：server 块里缺少兜底 `location / { proxy_pass …; }`。SPA history fallback 由 Server 内嵌静态服务完成，前提是请求先到达 Server；没有兜底反代时，`/` 与所有前端路由命中 Nginx 默认 root（OpenResty 常为 `/usr/local/openresty/nginx/html`）下的 `index.html`，即欢迎页。该块常被误认为“前端路由配置”而在精简配置时删掉。
+- 判别：
+  - `curl -sI https://<管理后台域名>/` 返回 200 且正文是欢迎页，而 `curl -sI https://<管理后台域名>/api/v1/health` 或登录接口正常 → 兜底反代缺失。
+  - 检查 nginx 配置：server 块只有 `/api/`、`/ws/*`、`/health/*` 等 location，没有 `location /`。
+  - 若 `/` 返回 404 而非欢迎页，则不是本节问题，多为 Server 未启动或 upstream 不可达。
+- 处理：
+  1. 加回兜底反代，见 [Nginx 推荐配置](../deployment/nginx.md) 最后一段：`location / { proxy_pass http://tunnelmesh_server; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }`。**不需要** `try_files` 或 rewrite。
+  2. `nginx -t` 通过后 reload；确认 `/`、任意前端路由深链、`/api/` 与 `/ws/webssh/` 四类路径都正常。
+  3. 该 location 是最短前缀，不会吞掉 `/api/` 与 `/ws/*`；若曾为“修欢迎页”加过 `try_files $uri $uri/ /index.html;` 指向本地目录，请一并删除，避免静态托管与反代并存。
+- 回归：配置类问题，无代码回归测试；[Nginx 推荐配置](../deployment/nginx.md) 的推荐配置注释与关键约束已写明“兜底反代不能删”，本节作为识别与恢复手册。

@@ -27,6 +27,14 @@ server:
     enabled: true
     path: /ws/tcp
     max_bytes: 65536
+  webssh:
+    enabled: true
+    ticket_ttl: 30s
+    session_ttl: 8h
+    max_active_sessions_per_user: 5
+    open_timeout: 10s
+    idle_timeout: 5m
+    max_message_bytes: 65536
   stream:
     max_concurrent_opens: 256
     max_pending_opens: 1024
@@ -130,6 +138,14 @@ server:
     enabled: true
     path: /ws/tcp
     max_bytes: 65536
+  webssh:
+    enabled: true
+    ticket_ttl: 30s
+    session_ttl: 8h
+    max_active_sessions_per_user: 5
+    open_timeout: 10s
+    idle_timeout: 5m
+    max_message_bytes: 65536
 
   # Server 节点间 relay。每个节点使用独立证书和私钥；
   # 所有节点使用同一 relay CA，并复用同一个 fleet token。

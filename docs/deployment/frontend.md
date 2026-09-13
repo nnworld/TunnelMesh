@@ -26,8 +26,17 @@ find web/dist -type f -print | sort
 
 ## Server 内嵌模式（默认）
 
-Server 使用 Go `embed` 提供管理后台静态文件。构建 Server 前，必须先生成
-`web/dist/`，再同步到 `internal/server/web_dist/`：
+Server 使用 Go `embed` 提供管理后台静态文件。`npm run build` 已内置同步步骤
+（`vite build && node scripts/sync-web-dist.mjs`），会把 `web/dist/` 镜像到
+`internal/server/web_dist/`。同步是镜像语义：先清空目标再拷贝，旧 hash 的 chunk
+不会被遗留进嵌入产物。手工 `rsync -a --delete web/dist/ internal/server/web_dist/`
+或 `cp -a` 只作为旁路校验与补救手段，不再是必需步骤：
+
+内嵌声明必须保持 `//go:embed all:web_dist`。Go 的 `embed` 默认排除以 `_` 或 `.`
+开头的文件，而 Vite 会产出 `_baseClone-*.js` 这类 lodash 辅助 chunk；一旦漏嵌，
+浏览器对这些路径的请求会落到 SPA history fallback 拿到 `index.html`，ES module
+加载失败，引用它的路由视图整页白屏。`TestEmbeddedWebDistContainsEverySourceFile`
+会把内嵌 FS 与源目录全量比对，漏嵌直接让测试失败。
 
 ```bash
 cd web
@@ -35,9 +44,7 @@ npm ci
 npm test -- --run
 npm run build
 cd ..
-rm -rf internal/server/web_dist
-mkdir -p internal/server/web_dist
-cp -a web/dist/. internal/server/web_dist/
+./scripts/verify-web-embed.sh
 GODEBUG=gotypesalias=1 GOEXPERIMENT=aliastypeparams go build ./cmd/tunnelmesh-server
 ```
 

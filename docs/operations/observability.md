@@ -2,6 +2,19 @@
 
 Server 在管理监听器暴露 `GET /metrics`、`/health/live` 和 `/health/ready`。生产环境建议只允许 Prometheus 所在内网访问 `/metrics`，公网入口通过 Nginx 仅暴露健康检查。
 
+## WebSSH/SFTP
+
+WebSSH 会话暴露以下指标。指标只包含状态、方向和稳定错误类别，不包含用户名、目标地址、终端内容、SFTP 路径或文件内容：
+
+- `tunnelmesh_webssh_sessions_active`
+- `tunnelmesh_webssh_tickets_created_total`
+- `tunnelmesh_webssh_ticket_reuse_total{reason}`
+- `tunnelmesh_webssh_streams_errors_total{error_class}`
+- `tunnelmesh_webssh_stream_duration_seconds`
+- `tunnelmesh_webssh_bytes_total{direction}`
+
+`reason` 只使用 `expired`、`reused`、`invalid` 等稳定枚举；`error_class` 使用统一错误归一化结果。后台清理器每 60 秒收敛过期 pending ticket 和 active session，进程退出或 Runtime Close 时会停止清理器。
+
 ## Grafana
 
 导入 [统一 Dashboard](../../deploy/grafana/dashboards/tunnelmesh.json)。这是项目唯一的 Dashboard 文件，内部按 Overview、Agent、Network、Cluster、Security 五个 Row 组织全部图表。Prometheus datasource 使用 `${DS_PROMETHEUS}`。

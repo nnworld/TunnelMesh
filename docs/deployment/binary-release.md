@@ -68,6 +68,16 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o tu
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o tunnelmesh-server_windows_amd64.exe ./cmd/tunnelmesh-server
 ```
 
+无论走 `build-release.sh` 还是手工交叉编译，`tunnelmesh-server` 都会在**编译时**嵌入
+`internal/server/web_dist/` 的当前内容，因此必须先执行 `cd web && npm run build`
+（该命令已内置同步到嵌入目录）。两种失败模式都要避免：干净 clone 的仓库里没有这个
+目录（被 gitignore，不受版本控制），直接编译会以 embed 模式匹配失败报错；发布机上残留
+旧 bundle 则更危险——编译成功，但嵌入的是上一版前端。`scripts/build-release.sh` 现在
+会在编译前校验嵌入目录存在且与 `web/dist` 完全一致，不满足时以非零退出并提示执行
+`cd web && npm run build`。交叉编译参数不影响嵌入：`CGO_ENABLED=0`、`GOOS`、
+`GOARCH`、`-trimpath` 只影响目标平台与路径记录，`-ldflags='-s -w'` 只剥离符号表与
+DWARF 调试信息，不触碰嵌入数据。
+
 ## 安装方式
 
 - Linux：使用 [linux-install.sh](../../deploy/install/linux-install.sh)，由 systemd 管理 Server/Agent。
@@ -80,7 +90,7 @@ Linux 归档包含 `deploy/systemd`，macOS 归档包含 `deploy/macos`，Window
 
 ## 回滚
 
-1. 在后台“下载”页或 GitHub Release 页面选择上一个版本。
+1. 在后台“发行管理”页或 GitHub Release 页面选择上一个版本。
 2. 下载并校验上一个版本的 `SHA256SUMS`。
 3. 停止当前进程，替换二进制和 service 模板，但保留配置、数据和密钥。
 4. 启动服务并检查健康状态、日志、客户端连接和核心链路。

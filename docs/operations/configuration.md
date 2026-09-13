@@ -36,6 +36,14 @@ server:
   tcp_bridge:
     enabled: true
     path: /ws/tcp
+  webssh:
+    enabled: true
+    ticket_ttl: 30s
+    session_ttl: 8h
+    max_active_sessions_per_user: 5
+    open_timeout: 10s
+    idle_timeout: 5m
+    max_message_bytes: 65536
 ```
 
 ```bash
@@ -80,6 +88,63 @@ registry:
     - https://etcd-1:2379
     - https://etcd-2:2379
 ```
+
+## WebSSH/SFTP 会话
+
+管理后台的 WebSSH/SFTP 使用一次性 ticket 建立 `/ws/webssh/<session-id>` 二进制 WebSocket。Server 只转发字节，不在服务端保存或解析 SSH 密码、私钥、终端输出或 SFTP 文件内容；浏览器负责 SSH/SFTP 协议。
+
+```yaml
+server:
+  webssh:
+    enabled: true
+    ticket_ttl: 30s
+    session_ttl: 8h
+    max_active_sessions_per_user: 5
+    open_timeout: 10s
+    idle_timeout: 5m
+    max_message_bytes: 65536
+```
+
+所有字段也可以通过命令行覆盖，例如：
+
+```bash
+tunnelmesh-server --server.webssh.enabled=true \
+  --server.webssh.ticket_ttl=30s \
+  --server.webssh.session_ttl=8h \
+  --server.webssh.max_active_sessions_per_user=5 \
+  --server.webssh.open_timeout=10s \
+  --server.webssh.idle_timeout=5m \
+  --server.webssh.max_message_bytes=65536
+```
+
+`ticket_ttl` 只表示 ticket 从创建到首次连接的等待时间；连接成功后由 `session_ttl`、`idle_timeout` 和用户主动关闭控制生命周期。`idle_timeout` 依赖底层 WebSocket 读超时能力；SSH keepalive 产生的流量会刷新该超时。`security.allowed_origins` 必须包含管理后台的精确 Origin，否则握手会被拒绝。
+
+浏览器 SFTP 在客户端内分块传输，默认单文件上限为 1 GiB。该限制独立于 Nginx 的 `client_max_body_size`，因为文件不通过管理 API 上传；如果部署反向代理其它大请求路径，请分别评估限制。
+
+终端内的 lrzsz（ZMODEM）收发不需要任何服务端开关：协议栈运行在浏览器中，Server 只转发字节。单个 WebSocket 帧仍受 `max_message_bytes` 约束（默认 64 KiB，上限 1 MiB），lrzsz 的数据块远小于该值，因此无需为 ZMODEM 调大该配置。ZMODEM 传输不走 SFTP 的 1 GiB 单文件限制，但接收方向会在浏览器内存中缓冲整个文件，超大文件请改用 SFTP 或其它带外通道。
+
+### 凭据自动认证
+
+远程服务器绑定带有认证秘密的凭据（`password` 类型，或已保存私钥的 `ssh_public_key` 类型）后，浏览器进入 WebSSH/SFTP 时可直接完成认证，不再弹出密码窗口。该能力依赖 Schema v13 与可恢复秘密加密密钥：
+
+```bash
+# base64（32 字节）或 hex；只能由环境变量或 Secret Manager 注入
+TUNNELMESH_TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)
+TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID=prod-2026-09
+```
+
+密钥同时用于 service token 的可恢复密文和凭据秘密密文，集群内所有 Server 节点必须一致，否则某个节点无法解密在其它节点写入的秘密。未配置密钥时 Server 正常启动，但创建带秘密的凭据会快速失败并返回 `503`，自动认证不可用并回退到手动输入密码；Server 不会静默降级为明文存储。轮换密钥会使旧密文不可解密，受影响凭据需要重新填写秘密，因此请把密钥版本记录在 Secret Manager 中。
+
+中继流控没有配置项，属于协议内置约定，改动会破坏 Server 与 Agent 的兼容性：
+
+| 常量 | 值 | 位置 |
+| --- | --- | --- |
+| `MaxStreamFrame` | 32 KiB | `internal/protocol/window.go` |
+| `DefaultServerReceiveWindow` | 512 KiB | 同上，Server 在 `OPEN_STREAM` 中通告 |
+| `DefaultAgentReceiveWindow` | 256 KiB | 同上，Agent 通告并对超额直接 `RESET` |
+| `DefaultWindowUpdateThreshold` | 128 KiB | 同上，两端每消费这么多字节回补一次窗口 |
+
+浏览器侧的 1 MiB 发送高水位与 64 MiB 接收队列上限同样是内置值（`web/src/webssh/byte-stream.ts`、`web/src/webssh/ssh-client.ts`）。`server.webssh.max_message_bytes` 只限制单个 WebSocket 帧大小，与上述窗口无关，不要用它来“调大传输能力”。
 
 ## Agent 连接池
 
@@ -195,5 +260,7 @@ relay 证书字段有两种合法状态：
 ### Recoverable service-token secrets
 
 Set `TUNNELMESH_TOKEN_ENCRYPTION_KEY` to a base64 or hexadecimal AES key (16, 24, or 32 bytes) and optionally set `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`. The key must come from an environment-injected secret or secret manager and must not be committed to a file or database. New and rotated service tokens are encrypted with AES-GCM. Existing hash-only tokens cannot be revealed and must be rotated. Secret reveal is administrator-only, audited, requires `X-Token-Reveal-Confirm` plus `Idempotency-Key`, and returns `Cache-Control: no-store`.
+
+The same key and key id also encrypt the SSH credential secrets (password, or private key plus passphrase) used by browser SSH/SFTP auto-authentication; see [WebSSH/SFTP 会话](#websshsftp-会话). Credential secrets are never exposed by a list or detail API and are decrypted only for the credential owner at session-creation time.
 
 For multi-server deployments set the same high-entropy `TUNNELMESH_TRACE_SIGNING_KEY` on every server/relay node so hop signatures can be verified across the cluster. It is never returned in traceroute output.

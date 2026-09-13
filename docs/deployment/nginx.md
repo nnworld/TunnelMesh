@@ -92,6 +92,24 @@ server {
         proxy_send_timeout 180s;
     }
 
+    # Browser WebSSH/SFTP one-time ticket bridge. The ticket is in the query
+    # string for this request only; do not log query strings in access logs.
+    location ^~ /ws/webssh/ {
+        limit_conn tunnelmesh_ws 100;
+        proxy_pass http://tunnelmesh_server;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header Origin $http_origin;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
     # SSH/websocat binary bridge. Keep exact path if it is enabled.
     location = /ws/tcp {
         limit_conn tunnelmesh_ws 100;
@@ -127,7 +145,11 @@ server {
         proxy_set_header Host $host;
     }
 
-    # SPA fallback comes last and must not swallow /api/ or /ws/*.
+    # Catch-all reverse proxy, and the one block that must never be deleted.
+    # The Server serves the SPA history fallback, but every frontend path still
+    # has to reach it: without this block `/` falls through to the Nginx or
+    # OpenResty default site and renders its welcome page. It is the shortest
+    # prefix, so the /api/ and /ws/* locations above still win.
     location / {
         proxy_pass http://tunnelmesh_server;
         proxy_http_version 1.1;
@@ -142,7 +164,11 @@ server {
 - `proxy_http_version 1.1`、`Upgrade`、`Connection`、`proxy_buffering off` 是 WebSocket 必需项。
 - 30 秒心跳下，`proxy_read_timeout` 建议至少 180 秒，避免短暂网络抖动被 Nginx 提前断开。
 - 必须透传 `Authorization` 和 `Origin`；不要把 token 放到 URL query 或 Cookie。
-- `/api/`、`/ws/agent`、`/ws/client`、`/ws/tcp` 使用精确或 `^~` location，优先于 SPA fallback。
+- `/api/`、`/ws/agent`、`/ws/client`、`/ws/webssh/`、`/ws/tcp` 使用精确或 `^~` location，优先于 SPA fallback。
+- 管理后台的前端路由不需要在 Nginx 配置 `try_files` 或 rewrite：SPA history fallback 由 Server 内嵌静态服务完成，`location /` 只需 `proxy_pass` 到 Server。本文件中的 `/api/` 与 `/ws/*` location 只服务于反代优先级和 WebSocket 升级，与前端路由无关。仅当改用“Nginx 独立静态文件模式”直接托管 `web/dist` 时，才需要 `try_files $uri $uri/ /index.html;` 与 `application/wasm` 类型补充，见 [前端构建与发布](frontend.md)。
+- 但 `location /` 兜底反代本身**不能删**：它不是前端路由配置，而是 `/` 与所有前端路径到达 Server 的唯一入口。删掉后请求落到 Nginx/OpenResty 默认 root 的 `index.html`，表现为 “Welcome to OpenResty!” 欢迎页，而 `/api/` 接口可能依旧正常——这是该误删最典型的识别特征。
+- WebSSH/SFTP 会话可能持续数小时；`/ws/webssh/` 的读写超时建议不低于 `server.webssh.session_ttl`，并保持双向 `proxy_buffering off`。若缩短超时，需同步评估 SSH keepalive 和 `server.webssh.idle_timeout`。
+- 静态资源默认由 Server 透传，Server 已固定 `.wasm` 的 `Content-Type: application/wasm`。若改为 Nginx 直接托管 `web/dist`，必须在 `types` 中补充 `application/wasm wasm;`，否则浏览器会拒绝 WASM 流式编译并回退到更慢的 ArrayBuffer 实例化。
 - `/metrics` 不建议暴露公网；优先让 Prometheus 访问 Server 内网管理地址。
 - 显式泛域名只允许单层 `tm-<name>.tunnel.example.com`；动态域名使用 `<agent>-<a>-<b>-<c>-<d>-<port>.<server.dynamic_suffix>`。Nginx 正则中的后缀必须与 `server.dynamic_suffix`、wildcard DNS 和证书一致；正则只做域名形状筛选，IP 八位组范围、端口范围、危险地址和 Agent 策略由 Server 再次校验。
 - 泛域名只解决 HTTP/HTTPS/WSS 路由，不提供公网 UDP 监听。
