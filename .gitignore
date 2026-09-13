@@ -1,8 +1,10 @@
 .worktrees/
+.superpowers/
 .env
 .env.*
 data/
 dist/
+deploy/certs/
 node_modules/
 coverage/
 *.log
