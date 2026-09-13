@@ -10,24 +10,14 @@ mkdir -p "$HOME/.local/bin" "$HOME/.config/tunnelmesh" "$HOME/Library/LaunchAgen
 install -m 0755 "$BINARY" "$HOME/.local/bin/tunnelmesh-$ROLE"
 label="com.tunnelmesh.$ROLE"
 plist="$HOME/Library/LaunchAgents/$label.plist"
-if [[ "$ROLE" == client ]]; then
-  sed "s|__HOME__|$HOME|g" "$(dirname "$0")/../macos/tunnelmesh-client.plist" > "$plist"
-else
-cat > "$plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>$label</string>
-  <key>ProgramArguments</key><array>
-    <string>$HOME/.local/bin/tunnelmesh-$ROLE</string><string>--config</string><string>$CONFIG</string><string>run</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/tunnelmesh-$ROLE.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/tunnelmesh-$ROLE.err.log</string>
-</dict></plist>
-EOF
-fi
+installed="$HOME/.local/bin/tunnelmesh-$ROLE"
+# 三个角色共用 deploy/macos/tunnelmesh.plist，只替换占位符。此前 client 走模板、
+# server/agent 走内联 heredoc，两份来源并存时 client 会原样拷贝模板并忽略 $CONFIG。
+sed -e "s|__ROLE__|$ROLE|g" \
+  -e "s|__HOME__|$HOME|g" \
+  -e "s|__BINARY__|$installed|g" \
+  -e "s|__CONFIG__|$CONFIG|g" \
+  "$(dirname "$0")/../macos/tunnelmesh.plist" >"$plist"
 plutil -lint "$plist"
 launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"

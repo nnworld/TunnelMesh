@@ -19,23 +19,19 @@ $xml = Join-Path $InstallDir "$service-service.xml"
 Copy-Item -Force $Binary (Join-Path $InstallDir "tunnelmesh-$Role.exe")
 Copy-Item -Force $WinSW $wrapper
 $binaryName = "tunnelmesh-$Role.exe"
-if ($Role -eq 'client') {
-  Get-Content -Raw -Path "$PSScriptRoot\..\windows\tunnelmesh-client-service.xml" | Set-Content -Encoding UTF8 -Path $xml
-} else {
-  @"
-<service>
-  <id>$service</id>
-  <name>TunnelMesh $Role</name>
-  <description>TunnelMesh $Role service</description>
-  <executable>$binaryName</executable>
-  <arguments>--config &quot;$Config&quot; run</arguments>
-  <workingdirectory>$InstallDir</workingdirectory>
-  <logpath>$InstallDir\logs</logpath>
-  <log mode="roll-by-size" />
-  <onfailure action="restart" delay="5 sec" />
-</service>
-"@ | Set-Content -Encoding UTF8 -Path $xml
-}
+$roleTitle = $Role.Substring(0, 1).ToUpperInvariant() + $Role.Substring(1)
+# 三个角色共用 deploy\windows\tunnelmesh-service.xml。此前 client 走模板、server/agent
+# 走内联 here-string，client 分支会原样拷贝模板并静默忽略 -Config。
+# 用 String.Replace 做字面替换：-replace 是正则，Windows 路径里的反斜杠会被当转义吃掉。
+$configXml = $Config.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+# 逐行替换而不是链式调用，避免依赖跨行成员访问的解析行为。
+$template = Get-Content -Raw -Path "$PSScriptRoot\..\windows\tunnelmesh-service.xml"
+$rendered = $template.Replace('__ROLE_TITLE__', $roleTitle)
+$rendered = $rendered.Replace('__ROLE__', $Role)
+$rendered = $rendered.Replace('__BINARY__', $binaryName)
+$rendered = $rendered.Replace('__CONFIG__', $configXml)
+$rendered = $rendered.Replace('__INSTALL_DIR__', $InstallDir)
+Set-Content -Encoding UTF8 -Path $xml -Value $rendered
 & $wrapper stop 2>$null; & $wrapper uninstall 2>$null
 & $wrapper install
 & $wrapper start
