@@ -22,12 +22,13 @@
 - 未知路由、停用路由与 ACL 拒绝对外表现一致（403 + 同一文案），只有日志与指标区分 reason。
 - 认证失败响应 407 必须带 `Proxy-Authenticate: Basic realm="TunnelMesh", charset="UTF-8"`；容量超限响应 503 必须带 `Retry-After: 5`。
 - 日志、审计、指标不得包含密码、完整 `Proxy-Authorization` 头或响应体。
-- CONNECT 使用 `relay.StreamRequest.Protocol = "tcp"`；绝对形式使用 `Protocol = "http"`，转发方式与既有 `internal/server/http_proxy.go` 的 `ServeRoute` 完全一致：`upstreamReq.Write(stream)` + `http.ReadResponse(bufio.NewReader(stream), upstreamReq)` + `copyResponse`（已核实 `ServeRoute` 不使用 `http.Client`，`streamNetConn` 只服务 WebSocket 升级分支）。
+- CONNECT 使用 `relay.StreamRequest.Protocol = "tcp"`（与 `internal/client/socks5_forward.go:250` 的裸隧道语义一致）；绝对形式使用 `Protocol = "http"`，转发方式与既有 `internal/server/http_proxy.go` 的 `ServeRoute` 完全一致：`upstreamReq.Write(stream)` + `http.ReadResponse(bufio.NewReader(stream), upstreamReq)` + `copyResponse`（已核实 `ServeRoute` 不使用 `http.Client`；WebSocket 升级走 `handleUpgrade` 的 `Hijack()` + `io.Copy`；`streamNetConn` 是预留适配器，当前在 `internal/` 下没有任何构造点，两条分支都不经过它，本计划不引用它）。
 - OpenResty 的 `tp-*` server 块禁止 `http2 on`，只协商 http/1.1；Lua 侧所有 cosocket 超时显式设置。
 - 分层保持 Handler -> Service -> Repository；管理 API 前缀 `/api/v1`，响应 `{code,msg,data}`，列表用 cursor 分页。
 - 每个任务先红后绿（TDD），完成后运行本任务列出的验证命令。
 - 未经用户在当前任务中明确授权，不得执行 `git commit` / `git push`；步骤中的 commit 只在已获授权时执行。
-- 仓库当前存在另一个会话的大规模暂存改动（573 文件）。执行本计划时只 `git add` 本任务列出的文件，禁止 `git add -A`、`git commit -a`、`git stash`、`git reset`。
+- 本计划基线为 `main` @ `b3acd34`（此前另一会话的大规模暂存改动已在 `6202b5b` / `b3acd34` 落盘，当前工作树除本计划与 spec 外干净）。开始 Task 0 前先用 `git log --oneline -1` 与 `git status --short` 复核基线；若 HEAD 已前进，必须重新核对本计划里所有以 `internal/server/api.go:NNNN` 形式给出的行号锚点（行号会随其它提交漂移，函数名与代码片段才是稳定锚点）。
+- 无论工作树是否干净，执行本计划时只 `git add` 本任务 `**Files:**` 列出的文件，禁止 `git add -A`、`git commit -a`、`git stash`、`git reset`：同一仓库可能随时出现其它会话的改动，全量暂存会把无关变更混进本 PR。
 
 ## File Structure
 
@@ -83,6 +84,9 @@
 | `docs/deployment/nginx.md`、`docs/operations/configuration.md`、`docs/operations/troubleshooting.md`、`docs/api/openapi.yaml`、`docs/README.md` | Modify | 同步文档 |
 | `docs/user-guide/managed-http-route.md` | Modify | 交叉引用：`http-proxy` 不是反代路由 |
 | `docs/development/testing.md`、`docs/development/README.md` | Modify | 验证层级表与索引补 proxy-entry 端到端冒烟 |
+| `docs/architecture/overview.md` | Modify | tp-* 入口拓扑链路（文字版）与“不新增公网端口、唯一策略执行点是 Server”的说明，spec 第 16 节要求 |
+| `docs/superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md` | Modify | 实现期偏差回写：Task 13 Step 6（活跃隧道数改为指向 Grafana 面板）、Task 14 Step 15（容器与 stub 修正）、Task 15 Step 15(b)（第 13 / 14 / 15 节） |
+| `docs/superpowers/plans/2026-09-13-managed-route-http-proxy-entry-implementation.md` | Modify | 本计划自身：Task 0 Step 5 在文件末尾追加 `## Task 0 验证记录`（spike 命令、实际输出与“继续 A3 / 回退 A2”结论） |
 | `README.md`、`README.zh-CN.md` | Modify | 能力清单、Edge 部署链接、用户指南索引 |
 | Go 测试文件（`internal/proxyentry/{route,identity,acl,auth,target,errors}_test.go`、`internal/server/{proxy_entry,proxy_entry_absolute,proxy_entry_listener,proxy_entry_routes,api_proxy_route,credential_api,credential_service}_test.go`、`internal/storage/credential_repository_test.go`、`internal/config/config_test.go`、`internal/observability/metrics_proxy_entry_test.go`） | Create/Modify | TDD 红灯测试；精确清单见各任务的 `**Files:**` 列表，此处只为文件总览完整性列出 |
 | `docs/pull-requests/README.md`、`docs/superpowers/plans/README.md`、`docs/superpowers/specs/README.md`、`docs/architecture/adr/README.md` | Regenerate | `python3 scripts/gen_doc_index.py` 生成的索引，Task 15 Step 12 统一重生成并验证幂等，不手工编辑 |
@@ -3101,6 +3105,11 @@ func proxyRouteConfigOf(raw string) (proxyRouteConfig, error)
 // validateProxyRouteDomain enforces the tp-<name>.<suffix> shape for
 // protocol=http-proxy routes without needing the configured domain suffix.
 func validateProxyRouteDomain(domain string) error
+
+// tunnelRouteConflict gains domainOnly: an http-proxy route claims a whole
+// hostname, so its conflict check ignores path_prefix. Callers are createTunnel
+// (id == "") and updateTunnel (id == the route being patched).
+func (a *API) tunnelRouteConflict(ctx context.Context, id, domain, pathPrefix string, domainOnly bool) (bool, error)
 ```
 
 `tunnelRequest` 与 `tunnelUpdateRequest` 新增字段（JSON 名与 spec §9 一致）：
@@ -3251,6 +3260,92 @@ func TestAPICreatesProxyRouteWithSentinelTarget(t *testing.T) {
     }
     if json.Valid(created.Body.Bytes()) == false {
         t.Fatal("response is not valid JSON")
+    }
+}
+
+// tp-* 域名是“整机代理端点”，一条域名只能有一条路由。这个用例锁住三层语义：
+// 大小写变体算同一条、同域名的路径级反代路由不允许共存、update 改域名同样受限。
+func TestAPIProxyRouteRejectsDuplicateDomain(t *testing.T) {
+    api, admin, _ := apiTestServer(t)
+    setCredentialSecretStore(t, api)
+    h := api.Handler()
+    token := apiToken(t, api, admin.Username, "admin-pass")
+    agentID := createProxyTestAgent(t, h, token, "egress-dup")
+
+    first := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-dup-1", map[string]any{
+        "agentId": agentID, "protocol": "http-proxy", "domain": "tp-dup.tm.example.com",
+        "authMode": "none", "sourceCIDRs": []string{"10.0.0.0/8"},
+    })
+    if first.Code != http.StatusCreated {
+        t.Fatalf("create status=%d: %s", first.Code, first.Body.String())
+    }
+    var created proxyRouteResponse
+    if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+        t.Fatal(err)
+    }
+
+    upper := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-dup-2", map[string]any{
+        "agentId": agentID, "protocol": "http-proxy", "domain": "TP-DUP.tm.example.com",
+        "authMode": "none", "sourceCIDRs": []string{"10.0.0.0/8"},
+    })
+    if upper.Code != http.StatusConflict {
+        t.Fatalf("case-variant duplicate status=%d body=%s, want 409", upper.Code, upper.Body.String())
+    }
+
+    reverse := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-dup-3", map[string]any{
+        "agentId": agentID, "protocol": "http", "domain": "tp-dup.tm.example.com", "pathPrefix": "/admin",
+        "targetHost": "10.0.0.9", "targetPort": 8080,
+    })
+    if reverse.Code != http.StatusConflict {
+        t.Fatalf("reverse-proxy route on a tp-* domain status=%d body=%s, want 409", reverse.Code, reverse.Body.String())
+    }
+
+    other := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-dup-4", map[string]any{
+        "agentId": agentID, "protocol": "http-proxy", "domain": "tp-other.tm.example.com",
+        "authMode": "none", "sourceCIDRs": []string{"10.0.0.0/8"},
+    })
+    if other.Code != http.StatusCreated {
+        t.Fatalf("second proxy route status=%d: %s", other.Code, other.Body.String())
+    }
+    var otherRoute proxyRouteResponse
+    if err := json.Unmarshal(other.Body.Bytes(), &otherRoute); err != nil {
+        t.Fatal(err)
+    }
+    if otherRoute.Data.ID == created.Data.ID {
+        t.Fatal("two distinct proxy routes share an ID")
+    }
+
+    renamed := apiJSON(t, h, http.MethodPatch, "/api/v1/routes/"+otherRoute.Data.ID, token, "", map[string]any{
+        "domain": "tp-dup.tm.example.com",
+    })
+    if renamed.Code != http.StatusConflict {
+        t.Fatalf("rename onto an existing tp-* domain status=%d body=%s, want 409", renamed.Code, renamed.Body.String())
+    }
+}
+
+// 反向顺序也必须被拒：反代路由先占用 tp-* 域名时，后建的 proxy 路由不能成功，
+// 否则它会被 nginx 的精确 server_name 永久遮蔽，且后台看不出原因。
+func TestAPIProxyRouteRejectsDomainClaimedByReverseProxy(t *testing.T) {
+    api, admin, _ := apiTestServer(t)
+    setCredentialSecretStore(t, api)
+    h := api.Handler()
+    token := apiToken(t, api, admin.Username, "admin-pass")
+    agentID := createProxyTestAgent(t, h, token, "egress-shadow")
+
+    reverse := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-shadow-1", map[string]any{
+        "agentId": agentID, "protocol": "http", "domain": "tp-shadow.tm.example.com", "pathPrefix": "/admin",
+        "targetHost": "10.0.0.9", "targetPort": 8080,
+    })
+    if reverse.Code != http.StatusCreated {
+        t.Fatalf("reverse-proxy create status=%d: %s", reverse.Code, reverse.Body.String())
+    }
+
+    shadowed := apiJSON(t, h, http.MethodPost, "/api/v1/routes", token, "proxy-shadow-2", map[string]any{
+        "agentId": agentID, "protocol": "http-proxy", "domain": "tp-shadow.tm.example.com",
+        "authMode": "none", "sourceCIDRs": []string{"10.0.0.0/8"},
+    })
+    if shadowed.Code != http.StatusConflict {
+        t.Fatalf("proxy route on a claimed domain status=%d body=%s, want 409", shadowed.Code, shadowed.Body.String())
     }
 }
 
@@ -3767,6 +3862,21 @@ func concurrencyOrZero(v *int) int {
 
 `credentialErrorStatus(err)` 复用 `credential_api.go` 中 `writeCredentialError` 已有的错误到状态码映射：把那段 switch 抽成 `credentialErrorStatus(err) int`，`writeCredentialError` 改为调用它，避免两份映射。未找到与无权访问都必须映射为 403/404（不得回 200），并统一对外文案 `credential is not usable`，防止凭据 ID 枚举。
 
+**路由域名冲突判定：`http-proxy` 按域名整体互斥（不看 `path_prefix`）**
+
+仓库现状（`main` @ `b3acd34`，已核实；`internal/server/api.go` 自 `f0ca22c` 起未变更，行号同样适用）：`a.tunnelRouteConflict(ctx, id, domain, pathPrefix)`（`internal/server/api.go:1246`，`updateTunnel` 调用）与 `createTunnel`（`internal/server/api.go:1262`）里内联的同语义循环（`internal/server/api.go:1287`）都用 `strings.EqualFold(route.Domain, domain) && route.PathPrefix == pathPrefix` 判冲突；`tunnels` 表另有 `UNIQUE(domain, path_prefix)`。
+
+这个条件对反代路由是正确的（同域名不同前缀是合法的多路径路由），但对 `http-proxy` 不成立：tp-* 域名的 `path_prefix` 恒为 `"/"` 且没有语义，它是一个整机代理端点。若允许它与同域名的路径级反代路由共存，nginx 的精确 `server_name` 会优先于 tp-* 的正则 `server_name`，那条 proxy 路由永远不可达，而 `UNIQUE(domain, path_prefix)` 也拦不住（两行前缀不同）。因此必须在应用层按域名整体互斥。
+
+改法（两处重复 + 本次新增语义 = 三处，按 DRY 收敛成一个函数）：
+
+1. `tunnelRouteConflict` 增加 `domainOnly bool` 形参：为 true 时只比较 `strings.EqualFold(route.Domain, domain)`，跳过 `PathPrefix` 比较；`domain == ""` 仍直接返回 `false, nil`。
+2. `createTunnel` 删掉 1287 起的内联循环，改调 `a.tunnelRouteConflict(r.Context(), "", req.Domain, req.PathPrefix, isProxyRoute)`。`id` 传空串代表新建，既有 `route.ID != id` 判断对空串天然成立；冲突时沿用既有文案与状态码 `writeAPIError(w, http.StatusConflict, "route already exists")`，不新增错误码。
+3. `updateTunnel` 的调用处传 `domainOnly = current.Protocol == storage.ProtocolHTTPProxy || protocol == storage.ProtocolHTTPProxy`。协议切换已被 (d) 的守卫拦掉，写全两侧只是让“任一端是 proxy 路由”的语义显式，避免以后放开切换时漏改。
+4. 不新增查询：`listAllTunnels` 的调用次数与既有一致（create 路径本来就调了一次）。
+
+集群模式下多个 Server 并发创建时 `a.routeMu` 只在进程内生效，跨节点竞争最终由 `UNIQUE(domain, path_prefix)` 兜底，`writeStorageError` 已把含 `unique` / `constraint` 的驱动错误映射为 409。注意两点：该兜底**只覆盖前缀也相同**的情况，跨协议的域名遮蔽必须靠上面的 `domainOnly` 判定在进库前拦住；兜底会把驱动原文写进 `msg`，这是所有路由共享的既有行为，本计划不改（改动会牵动全部路由的错误契约，属于独立议题）。
+
 **(c) `internal/server/api.go`：`apiService.CreateTunnel`**
 
 ```go
@@ -3939,6 +4049,7 @@ func credentialUsername(v storage.Credential) string {
 - `components.schemas.TunnelRequest`：`protocol` 的 enum 改为 `[http, websocket, http-proxy]`；`required` 改为 `[agentId]` 并在 `targetHost`/`targetPort` 的 `description` 里写明“`http-proxy` 路由必须省略，服务端强制写入哨兵 `*` / `0`”；新增 `authMode`（enum `[none, basic]`, default `none`）、`credentialId`、`sourceCIDRs`（`type: array, items: {type: string}`）、`targetCIDRs`、`targetPorts`（`items: {type: integer, minimum: 1, maximum: 65535}`）、`allowPrivateTargets`（`type: boolean, default: true`）、`maxConcurrentTunnels`（`type: integer, minimum: 0`）、`description`（`maxLength: 256`）。
 - `components.schemas.TunnelUpdateRequest`：同样把 `protocol` enum 加上 `http-proxy`，并新增上述 8 个字段（全部可选，语义为“省略即保持”）；在 `description` 中写明协议不得在 `http-proxy` 与其它值之间切换。
 - `/api/v1/routes` 的 `post.responses` 增加 `'400': {description: Invalid proxy route policy, credential or domain shape}`；`/api/v1/routes/{routeId}` 的 `patch.responses` 增加 `'400': {description: Invalid field, or a protocol switch involving http-proxy}`。
+- `post` 与 `patch` 的 `'409'` 响应 description 补一句 `http-proxy` 的域名互斥语义：一条 tp-* 域名只能对应一条路由，与同域名的路径级反代路由（任意 `pathPrefix`）冲突时返回 409 `route already exists`；大小写变体视为同一条。
 - `components.schemas.CredentialCreateRequest` / `CredentialPatchRequest` / `Credential` 的 `type` enum 改为 `[ssh_public_key, password, proxy_basic]`；三者新增 `username: {type: string, maxLength: 255, description: proxy_basic only; stored in publicKey and never secret}`；`CredentialSecretInput.password` 的 description 补上 “Required for `password` and `proxy_basic`”。
 - 新增一节说明 407/403/502/503/504 由代理入口（非 `/api/v1`）返回，指向 `docs/user-guide/http-proxy-entry.md` 的错误码表，避免读者以为管理 API 会返回 407。
 
@@ -3946,10 +4057,11 @@ func credentialUsername(v storage.Credential) string {
 
 Run: `go test ./internal/server/ ./internal/storage/ -count=1 && go test -race ./internal/server/ -count=1 && go vet ./internal/server/ && gofmt -l internal/ cmd/`
 Expected: PASS，`gofmt -l` 无输出。特别确认既有 `TestAPIRouteUpstreamDomainAndTLSConfig`、`TestAPIAuthAndRBAC`、credential 相关测试与 managed route 测试全部不回归。
+- `TestAPIProxyRouteRejectsDuplicateDomain` 与 `TestAPIProxyRouteRejectsDomainClaimedByReverseProxy` 必须 PASS；同时确认既有路由冲突用例（同域名同前缀 409、同域名不同前缀仍可创建）没有因为 `domainOnly` 参数而回归——反代路由的 `domainOnly` 恒为 false，语义与改动前完全一致。
 
 - [ ] **Step 6: 复审确认无重复实现**
 
-检查 `normalizeCIDRList` / `normalizePortList` / `credentialErrorStatus` 是否与仓库既有函数重复：
+检查 `normalizeCIDRList` / `normalizePortList` / `credentialErrorStatus` 是否与仓库既有函数重复，并确认 `createTunnel` 里原来那段内联的域名冲突循环已被删除、只剩 `tunnelRouteConflict` 一个实现：
 
 Run: `grep -rn "ParseCIDR\|normalizePorts\|sort.Ints" internal/server/ internal/routing/ internal/proxyentry/ | grep -v _test.go`
 Expected: 若发现等价的既有实现，删除本任务新增的版本并改为复用；否则保留并在代码注释中说明为何不能复用（例如既有实现的错误文案不适合作为 400 响应）。
@@ -5403,6 +5515,7 @@ git commit -m "feat(deploy): ship openresty tp proxy entry artifacts"
 - Create: `docs/pull-requests/2026-09-13-managed-route-http-proxy-entry.md`
 - Regenerate: `docs/pull-requests/README.md`、`docs/superpowers/plans/README.md`、`docs/superpowers/specs/README.md`、`docs/architecture/adr/README.md`（`python3 scripts/gen_doc_index.py`）
 - Modify: `docs/development/testing.md`、`docs/development/README.md`（Step 11：验证层级表与索引补 proxy-entry 端到端冒烟）
+- Modify: `docs/architecture/overview.md`（Step 11：tp-* 入口拓扑链路，spec 第 16 节要求）
 - Modify: `docs/superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md`（Step 15(b)：第 13 / 14 / 15 节偏差回写）
 - Modify: `docs/operations/configuration.md`（`server.proxy_entry` 配置表已由 Task 1 写入，Step 16 仅作为兜底出现在 `git add`，通常无变化）
 
@@ -5565,6 +5678,27 @@ Expected: `SUCCESS: 9 rules found`（既有 7 条 + 新增 2 条）。若本机�
 
 `docs/operations/completeness-checklist.md`：已完成项末尾追加 `- [x] tp-* 托管 HTTP 代理入口（OpenResty 搬运层 + Server 策略内核 + 管理后台）`；未完成项不动（SOCKS5 托管入口、单路由多出口池化仍属 deferred，不得写成已支持）。
 
+`docs/architecture/overview.md`（spec 第 16 节要求的“入口拓扑图”，用紧凑文字链路代替图片，避免图与代码之间出现第二处需要同步的地方）。在第一段（三个可执行程序的职责）之后插入：
+
+```text
+浏览器 / curl / 系统代理（HTTPS 代理方案，只能填 https://）
+  └─ TLS + SNI: tp-<name>.<domain_suffix>          复用既有 443，不新增公网端口
+       └─ OpenResty tp-* server 块：access_by_lua_block
+            · 打过 proxy_connect 补丁的内核对 CONNECT 跳过 location 匹配
+            · 只搬字节，不含任何策略判断
+            · 注入可信头 X-TunnelMesh-Route（来自 SNI）/ -Client-IP / -Client-Port
+            └─ 明文回环 127.0.0.1:8089（server.proxy_entry.listen）
+                 └─ tunnelmesh-server：ProxyEntryListener
+                      · trusted_proxies 前置校验，不在白名单则读请求前直接关闭
+                      · proxyentry 策略链：身份解析 → 源 IP ACL → Basic 认证 → 目标校验 → 并发限额
+                      └─ relay.NodeTransport.OpenStream（集群模式下自动跨节点）
+                           └─ Agent 出口：目标侧二次 SSRF / 私网 / 端口校验后建立真实连接
+```
+
+同时在该文件“公网模式只需要 HTTP/HTTPS/WSS 入口”那段补一句：tp-* 代理入口不新增公网监听端口，与既有 443 由 SNI 分流；唯一策略执行点是 Server，OpenResty 与 Lua 不含授权逻辑。
+
+不新建 ADR 文件：spec 第 16 节已声明 `docs/superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md` 本身即 ADR 载体，`docs/architecture/adr/README.md` 由 Step 12 的索引脚本重生成；只有在 Task 0 判定回退 A2 或后续发生重大设计回退时才另行补记 ADR。
+
 `README.md`：
 
 - 能力列表（`forward socks5` / `forward http-proxy` 那一段）之后加一条 bullet：`- Managed HTTP proxy entry — set \`https://tp-<name>.<domain>\` as a browser or OS proxy; the egress agent, Basic auth and source ACL are configured in the admin console, and nothing has to be installed on the user machine.`
@@ -5607,7 +5741,7 @@ Expected: 第二次执行后 diff 不再变化。
 - **Release Steps**：先升级 Server（`server.proxy_entry.enabled=false` 时行为与旧版完全一致）-> 部署 OpenResty 产物并 `nginx -t` -> 配 DNS 泛解析与通配证书 -> 打开 `enabled` 并 `check-config` -> 后台建一条 tp-* 路由验证 -> 导入更新后的 Grafana Dashboard。
 - **Rollback Steps**：5 分钟止损顺序——删除 nginx 里的 tp-* server 块并 reload（入口立即消失）；或 `enabled=false` 重启 Server；路由行可直接停用；Schema 无变更因此不涉及数据回滚。
 - **Reviewer Focus**：`internal/proxyentry` 的 fail-closed 语义（ACL 空列表=拒绝、非法条目=拒绝）、`internal/server/proxy_entry.go` 的 hijack 与 `spliceWithIdleTimeout` 半关闭处理、哨兵 `target_host="*"` 在 `loadManagedRoutes` 中被正确跳过（否则 `location /` 的泛域名反代会误匹配 tp-*）、Lua 里没有任何策略逻辑、日志与指标不含凭据。
-- **Integration Status**：写明本 PR 与并发会话在同一仓库的其它暂存改动无文件重叠（列出本 PR 触及的文件清单来源：Task 1-15 的 commit 步骤）。
+- **Integration Status**：写明基线 commit（`git merge-base HEAD main`）与本 PR 触及的文件清单来源（Task 0-15 的 commit 步骤）；若期间有其它会话的提交进入 `main`，逐条列出与本 PR 重叠的文件及处理方式，无重叠则明确写“无重叠”。
 - 全文不得出现密码、Token、私钥、生产 DSN 或未脱敏日志。
 
 - [ ] **Step 14: 全量门禁**
@@ -5652,8 +5786,63 @@ Expected: 全部通过；`gofmt -l` 与 `git diff --check` 无输出；`node tes
 - [ ] **Step 16: Commit（需授权）**
 
 ```bash
-git add deploy/grafana/dashboards/tunnelmesh.json deploy/grafana/dashboard_schema_test.go deploy/prometheus/alert-rules.yaml deploy/README.md docs/operations/observability.md docs/operations/troubleshooting.md docs/operations/configuration.md docs/operations/completeness-checklist.md docs/deployment/openresty-proxy-entry.md docs/deployment/nginx.md docs/user-guide/http-proxy-entry.md docs/user-guide/managed-http-route.md docs/development/testing.md docs/development/README.md docs/README.md docs/pull-requests/2026-09-13-managed-route-http-proxy-entry.md docs/pull-requests/README.md docs/superpowers/plans/README.md docs/superpowers/specs/README.md docs/architecture/adr/README.md docs/superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md README.md README.zh-CN.md
+git add deploy/grafana/dashboards/tunnelmesh.json deploy/grafana/dashboard_schema_test.go deploy/prometheus/alert-rules.yaml deploy/README.md docs/operations/observability.md docs/operations/troubleshooting.md docs/operations/configuration.md docs/operations/completeness-checklist.md docs/deployment/openresty-proxy-entry.md docs/deployment/nginx.md docs/user-guide/http-proxy-entry.md docs/user-guide/managed-http-route.md docs/architecture/overview.md docs/development/testing.md docs/development/README.md docs/README.md docs/pull-requests/2026-09-13-managed-route-http-proxy-entry.md docs/pull-requests/README.md docs/superpowers/plans/README.md docs/superpowers/specs/README.md docs/architecture/adr/README.md docs/superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md README.md README.zh-CN.md
 git commit -m "feat(observability): add proxy entry dashboard row, alerts and docs"
 ```
 
 `docs/operations/configuration.md` 的 `server.proxy_entry` 配置表已由 Task 1 写入，这里只作为兜底加入 `git add` 列表；若 Task 1 已提交，该文件在本次 commit 中不会有变化，属正常。
+
+---
+
+## Task 0 验证记录
+
+执行环境：`Darwin arm64`，Go `go1.27.1`，Node `v24.15.0`，基线 `main` @ `b3acd34`。
+
+### (a) build flags —— 未执行
+
+Run: `nginx -V 2>&1 | tr ' ' '\n' | grep -i "proxy_connect\|add-module\|with-http_ssl"`
+
+未执行，原因是本机没有 OpenResty，也没有任何容器运行时可用来自建一个：
+
+```text
+nginx      (not found)
+openresty  (not found)
+resty      (not found)
+docker     (not found)
+podman     (not found)
+colima     (not found)
+nerdctl    (not found)
+```
+
+曾尝试 `brew install openresty/brew/openresty` 以后台方式安装，但后台进程随工具会话结束被回收（日志 0 字节）。即使安装成功，Homebrew 的 openresty formula **不带** `ngx_http_proxy_connect_module` 补丁，CONNECT 会被 nginx 直接回 405，跑出来的结果只反映本机安装方式、不反映目标机内核，因此没有继续。
+
+### (b)(c)(d) 明文 CONNECT 经 server 级 access_by_lua —— 未执行
+
+Run: `bash deploy/openresty/spike-connect-check.sh 18443`
+
+未执行（同上，缺 OpenResty 内核）。脚本本身已按 Step 1 写入 `deploy/openresty/spike-connect-check.sh`，并通过 `bash -n` 语法检查；`shellcheck` 本机未安装，未执行。
+
+与计划的一处偏差：脚本用 `run_with_timeout` 包装了 `nc`，因为 macOS 没有 `timeout(1)`（只有 coreutils 的 `gtimeout`）。该脚本会作为部署前置检查在管理员本机运行，缺 `timeout` 时退化为“后台执行 + 定时 kill”，语义不变。
+
+### (e) 非 CONNECT 分支的 hop-by-hop 头 —— 未执行
+
+未执行（同上）。计划已按“必须显式 `proxy_set_header Proxy-Authorization $http_proxy_authorization;`”编写，且该约束由 `deploy/openresty/openresty_artifacts_test.go`（Task 14）以契约测试守护，不依赖本次 spike 的结果。
+
+### 已由上游源码核实的事实（Task 14 外部事实表，非本机经验验证）
+
+- `proxy_connect_rewrite_102101.patch`（模块 tag `v0.0.7`）把 `$connect_host` / `$connect_port` 注册进 `ngx_http_core_variables[]`，删除 nginx 对 CONNECT 的 405 拒绝，并在 `ngx_http_core_find_config_phase` 中 `r->phase_handler++` 跳过 location 匹配 —— 这正是 server 级 `access_by_lua` 能看到 CONNECT、而 `content_by_lua_block` 永不触发的机制。
+- `NGX_HTTP_PROXY_CONNECT` 宏由模块 `config` 定义，补丁与模块缺一都会让 CONNECT 失效。
+- OpenResty `1.25.3.1` 与该补丁成对（模块 README 的 Compatibility 表）。
+
+### 决策：继续 A3（附强制前置条件）
+
+不触发中止判据：中止判据是“spike 跑出来 `access_by_lua` 收不到 CONNECT / 拿不到 raw socket 或 SNI”，而本次是**无法执行**，不是执行后失败。机制层面已由上游补丁源码核实，A3 的核心假设成立。
+
+但因为缺少经验验证，落地必须满足以下强制前置条件，缺一不可：
+
+1. `server.proxy_entry.enabled` 默认 `false`（Task 1 已实现并有测试守护），代码合入后线上行为与旧版本完全一致，不存在“未验证即生效”的风险。
+2. 在目标 OpenResty 主机上启用之前，**必须**先执行 `bash deploy/openresty/spike-connect-check.sh 18443`，确认输出包含 `spike connect_host=example.com connect_port=443` 且 nc 侧收到 `HTTP/1.1 200 Connection Established` 与 `spike-ok`；把实际输出补记到本小节。
+3. 若目标机内核没有补丁（收到 405 或 error.log 无 spike 行），改用 `deploy/openresty/Dockerfile.proxy-connect` 构建的内核，或按 spec 第 15 节回退 A2，并把决策写回 spec 第 17 节。
+4. Task 14 的 OpenResty 端到端冒烟（`TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs`）需要 docker，本机同样无法执行，按 skip 语义退出 0；必须在有 docker 的环境补跑，并把结果写进 PR 记录的 Test Evidence。
+
+以上第 2、4 条在 PR 记录中必须标注为“未执行 + 原因”，不得写成已通过。

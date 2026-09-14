@@ -68,7 +68,7 @@ tunnelmesh-agent   出口拨号真实目标，并再次执行 SSRF/私网/端口
 
 - 代理地址：`https://tp-<name>.<domain_suffix>:443`。`<name>` 允许 `[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?`，统一小写。
 - `domain_suffix` 来自新配置 `server.proxy_entry.domain_suffix`，与 `server.dynamic_suffix` 解耦，必须与泛解析 DNS 和通配证书一致（单层 `tp-<name>`，`*. <domain_suffix>` 证书可覆盖）。
-- 存储的 `tunnels.domain` 为完整主机名 `tp-<name>.<domain_suffix>`；`UNIQUE(domain, path_prefix)` 保证同域下名称唯一，沿用既有 `tunnelRouteConflict` 冲突检查。
+- 存储的 `tunnels.domain` 为完整主机名 `tp-<name>.<domain_suffix>`，`path_prefix` 恒为 `"/"`（哨兵，无语义）。一条 tp-* 域名只能对应一条路由，冲突检查沿用既有 `tunnelRouteConflict` 但按**域名整体**判定（`domainOnly`），不比较 `path_prefix`：数据库的 `UNIQUE(domain, path_prefix)` 只在两行前缀也相同时才拦得住，而 tp-* 域名与同域名的路径级反代路由（例如 `pathPrefix=/admin`）共存时前缀不同，约束不会触发，可 nginx 的精确 `server_name` 会优先于 tp-* 的正则 `server_name`，那条 proxy 路由将永远不可达。大小写变体（`TP-Demo` 与 `tp-demo`）视为同一条，因为 SNI 与 Host 都不区分大小写。创建与更新（改域名）两条路径都受此约束，冲突返回 409 `route already exists`。
 - 客户端必须使用 `https://` 代理方案（TLS 直连代理）。原因：路由身份来自 SNI，且 Basic 凭据必须加密传输。macOS/Windows 系统代理的“安全 Web 代理 (HTTPS)”、Chrome PAC 的 `HTTPS host:port`、`curl --proxy https://...` 均支持；用户文档给出 PAC 与 curl 示例，并明确说明只能填 `http://` 代理地址的旧客户端无法使用本入口。
 
 ## 5. OpenResty 侧设计
@@ -186,7 +186,7 @@ type RouteIdentity interface {
 
 - CONNECT 目标 `host:port`：端口必须在 1..65535；host 为 IP 字面量时立即用 `routing.Policy.Validate` 校验（危险地址恒拒 + 路由级 `targetCIDRs`/`targetPorts`）；host 为域名时 Server 不解析，由 agent 解析后执行二次校验（与既有 client 转发行为一致）。
 - `allowPrivateTargets=false` 时额外拒绝 RFC1918、ULA、回环与链路本地目标（IP 字面量在 Server 拒绝，域名由 agent 拒绝）。默认 `true`，因为出口在 agent，访问其内网服务正是本功能的核心价值。
-- 开流复用 `relay.NodeTransport.OpenStream(ctx, relay.StreamRequest{...})`：`AgentID` 取自路由；CONNECT 使用 `Protocol: "tcp"`，与 `internal/client/socks5_forward.go` 的裸隧道语义一致；绝对形式使用 `Protocol: "http"`，转发方式与 `internal/server/http_proxy.go` 的 `ServeRoute` 一致（`upstreamReq.Write(stream)` + `http.ReadResponse(bufio.NewReader(stream), upstreamReq)` + `copyResponse`；已核实 `ServeRoute` 不使用 `http.Client`，`streamNetConn` 只服务 WebSocket 升级分支）。集群模式下 agent 挂在其它节点时由既有 relay 路径转发，无需新增逻辑。
+- 开流复用 `relay.NodeTransport.OpenStream(ctx, relay.StreamRequest{...})`：`AgentID` 取自路由；CONNECT 使用 `Protocol: "tcp"`，与 `internal/client/socks5_forward.go:250` 的裸隧道语义一致；绝对形式使用 `Protocol: "http"`，转发方式与 `internal/server/http_proxy.go` 的 `ServeRoute` 一致（`upstreamReq.Write(stream)` + `http.ReadResponse(bufio.NewReader(stream), upstreamReq)` + `copyResponse`；已核实 `ServeRoute` 不使用 `http.Client`，WebSocket 升级走 `handleUpgrade` 的 `Hijack()` + `io.Copy`，`streamNetConn` 是无构造点的预留适配器，两条分支都不经过它，本设计不引用它）。集群模式下 agent 挂在其它节点时由既有 relay 路径转发，无需新增逻辑。
 - CONNECT 成功后 hijack 下游连接，先写 `HTTP/1.1 200 Connection Established\r\n\r\n`，把 hijack 缓冲中已预读的字节先转发（复用 `internal/server/http_proxy.go` 的既有做法），再双向 `io.Copy`，受 flow-control 窗口与 idle 超时约束。
 - 绝对形式（非 CONNECT）请求把 `Host` 当目标，规范化为 origin-form 后经同一条 stream 转发，响应流式回写（等价于 client 侧 `normalizeProxyRequest`）。
 
@@ -387,6 +387,7 @@ spike 产物只作为结论文档记录，不进入生产代码。
 | 凭据 | 复用 `credentials`，新增 `proxy_basic` 类型 | 复用 `password` 类型：与 SSH 密码语义混淆，username 无处存放 |
 | 策略位置 | 全部在 Server（Go） | 放在 Lua：无法单测、形成双份权威、易与 Server 校验漂移 |
 | SOCKS5 | 本轮不做 | 用户已明确只做 HTTP 代理；stream 模块因此也不再需要 |
+| 域名冲突判定 | `http-proxy` 路由按域名整体互斥（`tunnelRouteConflict` 增加 `domainOnly`），create 与 update 共用一个实现 | 沿用 `domain + path_prefix` 复合判定：tp-* 的 `path_prefix` 恒为 `"/"`，与同域名不同前缀的反代路由不会被数据库 `UNIQUE` 拦住，会留下一条被 nginx 精确 `server_name` 永久遮蔽、后台看不出原因的不可达路由 |
 
 ## 18. 验收标准
 
