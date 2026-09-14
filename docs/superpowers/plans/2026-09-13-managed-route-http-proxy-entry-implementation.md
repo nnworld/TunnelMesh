@@ -5846,3 +5846,113 @@ Run: `bash deploy/openresty/spike-connect-check.sh 18443`
 4. Task 14 的 OpenResty 端到端冒烟（`TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs`）需要 docker，本机同样无法执行，按 skip 语义退出 0；必须在有 docker 的环境补跑，并把结果写进 PR 记录的 Test Evidence。
 
 以上第 2、4 条在 PR 记录中必须标注为“未执行 + 原因”，不得写成已通过。
+
+---
+
+## 实施结果与偏离记录（Task 0-15 收尾回写）
+
+执行环境：`Darwin arm64`，Go `go1.27.1`，Node `v24.15.0`。开发基线 `main` @ `b3acd34`；
+推送前发现另一会话已向 `origin/main` 推入 4 个提交（`91553a1`、`da994b3`、`6227c17`、`50b4130`），
+本 feature 的 17 个提交已 rebase 到 `origin/main` @ `50b4130` 之上，**无冲突**，下表哈希为 rebase
+后的最终值。重叠文件与处理方式见 PR 记录的 Integration Status。
+本节是全计划的权威执行记录；PR 记录见
+[docs/pull-requests/2026-09-13-managed-route-http-proxy-entry.md](../../pull-requests/2026-09-13-managed-route-http-proxy-entry.md)。
+
+计划正文里的 `- [ ]` 复选框**不作为完成度跟踪手段**（Task 0-12 期间也未勾选），完成情况以本节的
+提交对照表为准；这样避免“复选框已勾但实际未执行”与“实际已执行但忘记勾选”两类不一致。
+
+### 提交对照
+
+| Task | 提交 | 说明 |
+|---|---|---|
+| 计划细化 + Task 0 spike | `9981401` | 含 Task 0 验证记录 |
+| Task 0 诊断脚本 | `cb1abfe` | `deploy/openresty/spike-connect-check.sh` |
+| Task 1 配置项 | `3dce406` | `server.proxy_entry` 13 个键 |
+| Task 2 错误模型与路由类型 | `4332a24` | `internal/proxyentry/errors.go`、`route.go` |
+| Task 3 路由身份解析 | `97535be` | header 与 SNI 两种实现 |
+| Task 4 源 IP ACL | `2122f21` | fail-closed |
+| Task 5 Basic 认证与退避 | `d54e786` | 常量时间比较 + 指数退避 |
+| Task 6 目标地址校验 | `342e739` | SSRF / 私网 / 端口策略 |
+| Task 7 proxy 路由快照 | `700ecf0` | `http-proxy` 行不进反代路由表 |
+| Task 8 `proxy_basic` 凭据 | `4c98af3` | 复用既有 secret store |
+| Task 9 内部监听与可信 peer | `3503fd2` | 读请求前直接关闭不可信 peer |
+| Task 10 CONNECT 隧道 | `3911b0b` | 限额、指标、审计 |
+| Task 11 绝对形式转发 | `c7d9fc9` | 非 CONNECT 分支 |
+| Task 12 管理 API | `72416d7` | 同时修掉 Task 9 的 `-race` 缺陷（见下） |
+| Task 13 管理后台 | `dbc0fc5` | Vue + i18n + 前端测试 |
+| Task 14 OpenResty 产物 | `22527be` | Lua / conf / Dockerfile / E2E |
+| Task 15 收尾 | 本次提交（HEAD） | Dashboard row、告警、全部文档、PR 记录；本表自身也在这次提交里更新，因此不写死哈希 |
+
+### 门禁结果（Task 15 Step 14）
+
+| 命令 | 结果 |
+|---|---|
+| `go test ./... -count=1` | 20 个包全部 ok，0 FAIL |
+| `go test -race -timeout 40m ./...` | 退出码 0，20 个包全部 ok；最慢 `internal/server` 291.594s |
+| `go vet ./...` | 退出码 0，无输出 |
+| `gofmt -l internal/ cmd/ deploy/ test/` | 无输出 |
+| `git diff --check` | 无输出 |
+| `go test ./deploy/... -count=1` | grafana / install / openresty 全部 ok |
+| `cd web && npm test -- --run` | 30 文件、243 用例通过 |
+| `cd web && npm run build` | 成功并镜像到 `internal/server/web_dist` |
+| `./scripts/verify-web-embed.sh` | `web/dist and internal/server/web_dist match` |
+| `python3 scripts/gen_doc_index.py` | 四份索引重生成，二次执行幂等 |
+| `node test/e2e/proxy-entry/run.mjs` | SKIP（未设 `TM_PROXY_E2E_NGINX`），退出码 0 |
+| `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | SKIP（缺 docker），退出码 0 |
+
+### 未执行项（必须在具备条件的环境补跑，不得记为已通过）
+
+1. **Task 14 Step 13**：`TM_PROXY_E2E_NGINX=1` 的完整 13 条断言。原因是本机无 docker 且拉不到
+   `openresty.org` / `github.com`。已按计划的中止判据降级为手工步骤，并在
+   `deploy/openresty/README.md` 与 `test/e2e/proxy-entry/README.md` 顶部标注验证状态。未放宽任何断言。
+2. **Task 14 Step 5 的镜像构建**：同上，`Dockerfile.proxy-connect` 未经本机构建验证；版本 pin 与
+   `./configure → patch → make` 顺序由 `openresty_artifacts_test.go` 静态守护。
+3. **Task 15 Step 5 的 `promtool check rules`**：本机无 `promtool`，改用 `ruby -ryaml` 解析，
+   结果 `groups=1 rules=9`（既有 7 条 + 新增 2 条）。
+4. **真实 MySQL contract**：未设置 `TUNNELMESH_TEST_MYSQL_DSN`，只跑了 SQLite 方言。
+5. **spec 第 18 节验收标准第 1、2、5 条的现网部分**：需要真实 Agent、真实 OpenResty 与 DNS，
+   已在 PR 记录的验收对照表里逐条标注“部分验证 / 未验证”。
+6. **Task 0 强制前置条件第 2 条**（在目标 OpenResty 主机执行 `spike-connect-check.sh` 并把输出
+   补记到 `## Task 0 验证记录`）仍然待办：启用 `server.proxy_entry.enabled` 之前必须执行。
+
+### 逐任务偏离
+
+- **Task 12**：额外修复 Task 9 引入的 `-race` 缺陷——`runtime.go` 的 `ServeListener` 返回前没有
+  等待代理入口解绑，新增 `entryDone` 同步。
+- **Task 13**：① 列表“活跃隧道数”列改为抽屉内指向 Grafana（Row `HTTP Proxy Entry`、面板
+  `Proxy tunnels active`），因管理 API 未暴露该聚合，已回写 spec §10 与 §17；② 代理地址/认证方式/
+  ACL 三列用 `v-if="hasProxyRoutes"` 只在存在 tp-* 路由时渲染，避免整页横向滚动条；
+  ③ `buildProxyRouteUpdate()` 只提交策略字段，不带 `targetHost`/`targetPort`（PATCH 只接受哨兵值）；
+  ④ 顶层 i18n 补 `credentials.proxyBasic` 以镜像既有 `sshPublicKey` 约定；⑤ 抽屉补充
+  macOS/Windows/PAC/curl/错误码等 i18n 键（中英对齐），超出计划列出的键清单；
+  ⑥ 计划文件清单里的 `internal/server/web_dist` **未纳入提交**：该路径被 `.gitignore` 的
+  `internal/server/web_dist/*` 忽略且历史上从未被跟踪，构建产物由 `npm run build` +
+  `scripts/verify-web-embed.sh` 本地生成校验。
+- **Task 14**：① `deploy/openresty/README.md` 收录了 Task 0 留下的 `spike-connect-check.sh`，
+  计划的“四个文件”实际是五个产物，`deploy/README.md` 的校验小节同步补了 `bash -n` 一行；
+  ② spec §5.1 不再内联完整 nginx 配置，改为引用模板产物 + 结构约束清单；③ spec §14 第 11 条除改成
+  Node stub 外，把镜像来源从 `openresty/openresty:alpine` 更正为自建 `Dockerfile.proxy-connect`
+  镜像——未打补丁的官方镜像对 CONNECT 一律 405；④ `test/e2e/proxy-entry/README.md` 用中文
+  （与 `docs/`、`deploy/README.md` 一致），章节结构对齐 `test/e2e/webssh/README.md`；
+  ⑤ Lua/conf/Dockerfile/mjs 由脚本从本计划的代码块逐字提取以保证与已批准计划一致，Go 测试文件
+  提取后执行 `gofmt -w`（计划代码块是 4 空格缩进）。
+- **Task 15**：① `docs/operations/observability.md` 的“应用已占用标签名”清单补了 `route`
+  （计划只要求改“标签和留存”小节，但 `route` 是新引入的应用标签，不进这份清单会让 target label
+  覆盖告警失效）；② `docs/development/testing.md` 开头“三层验证”改为“各层验证”，并在产物一致性
+  测试表补 `deploy/openresty/openresty_artifacts_test.go` 一行（计划未列，但该表就是这份清单的
+  权威来源）；③ `docs/README.md` 的文档地图同时在 `user-guide/` 行补了“HTTP 代理入口”
+  （计划只要求 `deployment/` 行）；④ 顺带修正 `docs/operations/configuration.md` 中
+  `auth_backoff_threshold` 的错误描述——Task 1 写成“返回 429”，实现返回的是 407 与稳定错误码
+  `proxy_auth_backoff`；⑤ `docs/architecture/overview.md` 的链路图把 `access_by_lua_block` 更正为
+  `server 级 access_by_lua_file`，与实际产物一致；⑥ 不新建 ADR 文件，spec 本身即 ADR 载体
+  （与计划一致）。
+
+### rebase 后的复验
+
+rebase 引入了远端对 `web/src/i18n/messages/{zh-CN,en-US}.ts`（`downloads` 键）、
+`web/src/views/Downloads.vue`、`web/src/layouts/AppShell.vue` 与两份前端测试的修改，因此重跑了前端
+门禁：`npm test -- --run` 30 文件 / **244** 用例通过（rebase 前为 243，远端新增 1 例）、
+`npm run build` 成功并镜像到 `internal/server/web_dist`、`./scripts/verify-web-embed.sh` 输出
+`web/dist and internal/server/web_dist match`。Go 侧未受远端提交影响（远端只改了 web、CI workflow
+与一篇文档），`go vet ./...`、`gofmt -l`、`git diff --check` 与 `go test ./deploy/... -count=1`
+在 rebase 后重跑均通过。

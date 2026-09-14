@@ -248,3 +248,140 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
   2. `nginx -t` 通过后 reload；确认 `/`、任意前端路由深链、`/api/` 与 `/ws/webssh/` 四类路径都正常。
   3. 该 location 是最短前缀，不会吞掉 `/api/` 与 `/ws/*`；若曾为“修欢迎页”加过 `try_files $uri $uri/ /index.html;` 指向本地目录，请一并删除，避免静态托管与反代并存。
 - 回归：配置类问题，无代码回归测试；[Nginx 推荐配置](../deployment/nginx.md) 的推荐配置注释与关键约束已写明“兜底反代不能删”，本节作为识别与恢复手册。
+
+## tp-* HTTP 代理入口失败
+
+排障顺序固定为四段：**OpenResty `error_log`（info 级）→ Server 日志 `proxy_entry_*` → Prometheus
+`tunnelmesh_proxy_entry_*` → 审计日志 `proxy_tunnel_opened` / `proxy_tunnel_closed`**。
+
+OpenResty 的隧道关闭行包含 route/target/client/上下行字节数/时长/结束原因，是定位“隧道为什么断”的
+唯一现场；Server 日志给出稳定错误码与拒绝原因；指标给出趋势与量级；审计给出谁在什么时候被拒。
+**这三处都不得出现密码或完整 `Proxy-Authorization` 头**，若出现按安全事故处理（轮换凭据 + 清理日志）。
+
+客户端侧只能看到状态码，稳定错误码与使用者自助表见 [HTTP 代理入口](../user-guide/http-proxy-entry.md#错误码自助排查)。
+
+### `curl` 报 `Received HTTP code 403 from proxy after CONNECT`
+
+- 现象：三类原因（路由身份非法 `proxy_route_identity_invalid`、路由不存在或停用
+  `proxy_route_unavailable`、源 IP 不在 ACL `proxy_source_denied`）**对外文案完全一致**，这是刻意的
+  防枚举设计，客户端无法区分。
+- 定位：
+  ```bash
+  # 看是哪一类：error_class 标签区分三种 403（地址按 server.http_addr，默认 :80）
+  curl -s http://127.0.0.1/metrics | grep tunnelmesh_proxy_entry_requests_total | grep 'result="denied"'
+  ```
+  或查 Server 日志 `proxy_entry_denied` 行的 `error_class` 字段，取值固定为：`identity`（路由身份
+  非法）、`route_unavailable`（路由不存在或已停用）、`source_acl`（来源不在 ACL）、`target`（目标
+  非法或被策略拒绝）、`auth`（认证失败）、`capacity`（并发超限）、`egress` / `egress_write` /
+  `egress_read`（出口不可用）、`internal`（无稳定公开码的内部故障）。审计侧只有 ACL 与认证拒绝会
+  落库：`proxy_route_denied`（`reason=source_acl`）与 `proxy_auth_failed`（`reason` 是具体错误码）。
+- 根因与处理：
+  - `identity`：SNI 缺失或不是 `tp-<name>.<domain_suffix>` 形式。确认客户端填的是 `https://` 完整
+    域名，且 DNS 泛解析、通配证书、`server.proxy_entry.domain_suffix` 三者一致。
+  - `route_unavailable`：后台没有这条路由，或已停用。
+  - `source_acl`：**Server 看到的是 OpenResty 传来的 `$remote_addr`**。如果 OpenResty 前面还有
+    一层 LB，`$remote_addr` 是 LB 的地址，ACL 会按 LB 判定。处理办法：让 LB 透传真实客户端 IP
+    （如 `X-Forwarded-For`），把 `server.proxy_entry.client_ip_header` 改成对应的头，并让 OpenResty
+    把这个头透传到内部入口；同时确认 `trusted_proxies` 覆盖了 LB。
+- 回归：`internal/proxyentry/acl_test.go`、`internal/proxyentry/identity_test.go`。
+
+### 407 且连续失败后长时间不恢复
+
+- 现象：密码明明正确，仍然持续 407。
+- 定位：指标 `tunnelmesh_proxy_entry_auth_failures_total{reason="proxy_auth_backoff"}` 在涨；
+  审计事件 `proxy_auth_failed` 的 `reason` 是 `proxy_auth_backoff`。
+- 根因：`server.proxy_entry.auth_backoff_threshold`（默认 5）触发退避，30 秒起每次翻倍、上限
+  15 分钟。**退避期内不做密码比对，直接返回 407**，所以“改对密码也没用”。
+- 处理：停止重试等窗口过去；确认不是有人在爆破（`_auth_failures_total` 按 route 分组看是否集中在
+  单条路由）；必要时重启 Server 清空退避状态（退避是进程内状态，不入库）。
+- 回归：`internal/proxyentry/auth_test.go` 的退避阈值与指数上限用例。
+
+### 405 Method Not Allowed
+
+- 现象：所有 CONNECT 一律 405，`access_by_lua` 完全没有日志。
+- 定位：
+  ```bash
+  nginx -V 2>&1 | tr ' ' '\n' | grep proxy_connect
+  bash deploy/openresty/spike-connect-check.sh 18443
+  ```
+- 根因：OpenResty 内核**没有打 `proxy_connect_rewrite_102101.patch`**，或模块与补丁版本不匹配。
+  未打补丁时 nginx 在 `ngx_http_process_request_header` 阶段就对 CONNECT 回 405，`$connect_host`
+  这个变量也根本不存在。注意只看 `nginx -V` 会误判：模块单独编进去时一样能看到 `--add-module`。
+- 处理：用 `deploy/openresty/Dockerfile.proxy-connect` 重建内核，或按上游 Compatibility 表为当前
+  OpenResty 版本选对补丁；重建后两级检查都要过。
+- 回归：`deploy/openresty/openresty_artifacts_test.go` 守护版本 pin 与
+  `./configure → patch → make` 的构建顺序。
+
+### 502 `proxy_egress_unavailable`
+
+- 现象：`Received HTTP code 502 from proxy`，或 OpenResty error.log 里
+  `tunnelmesh: dial internal entry failed`。
+- 定位（按顺序）：
+  ```bash
+  # 1. Server 内部入口是否活着（应得到 Server 的 403，而不是 connection refused）
+  curl -sv http://127.0.0.1:8089/
+  # 2. 配置是否开启、地址是否与模板渲染结果一致
+  tunnelmesh-server --config /etc/tunnelmesh/server.yaml check-config
+  ```
+- 根因：`server.proxy_entry.enabled=false`；或 `listen` 与 conf 模板 `__INTERNAL_UPSTREAM__`（以及
+  Lua 的 `-- __TM_INTERNAL_HOST__` / `-- __TM_INTERNAL_PORT__` 标记）渲染结果不一致；或出口 Agent
+  离线、集群跨节点 relay 失败。
+- 处理：对齐三处地址；确认 Agent 在线；集群模式查 relay 与 `tunnelmesh_relay_total`。
+- 回归：`internal/server/proxy_entry_listener_test.go`（`enabled=false` 不监听、不可信 peer 直接关闭）。
+
+### 503 + `Retry-After: 5`
+
+- 现象：`proxy_capacity_exhausted`，客户端按 `Retry-After` 退避。
+- 定位：`tunnelmesh_proxy_entry_tunnels_active{route="tp-…"}` 是否贴住上限；Grafana Row
+  `HTTP Proxy Entry` 的 `Proxy tunnels active` 面板。
+- 根因：全局 `server.proxy_entry.max_concurrent_tunnels`（默认 512，0 表示不限）或该路由
+  `config.maxConcurrentTunnels` 被打满。
+- 处理：先确认是不是隧道泄漏（客户端断开但 `tunnels_active` 不降，见下面 `client aborted` 一节），
+  再考虑调高上限并同步评估 OpenResty 的 `worker_connections`（每条隧道 2 个 socket）。
+- 注意：nginx 侧的 `limit_conn` 只是兜底，配得比 Server 更紧时看到的是 nginx 自己的 503，
+  审计与指标里不会有对应记录。
+
+### 504 `proxy_egress_timeout`
+
+- 根因：`server.proxy_entry.connect_timeout`（默认 10s）内没能通过 Agent 建立到目标的连接。
+- 定位：Agent 是否在线；集群模式下目标 Agent 是否挂在别的节点、relay 是否正常
+  （`tunnelmesh_relay_total{result=~"failed|error"}`）；目标本身是否可达（Agent 侧还有一次
+  SSRF/私网/端口校验）。
+- 处理：修 Agent 或 relay；确实需要更长握手时间才调 `connect_timeout`。
+
+### 隧道建立后很快断开
+
+- 现象：CONNECT 返回 200，随后几十秒到几分钟内断开，error.log 里结束原因是 `upstream:timeout`
+  或 `downstream:timeout`。
+- 根因：Lua 的 `read_timeout_ms` 必须等于 Server `server.proxy_entry.idle_timeout` + 30s（默认
+  300s → 330000ms），让 Server 先判定空闲并关闭，Lua 只兜底。**配反了会表现为 nginx 先掐断**。
+- 定位：
+  ```bash
+  go test ./deploy/openresty -count=1   # 失败即 Lua 默认值与 Go 配置默认值已漂移
+  grep -n '__TM_READ_TIMEOUT_MS__' deploy/openresty/tunnelmesh_proxy_entry.lua
+  ```
+- 处理：按 `idle_timeout + 30s` 重算并替换标记处的值；改了 `idle_timeout` 就要同步改 Lua。
+
+### reload 后所有代理连接断开
+
+- 根因：main 上下文缺 `worker_shutdown_timeout 300s;`。旧 worker 收到 reload 后按默认窗口强制退出，
+  在途隧道被立刻掐断。
+- 处理：把 `worker_shutdown_timeout` 写进 `nginx.conf` 的 main 上下文（**不能写在 server 块里**，
+  `nginx -t` 会报错），发布选低峰期，集群模式先扩 Server 再 reload nginx。
+
+### 浏览器提示代理不支持 / 协商到 h2 失败
+
+- 根因一：tp-* server 块被加了 `http2`。`ngx.req.socket(true)` 在 HTTP/2 下游不可用，
+  proxy_connect 模块的 Known Issues 也明确不支持 HTTP/2 的 CONNECT。
+- 根因二：客户端只能填 `http://` 代理地址。路由身份来自 TLS SNI，明文入口无法识别路由。
+- 处理：删掉 tp-* 块里的 `http2 on;`（既有 admin 块的 per-server `http2 on;` 不用动，要求内核
+  nginx >= 1.25.1）；客户端改用 `https://tp-<name>.<domain_suffix>`。
+
+### error.log 里大量 `client aborted`
+
+- 单独的 `client aborted` 属**正常**：客户端主动断开，`ngx.on_abort` 立刻关闭上游 socket。
+- 异常特征：只有 `client aborted` 而没有对应的 `tunnelmesh: tunnel closed route=…` 行。这说明
+  `lua_check_client_abort` 未开或 `ngx.on_abort` 未注册，隧道要挂到读超时（默认 330s）才回收，
+  表现为 `tunnels_active` 持续上涨、worker connection 被半开隧道占满。
+- 处理：确认渲染后的 server 块里有 `lua_check_client_abort on;`，Lua 是仓库里的原版
+  （`go test ./deploy/openresty -count=1` 通过）。

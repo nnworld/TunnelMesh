@@ -183,10 +183,10 @@ func TestTunnelMeshDashboardSchema(t *testing.T) {
 	if dashboard.UID == "" || dashboard.Title == "" {
 		t.Fatalf("dashboard must have uid and title")
 	}
-	if strings.Count(string(b), `"type": "row"`) != 5 {
-		t.Fatalf("dashboard must contain exactly five row panels")
+	if strings.Count(string(b), `"type": "row"`) != 6 {
+		t.Fatalf("dashboard must contain exactly six row panels")
 	}
-	for _, row := range []string{"Overview", "Agent", "Network", "Cluster", "Security"} {
+	for _, row := range []string{"Overview", "Agent", "Network", "Cluster", "Security", "HTTP Proxy Entry"} {
 		if !strings.Contains(string(b), `"title": "`+row+`"`) {
 			t.Fatalf("missing row %q", row)
 		}
@@ -245,6 +245,11 @@ func TestTunnelMeshDashboardSchema(t *testing.T) {
 		"tunnelmesh_remote_validation_cache_requests_total",
 		"tunnelmesh_agent_connection_scale_decisions_total",
 		"tunnelmesh_agent_selection_total",
+		"tunnelmesh_proxy_entry_requests_total",
+		"tunnelmesh_proxy_entry_tunnels_active",
+		"tunnelmesh_proxy_entry_tunnel_duration_seconds",
+		"tunnelmesh_proxy_entry_auth_failures_total",
+		"tunnelmesh_proxy_entry_acl_denied_total",
 	} {
 		if !strings.Contains(allExpr.String(), metric) {
 			t.Errorf("dashboard is missing required metric %q", metric)

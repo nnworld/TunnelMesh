@@ -1,7 +1,7 @@
 {
   "uid": "tunnelmesh-overview",
   "title": "TunnelMesh",
-  "description": "Unified TunnelMesh control-plane, agent, network, cluster, and security observability.",
+  "description": "Unified TunnelMesh control-plane, agent, network, cluster, security, and HTTP proxy entry observability.",
   "__inputs": [{"name": "DS_PROMETHEUS", "label": "Prometheus", "type": "datasource", "pluginId": "prometheus", "pluginName": "Prometheus"}],
   "schemaVersion": 39,
   "version": 1,
@@ -61,6 +61,15 @@
       {"type": "timeseries", "title": "Configuration reloads", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (result) (rate(tunnelmesh_config_reload_total{cluster=~\"$cluster\", node_id=~\"$node_id\"}[5m]))", "refId": "A"}], "gridPos": {"h": 8, "w": 9, "x": 15, "y": 64}},
       {"type": "timeseries", "title": "Heartbeat misses", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (component) (rate(tunnelmesh_heartbeat_total{cluster=~\"$cluster\", node_id=~\"$node_id\", result=~\"miss|timeout\"}[5m]))", "refId": "A"}], "gridPos": {"h": 8, "w": 12, "x": 0, "y": 72}},
       {"type": "table", "title": "Security anomalies", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (component, result, error_class) (increase(tunnelmesh_connections_total{cluster=~\"$cluster\", node_id=~\"$node_id\", result=~\"unauthorized|forbidden|error\"}[15m]))", "refId": "A", "format": "table"}], "gridPos": {"h": 8, "w": 12, "x": 12, "y": 72}}
+    ]},
+    {"type": "row", "title": "HTTP Proxy Entry", "collapsed": false, "panels": [
+      {"type": "stat", "title": "Proxy denials", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum(increase(tunnelmesh_proxy_entry_requests_total{cluster=~\"$cluster\", node_id=~\"$node_id\", result!=\"success\"}[15m]))", "refId": "A"}], "gridPos": {"h": 4, "w": 6, "x": 0, "y": 80}},
+      {"type": "timeseries", "title": "Proxy requests", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (mode, result) (rate(tunnelmesh_proxy_entry_requests_total{cluster=~\"$cluster\", node_id=~\"$node_id\"}[5m]))", "refId": "A"}], "gridPos": {"h": 8, "w": 9, "x": 6, "y": 80}},
+      {"type": "timeseries", "title": "Proxy tunnels active", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (route) (tunnelmesh_proxy_entry_tunnels_active{cluster=~\"$cluster\", node_id=~\"$node_id\"})", "refId": "A"}], "gridPos": {"h": 8, "w": 9, "x": 15, "y": 80}},
+      {"type": "timeseries", "title": "Proxy tunnel duration p95", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "histogram_quantile(0.95, sum by (le, route, result) (rate(tunnelmesh_proxy_entry_tunnel_duration_seconds_bucket{cluster=~\"$cluster\", node_id=~\"$node_id\"}[5m])))", "refId": "A"}], "gridPos": {"h": 8, "w": 12, "x": 0, "y": 88}},
+      {"type": "timeseries", "title": "Proxy throughput", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (direction) (rate(tunnelmesh_bytes_total{cluster=~\"$cluster\", node_id=~\"$node_id\", component=\"proxy_entry\"}[5m]))", "refId": "A"}], "gridPos": {"h": 8, "w": 12, "x": 12, "y": 88}},
+      {"type": "timeseries", "title": "Proxy auth failures and ACL denials", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (route, reason) (rate(tunnelmesh_proxy_entry_auth_failures_total{cluster=~\"$cluster\", node_id=~\"$node_id\"}[5m]))", "refId": "A"}, {"expr": "sum by (route) (rate(tunnelmesh_proxy_entry_acl_denied_total{cluster=~\"$cluster\", node_id=~\"$node_id\"}[5m]))", "refId": "B"}], "gridPos": {"h": 8, "w": 12, "x": 0, "y": 96}},
+      {"type": "table", "title": "Proxy entry denials", "datasource": "${DS_PROMETHEUS}", "targets": [{"expr": "sum by (route, mode, result, error_class) (increase(tunnelmesh_proxy_entry_requests_total{cluster=~\"$cluster\", node_id=~\"$node_id\", result!=\"success\"}[15m]))", "refId": "A", "format": "table"}], "gridPos": {"h": 8, "w": 12, "x": 12, "y": 96}}
     ]}
   ]
 }

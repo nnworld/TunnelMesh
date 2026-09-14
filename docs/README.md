@@ -8,8 +8,8 @@
 
 | 目录 | 面向 | 内容 |
 | --- | --- | --- |
-| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、托管路由、SSH over WebSocket |
-| [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、systemd/launchd/Windows Service、发行打包 |
+| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、托管路由、HTTP 代理入口、SSH over WebSocket |
+| [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、OpenResty 代理入口、systemd/launchd/Windows Service、发行打包 |
 | [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、可观测性、探针、日志、SLO、容量、排障 |
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
@@ -34,6 +34,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
   - [Server 节点与共享令牌](user-guide/server-admin.md#server-节点)
   - [发行管理](user-guide/server-admin.md#发行管理)
 - [托管 HTTP 路由](user-guide/managed-http-route.md)：显式路由、通配域名、HTTPS 上游
+- [HTTP 代理入口（tp-*）](user-guide/http-proxy-entry.md)：把 `https://tp-<name>.<domain>` 填进浏览器或系统代理，无需安装 client
 - [SSH / websocat TCP 代理](user-guide/tcp-over-websocket-ssh.md)：`ProxyCommand`、stdio 字节桥
 
 ## 部署
@@ -41,6 +42,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [Docker 部署](deployment/docker.md)、[docker-compose.local.yml](../docker-compose.local.yml)、[docker-compose.cluster.yml](../docker-compose.cluster.yml)
 - [管理后台前端构建与部署](deployment/frontend.md)：embed 模式与 Nginx 独立静态文件模式
 - [Nginx/WSS 推荐配置](deployment/nginx.md)：`/api/`、`/ws/*` 反代优先级与 Upgrade 透传
+- [OpenResty tp-* 代理入口](deployment/openresty-proxy-entry.md)：模板渲染、镜像构建、容量评估、reload 影响与回滚
 - [跨平台可执行文件打包](deployment/binary-release.md)：构建矩阵、`SHA256SUMS`、`manifest.json`
 - [Linux systemd 安装](deployment/linux-systemd.md)、[macOS launchd 安装](deployment/macos-launchd.md)、[Windows Service 安装](deployment/windows-service.md)
 - [部署产物清单](../deploy/README.md)：`deploy/` 下每个文件的用途、模板占位符约定和发布归档布局

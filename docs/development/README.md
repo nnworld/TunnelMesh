@@ -30,4 +30,5 @@ python3 scripts/gen_doc_index.py
 - [Schema 升级与回滚](../operations/schema-upgrades.md)：版本升级路径与止损步骤
 - [OpenAPI](../api/openapi.yaml)：管理 API 契约
 - [WebSSH 浏览器端到端测试](../../test/e2e/webssh/README.md)：真实 Chrome + Server/Agent/SSH 主机
+- [tp-* 代理入口 OpenResty 端到端测试](../../test/e2e/proxy-entry/README.md)：真实 OpenResty 容器 + 内部入口替身
 - [架构概览](../architecture/overview.md)、[集群架构](../architecture/cluster.md)

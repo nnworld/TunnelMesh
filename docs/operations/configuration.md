@@ -222,7 +222,7 @@ server:
 | `server.proxy_entry.shutdown_timeout` | `30s` | 进程退出时等待在途隧道排空的时间，可为 0 | 否 |
 | `server.proxy_entry.max_concurrent_tunnels` | `512` | 全局并发隧道上限，超限返回 503 + `Retry-After: 5`；0 表示不限 | 否 |
 | `server.proxy_entry.max_header_bytes` | `16384` | 单个请求头上限，超出直接断开 | 否 |
-| `server.proxy_entry.auth_backoff_threshold` | `5` | 同一路由连续认证失败达到该次数后进入退避（30s 起翻倍，上限 15m），返回 429 | 否 |
+| `server.proxy_entry.auth_backoff_threshold` | `5` | 同一路由连续认证失败达到该次数后进入退避（30s 起翻倍，上限 15m）。退避期内不做密码比对，直接返回 407 与稳定错误码 `proxy_auth_backoff` | 否 |
 
 `listen` 不是回环地址时，`trusted_proxies` 不允许出现 `0.0.0.0/0` 或 `::/0`，否则任何主机都能伪造路由身份与来源 IP，配置校验会直接失败。命令行与环境变量等价（`TUNNELMESH_SERVER_PROXY_ENTRY_*`），例如：
 

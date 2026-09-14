@@ -43,6 +43,7 @@ SSH/SFTP console. Public ingress is HTTP/HTTPS/WSS only — the Server never lis
 
 - `forward tcp|udp|http` — a local port reaches an internal service; UDP preserves datagram boundaries and per-source associations.
 - `forward socks5` and `forward http-proxy` — browse or proxy into the internal network from a local proxy endpoint.
+- Managed HTTP proxy entry — set `https://tp-<name>.<domain>` as a browser or OS proxy; the egress agent, Basic auth and source ACL are configured in the admin console, and nothing has to be installed on the user machine.
 - `run` — starts every configured entry point in one process over a per-Agent WebSocket connection pool.
 
 **Publishing and ingress**
@@ -222,7 +223,7 @@ Public UDP is not supported: UDP only flows from the user side into the internal
 
 - Containers: [Docker deployment](docs/deployment/docker.md), [docker-compose.local.yml](docker-compose.local.yml), [docker-compose.cluster.yml](docker-compose.cluster.yml)
 - Services: [systemd](docs/deployment/linux-systemd.md), [launchd](docs/deployment/macos-launchd.md), [Windows Service](docs/deployment/windows-service.md)
-- Edge: [Nginx/WSS reverse proxy](docs/deployment/nginx.md), [frontend build and hosting](docs/deployment/frontend.md)
+- Edge: [Nginx/WSS reverse proxy](docs/deployment/nginx.md), [OpenResty tp-* proxy entry](docs/deployment/openresty-proxy-entry.md), [frontend build and hosting](docs/deployment/frontend.md)
 - Cluster: [relay mTLS certificates](docs/operations/relay-mtls.md), [Agent connection pool](docs/operations/connection-pool.md)
 - Monitoring: [observability and Grafana](docs/operations/observability.md); Prometheus config, rules, and the Grafana dashboard ship in [deploy/](deploy/README.md)
 
@@ -236,6 +237,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Agent usage](docs/user-guide/agent.md) — registration, connection pool, metadata allowlist
 - [Server admin console](docs/user-guide/server-admin.md) — Agents, routes, tokens, audit, WebSSH/SFTP, releases
 - [Managed HTTP routes](docs/user-guide/managed-http-route.md) — explicit and wildcard domains, HTTPS
+- [HTTP proxy entry](docs/user-guide/http-proxy-entry.md) — browser/OS proxy without installing the client
 - [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md) — `ProxyCommand` and `websocat`
 
 **Operations**

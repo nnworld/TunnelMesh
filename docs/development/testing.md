@@ -1,6 +1,6 @@
 # 测试与验证
 
-三层验证各自覆盖不同范围，不能互相替代。必须执行的命令清单以
+各层验证各自覆盖不同范围，不能互相替代。必须执行的命令清单以
 [AGENTS.md](../../AGENTS.md)「必须执行的验证」为准，本文件补充执行细节和已知成本。
 
 | 层级 | 命令 | 覆盖范围 |
@@ -8,10 +8,15 @@
 | Go 单元与集成 | `go test ./... -count=1`、`go test -race ./...`、`go vet ./...` | 协议状态机、流控、Repository 契约（SQLite 与 MySQL 双方言）、迁移、API 授权与分页、跨层集成 |
 | 前端单元 | `cd web && npm test -- --run`、`npm run build` | SSH/SFTP/ZMODEM 客户端逻辑、WebSocket 字节流背压、store、路由、视图交互 |
 | 浏览器端到端 | `node test/e2e/webssh/run.mjs` | 真实 Chrome + 真实 Server/Agent/SSH 主机，验证凭据自动认证、pty 终端、ZMODEM 双向传输、SFTP 复用与上传逐字节完整性、刷新恢复、浏览器控制台洁净 |
+| OpenResty 端到端 | `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | 真实 OpenResty 容器 + 内部入口替身，验证 CONNECT 搬运、请求头白名单、非 200 响应原样透传、绝对形式改写、客户端断开后隧道回收、日志不含凭据 |
 
 端到端测试不在 `go test` 与 `npm test` 中，需要 Chrome 与 `lrzsz`，详见
 [test/e2e/webssh/README.md](../../test/e2e/webssh/README.md)。修改中继流控、WebSSH broker、
 Agent 流分发或终端/SFTP 前端后，发布前必须跑一次。
+
+tp-* 代理入口的冒烟同样不在 `go test` 与 `npm test` 中，需要 docker 与 openssl；未设置
+`TM_PROXY_E2E_NGINX=1` 或前置条件缺失时打印原因并以 0 退出。修改 `deploy/openresty/` 下任一产物后
+发布前必须跑一次，详见 [test/e2e/proxy-entry/README.md](../../test/e2e/proxy-entry/README.md)。
 
 ## race 测试的超时要求
 
@@ -61,6 +66,7 @@ go test ./deploy/... -count=1
 | --- | --- |
 | `deploy/grafana/dashboard_schema_test.go` | 唯一 Dashboard 的 JSON 结构、Row 划分与 datasource 变量 |
 | `deploy/install/install_templates_test.go` | 每个角色只有一份模板来源，安装脚本引用共享模板且替换全部占位符 |
+| `deploy/openresty/openresty_artifacts_test.go` | Lua/conf/Dockerfile 与 `server.proxy_entry.*` 默认值一致、可信头齐全、tp-* server 块不开 http2、版本 pin 与 `configure → patch → make` 构建顺序、Lua 不含策略逻辑 |
 
 以下校验依赖平台工具，CI 与本机不一定具备，改动对应产物后需要在目标平台补跑：
 

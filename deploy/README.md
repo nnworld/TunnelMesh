@@ -15,7 +15,7 @@
 | `openresty/tunnelmesh_proxy_entry.lua`、`openresty/tunnelmesh-proxy.conf.example`、`openresty/Dockerfile.proxy-connect` | tp-* HTTP 代理入口的 OpenResty 搬运层、server 块模板与补丁内核镜像 | [OpenResty 代理入口部署](../docs/deployment/openresty-proxy-entry.md) |
 | `prometheus/prometheus.yml.example` | Prometheus 抓取起点配置（单节点与集群两种形态） | [可观测性](../docs/operations/observability.md) |
 | `prometheus/recording-rules.yaml`、`alert-rules.yaml` | 录制规则与告警规则 | 同上 |
-| `grafana/dashboards/tunnelmesh.json` | 唯一 Dashboard，内部按 Overview / Agent / Network / Cluster / Security 五个 Row 组织 | 同上 |
+| `grafana/dashboards/tunnelmesh.json` | 唯一 Dashboard，内部按 Overview / Agent / Network / Cluster / Security / HTTP Proxy Entry 六个 Row 组织 | 同上 |
 | `grafana/provisioning/dashboards.yml`、`datasources.yml` | Grafana 自动装载配置 | 同上 |
 | `grafana/dashboard_schema_test.go`、`install/install_templates_test.go`、`openresty/openresty_artifacts_test.go` | 产物一致性测试，随 `go test ./deploy/...` 执行 | [测试与验证](../docs/development/testing.md) |
 

@@ -317,7 +317,7 @@ CONNECT 场景下上述响应都发生在隧道建立之前，因此是标准 HT
 - `tunnelmesh_proxy_entry_acl_denied_total{route}`
 - 字节复用 `tunnelmesh_bytes_total{component="proxy_entry",direction,protocol}`；阶段耗时复用 `tunnelmesh_stream_stage_duration_seconds`
 
-审计事件（结构化，沿用既有 action/resource 风格）：`proxy_route_denied`、`proxy_auth_failed`、`proxy_tunnel_opened`、`proxy_tunnel_closed`，以及管理操作 `proxy_route_created|updated|deleted`。字段含 routeID、routeDomain、agentID、clientIP、targetHost、targetPort、bytesUp、bytesDown、duration、errorClass；不含凭据、不含完整请求头、不含响应体。
+审计事件（结构化，沿用既有 action/resource 风格）：运行时事件为 `proxy_route_denied`、`proxy_auth_failed`、`proxy_egress_failed`、`proxy_tunnel_opened`、`proxy_tunnel_closed`、`proxy_request_forwarded`；管理操作**复用既有的 `route.created` / `route.updated` / `route.deleted`**，不再新增 `proxy_route_created|updated|deleted`。理由：`internal/server/api.go` 的 `auditRoute` 已经为所有 `tunnels` 行写这三个动作，`http-proxy` 路由与反代路由在存储层是同一种实体，再加一套 `proxy_route_*` 会让同一次操作产生两条语义重复的审计记录，也让审计检索多一套命名。字段含 routeID、routeDomain、agentID、clientIP、targetHost、targetPort、bytesUp、bytesDown、duration、errorClass；不含凭据、不含完整请求头、不含响应体。
 
 Trace：入口生成或继承 `traceparent`，随 stream 传播到 agent，使既有 `POST /api/v1/agents/{agentId}/trace`、探针与排障流程能覆盖代理链路。
 
@@ -331,15 +331,16 @@ Grafana：在既有单一 Dashboard 中新增一行“HTTP 代理入口”面板
 2. `internal/proxyentry/auth_test.go`：正确、错误、缺失、username 大小写、base64 非法、非 UTF-8；常量时间比较；退避阈值与指数上限；凭据 disabled、软删、解密失败；secret store 不可用返回 503。
 3. `internal/proxyentry/identity_test.go`：完整域名、裸名、大写、后缀不匹配、头缺失、重复头。
 4. `internal/server/proxy_entry_listener_test.go`：不可信 peer 立即关闭且不读请求；`enabled=false` 不监听；优雅退出等待在途隧道，超过 `shutdown_timeout` 后强制关闭。
-5. `internal/server/proxy_entry_handler_test.go`：CONNECT 全链路（内存 agent stub）成功建隧与双向字节；绝对形式转发；12 节全部错误码；并发上限；idle 超时；半关闭与 EOF；GOAWAY drain；集群跨节点 relay（沿用既有 relay 测试夹具）。
-6. `internal/server/api_test.go` 扩展：`protocol=http-proxy` 的创建与更新（哨兵强制、config 字段校验、credentialId 归属校验、domain 冲突）、非管理员越权、分页、幂等重放。
-7. `internal/storage/credential_repository_test.go`：`proxy_basic` 写入、读取、软删、加解密往返，SQLite 与 MySQL 双驱动。
+5. `internal/server/proxy_entry_test.go` 与 `internal/server/proxy_entry_absolute_test.go`：CONNECT 全链路（内存 agent stub）成功建隧与双向字节；绝对形式转发；12 节全部错误码；并发上限；idle 超时；半关闭与 EOF；GOAWAY drain；集群跨节点 relay（沿用既有 relay 测试夹具）。
+6. `internal/server/api_proxy_route_test.go`：`protocol=http-proxy` 的创建与更新（哨兵强制、config 字段校验、credentialId 归属校验、domain 冲突）、非管理员越权、分页、幂等重放。
+7. `internal/storage/credential_repository_test.go` 与 `internal/server/credential_api_test.go`：`proxy_basic` 写入、读取、软删、加解密往返，SQLite 与 MySQL 双驱动；API 层的类型枚举、username 校验与 secret 只写不回显。
+7b. `internal/observability/metrics_proxy_entry_test.go`：5 个 `tunnelmesh_proxy_entry_*` 指标的标签集合与 histogram 桶，防止 Dashboard 与告警表达式引用到不存在的标签。
 8. `internal/config/config_test.go`：新键默认值、三路优先级、启动校验失败用例（`domain_suffix` 缺失、`trusted_proxies` 非法、非回环 listen 搭配 `0.0.0.0/0`）。
 9. `internal/server/managed_route_handler_test.go`：`http-proxy` 行不进入 HTTP 反代路由表；proxy 索引正确；TTL 生效；停用路由在下一次快照后不可用。
 10. 前端：`web` 单测覆盖表单校验与类型切换；`npm run build` 后执行 `./scripts/verify-web-embed.sh`。
 11. Lua/nginx 冒烟：`test/e2e/proxy-entry/`，用 `deploy/openresty/Dockerfile.proxy-connect` 构建出的镜像跑真实 OpenResty，上游是 Node stub（`test/e2e/proxy-entry/lib/stub.mjs`）；无 docker 或未设置 `TM_PROXY_E2E_NGINX=1` 时 skip 并打印原因。冒烟只覆盖 OpenResty 搬运层（请求头白名单、CONNECT 双向 splice、非 200 原样透传、客户端断开后隧道回收、日志不含凭据），Server 的路由解析、ACL、认证、限额与转发由第 1-9 项的 Go 测试覆盖，不在此重复。
 
-门禁命令：`go test ./... -count=1`、`go test -race ./...`、`go vet ./...`、`gofmt -l internal/ cmd/ test/`、`git diff --check`、`cd web && npm test -- --run && npm run build`、`./scripts/verify-web-embed.sh`。
+门禁命令：`go test ./... -count=1`、`go test -race ./...`、`go vet ./...`、`gofmt -l internal/ cmd/ deploy/ test/`（Task 14 在 `deploy/openresty/` 下新增了 Go 测试文件，因此 `gofmt -l` 必须覆盖 `deploy/`）、`git diff --check`、`cd web && npm test -- --run && npm run build`、`./scripts/verify-web-embed.sh`。
 
 ## 15. 实施阶段与 Task 0 中止判据
 
@@ -351,7 +352,7 @@ Task 0（spike，先行且阻塞后续任务）在目标 OpenResty 上验证：
 - (d) `ngx.exit(444)` 不产生额外响应，error.log 无异常噪声；
 - (e) 非 CONNECT 分支中 `Proxy-Authorization` 是否被 nginx 丢弃，据此确认是否必须显式 `proxy_set_header`。
 
-spike 产物只作为结论文档记录，不进入生产代码。
+spike 产物只作为结论文档记录，不进入生产代码。**唯一例外**：`deploy/openresty/spike-connect-check.sh` 作为只读诊断脚本提交进仓库并被部署文档引用，因为它不参与请求处理，而且是“这台机器的内核到底有没有打 proxy_connect 补丁”的唯一可执行判据（只看 `nginx -V` 会误判：模块单独编进去时一样能看到 `--add-module`，但没打补丁的内核对每个 CONNECT 回 405）。结论记录仍然写在本计划文件末尾的 `## Task 0 验证记录`。
 
 中止判据：若 (b) 或 (c) 不成立，停止 A3，回退 A2（Server 自终止 TLS + `SNIRouteIdentity`）。由于 identity 已抽象、Server 策略与转发逻辑不变，回退只需新增 TLS 监听与证书配置，nginx 改动归零；回退决定必须写回本文件第 17 节并重出实施计划。
 

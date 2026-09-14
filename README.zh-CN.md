@@ -41,6 +41,7 @@ TunnelMesh 是用 Go 实现的自托管内网穿透与服务代理平台。部�
 
 - `forward tcp|udp|http`：本地端口直达内网服务；UDP 保留 datagram 边界并按源地址复用 association。
 - `forward socks5`、`forward http-proxy`：通过本地代理入口访问内网服务。
+- 托管 HTTP 代理入口：把 `https://tp-<name>.<domain>` 填进浏览器或系统代理即可出网或访问 Agent 内网服务；出口 Agent、Basic 认证与来源 ACL 全部在管理后台配置，用户机器上不需要安装 client。
 - `run`：在一个进程内启动配置文件中的全部入口，并按 Agent 建立 WebSocket 连接池。
 
 **发布与公网入口**
@@ -214,7 +215,7 @@ make docker-build                                          # 三个镜像
 
 - 容器：[Docker 部署](docs/deployment/docker.md)、[docker-compose.local.yml](docker-compose.local.yml)、[docker-compose.cluster.yml](docker-compose.cluster.yml)
 - 服务化：[systemd](docs/deployment/linux-systemd.md)、[launchd](docs/deployment/macos-launchd.md)、[Windows Service](docs/deployment/windows-service.md)
-- 入口：[Nginx/WSS 反向代理](docs/deployment/nginx.md)、[前端构建与部署](docs/deployment/frontend.md)
+- 入口：[Nginx/WSS 反向代理](docs/deployment/nginx.md)、[OpenResty tp-* 代理入口](docs/deployment/openresty-proxy-entry.md)、[前端构建与部署](docs/deployment/frontend.md)
 - 集群：[relay mTLS 证书](docs/operations/relay-mtls.md)、[Agent 连接池](docs/operations/connection-pool.md)
 - 监控：[可观测性与 Grafana](docs/operations/observability.md)；Prometheus 配置、规则与 Grafana Dashboard 等产物见 [deploy/](deploy/README.md)
 
@@ -228,6 +229,7 @@ make docker-build                                          # 三个镜像
 - [Agent 使用帮助](docs/user-guide/agent.md)：注册、连接池、metadata allowlist
 - [Server 管理后台](docs/user-guide/server-admin.md)：Agent、路由、token、审计、WebSSH/SFTP、发行管理
 - [托管 HTTP 路由](docs/user-guide/managed-http-route.md)：显式域名与通配域名、HTTPS
+- [HTTP 代理入口（tp-*）](docs/user-guide/http-proxy-entry.md)：浏览器/系统代理，免安装 client
 - [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md)：`ProxyCommand` 与 `websocat`
 
 **运维**

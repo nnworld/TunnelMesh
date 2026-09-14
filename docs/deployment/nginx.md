@@ -159,6 +159,26 @@ server {
 }
 ```
 
+## tp-* HTTP 代理入口（OpenResty）
+
+托管路由的 `http-proxy` 类型提供的是**正向代理入口**（`https://tp-<name>.<domain_suffix>`），不是
+反向代理。它与本文上面的 server 块**共用 443**，由 SNI 分流：既有块匹配 admin 与 `tm-*` 域名，
+tp-* 块用正则 `server_name` 匹配 `tp-<name>.<domain_suffix>`，两块互不影响。
+
+本文不重复模板内容。模板、占位符、渲染示例、容量评估、reload 影响与回滚步骤见
+[OpenResty tp-* 代理入口](openresty-proxy-entry.md)，产物在
+[`deploy/openresty/`](../../deploy/openresty/README.md)。
+
+两点前提必须注意：
+
+- **必须是 OpenResty**，纯 nginx 做不到：CONNECT 跳过 location 匹配，只有打过
+  `ngx_http_proxy_connect_module` 补丁的内核才会注册 `$connect_host`/`$connect_port` 并允许
+  server 级 `access_by_lua_file` 接管；`lua-nginx-module` 的 `ngx.req.socket(true)` 才能做双向
+  splice。上线前用 `nginx -V` 加 `deploy/openresty/spike-connect-check.sh` 做两级检查。
+- **tp-* server 块必须省略 `http2`**：`ngx.req.socket(true)` 在 HTTP/2 下游不可用，proxy_connect
+  模块的 Known Issues 也明确不支持 HTTP/2 的 CONNECT。既有 admin 块用的是 per-server 的
+  `http2 on;`，两块各自独立，因此新块省略即可，不需要改动既有块（要求内核 nginx >= 1.25.1）。
+
 ## 关键约束
 
 - `proxy_http_version 1.1`、`Upgrade`、`Connection`、`proxy_buffering off` 是 WebSocket 必需项。
@@ -172,6 +192,9 @@ server {
 - `/metrics` 不建议暴露公网；优先让 Prometheus 访问 Server 内网管理地址。
 - 显式泛域名只允许单层 `tm-<name>.tunnel.example.com`；动态域名使用 `<agent>-<a>-<b>-<c>-<d>-<port>.<server.dynamic_suffix>`。Nginx 正则中的后缀必须与 `server.dynamic_suffix`、wildcard DNS 和证书一致；正则只做域名形状筛选，IP 八位组范围、端口范围、危险地址和 Agent 策略由 Server 再次校验。
 - 泛域名只解决 HTTP/HTTPS/WSS 路由，不提供公网 UDP 监听。
+- tp-* server 块禁止 `http2`：`ngx.req.socket(true)` 在 HTTP/2 下游不可用，proxy_connect 模块的 Known Issues 也明确不支持 HTTP/2 的 CONNECT。
+- tp-* 的 `location /` 必须显式写 `proxy_set_header Proxy-Authorization $http_proxy_authorization;`：它是 hop-by-hop 头，Nginx 默认不转发给上游，漏掉这一行会让所有非 CONNECT 的代理请求返回 407。
+- 不能用 `proxy_connect;` + `proxy_pass` 做链式转发：模块 README 明确 “Any `location {}` block, `upstream {}` block and any other standard backend/upstream directives, such as `proxy_pass`, do not impact the functionality of this module.”，模块会自己直连目标，路由身份与 `Proxy-Authorization` 全部丢失。本项目的做法是**不启用** `proxy_connect;` 指令，只用补丁提供的 `$connect_host`/`$connect_port` 变量与 server 级 `access_by_lua_file`，把 CONNECT 原样搬到 Server 的内部入口（`server.proxy_entry.listen`），策略全部由 Server 执行。
 - 修改配置后先执行 `nginx -t`，再 reload；证书轮换必须验证 WSS 和 API 登录。
 
 ## 验证命令

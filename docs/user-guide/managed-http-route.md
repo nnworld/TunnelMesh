@@ -2,6 +2,11 @@
 
 托管路由由 Server 接收公网 HTTP/HTTPS/WebSocket 请求，再通过 Agent 连接到指定内网服务。公网只需要暴露 Server 的 80/443，不需要为每个 Agent 新开端口。
 
+`protocol=http-proxy` 的路由**不是反向代理**：它由 TLS SNI 选路由、目标由每个代理请求决定，
+`target_host`/`target_port` 存的是哨兵 `*`/`0`，域名固定为 `tp-<name>.<domain_suffix>`。
+使用说明见 [HTTP 代理入口（tp-*）](http-proxy-entry.md)，部署见
+[OpenResty tp-* 代理入口](../deployment/openresty-proxy-entry.md)。
+
 ## 明确子域名
 
 在管理后台创建 Route，填写：

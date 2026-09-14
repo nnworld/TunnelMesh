@@ -36,3 +36,17 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations: {summary: TunnelMesh metrics scrape is absent}
+      # 下面两条刻意不加 `absent(...) or` 前缀：server.proxy_entry.enabled 默认 false，
+      # 未启用时 tunnelmesh_proxy_entry_* 根本不存在，加 absent() 会让所有没开这个功能的
+      # 部署持续告警。阈值取“10 分钟平均每秒 0.2 次认证失败 / 0.5 次拒绝”，低于该量级的
+      # 零星公网扫描不值得叫人。
+      - alert: TunnelMeshProxyEntryAuthFailures
+        expr: sum(rate(tunnelmesh_proxy_entry_auth_failures_total[10m])) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh tp proxy entry sees sustained Basic auth failures}
+      - alert: TunnelMeshProxyEntryDenials
+        expr: sum(rate(tunnelmesh_proxy_entry_requests_total{result!="success"}[10m])) > 0.5
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh tp proxy entry is denying proxy requests}
