@@ -113,6 +113,16 @@ func validateCredential(credential Credential) error {
 		}
 	case CredentialTypePassword:
 		// Password credentials intentionally have no public key or fingerprint.
+	case CredentialTypeProxyBasic:
+		// public_key carries the proxy username and fingerprint its hash, so a
+		// row without either cannot be matched against a Basic header. The
+		// password itself only ever exists as sealed ciphertext.
+		if strings.TrimSpace(credential.PublicKey) == "" || strings.TrimSpace(credential.Fingerprint) == "" {
+			return errors.New("credential username and fingerprint are required")
+		}
+		if credential.SecretCiphertext == "" {
+			return errors.New("proxy credential requires an encrypted password")
+		}
 	default:
 		return errors.New("unsupported credential type")
 	}

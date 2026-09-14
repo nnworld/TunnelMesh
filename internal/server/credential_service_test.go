@@ -416,3 +416,117 @@ func TestCredentialServiceUpdatePreservesAndReplacesSecret(t *testing.T) {
 		t.Fatalf("secret = %+v, err = %v, want private key only", secret, err)
 	}
 }
+
+// A proxy_basic credential pairs a username with a sealed password. The
+// username lives in public_key so list views can render it; the password only
+// ever leaves storage through ProxyBasicSecret.
+func TestCredentialServiceCreatesProxyBasicWithEncryptedPassword(t *testing.T) {
+	_, service := newCredentialSecretFixture(t)
+	ctx := context.Background()
+	actor := auth.Principal{UserID: "admin-a", Username: "root", Role: "admin"}
+
+	created, err := service.Create(ctx, actor, CredentialInput{
+		Name: "proxy demo", Type: storage.CredentialTypeProxyBasic, Username: "  demo  ",
+		Enabled: true, Secret: &CredentialSecret{Password: "s3cret"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.PublicKey != "demo" || created.Fingerprint == "" || !created.HasSecret() {
+		t.Fatalf("created = %#v", created)
+	}
+	if strings.Contains(created.SecretCiphertext, "s3cret") {
+		t.Fatal("plaintext password leaked into the ciphertext column")
+	}
+	username, password, err := service.ProxyBasicSecret(ctx, actor, created.ID)
+	if err != nil {
+		t.Fatalf("ProxyBasicSecret: %v", err)
+	}
+	if username != "demo" || password != "s3cret" {
+		t.Fatalf("secret = %q/%q", username, password)
+	}
+
+	if _, err := service.Create(ctx, actor, CredentialInput{
+		Name: "missing password", Type: storage.CredentialTypeProxyBasic, Username: "demo", Enabled: true,
+	}); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("missing password err = %v, want ErrCredentialInvalid", err)
+	}
+	if _, err := service.Create(ctx, actor, CredentialInput{
+		Name: "missing username", Type: storage.CredentialTypeProxyBasic, Enabled: true,
+		Secret: &CredentialSecret{Password: "s3cret"},
+	}); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("missing username err = %v, want ErrCredentialInvalid", err)
+	}
+	if _, err := service.Create(ctx, actor, CredentialInput{
+		Name: "key material rejected", Type: storage.CredentialTypeProxyBasic, Username: "demo", Enabled: true,
+		Secret: &CredentialSecret{Password: "s3cret", PrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----"},
+	}); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("private key on proxy credential err = %v, want ErrCredentialInvalid", err)
+	}
+}
+
+// Rotating the username must rewrite public_key and the fingerprint together,
+// and it must never be possible to blank the username out.
+func TestCredentialServiceUpdatesProxyBasicUsername(t *testing.T) {
+	_, service := newCredentialSecretFixture(t)
+	ctx := context.Background()
+	actor := auth.Principal{UserID: "admin-a", Username: "root", Role: "admin"}
+	created, err := service.Create(ctx, actor, CredentialInput{
+		Name: "proxy demo", Type: storage.CredentialTypeProxyBasic, Username: "demo",
+		Enabled: true, Secret: &CredentialSecret{Password: "s3cret"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	blank := "   "
+	if _, err := service.Update(ctx, actor, created.ID, CredentialPatch{Username: &blank}); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("blank username err = %v, want ErrCredentialInvalid", err)
+	}
+	replaced := "demo2"
+	updated, err := service.Update(ctx, actor, created.ID, CredentialPatch{Username: &replaced})
+	if err != nil {
+		t.Fatalf("update username: %v", err)
+	}
+	if updated.PublicKey != "demo2" || updated.Fingerprint == created.Fingerprint {
+		t.Fatalf("updated = %#v", updated)
+	}
+	username, password, err := service.ProxyBasicSecret(ctx, actor, created.ID)
+	if err != nil || username != "demo2" || password != "s3cret" {
+		t.Fatalf("secret = %q/%q, err = %v", username, password, err)
+	}
+}
+
+// A disabled or soft-deleted credential must stop authenticating immediately,
+// because the proxy entry resolves it on every request.
+func TestCredentialServiceProxyBasicSecretRejectsUnusableCredential(t *testing.T) {
+	_, service := newCredentialSecretFixture(t)
+	ctx := context.Background()
+	actor := auth.Principal{UserID: "admin-a", Username: "root", Role: "admin"}
+	created, err := service.Create(ctx, actor, CredentialInput{
+		Name: "proxy demo", Type: storage.CredentialTypeProxyBasic, Username: "demo",
+		Enabled: true, Secret: &CredentialSecret{Password: "s3cret"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := service.ProxyBasicSecret(ctx, actor, "missing-id"); err == nil {
+		t.Fatal("missing credential resolved")
+	}
+	disabled := false
+	if _, err := service.Update(ctx, actor, created.ID, CredentialPatch{Enabled: &disabled}); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if _, _, err := service.ProxyBasicSecret(ctx, actor, created.ID); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("disabled credential err = %v, want ErrCredentialInvalid", err)
+	}
+	enabled := true
+	if _, err := service.Update(ctx, actor, created.ID, CredentialPatch{Enabled: &enabled}); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if err := service.Delete(ctx, actor, created.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, _, err := service.ProxyBasicSecret(ctx, actor, created.ID); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("deleted credential err = %v, want ErrCredentialInvalid", err)
+	}
+}

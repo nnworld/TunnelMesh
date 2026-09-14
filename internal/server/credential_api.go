@@ -10,11 +10,14 @@ import (
 )
 
 type credentialRequest struct {
-	Name      string                   `json:"name"`
-	Type      storage.CredentialType   `json:"type"`
-	PublicKey string                   `json:"publicKey"`
-	Enabled   *bool                    `json:"enabled"`
-	Secret    *credentialSecretRequest `json:"secret"`
+	Name      string                 `json:"name"`
+	Type      storage.CredentialType `json:"type"`
+	PublicKey string                 `json:"publicKey"`
+	// Username is only meaningful for proxy_basic credentials. The password
+	// still arrives through Secret and is never rendered back.
+	Username string                   `json:"username"`
+	Enabled  *bool                    `json:"enabled"`
+	Secret   *credentialSecretRequest `json:"secret"`
 }
 
 // credentialSecretRequest carries write-only material. It is accepted on create
@@ -49,7 +52,10 @@ type credentialResponse struct {
 	Type        storage.CredentialType `json:"type"`
 	PublicKey   string                 `json:"publicKey"`
 	Fingerprint string                 `json:"fingerprint"`
-	Enabled     bool                   `json:"enabled"`
+	// Username mirrors public_key for proxy_basic rows so the frontend does not
+	// have to know that the two share a column.
+	Username string `json:"username,omitempty"`
+	Enabled  bool   `json:"enabled"`
 	// HasSecret tells the UI whether auto-authentication is possible without
 	// exposing the ciphertext, nonce, key id or plaintext.
 	HasSecret bool             `json:"hasSecret"`
@@ -62,11 +68,15 @@ type credentialResponse struct {
 type CredentialStatus = storage.CredentialStatus
 
 func publicCredential(v storage.Credential) credentialResponse {
-	return credentialResponse{
+	response := credentialResponse{
 		ID: v.ID, OwnerUserID: v.OwnerUserID, Name: v.Name, Type: v.Type, PublicKey: v.PublicKey,
 		Fingerprint: v.Fingerprint, Enabled: v.Enabled, HasSecret: v.HasSecret(), Status: credentialStatus(v.DeletedAt),
 		DeletedAt: timeString(v.DeletedAt), CreatedAt: tmString(v.CreatedAt), UpdatedAt: tmString(v.UpdatedAt),
 	}
+	if v.Type == storage.CredentialTypeProxyBasic {
+		response.Username = v.PublicKey
+	}
+	return response
 }
 
 func credentialStatus(deleted *time.Time) CredentialStatus {
@@ -156,7 +166,7 @@ func (a *API) handleCredentialListCreate(w http.ResponseWriter, r *http.Request,
 			writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		input := CredentialInput{Name: req.Name, Type: req.Type, PublicKey: req.PublicKey, Enabled: req.Enabled == nil || *req.Enabled}
+		input := CredentialInput{Name: req.Name, Type: req.Type, PublicKey: req.PublicKey, Username: req.Username, Enabled: req.Enabled == nil || *req.Enabled}
 		input.Secret = req.Secret.toSecret()
 		defer req.Secret.clear()
 		status, data, err := a.mutate(r, p, func() (int, any, error) {
@@ -193,6 +203,11 @@ func (a *API) handleCredentialItem(w http.ResponseWriter, r *http.Request, p aut
 		}
 		enabled := req.Enabled == nil || *req.Enabled
 		patch := CredentialPatch{Name: &req.Name, Type: &req.Type, PublicKey: &req.PublicKey, Enabled: &enabled}
+		if req.Username != "" {
+			// A blank username is never a valid PUT value, so it is treated as
+			// "field absent" instead of "clear the username".
+			patch.Username = &req.Username
+		}
 		patch.Secret = req.Secret.toSecret()
 		defer req.Secret.clear()
 		status, data, err := a.mutate(r, p, func() (int, any, error) {
@@ -262,6 +277,9 @@ func credentialPatchFromRequest(req credentialRequest) CredentialPatch {
 	}
 	if req.PublicKey != "" {
 		patch.PublicKey = &req.PublicKey
+	}
+	if req.Username != "" {
+		patch.Username = &req.Username
 	}
 	if req.Enabled != nil {
 		patch.Enabled = req.Enabled

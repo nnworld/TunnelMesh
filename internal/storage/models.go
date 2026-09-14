@@ -93,6 +93,12 @@ const CredentialTypeSSHPublicKey CredentialType = "ssh_public_key"
 // plaintext never lives in this struct.
 const CredentialTypePassword CredentialType = "password"
 
+// CredentialTypeProxyBasic stores an HTTP proxy username/password pair used by
+// the managed `tp-*` forward-proxy entry. The username lives in PublicKey so
+// list views can render it without decrypting anything; the password only
+// exists inside the encrypted secret blob.
+const CredentialTypeProxyBasic CredentialType = "proxy_basic"
+
 // ProtocolHTTPProxy marks a managed route that terminates a forward-proxy
 // request instead of reverse-proxying a fixed target. The row lives in the same
 // tunnels table so route administration, audit and ownership stay unified, but

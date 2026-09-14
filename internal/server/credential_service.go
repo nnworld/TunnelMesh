@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,22 +32,32 @@ const (
 	maxSSHPrivateKeyBytes        = 64 << 10
 	maxCredentialPasswordBytes   = 4 << 10
 	maxCredentialPassphraseBytes = 1 << 10
+	// maxCredentialUsernameBytes bounds the proxy username. It is stored in the
+	// public_key column and echoed in every 407 challenge round-trip, so an
+	// unbounded value would be an amplification vector.
+	maxCredentialUsernameBytes = 256
 )
 
 type CredentialInput struct {
 	Name      string
 	Type      storage.CredentialType
 	PublicKey string
-	Enabled   bool
-	Secret    *CredentialSecret
+	// Username is the proxy account name for CredentialTypeProxyBasic. It is
+	// stored in the public_key column; see proxyBasicIdentity.
+	Username string
+	Enabled  bool
+	Secret   *CredentialSecret
 }
 
 type CredentialPatch struct {
 	Name      *string
 	Type      *storage.CredentialType
 	PublicKey *string
-	Enabled   *bool
-	Secret    *CredentialSecret
+	// Username rewrites the proxy account name. nil means "unchanged"; a
+	// non-nil blank value is rejected because the username is mandatory.
+	Username *string
+	Enabled  *bool
+	Secret   *CredentialSecret
 }
 
 // CredentialSecret is the plaintext material a browser needs to complete SSH
@@ -125,6 +136,13 @@ func (s *CredentialService) Create(ctx context.Context, actor auth.Principal, in
 		}
 		credential.PublicKey, credential.Fingerprint = normalized, fingerprint
 	}
+	if credentialType == storage.CredentialTypeProxyBasic {
+		username, fingerprint, err := proxyBasicIdentity(input.Username)
+		if err != nil {
+			return storage.Credential{}, err
+		}
+		credential.PublicKey, credential.Fingerprint = username, fingerprint
+	}
 	if err := validateCredentialShape(credential, input.Secret, false); err != nil {
 		return storage.Credential{}, err
 	}
@@ -170,8 +188,15 @@ func (s *CredentialService) Update(ctx context.Context, actor auth.Principal, id
 	if input.Type != nil {
 		current.Type = *input.Type
 	}
-	if current.Type == storage.CredentialTypePassword {
+	switch current.Type {
+	case storage.CredentialTypePassword:
 		current.PublicKey, current.Fingerprint = "", ""
+	case storage.CredentialTypeProxyBasic:
+		if typeChanged {
+			// Switching into proxy_basic must not inherit an SSH public key as
+			// the username, so the caller has to supply one explicitly.
+			current.PublicKey, current.Fingerprint = "", ""
+		}
 	}
 	if input.PublicKey != nil {
 		if current.Type == storage.CredentialTypeSSHPublicKey {
@@ -181,6 +206,18 @@ func (s *CredentialService) Update(ctx context.Context, actor auth.Principal, id
 			}
 			current.PublicKey, current.Fingerprint = normalized, fingerprint
 		}
+	}
+	if input.Username != nil {
+		// Only proxy credentials own a username, and blanking it is rejected so
+		// a partial PATCH cannot leave an unmatchable row behind.
+		if current.Type != storage.CredentialTypeProxyBasic {
+			return storage.Credential{}, fmt.Errorf("%w: username applies to proxy credentials only", ErrCredentialInvalid)
+		}
+		username, fingerprint, err := proxyBasicIdentity(*input.Username)
+		if err != nil {
+			return storage.Credential{}, err
+		}
+		current.PublicKey, current.Fingerprint = username, fingerprint
 	}
 	if input.Enabled != nil {
 		current.Enabled = *input.Enabled
@@ -229,6 +266,43 @@ func (s *CredentialService) GetWithSecret(ctx context.Context, actor auth.Princi
 		return storage.Credential{}, nil, err
 	}
 	return credential, secret, nil
+}
+
+// ProxyBasicSecret decrypts one proxy credential for the managed HTTP proxy
+// entry. It is the only path that turns the stored blob back into a password,
+// and the value must never reach a log line, an audit record or a metric label.
+//
+// The actor is the entry's own service identity rather than an end user: the
+// proxy authenticates on behalf of whoever supplied the Basic header, so
+// ownership is checked against the route's credential, not the HTTP caller.
+func (s *CredentialService) ProxyBasicSecret(ctx context.Context, actor auth.Principal, id string) (string, string, error) {
+	credential, err := s.Get(ctx, actor, id)
+	if err != nil {
+		return "", "", err
+	}
+	if credential.Type != storage.CredentialTypeProxyBasic || !credential.Enabled || credential.DeletedAt != nil {
+		// Reported as ErrCredentialInvalid on purpose: the proxy entry maps
+		// anything that is not a store failure to "bad credentials", which
+		// keeps credential IDs unprobeable.
+		return "", "", ErrCredentialInvalid
+	}
+	if !credential.HasSecret() {
+		return "", "", ErrCredentialInvalid
+	}
+	secret, err := s.openSecret(credential)
+	if err != nil {
+		if errors.Is(err, ErrCredentialSecretUnavailable) {
+			return "", "", err
+		}
+		// A corrupt blob or a rotated encryption key is an operator-side fault.
+		// Surfacing it as "unavailable" stops the entry from counting the
+		// attempt against the client's brute-force backoff.
+		return "", "", fmt.Errorf("%w: %v", ErrCredentialSecretUnavailable, err)
+	}
+	if secret.Password == "" {
+		return "", "", ErrCredentialInvalid
+	}
+	return credential.PublicKey, secret.Password, nil
 }
 
 // applySecret seals the plaintext into the credential row. The plaintext bytes
@@ -292,13 +366,23 @@ func validateCredentialShape(credential storage.Credential, secret *CredentialSe
 		if strings.TrimSpace(credential.PublicKey) == "" || strings.TrimSpace(credential.Fingerprint) == "" {
 			return fmt.Errorf("%w: public key is required", ErrCredentialInvalid)
 		}
+	case storage.CredentialTypeProxyBasic:
+		if strings.TrimSpace(credential.PublicKey) == "" || strings.TrimSpace(credential.Fingerprint) == "" {
+			return fmt.Errorf("%w: a proxy credential requires a username", ErrCredentialInvalid)
+		}
 	case storage.CredentialTypePassword:
 	default:
 		return fmt.Errorf("%w: unsupported credential type %q", ErrCredentialInvalid, credential.Type)
 	}
 	if secret == nil || secret.isEmpty() {
-		if credential.Type == storage.CredentialTypePassword && !hasStoredSecret {
-			return fmt.Errorf("%w: a password credential requires a password", ErrCredentialInvalid)
+		switch credential.Type {
+		case storage.CredentialTypePassword, storage.CredentialTypeProxyBasic:
+			// Both kinds are useless without a secret: WebSSH cannot
+			// auto-authenticate and the proxy entry has nothing to compare a
+			// Basic header against.
+			if !hasStoredSecret {
+				return fmt.Errorf("%w: a %s credential requires a password", ErrCredentialInvalid, credential.Type)
+			}
 		}
 		return nil
 	}
@@ -319,6 +403,13 @@ func validateCredentialShape(credential storage.Credential, secret *CredentialSe
 		if secret.PrivateKey != "" || secret.Passphrase != "" {
 			return fmt.Errorf("%w: a password credential must not carry a private key", ErrCredentialInvalid)
 		}
+	case storage.CredentialTypeProxyBasic:
+		if secret.Password == "" {
+			return fmt.Errorf("%w: a proxy credential requires a password", ErrCredentialInvalid)
+		}
+		if secret.PrivateKey != "" || secret.Passphrase != "" {
+			return fmt.Errorf("%w: a proxy credential must not carry SSH key material", ErrCredentialInvalid)
+		}
 	default:
 		if secret.Password != "" {
 			return fmt.Errorf("%w: a public-key credential stores a private key instead of a password", ErrCredentialInvalid)
@@ -337,6 +428,8 @@ func mapCredentialStorageError(err error) error {
 	message := err.Error()
 	if strings.Contains(message, "credential owner and name are required") ||
 		strings.Contains(message, "credential public key and fingerprint are required") ||
+		strings.Contains(message, "credential username and fingerprint are required") ||
+		strings.Contains(message, "proxy credential requires an encrypted password") ||
 		strings.Contains(message, "unsupported credential type") {
 		return fmt.Errorf("%w: %s", ErrCredentialInvalid, message)
 	}
@@ -440,6 +533,31 @@ func ParseOpenSSHPublicKey(raw string) (string, string, error) {
 	}
 	sum := sha256.Sum256([]byte(algorithm + " " + encoded))
 	return algorithm + " " + encoded, "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), nil
+}
+
+// proxyBasicIdentity normalizes a proxy username and derives a stable
+// fingerprint for it.
+//
+// The username is not a secret — it travels in cleartext inside every Basic
+// header — so it is stored in the public_key column and only the password is
+// sealed. A colon is rejected because RFC 7617 forbids it in the userid and the
+// entry splits the decoded header on the first colon; accepting one here would
+// create a credential that can never authenticate.
+func proxyBasicIdentity(username string) (string, string, error) {
+	normalized := strings.TrimSpace(username)
+	if normalized == "" {
+		return "", "", fmt.Errorf("%w: a proxy credential requires a username", ErrCredentialInvalid)
+	}
+	if len(normalized) > maxCredentialUsernameBytes {
+		return "", "", fmt.Errorf("%w: username exceeds %d bytes", ErrCredentialInvalid, maxCredentialUsernameBytes)
+	}
+	for _, r := range normalized {
+		if r == ':' || r < ' ' || r == 0x7f {
+			return "", "", fmt.Errorf("%w: username must not contain a colon or control character", ErrCredentialInvalid)
+		}
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return normalized, hex.EncodeToString(sum[:]), nil
 }
 
 func parseSSHString(payload []byte) ([]byte, []byte, error) {

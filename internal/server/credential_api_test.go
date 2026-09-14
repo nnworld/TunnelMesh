@@ -333,3 +333,59 @@ func TestCredentialAPIRejectsSecretWithoutEncryptionKey(t *testing.T) {
 		t.Fatalf("public-only create status = %d: %s", r.Code, r.Body.String())
 	}
 }
+
+// The managed HTTP proxy entry authenticates with a username/password pair, so
+// the credential API exposes the username as its own field while the password
+// stays write-only.
+func TestCredentialAPIStoresProxyBasicUsername(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	setCredentialSecretStore(t, api)
+	token := apiToken(t, api, user.Username, "alice-pass")
+	handler := api.Handler()
+
+	create := apiJSON(t, handler, http.MethodPost, "/api/v1/credentials", token, "cred-proxy-basic", map[string]any{
+		"name": "proxy demo", "type": "proxy_basic", "username": "demo", "enabled": true,
+		"secret": map[string]any{"password": "s3cr3t-password"},
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status = %d: %s", create.Code, create.Body.String())
+	}
+	if strings.Contains(create.Body.String(), "s3cr3t-password") {
+		t.Fatalf("create response echoed the password: %s", create.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID        string `json:"id"`
+			Type      string `json:"type"`
+			Username  string `json:"username"`
+			HasSecret bool   `json:"hasSecret"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(create.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Data.Type != "proxy_basic" || created.Data.Username != "demo" || !created.Data.HasSecret {
+		t.Fatalf("created credential = %+v", created.Data)
+	}
+
+	detail := apiJSON(t, handler, http.MethodGet, "/api/v1/credentials/"+created.Data.ID, token, "", nil)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"username":"demo"`) {
+		t.Fatalf("detail = %d: %s", detail.Code, detail.Body.String())
+	}
+
+	rotated := apiJSON(t, handler, http.MethodPatch, "/api/v1/credentials/"+created.Data.ID, token, "", map[string]any{"username": "demo2"})
+	if rotated.Code != http.StatusOK || !strings.Contains(rotated.Body.String(), `"username":"demo2"`) {
+		t.Fatalf("patch = %d: %s", rotated.Code, rotated.Body.String())
+	}
+	username, password, err := api.credentialService.ProxyBasicSecret(context.Background(), auth.Principal{UserID: user.ID, Role: "user"}, created.Data.ID)
+	if err != nil || username != "demo2" || password != "s3cr3t-password" {
+		t.Fatalf("secret = %q/%q, err = %v", username, password, err)
+	}
+
+	missing := apiJSON(t, handler, http.MethodPost, "/api/v1/credentials", token, "", map[string]any{
+		"name": "no username", "type": "proxy_basic", "enabled": true, "secret": map[string]any{"password": "p"},
+	})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("missing username status = %d: %s", missing.Code, missing.Body.String())
+	}
+}

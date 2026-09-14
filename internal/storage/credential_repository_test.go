@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,5 +145,42 @@ func TestCredentialValidationByType(t *testing.T) {
 	}
 	if _, err := db.Credentials().Create(ctx, Credential{OwnerUserID: "user-a", Name: "ok", Type: CredentialTypePassword, Enabled: true, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("password credential without public key rejected: %v", err)
+	}
+}
+
+// proxy_basic credentials keep the username in public_key so list views can
+// render it, and they must always carry an encrypted password blob.
+func TestCredentialRepositoryAcceptsProxyBasic(t *testing.T) {
+	dsn := "file:credential-proxy-basic-" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	db, err := OpenSQLite(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	created, err := db.Credentials().Create(context.Background(), Credential{
+		ID: "cred-proxy", OwnerUserID: "user-1", Name: "proxy demo",
+		Type: CredentialTypeProxyBasic, PublicKey: "demo", Fingerprint: "fp-demo",
+		SecretCiphertext: "ct", SecretNonce: "nonce", SecretKeyID: "key-1", SecretVersion: 1,
+		Enabled: true, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("proxy_basic credential rejected: %v", err)
+	}
+	if !created.HasSecret() || created.Type != CredentialTypeProxyBasic {
+		t.Fatalf("created = %#v", created)
+	}
+	if _, err := db.Credentials().Create(context.Background(), Credential{
+		ID: "cred-bad", OwnerUserID: "user-1", Name: "no username",
+		Type: CredentialTypeProxyBasic, Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err == nil {
+		t.Fatal("proxy_basic without username must be rejected")
+	}
+	if _, err := db.Credentials().Create(context.Background(), Credential{
+		ID: "cred-plain", OwnerUserID: "user-1", Name: "no secret",
+		Type: CredentialTypeProxyBasic, PublicKey: "demo", Fingerprint: "fp-demo",
+		Enabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err == nil {
+		t.Fatal("proxy_basic without an encrypted password must be rejected")
 	}
 }
