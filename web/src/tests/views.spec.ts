@@ -14,13 +14,15 @@ describe('localized management views', () => {
     }
   })
 
-  it('renders the immutable release download surface', () => {
+  it('renders release information with only the GitHub Releases link', () => {
     const source = readFileSync('src/views/Downloads.vue', 'utf8')
     expect(source).toContain('getDownloads')
     expect(source).toContain('release.version')
-    expect(source).toContain('downloads.checksumCommand')
-    expect(source).toContain('downloads.platform')
+    expect(source).toContain('https://github.com/nnworld/TunnelMesh/releases')
+    expect(source).toContain('downloads.releaseLink')
     expect(source).toContain('downloads.upgradeNote')
-    expect(source).toContain('class="checksum-command"')
+    expect(source).not.toContain('v-for="asset in release.assets"')
+    expect(source).not.toContain('asset.url')
+    expect(source).not.toContain('checksumCommand')
   })
 })

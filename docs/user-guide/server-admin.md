@@ -206,7 +206,7 @@ Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`serve
 
 ## 发行管理
 
-“发行管理”是左侧菜单的最后一项，仅管理员可见。页面展示当前 Server 的版本、Commit、构建时间、Schema 版本和仓库地址，以及各平台不可变发行包的压缩包、SHA256 校验和与校验命令，可直接复制校验命令或打开对应的 GitHub Release。升级前请先备份数据库，并阅读当前版本的 Schema 升级与回滚说明。发行包由 CI 产出，管理后台只展示下载信息，不代理 GitHub 凭据，也不缓存发行文件。
+“发行管理”是左侧菜单的最后一项，仅管理员可见。页面展示当前 Server 的版本、Commit、构建时间、Schema 版本和仓库地址，以及 SHA256SUMS 和 manifest 链接，并通过固定入口打开 GitHub Release：<https://github.com/nnworld/TunnelMesh/releases>。页面不再展示各平台下载、压缩包和校验命令。升级前请先备份数据库，并阅读当前版本的 Schema 升级与回滚说明。
 
 ## 配置与排障建议
 
