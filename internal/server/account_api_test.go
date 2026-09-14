@@ -132,6 +132,27 @@ func TestDashboardSummaryUsesPrincipalResourceScope(t *testing.T) {
 	}
 }
 
+func TestDashboardSummaryToleratesActorlessAuditEvents(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	// Proxy entry and other system audits have no acting user; the repository
+	// persists an empty actor as NULL, so the summary scan must tolerate NULLs.
+	if err := api.DB.Audits().Create(context.Background(), storage.AuditLog{
+		Action:       "proxy_auth_failed",
+		ResourceType: "proxy_route",
+		ResourceID:   "route-1",
+		Details:      `{"reason":"bad_password"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary := apiJSON(t, api, http.MethodGet, "/api/v1/dashboard/summary", apiToken(t, api, admin.Username, "admin-pass"), "", nil)
+	if summary.Code != http.StatusOK {
+		t.Fatalf("summary = %d: %s", summary.Code, summary.Body.String())
+	}
+	if !strings.Contains(summary.Body.String(), `"action":"proxy_auth_failed"`) {
+		t.Fatalf("summary missing actorless event: %s", summary.Body.String())
+	}
+}
+
 func TestAccountAPIChangesOwnPasswordWithoutRevokingToken(t *testing.T) {
 	api, _, user := apiTestServer(t)
 	token := apiToken(t, api, user.Username, "alice-pass")

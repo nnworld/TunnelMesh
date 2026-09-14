@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
@@ -176,6 +177,9 @@ func (a *API) handleDashboard(w http.ResponseWriter, r *http.Request, principal 
 	}
 	summary, err := a.dashboard.Summary(r.Context(), ownerUserID, 10)
 	if err != nil {
+		// The summary aggregates several tables; without this log a schema or
+		// scan regression surfaces only as an opaque 500 in the console.
+		slog.ErrorContext(r.Context(), "dashboard_summary_failed", "error", err)
 		writeAPIError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}

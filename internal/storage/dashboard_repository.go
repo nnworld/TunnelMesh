@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -68,11 +69,20 @@ func (r *dashboardRepo) Summary(ctx context.Context, ownerUserID string, recentL
 	defer rows.Close()
 	for rows.Next() {
 		var event AuditLog
-		var created string
-		if err := rows.Scan(&event.ID, &event.ActorUserID, &event.Action, &event.ResourceType, &event.ResourceID, &event.Details, &created); err != nil {
+		// actor_user_id and resource_id are nullable: system events such as
+		// proxy entry audits have no acting user, and scanning them into plain
+		// strings would fail the whole summary on the first NULL row.
+		var actor, resource, created sql.NullString
+		if err := rows.Scan(&event.ID, &actor, &event.Action, &event.ResourceType, &resource, &event.Details, &created); err != nil {
 			return DashboardSummary{}, err
 		}
-		event.CreatedAt = parseTime(created)
+		if actor.Valid {
+			event.ActorUserID = actor.String
+		}
+		if resource.Valid {
+			event.ResourceID = resource.String
+		}
+		event.CreatedAt = parseTime(created.String)
 		result.RecentEvents = append(result.RecentEvents, event)
 	}
 	if err := rows.Err(); err != nil {
