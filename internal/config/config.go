@@ -677,13 +677,14 @@ func validateServerStream(cfg ServerStreamConfig) []string {
 
 // validateProxyEntry mirrors validateWebSSH: a disabled feature contributes no
 // problems, so upgrading never breaks an existing deployment. Once enabled, the
-// listener becomes a trust boundary, hence the loopback/wildcard rule below.
+// listener becomes a trust boundary; deployments that expose it must restrict
+// access at the network layer when trusted_proxies is broad.
 func validateProxyEntry(cfg ProxyEntryConfig) []string {
 	var problems []string
 	if !cfg.Enabled {
 		return nil
 	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen))
+	_, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen))
 	if err != nil || port == "" {
 		problems = append(problems, "proxy entry listen must be a host:port value")
 	}
@@ -698,16 +699,6 @@ func validateProxyEntry(cfg ProxyEntryConfig) []string {
 	for _, cidr := range cfg.TrustedProxies {
 		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
 			problems = append(problems, "proxy entry trusted proxy "+cidr+" is not a valid CIDR")
-		}
-	}
-	// A non-loopback listener is reachable from the network, so a wildcard
-	// trust list would let any host forge the route and client-IP headers.
-	if host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "" {
-		for _, cidr := range cfg.TrustedProxies {
-			trimmed := strings.TrimSpace(cidr)
-			if trimmed == "0.0.0.0/0" || trimmed == "::/0" {
-				problems = append(problems, "proxy entry trusted_proxies must not be 0.0.0.0/0 or ::/0 when listen is not loopback")
-			}
 		}
 	}
 	if cfg.ConnectTimeout <= 0 || cfg.IdleTimeout <= 0 || cfg.ShutdownTimeout < 0 {

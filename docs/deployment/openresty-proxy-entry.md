@@ -67,8 +67,9 @@ export TUNNELMESH_SERVER_PROXY_ENTRY_LISTEN=127.0.0.1:8089
 tunnelmesh-server --config /etc/tunnelmesh/server.yaml check-config
 ```
 
-`enabled=true` 时 `domain_suffix` 必填；`listen` 不是回环地址时 `trusted_proxies` 不允许出现
-`0.0.0.0/0` 或 `::/0`，否则任何主机都能伪造路由身份与来源 IP，`check-config` 会直接失败。
+`enabled=true` 时 `domain_suffix` 必填。`trusted_proxies` 允许配置 `0.0.0.0/0` 或 `::/0`，但
+当 `listen` 不是回环地址时，这表示信任所有能访问该端口的主机，它们都可能伪造路由身份与来源 IP；
+生产环境必须用防火墙、安全组或专线限制内部入口的访问范围。
 
 ## 渲染模板
 
@@ -243,7 +244,7 @@ agent 的 stream。因此：
 
 - `listen` 绑内网地址而不是 `0.0.0.0`。
 - `trusted_proxies` 收紧到 OpenResty 主机的具体 IP（`/32`）。
-- 禁止 `0.0.0.0/0` 与 `::/0`——`check-config` 在非回环 `listen` 下会直接拒绝这种组合。
+- 如确需配置 `0.0.0.0/0` 或 `::/0`，必须依赖防火墙、安全组或专线限制内部入口访问范围。
 - 内部网段走专线或 IPSec，不要跨公网。
 
 同机部署时内部入口只绑回环，`trusted_proxies` 保持默认的 `["127.0.0.1/32", "::1/128"]` 即可。

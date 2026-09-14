@@ -1182,7 +1182,7 @@ func TestProxyEntryDefaultsAndFlagOverride(t *testing.T) {
 	}
 }
 
-func TestValidateProxyEntryRejectsUnsafeCombinations(t *testing.T) {
+func TestValidateProxyEntryAllowsWildcardTrustedProxies(t *testing.T) {
 	base := func() config.Config {
 		cfg, err := config.Load(context.Background(), config.ConfigOptions{})
 		if err != nil {
@@ -1209,7 +1209,13 @@ func TestValidateProxyEntryRejectsUnsafeCombinations(t *testing.T) {
 	wildcardTrust := base()
 	wildcardTrust.Server.ProxyEntry.Listen = "0.0.0.0:8089"
 	wildcardTrust.Server.ProxyEntry.TrustedProxies = []string{"0.0.0.0/0"}
-	if err := config.Validate(wildcardTrust); err == nil {
-		t.Fatal("non-loopback listen must not trust 0.0.0.0/0")
+	if err := config.Validate(wildcardTrust); err != nil {
+		t.Fatalf("valid wildcard trusted proxy config rejected: %v", err)
+	}
+	ipv6WildcardTrust := base()
+	ipv6WildcardTrust.Server.ProxyEntry.Listen = "0.0.0.0:8089"
+	ipv6WildcardTrust.Server.ProxyEntry.TrustedProxies = []string{"::/0"}
+	if err := config.Validate(ipv6WildcardTrust); err != nil {
+		t.Fatalf("valid IPv6 wildcard trusted proxy config rejected: %v", err)
 	}
 }

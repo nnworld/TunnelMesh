@@ -224,7 +224,7 @@ server:
 | `server.proxy_entry.max_header_bytes` | `16384` | 单个请求头上限，超出直接断开 | 否 |
 | `server.proxy_entry.auth_backoff_threshold` | `5` | 同一路由连续认证失败达到该次数后进入退避（30s 起翻倍，上限 15m）。退避期内不做密码比对，直接返回 407 与稳定错误码 `proxy_auth_backoff` | 否 |
 
-`listen` 不是回环地址时，`trusted_proxies` 不允许出现 `0.0.0.0/0` 或 `::/0`，否则任何主机都能伪造路由身份与来源 IP，配置校验会直接失败。命令行与环境变量等价（`TUNNELMESH_SERVER_PROXY_ENTRY_*`），例如：
+`trusted_proxies` 支持 `0.0.0.0/0` 或 `::/0`。若 `listen` 不是回环地址，这表示信任所有能访问该端口的主机，它们都可能伪造路由身份与来源 IP；生产环境必须用防火墙、安全组或专线限制内部入口的访问范围。命令行与环境变量等价（`TUNNELMESH_SERVER_PROXY_ENTRY_*`），例如：
 
 ```bash
 tunnelmesh-server --server.proxy_entry.enabled=true \
