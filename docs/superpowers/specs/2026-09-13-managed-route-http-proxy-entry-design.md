@@ -284,6 +284,8 @@ type RouteIdentity interface {
 - i18n：`web/src/i18n/schema.ts`、`messages/zh-CN.ts`、`messages/en-US.ts` 同步新增键（schema 为强类型，缺键会编译失败）。
 - 前端测试覆盖表单校验（CIDR 非法、basic 未选凭据、名称重复）、类型切换时字段重置、列表渲染；执行 `npm test -- --run` 与 `npm run build`（自动镜像到 `internal/server/web_dist`）。
 
+- **实现偏差（Task 13 Step 6 回写）**：列表页不再新增“活跃隧道数”列，改为在“使用说明”抽屉内指向 Grafana 单 Dashboard 的 Row `HTTP Proxy Entry` → 面板 `Proxy tunnels active`，并在抽屉内补一行提示文案（i18n 键 `routes.proxyActiveTunnelsHint`，中英双语）。原因：管理 API 未暴露该聚合，为纯展示新增只读接口需要额外的权限校验与前端轮询，违背 KISS/YAGNI。Row 名与面板名保持英文字面量、中文界面也不翻译，取值以 Task 15 Step 3 写入 Dashboard JSON 的字面量为准，否则用户按中文 Row 名在 Grafana 里找不到对应视图。
+
 ## 11. 安全模型（威胁与对策）
 
 | 威胁 | 对策 |
@@ -388,6 +390,7 @@ spike 产物只作为结论文档记录，不进入生产代码。
 | 策略位置 | 全部在 Server（Go） | 放在 Lua：无法单测、形成双份权威、易与 Server 校验漂移 |
 | SOCKS5 | 本轮不做 | 用户已明确只做 HTTP 代理；stream 模块因此也不再需要 |
 | 域名冲突判定 | `http-proxy` 路由按域名整体互斥（`tunnelRouteConflict` 增加 `domainOnly`），create 与 update 共用一个实现 | 沿用 `domain + path_prefix` 复合判定：tp-* 的 `path_prefix` 恒为 `"/"`，与同域名不同前缀的反代路由不会被数据库 `UNIQUE` 拦住，会留下一条被 nginx 精确 `server_name` 永久遮蔽、后台看不出原因的不可达路由 |
+| 前端“活跃隧道数” | 不新增列表列；抽屉内指向 Grafana Row `HTTP Proxy Entry` → 面板 `Proxy tunnels active` | 新增只读聚合接口：管理 API 未暴露该指标，为纯展示引入新端点、权限校验与前端轮询，成本高于收益 |
 
 ## 18. 验收标准
 

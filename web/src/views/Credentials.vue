@@ -55,6 +55,7 @@
           <el-radio-group v-model="form.type" :disabled="Boolean(editingCredential)">
             <el-radio-button value="ssh_public_key">{{ t('credentials.types.sshPublicKey') }}</el-radio-button>
             <el-radio-button value="password">{{ t('credentials.types.password') }}</el-radio-button>
+            <el-radio-button value="proxy_basic">{{ t('credentials.types.proxyBasic') }}</el-radio-button>
           </el-radio-group>
         </el-form-item>
 
@@ -72,6 +73,13 @@
         </template>
 
         <template v-else>
+          <!-- proxy_basic shares the password branch: it authenticates a tp-*
+               proxy entry with a username plus a sealed password, and has no
+               SSH key material at all. -->
+          <el-form-item v-if="form.type === 'proxy_basic'" :label="t('credentials.username')" prop="username">
+            <el-input v-model="form.username" maxlength="256" autocomplete="off" />
+            <p class="field-help">{{ t('credentials.usernameHelp') }}</p>
+          </el-form-item>
           <el-form-item :label="t('credentials.password')" prop="secretPassword">
             <el-input v-model="form.secretPassword" type="password" show-password autocomplete="new-password" :placeholder="secretPasswordPlaceholder" />
           </el-form-item>
@@ -92,6 +100,9 @@
         <dl v-if="detailCredential" class="detail-list">
           <dt>{{ t('credentials.name') }}</dt><dd>{{ detailCredential.name }}</dd>
           <dt>{{ t('credentials.type') }}</dt><dd>{{ credentialTypeLabel(detailCredential.type) }}</dd>
+          <template v-if="detailCredential.type === 'proxy_basic'">
+            <dt>{{ t('credentials.username') }}</dt><dd>{{ detailCredential.username || detailCredential.publicKey || '—' }}</dd>
+          </template>
           <dt>{{ t('credentials.publicKey') }}</dt><dd><code v-if="detailCredential.publicKey">{{ detailCredential.publicKey }}</code><span v-else>—</span></dd>
           <dt>{{ t('credentials.fingerprint') }}</dt><dd>{{ detailCredential.fingerprint || '—' }}</dd>
           <dt>{{ t('credentials.secretColumn') }}</dt><dd>{{ detailCredential.hasSecret ? t('credentials.secretStored') : t('credentials.secretNotStored') }}</dd>
@@ -146,14 +157,14 @@ const extractError = ref('')
 const extractedFingerprint = ref('')
 const form = reactive({
   name: '', type: 'ssh_public_key' as CredentialType, publicKey: '', privateKey: '', passphrase: '',
-  storePrivateKey: false, secretPassword: '', enabled: true,
+  storePrivateKey: false, secretPassword: '', username: '', enabled: true,
 })
 
 // A secret is uploaded only when the user actually typed one. Leaving the field
 // empty while editing keeps the stored material, which is what the server does
 // too: a PATCH without `secret` never clears it.
 const pendingSecret = computed<CredentialSecretInput | null>(() => {
-  if (form.type === 'password') return form.secretPassword ? { password: form.secretPassword } : null
+  if (form.type === 'password' || form.type === 'proxy_basic') return form.secretPassword ? { password: form.secretPassword } : null
   if (!form.storePrivateKey || !form.privateKey.trim()) return null
   return { privateKey: form.privateKey, passphrase: form.passphrase || undefined }
 })
@@ -166,7 +177,9 @@ const secretPasswordPlaceholder = computed(() => (
 ))
 
 function credentialTypeLabel(type: CredentialType | string) {
-  return type === 'password' ? t('credentials.types.password') : t('credentials.types.sshPublicKey')
+  if (type === 'password') return t('credentials.types.password')
+  if (type === 'proxy_basic') return t('credentials.types.proxyBasic')
+  return t('credentials.types.sshPublicKey')
 }
 
 // Both rules are functions because the required field depends on the selected
@@ -178,8 +191,22 @@ function validatePublicKey(_rule: unknown, value: unknown, callback: (error?: Er
 }
 
 function validateSecretPassword(_rule: unknown, value: unknown, callback: (error?: Error) => void) {
-  const needsPassword = form.type === 'password' && !editingCredential.value?.hasSecret
+  const needsPassword = (form.type === 'password' || form.type === 'proxy_basic') && !editingCredential.value?.hasSecret
   if (needsPassword && !String(value ?? '').trim()) callback(new Error(t('credentials.passwordRequired')))
+  else callback()
+}
+
+// The username is the identifier a proxy client sends in its Basic header, so a
+// proxy credential without one can never authenticate. Colons are rejected here
+// as well as on the server: RFC 7617 forbids them in a user-id and the entry
+// splits on the first colon, so accepting one would create an unusable pair.
+function validateUsername(_rule: unknown, value: unknown, callback: (error?: Error) => void) {
+  const username = String(value ?? '').trim()
+  if (form.type !== 'proxy_basic') {
+    callback()
+    return
+  }
+  if (!username || username.includes(':')) callback(new Error(t('credentials.usernameRequired')))
   else callback()
 }
 
@@ -187,6 +214,7 @@ const rules = reactive<FormRules>({
   name: [{ required: true, message: t('credentials.name'), trigger: 'blur' }],
   publicKey: [{ validator: validatePublicKey, trigger: 'blur' }],
   secretPassword: [{ validator: validateSecretPassword, trigger: 'blur' }],
+  username: [{ validator: validateUsername, trigger: 'blur' }],
 })
 const detailVisible = ref(false)
 const detailLoading = ref(false)
@@ -239,6 +267,7 @@ function resetForm() {
   form.name = ''
   form.type = 'ssh_public_key'
   form.publicKey = ''
+  form.username = ''
   form.enabled = true
   extractError.value = ''
   extractedFingerprint.value = ''
@@ -256,8 +285,9 @@ async function openEdit(row: Credential) {
   editingCredential.value = row
   resetForm()
   form.name = row.name
-  form.type = row.type === 'password' ? 'password' : 'ssh_public_key'
+  form.type = row.type
   form.publicKey = row.publicKey
+  form.username = row.username || (row.type === 'proxy_basic' ? row.publicKey : '')
   form.enabled = row.enabled
   formVisible.value = true
 }
@@ -296,6 +326,9 @@ async function save() {
       name: form.name.trim(),
       type: form.type,
       publicKey: form.type === 'ssh_public_key' ? form.publicKey.trim() : '',
+      // The server stores a proxy username in the publicKey column, but the API
+      // takes it as its own field so the two never have to be kept in sync here.
+      username: form.type === 'proxy_basic' ? form.username.trim() : '',
       enabled: form.enabled,
       ...(pendingSecret.value ? { secret: pendingSecret.value } : {}),
     }

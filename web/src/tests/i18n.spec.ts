@@ -54,6 +54,24 @@ describe('locale preferences', () => {
       ]) expect(Object.keys(locale.remoteServers).sort(), key).toContainEqual(key)
     }
   })
+
+  it('translates every proxy entry key in both locales', () => {
+    for (const locale of [zhCN, enUS]) {
+      for (const key of [
+        'protocolHttpProxy', 'proxyName', 'proxyNameHelp', 'proxyDomainPreview', 'proxyAuthMode',
+        'proxyAuthNone', 'proxyAuthBasic', 'proxyCredential', 'proxyCreateCredential',
+        'proxySourceCIDRs', 'proxySourceCIDRsHelp', 'proxyAllowAll', 'proxyTargetCIDRs',
+        'proxyTargetPorts', 'proxyAllowPrivateTargets', 'proxyMaxConcurrentTunnels',
+        'proxyDescription', 'proxyUrl', 'proxyCopy', 'proxyCopied', 'proxyUsage', 'proxyUsageTitle',
+        'proxyActiveTunnelsHint', 'proxyTargetDynamic',
+        'proxyNameInvalid', 'proxyCredentialRequired', 'proxyCIDRInvalid', 'proxyPortInvalid',
+      ]) expect(Object.keys(locale.routes).sort(), key).toContainEqual(key)
+      for (const key of ['proxyBasic', 'username', 'usernameRequired']) {
+        expect(Object.keys(locale.credentials).sort(), key).toContainEqual(key)
+      }
+      expect(Object.keys(locale.credentials.types).sort()).toContainEqual('proxyBasic')
+    }
+  })
 })
 
 function messageKeys(value: unknown, prefix = ''): string[] {

@@ -53,6 +53,8 @@ export type ClusterAgentConnection = {
   local: boolean
 }
 
+export type ManagedRouteAuthMode = 'none' | 'basic'
+
 export type ManagedRoute = {
   id: string
   agentId: string
@@ -68,6 +70,18 @@ export type ManagedRoute = {
   status: string
   createdAt: string
   updatedAt: string
+  // Proxy-entry policy. Present only on protocol=http-proxy routes, whose
+  // targetHost/targetPort are the server-owned * / 0 sentinel.
+  authMode?: ManagedRouteAuthMode
+  credentialId?: string
+  sourceCIDRs?: string[]
+  targetCIDRs?: string[]
+  targetPorts?: number[]
+  allowPrivateTargets?: boolean
+  maxConcurrentTunnels?: number
+  description?: string
+  // Read-only and derived server-side from the stored domain.
+  proxyUrl?: string
 }
 export type ManagedRouteCreateInput = {
   agentId: string
@@ -79,6 +93,14 @@ export type ManagedRouteCreateInput = {
   hostHeader?: string
   targetScheme?: string
   tlsServerName?: string
+  authMode?: ManagedRouteAuthMode
+  credentialId?: string
+  sourceCIDRs?: string[]
+  targetCIDRs?: string[]
+  targetPorts?: number[]
+  allowPrivateTargets?: boolean
+  maxConcurrentTunnels?: number
+  description?: string
 }
 export type ManagedRouteUpdateInput = Partial<ManagedRouteCreateInput & { status: string }>
 export type ManagedRoutePage = { items: ManagedRoute[]; nextCursor?: string; hasMore?: boolean }

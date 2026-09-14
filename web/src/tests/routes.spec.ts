@@ -127,6 +127,72 @@ describe('admin routes', () => {
     expect(source).toContain('editingRoute')
   })
 
+  it('supports the tp-* http proxy entry route type', () => {
+    const source = readFileSync('src/views/Routes.vue', 'utf8')
+    for (const marker of [
+      'value="http-proxy"',
+      "t('routes.protocolHttpProxy')",
+      'form.authMode',
+      'value="basic"',
+      'form.credentialId',
+      'listCredentials',
+      'proxy_basic',
+      'form.sourceCIDRs',
+      'form.allowPrivateTargets',
+      'form.maxConcurrentTunnels',
+      'proxyUrl',
+      "t('routes.proxyUsageTitle')",
+      'isProxyRoute',
+      'proxyDomainPreview',
+    ]) expect(source, marker).toContain(marker)
+  })
+
+  it('validates proxy route input before submitting', () => {
+    const source = readFileSync('src/views/Routes.vue', 'utf8')
+    expect(source).toContain("t('routes.proxyNameInvalid')")
+    expect(source).toContain("t('routes.proxyCredentialRequired')")
+    expect(source).toContain("t('routes.proxyCIDRInvalid')")
+    expect(source).toContain("t('routes.proxyPortInvalid')")
+    // The sentinel target is owned by the server, so the form must never send it.
+    expect(source).toContain('buildProxyRouteInput')
+    expect(source).not.toMatch(/targetHost:\s*'\*'/)
+  })
+
+  it('sends proxy routes without upstream-only fields', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { id: 'r1' } }) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await createRoute({
+      agentId: 'agent-1',
+      domain: 'tp-demo.tm.example.com',
+      pathPrefix: '/',
+      protocol: 'http-proxy',
+      targetHost: '',
+      targetPort: 0,
+      authMode: 'basic',
+      credentialId: 'cred-1',
+      sourceCIDRs: ['11.71.85.0/24'],
+      targetCIDRs: [],
+      targetPorts: [443],
+      allowPrivateTargets: true,
+      maxConcurrentTunnels: 8,
+      description: 'demo',
+    }, 'proxy-key')
+
+    const call = fetchMock.mock.calls[0]
+    const body = JSON.parse(call[1].body as string)
+    expect(body.protocol).toBe('http-proxy')
+    expect(body.authMode).toBe('basic')
+    expect(body.credentialId).toBe('cred-1')
+    expect(body.sourceCIDRs).toEqual(['11.71.85.0/24'])
+    expect(body.targetPorts).toEqual([443])
+    expect(body).not.toHaveProperty('hostHeader')
+    expect(body).not.toHaveProperty('targetScheme')
+    expect(body).not.toHaveProperty('tlsServerName')
+    expect(body).not.toHaveProperty('config')
+    vi.unstubAllGlobals()
+  })
+
   it('lists audit logs with the public API contract', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { items: [] } }) })
     vi.stubGlobal('fetch', fetchMock)

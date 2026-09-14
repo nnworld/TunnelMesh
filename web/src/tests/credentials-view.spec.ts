@@ -54,4 +54,18 @@ describe('credentials management view', () => {
     expect(source).toContain("t('credentials.secretKept')")
     expect(source).not.toContain('secretCiphertext')
   })
+
+  it('supports the proxy_basic credential type', () => {
+    const source = readFileSync('src/views/Credentials.vue', 'utf8')
+    for (const marker of [
+      'value="proxy_basic"',
+      "t('credentials.types.proxyBasic')",
+      'form.username',
+      "t('credentials.username')",
+      "t('credentials.usernameRequired')",
+    ]) expect(source, marker).toContain(marker)
+    // A proxy_basic password is write-only like every other secret.
+    expect(source).toContain('form.secretPassword')
+    expect(source).not.toContain('credential.password')
+  })
 })

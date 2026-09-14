@@ -1,7 +1,9 @@
 import { api } from './client'
 import { extractSSHPublicKey } from './ssh-public-key'
 
-export type CredentialType = 'ssh_public_key' | 'password'
+// proxy_basic protects a tp-* managed HTTP proxy entry. Its username shares the
+// publicKey column server-side and is not a secret; only the password is sealed.
+export type CredentialType = 'ssh_public_key' | 'password' | 'proxy_basic'
 export type ResourceStatus = 'active' | 'deleted'
 
 // Write-only secret material. The server seals it into one AES-GCM blob and
@@ -19,6 +21,7 @@ export type Credential = {
   type: CredentialType
   publicKey: string
   fingerprint: string
+  username?: string
   enabled: boolean
   hasSecret?: boolean
   status: ResourceStatus
@@ -39,6 +42,7 @@ export type CredentialInput = {
   name: string
   type: CredentialType
   publicKey: string
+  username?: string
   enabled: boolean
   secret?: CredentialSecretInput
 }
