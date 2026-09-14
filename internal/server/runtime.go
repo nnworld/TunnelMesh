@@ -86,6 +86,7 @@ type ServerRuntime struct {
 	relayServer                 *grpc.Server
 	relayListener               net.Listener
 	proxyEntry                  *ProxyEntryListener
+	proxyEntryService           *ProxyEntry
 	clientMetadataSweeper       *ClientMetadataSweeper
 	clientMetadataSweeperCancel context.CancelFunc
 	clientMetadataSweeperDone   chan error
@@ -290,7 +291,13 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		// Construction happens here rather than in ServeListener so an invalid
 		// trusted_proxies value fails startup instead of silently leaving the
 		// entry down while OpenResty keeps relaying into a dead port.
-		entryListener, err := NewProxyEntryListener(runtimeConfig.ProxyEntry, runtime.proxyEntryHandler(), runtime.metrics)
+		// clientTransport is the agent-facing transport (local sessions plus the
+		// cluster connection selector), so an egress agent attached to another
+		// Server node is reached through the existing relay without extra wiring.
+		entry := NewProxyEntry(runtimeConfig.ProxyEntry, routeTable, clientTransport,
+			credentialSecretResolver{credentials: runtime.API.credentialService}, runtime.metrics, db.Audits())
+		runtime.proxyEntryService = entry
+		entryListener, err := NewProxyEntryListener(runtimeConfig.ProxyEntry, entry.Handler(), runtime.metrics)
 		if err != nil {
 			closeStartup()
 			return nil, fmt.Errorf("server runtime: proxy entry: %w", err)
@@ -841,21 +848,6 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 		shutdown()
 		return nil
 	}
-}
-
-// proxyEntryHandler returns the handler mounted on the internal proxy entry
-// listener.
-//
-// It is a placeholder until the CONNECT/absolute-form engine lands: answering
-// 501 with a Retry-After hint makes an OpenResty relay that is already
-// forwarding traffic fail loudly and retryably instead of hanging the client.
-func (r *ServerRuntime) proxyEntryHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Retry-After", "5")
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusNotImplemented)
-		_, _ = w.Write([]byte(`{"code":501,"msg":"proxy entry is not ready","data":null}` + "\n"))
-	})
 }
 
 func loadRelayServerTLS(cfg config.RelayConfig) (*tls.Config, error) {

@@ -258,16 +258,19 @@ func TestServeListenerStartsAndStopsProxyEntry(t *testing.T) {
 		t.Fatalf("dial proxy entry: %v", err)
 	}
 	defer conn.Close()
-	if _, err := conn.Write([]byte("GET http://target.example/ HTTP/1.1\r\nHost: target.example\r\nConnection: close\r\n\r\n")); err != nil {
+	// The runtime mounts the real entry, so a request without the trusted-peer
+	// headers must be rejected by the policy engine rather than proxied.
+	request := "CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: 93.184.216.34:443\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	body, err := io.ReadAll(conn)
 	if err != nil {
-		t.Fatalf("read placeholder response: %v", err)
+		t.Fatalf("read entry response: %v", err)
 	}
-	if !bytes.Contains(body, []byte("501")) {
-		t.Fatalf("placeholder response = %q", body)
+	if !bytes.Contains(body, []byte("403")) || !bytes.Contains(body, []byte("proxy_route_identity_invalid")) {
+		t.Fatalf("entry response = %q", body)
 	}
 
 	cancel()

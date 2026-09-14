@@ -268,22 +268,41 @@ func (s *CredentialService) GetWithSecret(ctx context.Context, actor auth.Princi
 	return credential, secret, nil
 }
 
-// ProxyBasicSecret decrypts one proxy credential for the managed HTTP proxy
-// entry. It is the only path that turns the stored blob back into a password,
-// and the value must never reach a log line, an audit record or a metric label.
-//
-// The actor is the entry's own service identity rather than an end user: the
-// proxy authenticates on behalf of whoever supplied the Basic header, so
-// ownership is checked against the route's credential, not the HTTP caller.
+// ProxyBasicSecret decrypts one proxy credential for an authenticated caller.
+// It is the management path: ownership is enforced exactly like every other
+// credential read.
 func (s *CredentialService) ProxyBasicSecret(ctx context.Context, actor auth.Principal, id string) (string, string, error) {
 	credential, err := s.Get(ctx, actor, id)
 	if err != nil {
 		return "", "", err
 	}
+	return s.proxyBasicSecret(credential)
+}
+
+// ResolveProxyBasicSecret decrypts one proxy credential WITHOUT an ownership
+// check. It exists solely for the managed HTTP proxy entry.
+//
+// The entry authenticates whoever supplied the Proxy-Authorization header; that
+// person is not a TunnelMesh user and has no principal to compare against. The
+// authorization decision was already made when an administrator attached this
+// credential to a route, so the entry is allowed to read it. Management API
+// handlers must never call this method -- use ProxyBasicSecret instead.
+func (s *CredentialService) ResolveProxyBasicSecret(ctx context.Context, id string) (string, string, error) {
+	credential, err := s.credentials.Get(ctx, id)
+	if err != nil {
+		return "", "", err
+	}
+	return s.proxyBasicSecret(credential)
+}
+
+// proxyBasicSecret is the single path that turns a stored blob back into a
+// password. The value must never reach a log line, an audit record or a metric
+// label.
+func (s *CredentialService) proxyBasicSecret(credential storage.Credential) (string, string, error) {
 	if credential.Type != storage.CredentialTypeProxyBasic || !credential.Enabled || credential.DeletedAt != nil {
 		// Reported as ErrCredentialInvalid on purpose: the proxy entry maps
-		// anything that is not a store failure to "bad credentials", which
-		// keeps credential IDs unprobeable.
+		// anything that is not a store failure to "bad credentials", which keeps
+		// credential IDs unprobeable.
 		return "", "", ErrCredentialInvalid
 	}
 	if !credential.HasSecret() {

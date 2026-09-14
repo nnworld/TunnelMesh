@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/proxyentry"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"golang.org/x/crypto/ssh"
 )
@@ -528,5 +529,37 @@ func TestCredentialServiceProxyBasicSecretRejectsUnusableCredential(t *testing.T
 	}
 	if _, _, err := service.ProxyBasicSecret(ctx, actor, created.ID); !errors.Is(err, ErrCredentialInvalid) {
 		t.Fatalf("deleted credential err = %v, want ErrCredentialInvalid", err)
+	}
+}
+
+// The proxy entry authenticates whoever holds the Basic header, not a logged-in
+// user, so it must be able to read a credential owned by the administrator who
+// attached it to the route. The management path keeps enforcing ownership.
+func TestResolveProxyBasicSecretIgnoresOwnership(t *testing.T) {
+	_, service := newCredentialSecretFixture(t)
+	ctx := context.Background()
+	admin := auth.Principal{UserID: "admin-a", Username: "root", Role: "admin"}
+	created, err := service.Create(ctx, admin, CredentialInput{
+		Name: "proxy demo", Type: storage.CredentialTypeProxyBasic, Username: "demo",
+		Enabled: true, Secret: &CredentialSecret{Password: "s3cret"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	username, password, err := service.ResolveProxyBasicSecret(ctx, created.ID)
+	if err != nil || username != "demo" || password != "s3cret" {
+		t.Fatalf("resolved = %q/%q, err = %v", username, password, err)
+	}
+	if _, _, err := service.ResolveProxyBasicSecret(ctx, "missing-id"); err == nil {
+		t.Fatal("missing credential resolved")
+	}
+	// The resolver adapter must surface a store failure as the proxyentry
+	// sentinel so the entry answers 503 instead of counting a failed attempt.
+	service.SetSecretStore(nil)
+	if _, err := (credentialSecretResolver{credentials: service}).ProxyBasicSecret(ctx, created.ID); !errors.Is(err, proxyentry.ErrSecretStoreUnavailable) {
+		t.Fatalf("adapter err = %v, want ErrSecretStoreUnavailable", err)
+	}
+	if secret, err := (credentialSecretResolver{credentials: nil}).ProxyBasicSecret(ctx, created.ID); err == nil || secret.Username != "" {
+		t.Fatalf("nil-credential resolver = %+v, %v", secret, err)
 	}
 }

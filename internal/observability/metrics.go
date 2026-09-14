@@ -50,6 +50,11 @@ type Metrics struct {
 	websshStreamErrorsTotal   *prometheus.CounterVec
 	websshStreamDuration      *prometheus.HistogramVec
 	websshBytesTotal          *prometheus.CounterVec
+	proxyEntryRequests        *prometheus.CounterVec
+	proxyEntryTunnels         *prometheus.GaugeVec
+	proxyEntryTunnelDuration  *prometheus.HistogramVec
+	proxyEntryAuthFailures    *prometheus.CounterVec
+	proxyEntryACLDenied       *prometheus.CounterVec
 	activeMu                  sync.Mutex
 	activeConnections         map[string]int
 	activeStreams             map[string]int
@@ -120,12 +125,31 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		websshBytesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tunnelmesh_webssh_bytes_total", Help: "Total bytes transferred by browser WebSSH sessions.",
 		}, []string{"direction"}),
+		proxyEntryRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_proxy_entry_requests_total", Help: "Total managed HTTP proxy entry requests by outcome.",
+		}, []string{"route", "mode", "result", "error_class"}),
+		proxyEntryTunnels: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tunnelmesh_proxy_entry_tunnels_active", Help: "Current active managed proxy CONNECT tunnels.",
+		}, []string{"route"}),
+		proxyEntryTunnelDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "tunnelmesh_proxy_entry_tunnel_duration_seconds", Help: "Managed proxy CONNECT tunnel lifetime in seconds.",
+		}, []string{"route", "result"}),
+		proxyEntryAuthFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_proxy_entry_auth_failures_total", Help: "Total managed proxy Basic authentication failures.",
+		}, []string{"route", "reason"}),
+		proxyEntryACLDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_proxy_entry_acl_denied_total", Help: "Total managed proxy requests denied by the source ACL.",
+		}, []string{"route"}),
 		activeConnections:      make(map[string]int),
 		activeStreams:          make(map[string]int),
 		agentConnectionStates:  make(map[string]bool),
 		agentConnectionStreams: make(map[string]int),
 	}
 	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
+	// Registered separately from the collector list above: that call is already
+	// one line per feature area and appending here keeps the proxy entry
+	// collectors reviewable as a unit.
+	reg.MustRegister(m.proxyEntryRequests, m.proxyEntryTunnels, m.proxyEntryTunnelDuration, m.proxyEntryAuthFailures, m.proxyEntryACLDenied)
 	return m
 }
 
@@ -400,4 +424,48 @@ func (m *Metrics) ObserveWebSSHBytes(direction string, n int64) {
 	if n > 0 {
 		m.websshBytesTotal.WithLabelValues(label(direction)).Add(float64(n))
 	}
+}
+
+// ObserveProxyEntryRequest counts one managed HTTP proxy entry decision.
+//
+// mode is "connect" or "absolute", result is "success" or "denied", and
+// errorClass carries the stable proxyentry error code so a dashboard can tell a
+// source-ACL denial from an auth failure without a second metric. route may be
+// empty when identity resolution itself failed; it is never an arbitrary
+// client-supplied hostname, only a normalized tp-* route key.
+func (m *Metrics) ObserveProxyEntryRequest(route, mode, result, errorClass string) {
+	m.proxyEntryRequests.WithLabelValues(label(route), label(mode), label(result), label(errorClass)).Inc()
+}
+
+// ObserveProxyEntryTunnel moves the active-tunnel gauge for one route. Callers
+// must pair every true with exactly one false, otherwise the gauge drifts and
+// the capacity alert becomes meaningless.
+func (m *Metrics) ObserveProxyEntryTunnel(route string, active bool) {
+	gauge := m.proxyEntryTunnels.WithLabelValues(label(route))
+	if active {
+		gauge.Inc()
+		return
+	}
+	gauge.Dec()
+}
+
+// ObserveProxyEntryTunnelDuration records a finished tunnel. result is the
+// three-value enum produced by classifyTunnelResult: success, timeout or error.
+func (m *Metrics) ObserveProxyEntryTunnelDuration(route, result string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	m.proxyEntryTunnelDuration.WithLabelValues(label(route), label(result)).Observe(duration.Seconds())
+}
+
+// ObserveProxyEntryAuthFailure counts a Basic authentication failure. reason is
+// derived from the stable error code, never from the supplied credentials.
+func (m *Metrics) ObserveProxyEntryAuthFailure(route, reason string) {
+	m.proxyEntryAuthFailures.WithLabelValues(label(route), label(reason)).Inc()
+}
+
+// ObserveProxyEntryACLDenied counts a request rejected by the route's source
+// CIDR allowlist.
+func (m *Metrics) ObserveProxyEntryACLDenied(route string) {
+	m.proxyEntryACLDenied.WithLabelValues(label(route)).Inc()
 }
