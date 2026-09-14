@@ -1,0 +1,67 @@
+# TunnelMesh tp-* HTTP 代理入口 server 块模板。
+#
+# 这是模板而不是可以直接 include 的配置：占位符必须由部署者渲染，含义、生产渲染
+# 示例与验证步骤见 docs/deployment/openresty-proxy-entry.md。渲染后放进 http{}
+# 内，与现有 admin / 托管路由 server 块并列；两块共用 443，由 SNI 选择。
+#
+# 占位符：
+#   __LISTEN__             监听地址。生产写 443；本地验证写 127.0.0.1:18443。
+#   __SERVER_NAME_REGEX__  tp-* 主机名正则，生产渲染示例：
+#                          ~^tp-[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?\.tm\.example\.com$
+#   __SSL_CERT__           证书路径，必须覆盖 *.<domain_suffix>
+#   __SSL_CERT_KEY__       私钥路径
+#   __LUA_FILE__           tunnelmesh_proxy_entry.lua 的绝对路径
+#   __INTERNAL_UPSTREAM__  必须等于 server.proxy_entry.listen，默认 127.0.0.1:8089
+#   __EDGE_ALLOW__         粗粒度来源白名单，生产渲染示例：
+#                          allow 10.0.0.0/8; allow 11.0.0.0/8; deny all;
+#
+# 两条硬约束（由 deploy/openresty/openresty_artifacts_test.go 守护）：
+#   1. 本 server 块禁止 h2。ngx.req.socket(true) 在 HTTP/2 下游不可用，
+#      proxy_connect 模块的 Known Issues 也明确不支持 HTTP/2 的 CONNECT。
+#      现有 admin server 块用 per-server 的 `http2 on;`，两块互不影响
+#      （要求 OpenResty 基于 nginx >= 1.25.1，Task 0 已验证）。
+#   2. Proxy-Authorization 是 hop-by-hop 头，nginx 默认不转发给上游；
+#      location / 里少这一行，非 CONNECT 的 HTTP 代理请求会全部 407。
+#
+# worker_shutdown_timeout 300s; 属于 main 上下文，写在 nginx.conf 而不是这里：
+# reload 时给在途隧道留排空时间，否则发布瞬间所有代理连接被立刻掐断。
+
+upstream tunnelmesh_proxy_entry {
+    server __INTERNAL_UPSTREAM__;
+    keepalive 32;
+}
+
+server {
+    listen __LISTEN__ ssl;
+    server_name __SERVER_NAME_REGEX__;
+
+    ssl_certificate     __SSL_CERT__;
+    ssl_certificate_key __SSL_CERT_KEY__;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:TLS:10m;
+
+    # 粗粒度前置，只挡明显的公网扫描；按路由的细粒度 ACL 在 Server 侧执行。
+    __EDGE_ALLOW__
+
+    # 客户端断开时立刻结束 Lua 请求，避免半开隧道占用 worker connection。
+    lua_check_client_abort on;
+    access_by_lua_file __LUA_FILE__;
+
+    # 非 CONNECT（绝对形式）请求。nginx 会把绝对形式改写成 origin-form 再交给
+    # location，所以 Server 侧从 Host 头恢复目标（见 splitProxyTarget）。
+    location / {
+        proxy_pass http://tunnelmesh_proxy_entry;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $http_host;
+        proxy_set_header Proxy-Authorization $http_proxy_authorization;
+        proxy_set_header X-TunnelMesh-Route $ssl_server_name;
+        proxy_set_header X-TunnelMesh-Client-IP $remote_addr;
+        proxy_set_header X-TunnelMesh-Client-Port $remote_port;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

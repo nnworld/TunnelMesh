@@ -30,12 +30,16 @@
 
 | 事实 | 证据 | 影响 |
 |---|---|---|
-| proxy_connect 补丁对 CONNECT 跳过 location 匹配 | `patch/proxy_connect.patch` 中 `ngx_http_core_find_config_phase` 分支：`ngx_http_update_location_config(r); r->phase_handler++;` | `content_by_lua_block`（context 仅 `location, location-if`）接不到 CONNECT，必须使用 server 级 `access_by_lua_block` |
-| `$connect_host` / `$connect_port` 是 nginx core 变量 | 补丁修改 `src/http/ngx_http_variables.c` 的 `ngx_http_core_variables[]` | Lua 无需在 location 中写 `proxy_connect;` 即可读到隧道目标 |
+| proxy_connect 补丁对 CONNECT 跳过 location 匹配 | 上游模块 `chobits/ngx_http_proxy_connect_module` v0.0.7 的 `patch/proxy_connect_rewrite_102101.patch`（仓库内不存在该文件，由 `deploy/openresty/Dockerfile.proxy-connect` 构建时拉取）中 `ngx_http_core_find_config_phase` 分支：`ngx_http_update_location_config(r); r->phase_handler++;` | `content_by_lua_block`（context 仅 `location, location-if`）接不到 CONNECT，必须使用 server 级 `access_by_lua_block` |
+| `$connect_host` / `$connect_port` 是 nginx core 变量 | 同补丁 `proxy_connect_rewrite_102101.patch` 修改 `src/http/ngx_http_variables.c` 的 `ngx_http_core_variables[]`，在表头新增两项 `ngx_http_variable_request` | Lua 无需在 location 中写 `proxy_connect;` 即可读到隧道目标 |
+| 补丁同时删掉了 nginx 对 CONNECT 的 405 拒绝 | 同补丁 `src/http/ngx_http_request.c` 段删除 `client sent CONNECT method` -> `NGX_HTTP_NOT_ALLOWED` 分支 | 只 `--add-module` 不打补丁时，每个 CONNECT 一律 405，`access_by_lua` 永远看不到它 |
+| `NGX_HTTP_PROXY_CONNECT` 宏由模块 config 定义 | 模块 `config` 末行 `have=NGX_HTTP_PROXY_CONNECT . auto/have` | 补丁与模块必须同时存在，`--add-module=/build/ngx_http_proxy_connect_module` 不可省 |
+| OpenResty 构建顺序是先 configure 再 patch | 模块 README “Build OpenResty”：`./configure --add-module=...` -> `patch -d build/nginx-1.19.3/ -p 1 < ...` -> `make` | `configure` 才会解出 `build/nginx-<ver>/`，顺序反了补丁无处可打；Dockerfile 的顺序由 `openresty_artifacts_test.go` 守护 |
 | `ngx.req.socket` 的 context 含 `access_by_lua*`，`raw=true` 返回全双工 socket | lua-nginx-module README `ngx.req.socket` 章节 | access 阶段即可完成 raw splice |
 | `ngx.req.socket` 在 HTTP/2 下游不可用 | 同上 README 的 SPDY/HTTP2 限制说明 | tp-* server 块禁止 `http2 on`，ALPN 只提供 http/1.1 |
 | proxy_connect 模块不会把 CONNECT 转发给上游 | 模块 README：“Any `location {}` block, `upstream {}` block and any other standard backend/upstream directives, such as `proxy_pass`, do not impact the functionality of this module.” | 不能依赖该模块做链式转发；本设计不使用它 |
 | nginx 不向上游转发 hop-by-hop 头（含 `Proxy-Authorization`） | nginx 上游请求构造行为，Task 0 实测确认 | 非 CONNECT 分支必须显式 `proxy_set_header Proxy-Authorization $http_proxy_authorization;` |
+| proxy_connect 模块在 HTTP/2 下不支持 CONNECT | 模块 README “Known Issues”：`In HTTP/2, the CONNECT method is not supported.` | 与 `ngx.req.socket` 的 HTTP/2 限制互为双重理由：tp-* server 块禁止 `http2 on;`，ALPN 只协商 http/1.1 |
 
 ## 3. 架构总览
 
@@ -75,39 +79,24 @@ tunnelmesh-agent   出口拨号真实目标，并再次执行 SSRF/私网/端口
 
 ### 5.1 server 块（产物 `deploy/openresty/tunnelmesh-proxy.conf.example`）
 
-```nginx
-upstream tunnelmesh_proxy_entry { server 127.0.0.1:8089; keepalive 32; }
+完整配置只存一份：产物 [`deploy/openresty/tunnelmesh-proxy.conf.example`](../../../deploy/openresty/tunnelmesh-proxy.conf.example)。
+本节不再复制它，避免同一份 nginx 配置在 spec、模板与部署文档里各存一份后静默漂移。模板使用占位符
+`__LISTEN__`、`__SERVER_NAME_REGEX__`、`__SSL_CERT__`、`__SSL_CERT_KEY__`、`__LUA_FILE__`、
+`__INTERNAL_UPSTREAM__`、`__EDGE_ALLOW__`；生产渲染示例、通配证书要求、`nginx -t` 与上线验证步骤见
+[OpenResty 代理入口部署](../../deployment/openresty-proxy-entry.md)。
 
-server {
-    listen 443 ssl;                 # 不得加 http2
-    server_name ~^tp-[a-z0-9-]+\.example\.com$;
-    ssl_certificate     /data/ssl/example.com_bundle.crt;   # 必须覆盖 *.example.com
-    ssl_certificate_key /data/ssl/example.com.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
+模板必须满足的结构约束（由 `deploy/openresty/openresty_artifacts_test.go` 守护，改模板必须同步改测试）：
 
-    allow 10.0.0.0/8;               # 粗粒度前置，细粒度 ACL 由 Server 执行
-    allow 11.0.0.0/8;
-    deny  all;
-
-    lua_check_client_abort on;
-    access_by_lua_file /etc/openresty/lua/tunnelmesh_proxy_entry.lua;
-
-    location / {                    # 非 CONNECT：绝对形式 http:// 目标
-        proxy_pass http://tunnelmesh_proxy_entry;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host $http_host;
-        proxy_set_header Proxy-Authorization $http_proxy_authorization;
-        proxy_set_header X-TunnelMesh-Route $ssl_server_name;
-        proxy_set_header X-TunnelMesh-Client-IP $remote_addr;
-        proxy_set_header X-TunnelMesh-Client-Port $remote_port;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-}
-```
+- `listen __LISTEN__ ssl;`，且**不得**出现 `http2 on;`（双重理由见第 2 节最后两行）。
+- server 级 `lua_check_client_abort on;` 与 `access_by_lua_file __LUA_FILE__;`：CONNECT 跳过 location
+  匹配，写在 location 级永远收不到。
+- `upstream tunnelmesh_proxy_entry` 指向 `__INTERNAL_UPSTREAM__`，必须等于 `server.proxy_entry.listen`。
+- `location /`（非 CONNECT 的绝对形式请求）必须显式 `proxy_set_header Proxy-Authorization $http_proxy_authorization;`，
+  以及三个可信头 `X-TunnelMesh-Route $ssl_server_name`、`X-TunnelMesh-Client-IP $remote_addr`、
+  `X-TunnelMesh-Client-Port $remote_port`；`proxy_request_buffering off; proxy_buffering off;`，
+  读写超时不小于 `server.proxy_entry.idle_timeout`。
+- `__EDGE_ALLOW__` 只做粗粒度前置（挡明显公网扫描），按路由的细粒度 ACL 一律在 Server 侧执行。
+- `worker_shutdown_timeout` 属于 main 上下文，写在 `nginx.conf` 而不是本模板；reload 时给在途隧道留排空时间。
 
 现有 admin/托管路由 server 块保持不变；两块共用 443，由 SNI 选择。现有块使用 per-server 的 `http2 on;`，新块省略即互不影响（要求 OpenResty 基于 nginx >= 1.25.1，Task 0 验证）。
 
@@ -348,7 +337,7 @@ Grafana：在既有单一 Dashboard 中新增一行“HTTP 代理入口”面板
 8. `internal/config/config_test.go`：新键默认值、三路优先级、启动校验失败用例（`domain_suffix` 缺失、`trusted_proxies` 非法、非回环 listen 搭配 `0.0.0.0/0`）。
 9. `internal/server/managed_route_handler_test.go`：`http-proxy` 行不进入 HTTP 反代路由表；proxy 索引正确；TTL 生效；停用路由在下一次快照后不可用。
 10. 前端：`web` 单测覆盖表单校验与类型切换；`npm run build` 后执行 `./scripts/verify-web-embed.sh`。
-11. Lua/nginx 冒烟：`test/e2e/proxy-entry/`，使用 `openresty/openresty:alpine` 容器加 Go stub 上游；无 docker 时 skip 并打印原因；覆盖 CONNECT 成功、403、407 与非 CONNECT 绝对形式。
+11. Lua/nginx 冒烟：`test/e2e/proxy-entry/`，用 `deploy/openresty/Dockerfile.proxy-connect` 构建出的镜像跑真实 OpenResty，上游是 Node stub（`test/e2e/proxy-entry/lib/stub.mjs`）；无 docker 或未设置 `TM_PROXY_E2E_NGINX=1` 时 skip 并打印原因。冒烟只覆盖 OpenResty 搬运层（请求头白名单、CONNECT 双向 splice、非 200 原样透传、客户端断开后隧道回收、日志不含凭据），Server 的路由解析、ACL、认证、限额与转发由第 1-9 项的 Go 测试覆盖，不在此重复。
 
 门禁命令：`go test ./... -count=1`、`go test -race ./...`、`go vet ./...`、`gofmt -l internal/ cmd/ test/`、`git diff --check`、`cd web && npm test -- --run && npm run build`、`./scripts/verify-web-embed.sh`。
 
@@ -391,6 +380,7 @@ spike 产物只作为结论文档记录，不进入生产代码。
 | SOCKS5 | 本轮不做 | 用户已明确只做 HTTP 代理；stream 模块因此也不再需要 |
 | 域名冲突判定 | `http-proxy` 路由按域名整体互斥（`tunnelRouteConflict` 增加 `domainOnly`），create 与 update 共用一个实现 | 沿用 `domain + path_prefix` 复合判定：tp-* 的 `path_prefix` 恒为 `"/"`，与同域名不同前缀的反代路由不会被数据库 `UNIQUE` 拦住，会留下一条被 nginx 精确 `server_name` 永久遮蔽、后台看不出原因的不可达路由 |
 | 前端“活跃隧道数” | 不新增列表列；抽屉内指向 Grafana Row `HTTP Proxy Entry` → 面板 `Proxy tunnels active` | 新增只读聚合接口：管理 API 未暴露该指标，为纯展示引入新端点、权限校验与前端轮询，成本高于收益 |
+| OpenResty 产物形态 | 占位符模板 + Go 侧产物一致性测试（`deploy/openresty/openresty_artifacts_test.go`） | 直接写死生产值：E2E 只能测一份手抄副本，模板与 Go 配置默认值漂移无人发现 |
 
 ## 18. 验收标准
 

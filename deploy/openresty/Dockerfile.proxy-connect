@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+#
+# OpenResty + ngx_http_proxy_connect_module 补丁内核，供 tp-* HTTP 代理入口使用。
+#
+# 为什么必须自己构建：没有补丁时 nginx 在 ngx_http_process_request_header 里直接
+# 对 CONNECT 回 405，$connect_host / $connect_port 这两个变量也由补丁注册进
+# nginx core variables。模块与补丁来自同一个 tag，缺一都会让 CONNECT 失效。
+#
+# 版本必须成对选择：模块 README 的 Compatibility 表列出了 OpenResty 版本与补丁
+# 文件的对应关系（1.25.3.1 -> proxy_connect_rewrite_102101.patch）。换版本前先读
+# https://github.com/chobits/ngx_http_proxy_connect_module#select-patch ，
+# 并同步 deploy/openresty/openresty_artifacts_test.go 里的 pin 断言。
+
+ARG ALPINE_VERSION=3.20
+ARG OPENRESTY_VERSION=1.25.3.1
+ARG PROXY_CONNECT_VERSION=v0.0.7
+ARG PROXY_CONNECT_PATCH=proxy_connect_rewrite_102101.patch
+
+FROM alpine:${ALPINE_VERSION} AS build
+ARG OPENRESTY_VERSION
+ARG PROXY_CONNECT_VERSION
+ARG PROXY_CONNECT_PATCH
+RUN apk add --no-cache build-base perl linux-headers openssl-dev pcre2-dev zlib-dev \
+        bash patch wget
+WORKDIR /build
+RUN wget -qO openresty.tar.gz "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
+    && tar -xzf openresty.tar.gz
+RUN wget -qO proxy-connect.tar.gz \
+        "https://github.com/chobits/ngx_http_proxy_connect_module/archive/refs/tags/${PROXY_CONNECT_VERSION}.tar.gz" \
+    && tar -xzf proxy-connect.tar.gz \
+    && mv "ngx_http_proxy_connect_module-${PROXY_CONNECT_VERSION#v}" ngx_http_proxy_connect_module
+WORKDIR /build/openresty-${OPENRESTY_VERSION}
+# 替换生产 OpenResty 之前，先在目标机执行 nginx -V，把输出里的 --with-* 参数补进
+# 下面这条 configure，否则现有 server 块可能因为缺模块起不来。E2E 只需要 ssl。
+RUN ./configure \
+        --prefix=/usr/local/openresty \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_realip_module \
+        --with-http_gzip_static_module \
+        --with-pcre-jit \
+        --add-module=/build/ngx_http_proxy_connect_module \
+        -j"$(nproc)" \
+    && patch -d "build/nginx-${OPENRESTY_VERSION%.*}" -p1 \
+        < "/build/ngx_http_proxy_connect_module/patch/${PROXY_CONNECT_PATCH}" \
+    && make -j"$(nproc)" \
+    && make install \
+    && /usr/local/openresty/nginx/sbin/nginx -V 2>&1 | grep -q proxy_connect
+
+FROM alpine:${ALPINE_VERSION} AS runtime
+LABEL org.opencontainers.image.title="TunnelMesh OpenResty (proxy_connect)" \
+      org.opencontainers.image.description="OpenResty with the ngx_http_proxy_connect_module patch for the tp-* HTTP proxy entry" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/nnworld/TunnelMesh"
+RUN apk add --no-cache libgcc openssl pcre2 zlib \
+    && addgroup -S openresty && adduser -S -G openresty openresty
+COPY --from=build /usr/local/openresty /usr/local/openresty
+# 非 root 运行需要让 openresty 用户可写 logs 与各类 temp 目录；生产环境若沿用
+# 宿主机既有的 OpenResty 用户，按实际情况调整 chown 目标。
+RUN mkdir -p /var/run/openresty \
+    && chown -R openresty:openresty /usr/local/openresty/nginx /var/run/openresty
+ENV PATH=/usr/local/openresty/bin:/usr/local/openresty/nginx/sbin:${PATH}
+# 443 需要 root 或 cap_net_bind_service，因此本镜像默认非 root 时只适合监听
+# 1024 以上端口（E2E 用 18443）。要在容器里直接监听 443，改用 root 运行或
+# setcap cap_net_bind_service=ep /usr/local/openresty/nginx/sbin/nginx。
+EXPOSE 443
+USER openresty:openresty
+ENTRYPOINT ["/usr/local/openresty/nginx/sbin/nginx"]
+CMD ["-g", "daemon off;"]
