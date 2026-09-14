@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -284,18 +285,18 @@ func (p *ProxyEntry) handleConnect(w http.ResponseWriter, r *http.Request, route
 		return
 	}
 	if err := policy.Validate(host, port); err != nil {
-		p.deny(w, r, routeName, mode, started, err, "target")
+		p.deny(w, r, routeName, mode, started, targetError(err), "target")
 		return
 	}
 
-	stream, cancelOpen, err := p.openEgress(r, route, host, port)
+	request := relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: host, TargetPort: port}
+	request.Metadata = traceparentFromRequest(r)
+	stream, cancelOpen, err := p.openEgress(r.Context(), request)
 	if err != nil {
-		perr := asProxyEntryError(err)
-		if perr == nil {
-			perr = proxyentry.ErrEgressUnavailable
-		}
+		perr := egressError(err)
 		p.audit(r.Context(), "proxy_egress_failed", route, proxyEntryAuditDetail{
-			RouteDomain: routeName, AgentID: route.AgentID, ClientIP: clientIP.String(), Target: target, Reason: perr.Code,
+			RouteDomain: routeName, AgentID: route.AgentID, ClientIP: clientIP.String(), Target: target,
+			Reason: proxyEntryErrorCode(perr),
 		})
 		p.deny(w, r, routeName, mode, started, perr, "egress")
 		return
@@ -344,13 +345,187 @@ func (p *ProxyEntry) handleConnect(w http.ResponseWriter, r *http.Request, route
 		"setup_ms", tunnelStarted.Sub(started).Milliseconds(), "duration_ms", elapsed.Milliseconds())
 }
 
-// handleAbsoluteForm is a compile-time placeholder in Task 10; Task 11 replaces
-// the body. Both tasks land in the same release, so the 501 never reaches
-// production.
-func (p *ProxyEntry) handleAbsoluteForm(w http.ResponseWriter, r *http.Request, route proxyentry.Route, _ net.IP, mode string, started time.Time) {
-	p.deny(w, r, route.Domain, mode, started,
-		proxyentry.NewError(http.StatusNotImplemented, "proxy_absolute_form_unimplemented", "absolute-form forwarding is not implemented yet"),
-		"absolute_unimplemented")
+// handleAbsoluteForm forwards a non-CONNECT proxy request over one logical
+// stream. Field for field it mirrors HTTPProxyHandler.ServeRoute: write the
+// normalized request into the stream, read exactly one response back, stream it
+// out. No http.Client is involved, so there is no connection pool and no
+// redirect following -- a 3xx is passed through verbatim and the browser decides
+// whether to come back through the proxy.
+//
+// Protocol upgrades are deliberately unsupported here. A WebSocket target
+// belongs on a managed reverse-proxy route, and leaving Upgrade in place would
+// make http.ReadResponse expect a 101 this branch cannot splice.
+func (p *ProxyEntry) handleAbsoluteForm(w http.ResponseWriter, r *http.Request, route proxyentry.Route, clientIP net.IP, mode string, started time.Time) {
+	routeName := route.Domain
+	host, port, scheme, err := splitProxyTarget(r)
+	if err != nil {
+		p.deny(w, r, routeName, mode, started, targetError(err), "target")
+		return
+	}
+	policy, err := proxyentry.NewTargetPolicy(route.TargetCIDRs, route.TargetPorts, route.AllowPrivateTargets)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "proxy_entry_target_policy_invalid", "route", routeName, "error", err)
+		p.deny(w, r, routeName, mode, started, proxyentry.ErrTargetDenied, "target")
+		return
+	}
+	if err := policy.Validate(host, port); err != nil {
+		p.deny(w, r, routeName, mode, started, targetError(err), "target")
+		return
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	request := relay.StreamRequest{
+		AgentID: route.AgentID, Protocol: "http",
+		TargetHost: host, TargetPort: port, TargetScheme: scheme, HostHeader: host,
+	}
+	request.Metadata = traceparentFromRequest(r)
+	stream, cancelOpen, err := p.openEgress(r.Context(), request)
+	if err != nil {
+		perr := egressError(err)
+		p.audit(r.Context(), "proxy_egress_failed", route, proxyEntryAuditDetail{
+			RouteDomain: routeName, AgentID: route.AgentID, ClientIP: clientIP.String(), Target: target,
+			Reason: proxyEntryErrorCode(perr),
+		})
+		p.deny(w, r, routeName, mode, started, perr, "egress")
+		return
+	}
+	defer cancelOpen()
+	defer stream.Close()
+
+	upstreamReq := p.normalizeProxyEntryRequest(r, host, port)
+	if err := upstreamReq.Write(stream); err != nil {
+		slog.WarnContext(r.Context(), "proxy_entry_upstream_write_failed", "route", routeName, "target", target, "error", err)
+		p.deny(w, r, routeName, mode, started, proxyentry.ErrEgressUnavailable, "egress_write")
+		return
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(stream), upstreamReq)
+	if err != nil {
+		slog.WarnContext(r.Context(), "proxy_entry_upstream_read_failed", "route", routeName, "target", target, "error", err)
+		p.deny(w, r, routeName, mode, started, proxyentry.ErrEgressUnavailable, "egress_read")
+		return
+	}
+	defer resp.Body.Close()
+
+	p.observeRequest(routeName, mode, proxyEntryResultSuccess, "")
+	elapsed := time.Since(started)
+	p.audit(r.Context(), "proxy_request_forwarded", route, proxyEntryAuditDetail{
+		RouteDomain: routeName, AgentID: route.AgentID, ClientIP: clientIP.String(), Target: target,
+		DurationMs: elapsed.Milliseconds(), Status: resp.StatusCode,
+	})
+	copyResponse(w, resp)
+	slog.InfoContext(r.Context(), "proxy_request_forwarded",
+		"route", routeName, "agent_id", route.AgentID, "target", target, "client_ip", clientIP.String(),
+		"method", r.Method, "status", resp.StatusCode, "duration_ms", elapsed.Milliseconds())
+}
+
+// splitProxyTarget resolves the real target of a non-CONNECT proxy request. It
+// accepts both shapes the entry can see: an absolute-form URL (a direct hit on
+// the internal listener, which is what tests and curl produce) and the
+// origin-form rewrite OpenResty's "location /" emits, where the authority
+// survives only in the Host header.
+func splitProxyTarget(r *http.Request) (string, int, string, error) {
+	if r == nil || r.URL == nil {
+		return "", 0, "", proxyentry.ErrTargetInvalid
+	}
+	target, scheme := r.URL, r.URL.Scheme
+	if target.Host == "" {
+		// Origin-form. Defaulting the scheme to http is not a guess: an https
+		// target always reaches this entry as CONNECT and is served by
+		// handleConnect, so anything arriving in origin-form is plaintext.
+		authority := strings.TrimSpace(r.Host)
+		if authority == "" {
+			return "", 0, "", proxyentry.ErrTargetInvalid
+		}
+		parsed, err := url.Parse("http://" + authority)
+		if err != nil {
+			return "", 0, "", proxyentry.ErrTargetInvalid
+		}
+		target, scheme = parsed, "http"
+	}
+	if scheme != "http" && scheme != "https" {
+		return "", 0, "", proxyentry.ErrTargetInvalid
+	}
+	host := target.Hostname()
+	portText := target.Port()
+	if portText == "" {
+		if scheme == "https" {
+			portText = "443"
+		} else {
+			portText = "80"
+		}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 || host == "" {
+		return "", 0, "", proxyentry.ErrTargetInvalid
+	}
+	return host, port, scheme, nil
+}
+
+// normalizeProxyEntryRequest rewrites an absolute-form proxy request into the
+// origin-form the target expects and strips hop-by-hop plus trusted-peer
+// headers. It mirrors internal/client.normalizeProxyRequest and additionally
+// removes the X-TunnelMesh-* headers so route metadata never reaches a target.
+func (p *ProxyEntry) normalizeProxyEntryRequest(r *http.Request, host string, port int) *http.Request {
+	upstream := r.Clone(r.Context())
+	upstream.RequestURI = ""
+	upstream.URL.Scheme = ""
+	upstream.URL.Host = ""
+	upstream.Host = net.JoinHostPort(host, strconv.Itoa(port))
+	// Hop-by-hop headers are meaningful only between the client and this entry.
+	for _, name := range []string{
+		"Proxy-Authorization", "Proxy-Connection", "Connection", "Keep-Alive",
+		"Te", "Trailer", "Transfer-Encoding", "Upgrade",
+	} {
+		upstream.Header.Del(name)
+	}
+	// Map keys are already canonical, so one prefix sweep covers every
+	// X-TunnelMesh-* header without enumerating them.
+	for key := range upstream.Header {
+		if strings.HasPrefix(key, "X-Tunnelmesh-") {
+			upstream.Header.Del(key)
+		}
+	}
+	// The prefix sweep misses operator-renamed headers, whose canonical form may
+	// not start with X-Tunnelmesh-. Deleting the configured names explicitly
+	// closes that gap; Del is a no-op when the name is absent.
+	upstream.Header.Del(p.routeHeader)
+	upstream.Header.Del(p.clientIPHeader)
+	upstream.Header.Del(p.clientPortHeader)
+	return upstream
+}
+
+// traceparentFromRequest extracts the caller's W3C trace context. Metadata is
+// the only field the stream-open payload carries for cross-process correlation,
+// so the value rides along and the agent-side connect joins the same trace. It
+// returns nil when the front end did not forward one.
+func traceparentFromRequest(r *http.Request) []byte {
+	value := strings.TrimSpace(r.Header.Get("Traceparent"))
+	if value == "" {
+		return nil
+	}
+	return []byte(value)
+}
+
+// targetError normalizes a target-validation failure. proxyentry already returns
+// the two stable codes; anything unexpected is treated as a policy denial
+// rather than an internal fault, so a target can never be reached by accident
+// because a mapping was missing.
+func targetError(err error) error {
+	if perr := asProxyEntryError(err); perr != nil {
+		return perr
+	}
+	return proxyentry.ErrTargetDenied
+}
+
+// egressError normalizes a stream failure onto the two stable egress codes, so
+// the CONNECT and absolute-form branches cannot drift apart.
+func egressError(err error) error {
+	if perr := asProxyEntryError(err); perr != nil {
+		return perr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return proxyentry.ErrEgressTimeout
+	}
+	return proxyentry.ErrEgressUnavailable
 }
 
 // splitConnectTarget parses the CONNECT authority. The Host header is preferred
@@ -380,26 +555,22 @@ func splitConnectTarget(r *http.Request) (string, int, error) {
 	return host, port, nil
 }
 
-// openEgress dials the agent-side stream and enforces the connect timeout with
-// a timer instead of a deadline context.
+// openEgress dials the agent-side stream described by request and enforces the
+// connect timeout with a timer instead of a deadline context. Both the CONNECT
+// and absolute-form branches go through it so the timeout, the abandonment
+// behaviour and the error mapping cannot drift apart; the caller supplies the
+// fully populated StreamRequest, including Protocol and any trace metadata.
 //
 // A deadline context cannot be used here: relay.GRPCNodeTransport creates the
 // client stream from the context it is given, so a deadline that fires after a
 // successful open would kill a healthy tunnel. The caller owns the returned
 // cancel func and must defer it for the tunnel's whole lifetime.
-func (p *ProxyEntry) openEgress(r *http.Request, route proxyentry.Route, host string, port int) (io.ReadWriteCloser, context.CancelFunc, error) {
+func (p *ProxyEntry) openEgress(ctx context.Context, request relay.StreamRequest) (io.ReadWriteCloser, context.CancelFunc, error) {
 	if p.opener == nil {
 		return nil, func() {}, proxyentry.ErrEgressUnavailable
 	}
-	request := relay.StreamRequest{AgentID: route.AgentID, Protocol: "tcp", TargetHost: host, TargetPort: port}
-	if traceparent := strings.TrimSpace(r.Header.Get("Traceparent")); traceparent != "" {
-		// Metadata is the only field the stream-open payload carries for
-		// cross-process correlation, so the caller's W3C trace context rides
-		// along and the agent-side connect joins the same trace.
-		request.Metadata = []byte(traceparent)
-	}
-
-	openCtx, cancelOpen := context.WithCancel(r.Context())
+	target := net.JoinHostPort(request.TargetHost, strconv.Itoa(request.TargetPort))
+	openCtx, cancelOpen := context.WithCancel(ctx)
 	type openResult struct {
 		stream io.ReadWriteCloser
 		err    error
@@ -430,17 +601,17 @@ func (p *ProxyEntry) openEgress(r *http.Request, route proxyentry.Route, host st
 	case res := <-results:
 		if res.err != nil {
 			cancelOpen()
-			slog.WarnContext(r.Context(), "proxy_entry_egress_open_failed",
-				"route", route.Domain, "agent_id", route.AgentID, "target", net.JoinHostPort(host, strconv.Itoa(port)), "error", res.err)
+			slog.WarnContext(ctx, "proxy_entry_egress_open_failed",
+				"agent_id", request.AgentID, "protocol", request.Protocol, "target", target, "error", res.err)
 			return nil, func() {}, proxyentry.ErrEgressUnavailable
 		}
 		return res.stream, cancelOpen, nil
 	case <-timer.C:
 		abandon()
-		slog.WarnContext(r.Context(), "proxy_entry_egress_open_timeout",
-			"route", route.Domain, "agent_id", route.AgentID, "timeout", timeout.String())
+		slog.WarnContext(ctx, "proxy_entry_egress_open_timeout",
+			"agent_id", request.AgentID, "protocol", request.Protocol, "target", target, "timeout", timeout.String())
 		return nil, func() {}, proxyentry.ErrEgressTimeout
-	case <-r.Context().Done():
+	case <-ctx.Done():
 		// The client hung up while the dial was still in flight.
 		abandon()
 		return nil, func() {}, errProxyEntryInternal
@@ -538,6 +709,7 @@ type proxyEntryAuditDetail struct {
 	BytesUp     int64  `json:"bytesUp,omitempty"`
 	BytesDown   int64  `json:"bytesDown,omitempty"`
 	DurationMs  int64  `json:"durationMs,omitempty"`
+	Status      int    `json:"status,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 }
 
