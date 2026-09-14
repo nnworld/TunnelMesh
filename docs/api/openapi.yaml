@@ -2,7 +2,15 @@ openapi: 3.0.3
 info:
   title: TunnelMesh Server API
   version: 1.0.0
-  description: Versioned management API for agents, policies, routes, tunnels and audit logs.
+  description: |
+    Versioned management API for agents, policies, routes, tunnels and audit logs.
+
+    Managed HTTP proxy routes (`protocol: http-proxy`, `tp-*` domains) are
+    configured here but served on a separate entry listener. The proxy-specific
+    statuses - 407 Proxy Authentication Required, 403 source or target denial,
+    502 egress unavailable, 503 tunnel capacity exhausted or credential secret
+    store unavailable, 504 connect timeout - are returned by that entry and never
+    by `/api/v1`. See `docs/user-guide/http-proxy-entry.md` for the full table.
 servers:
   - url: /
 paths:
@@ -255,7 +263,18 @@ paths:
         '404': {description: Policy is not deleted}
   /api/v1/routes:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Managed routes}}}
-    post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}, '409': {description: Duplicate route}}}
+    post:
+      security: [{bearerAuth: []}]
+      description: Creates a managed reverse-proxy route, or a whole-host HTTP proxy entry when `protocol` is `http-proxy`. Replaying the same `Idempotency-Key` returns the stored 201 response instead of a 409.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}
+      responses:
+        '201': {description: Created}
+        '400': {description: Invalid proxy route policy, credential reference or tp-* domain shape}
+        '403': {description: Administrator required, or the referenced credential is not usable by the caller}
+        '404': {description: Unknown agentId or credentialId}
+        '409': {description: 'Duplicate route. A tp-* domain is claimed as a whole hostname: it conflicts with any other route on the same domain regardless of pathPrefix, and case variants count as the same claim.'}
+        '503': {description: Credential service unavailable while validating a basic-auth proxy route}
   /api/v1/credentials:
     get:
       summary: List SSH credentials visible to the caller
@@ -263,7 +282,7 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
-        - {name: type, in: query, schema: {type: string, enum: [ssh_public_key, password]}}
+        - {name: type, in: query, schema: {type: string, enum: [ssh_public_key, password, proxy_basic]}}
         - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}}
         - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
       responses:
@@ -432,14 +451,14 @@ paths:
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}
-      responses: {'200': {description: Updated route}, '400': {description: Invalid route fields}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: Duplicate domain and path}}
+      responses: {'200': {description: Updated route}, '400': {description: 'Invalid route fields, or a protocol switch to or from http-proxy'}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: 'Duplicate domain and path. An http-proxy route claims its whole tp-* domain, so any other route on that domain conflicts.'}}
     patch:
       security: [{bearerAuth: []}]
-      description: Updates only supplied route fields. Agent, protocol, domain, path, target, public port, status, and config are supported.
+      description: Updates only supplied route fields. Agent, protocol, domain, path, target, public port, status, and config are supported. For an `http-proxy` route the proxy policy fields are supported instead of `config`, `hostHeader`, `targetScheme` and `tlsServerName`, and `targetHost`/`targetPort` are fixed to the `*` / `0` sentinel.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/TunnelUpdateRequest'}}}
-      responses: {'200': {description: Updated route}, '400': {description: Invalid route fields}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: Duplicate domain and path}}
+      responses: {'200': {description: Updated route}, '400': {description: 'Invalid field, or a protocol switch to or from http-proxy'}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: 'Duplicate domain and path. An http-proxy route claims its whole tp-* domain, so renaming another route onto it conflicts.'}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
   /api/v1/tunnels:
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnels}}}
@@ -658,8 +677,9 @@ components:
       required: [name]
       properties:
         name: {type: string, minLength: 1, maxLength: 255}
-        type: {type: string, enum: [ssh_public_key, password], default: ssh_public_key}
-        publicKey: {type: string, minLength: 20, maxLength: 16384, description: OpenSSH public-key line; required for ssh_public_key, must be omitted for password. Private-key material is rejected.}
+        type: {type: string, enum: [ssh_public_key, password, proxy_basic], default: ssh_public_key}
+        publicKey: {type: string, minLength: 20, maxLength: 16384, description: OpenSSH public-key line; required for ssh_public_key, must be omitted for password and proxy_basic. Private-key material is rejected.}
+        username: {type: string, maxLength: 256, description: 'proxy_basic only: the Basic-auth user name. It is not a secret, is stored in publicKey and is echoed back by every read API. Colons and control characters are rejected because RFC 7617 forbids them in a user-id.'}
         enabled: {type: boolean, default: true}
         secret: {$ref: '#/components/schemas/CredentialSecretInput'}
     CredentialSecretInput:
@@ -667,7 +687,7 @@ components:
       additionalProperties: false
       description: Write-only authentication secret. Sealed with AES-256-GCM before it reaches storage and never rendered back by any read API. Omit or send an empty object to keep the stored secret unchanged; changing `type` clears it.
       properties:
-        password: {type: string, format: password, maxLength: 4096, description: Required for a password credential; rejected for ssh_public_key}
+        password: {type: string, format: password, maxLength: 4096, description: Required for password and proxy_basic credentials; rejected for ssh_public_key}
         privateKey: {type: string, format: password, maxLength: 65536, description: Optional for ssh_public_key; enables browser auto-authentication. Rejected for a password credential.}
         passphrase: {type: string, format: password, maxLength: 1024, description: Requires privateKey}
     ExtractSSHPublicKeyRequest:
@@ -695,8 +715,9 @@ components:
       minProperties: 1
       properties:
         name: {type: string, minLength: 1, maxLength: 255}
-        type: {type: string, enum: [ssh_public_key, password]}
+        type: {type: string, enum: [ssh_public_key, password, proxy_basic]}
         publicKey: {type: string, minLength: 20, maxLength: 16384}
+        username: {type: string, maxLength: 256, description: proxy_basic only; an empty value is treated as "field absent" and never clears the stored user name}
         enabled: {type: boolean}
         secret: {$ref: '#/components/schemas/CredentialSecretInput'}
     Credential:
@@ -707,9 +728,10 @@ components:
         id: {type: string}
         ownerUserId: {type: string}
         name: {type: string}
-        type: {type: string, enum: [ssh_public_key, password]}
-        publicKey: {type: string, description: Empty for a password credential}
-        fingerprint: {type: string, description: Empty for a password credential}
+        type: {type: string, enum: [ssh_public_key, password, proxy_basic]}
+        publicKey: {type: string, description: Empty for a password credential; holds the user name for proxy_basic}
+        fingerprint: {type: string, description: Empty for a password credential; hex SHA-256 of the user name for proxy_basic}
+        username: {type: string, description: Present only for proxy_basic credentials; mirrors publicKey so callers do not need to know the two share a column}
         enabled: {type: boolean}
         hasSecret: {type: boolean, description: True when an encrypted authentication secret is stored. Neither the ciphertext, nonce, key id nor plaintext is ever returned.}
         status: {type: string, enum: [active, deleted]}
@@ -1106,36 +1128,53 @@ components:
         hasMore: {type: boolean}
     TunnelRequest:
       type: object
-      required: [agentId, targetHost, targetPort]
+      required: [agentId]
       properties:
         agentId: {type: string}
-        protocol: {type: string, enum: [http, websocket], description: Public application protocol}
-        domain: {type: string, description: Exact domain or single-level tm-* wildcard}
-        pathPrefix: {type: string, default: /}
-        targetHost: {type: string, description: IP or hostname that the Agent dials}
-        targetPort: {type: integer, minimum: 1, maximum: 65535}
+        protocol: {type: string, enum: [http, websocket, http-proxy], description: 'Public application protocol. http-proxy creates a whole-host managed proxy entry instead of a reverse-proxy route.'}
+        domain: {type: string, description: 'Exact domain or single-level tm-* wildcard. An http-proxy route must use tp-<name>.<suffix> with a lowercase name of at most 32 characters.'}
+        pathPrefix: {type: string, default: /, description: Forced to / for http-proxy routes, where it carries no routing meaning}
+        targetHost: {type: string, description: 'IP or hostname that the Agent dials. Required unless protocol is http-proxy, which must omit it: the server stores the wildcard sentinel * because the real target comes from each proxied request.'}
+        targetPort: {type: integer, minimum: 1, maximum: 65535, description: Required unless protocol is http-proxy, which must omit it; the server stores 0.}
         publicPort: {type: integer}
         status: {type: string}
         hostHeader: {type: string, description: Host sent to the upstream service; defaults to targetHost}
         targetScheme: {type: string, enum: [http, https], default: http, description: Upstream transport scheme used by the Agent}
         tlsServerName: {type: string, description: TLS SNI and certificate name; requires targetScheme https and defaults to targetHost}
-        config: {type: object, description: Backward-compatible route configuration; new route fields are also persisted here}
+        config: {type: object, description: 'Backward-compatible route configuration; new route fields are also persisted here. Must be omitted for http-proxy routes, which use the dedicated policy fields below.'}
+        authMode: {type: string, enum: [none, basic], default: none, description: 'http-proxy only: authentication the proxy entry enforces on every proxied request'}
+        credentialId: {type: string, description: 'http-proxy only: required when authMode is basic and must reference an enabled proxy_basic credential the caller may read'}
+        sourceCIDRs: {type: array, items: {type: string}, description: 'http-proxy only: client IP allowlist evaluated on the real peer address. Bare IPs are normalized to /32 or /128, duplicates are dropped and the supplied order is kept. An empty list denies every client.'}
+        targetCIDRs: {type: array, items: {type: string}, description: 'http-proxy only: target network allowlist. Empty allows any address the dangerous-address filter permits.'}
+        targetPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: 'http-proxy only: target port allowlist, deduped and sorted. Empty allows any port. It applies to hostname targets as well as IP literals.'}
+        allowPrivateTargets: {type: boolean, default: true, description: 'http-proxy only: whether loopback, private, link-local and unique-local targets may be dialled. Cloud metadata addresses are refused either way.'}
+        maxConcurrentTunnels: {type: integer, minimum: 0, description: 'http-proxy only: per-route concurrent tunnel cap; 0 keeps the server-wide default'}
+        description: {type: string, maxLength: 256, description: 'http-proxy only: operator note rendered by the admin UI'}
     TunnelUpdateRequest:
       type: object
       additionalProperties: false
+      description: Omitted fields keep their stored value. `protocol` cannot be switched to or from `http-proxy`; create a new route instead.
       properties:
         agentId: {type: string, description: Omitted preserves the current Agent}
-        protocol: {type: string, enum: [http, websocket], description: Omitted preserves the current protocol}
+        protocol: {type: string, enum: [http, websocket, http-proxy], description: Omitted preserves the current protocol; switching to or from http-proxy is refused with 400}
         domain: {type: string, description: Exact domain or single-level tm-* wildcard}
         pathPrefix: {type: string, default: /}
-        targetHost: {type: string}
-        targetPort: {type: integer, minimum: 1, maximum: 65535}
+        targetHost: {type: string, description: 'Fixed to the * sentinel on an http-proxy route; sending any other value is refused with 400'}
+        targetPort: {type: integer, minimum: 0, maximum: 65535, description: 'Fixed to 0 on an http-proxy route; sending any other value is refused with 400'}
         hostHeader: {type: string, description: Omitted preserves the current Host header; empty uses targetHost}
         targetScheme: {type: string, enum: [http, https], description: Omitted preserves the current upstream scheme; empty defaults to http}
         tlsServerName: {type: string, description: Omitted preserves the current TLS name; empty uses targetHost}
         publicPort: {type: integer, minimum: 0, maximum: 65535}
         status: {type: string, enum: [active, disabled]}
-        config: {type: object}
+        config: {type: object, description: Must be omitted on an http-proxy route together with hostHeader, targetScheme and tlsServerName}
+        authMode: {type: string, enum: [none, basic], description: 'http-proxy only; switching to basic re-validates the stored credentialId when none is supplied'}
+        credentialId: {type: string, description: 'http-proxy only; must reference an enabled proxy_basic credential'}
+        sourceCIDRs: {type: array, items: {type: string}, description: 'http-proxy only; an explicit empty list denies every client, which is a real change and not an omission'}
+        targetCIDRs: {type: array, items: {type: string}, description: 'http-proxy only; replaces the stored allowlist'}
+        targetPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: 'http-proxy only; replaces the stored allowlist'}
+        allowPrivateTargets: {type: boolean, description: 'http-proxy only'}
+        maxConcurrentTunnels: {type: integer, minimum: 0, description: 'http-proxy only; 0 restores the server-wide default'}
+        description: {type: string, maxLength: 256, description: 'http-proxy only'}
     AuditLog:
       type: object
       additionalProperties: false

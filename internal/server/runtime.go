@@ -795,12 +795,20 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	entryCtx, cancelEntry := context.WithCancel(ctx)
 	defer cancelEntry()
 	proxyErrCh := make(chan error, 1)
+	// entryDone is closed once the entry goroutine has returned, which is what
+	// makes shutdown synchronous: Addr() doubles as the "is it listening"
+	// signal, so a supervisor (or a test) that sees ServeListener return must
+	// not still observe a bound public traffic port.
+	entryDone := make(chan struct{})
 	if r.proxyEntry != nil {
 		go func() {
+			defer close(entryDone)
 			if err := r.proxyEntry.Serve(entryCtx); err != nil {
 				proxyErrCh <- fmt.Errorf("server runtime: proxy entry serve failed: %w", err)
 			}
 		}()
+	} else {
+		close(entryDone)
 	}
 	relayErrCh := make(chan error, 1)
 	if r.relayServer != nil && r.relayListener != nil {
@@ -821,6 +829,9 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	go func() { errCh <- srv.Serve(serveListener) }()
 	shutdown := func() {
 		cancelEntry()
+		// Bounded by the entry's own shutdown timeout: Serve always returns
+		// after its context is cancelled, so this cannot hang the runtime.
+		<-entryDone
 		if r.relayServer != nil {
 			r.relayServer.Stop()
 		}

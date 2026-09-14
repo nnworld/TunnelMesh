@@ -17,6 +17,7 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/proxyentry"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -158,7 +159,13 @@ func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentReq
 }
 
 func (s *apiService) CreateTunnel(ctx context.Context, v storage.Tunnel) (storage.Tunnel, error) {
-	if v.AgentID == "" || v.TargetHost == "" || v.TargetPort < 1 || v.TargetPort > 65535 {
+	if v.Protocol == storage.ProtocolHTTPProxy {
+		// The real target of a tp-* route comes from each proxied request, so
+		// the wildcard sentinel is the only valid stored value.
+		if v.AgentID == "" || v.TargetHost != storage.ProxyTargetWildcard || v.TargetPort != 0 {
+			return storage.Tunnel{}, errors.New("http-proxy routes require an agentId and the wildcard sentinel target")
+		}
+	} else if v.AgentID == "" || v.TargetHost == "" || v.TargetPort < 1 || v.TargetPort > 65535 {
 		return storage.Tunnel{}, errors.New("agentId, targetHost and valid targetPort are required")
 	}
 	if err := routing.ValidateDomainPattern(v.Domain); err != nil {
@@ -1028,6 +1035,17 @@ type tunnelRequest struct {
 	TargetScheme  string         `json:"targetScheme"`
 	TLSServerName string         `json:"tlsServerName"`
 	Config        map[string]any `json:"config"`
+	// Proxy policy fields, meaningful only when Protocol is http-proxy. They are
+	// dedicated fields instead of Config entries so the OpenAPI contract and the
+	// admin UI can validate each one individually.
+	AuthMode             string   `json:"authMode"`
+	CredentialID         string   `json:"credentialId"`
+	SourceCIDRs          []string `json:"sourceCIDRs"`
+	TargetCIDRs          []string `json:"targetCIDRs"`
+	TargetPorts          []int    `json:"targetPorts"`
+	AllowPrivateTargets  *bool    `json:"allowPrivateTargets"`
+	MaxConcurrentTunnels *int     `json:"maxConcurrentTunnels"`
+	Description          string   `json:"description"`
 }
 
 // tunnelUpdateRequest uses pointers so PATCH can distinguish an omitted field
@@ -1045,6 +1063,17 @@ type tunnelUpdateRequest struct {
 	TargetScheme  *string         `json:"targetScheme"`
 	TLSServerName *string         `json:"tlsServerName"`
 	Config        *map[string]any `json:"config"`
+	// Every proxy policy field is a pointer so PATCH can tell "not supplied"
+	// from "explicitly cleared"; an empty sourceCIDRs list is a real change
+	// (deny every client) and must not be mistaken for an omitted field.
+	AuthMode             *string   `json:"authMode"`
+	CredentialID         *string   `json:"credentialId"`
+	SourceCIDRs          *[]string `json:"sourceCIDRs"`
+	TargetCIDRs          *[]string `json:"targetCIDRs"`
+	TargetPorts          *[]int    `json:"targetPorts"`
+	AllowPrivateTargets  *bool     `json:"allowPrivateTargets"`
+	MaxConcurrentTunnels *int      `json:"maxConcurrentTunnels"`
+	Description          *string   `json:"description"`
 }
 
 type upstreamRouteConfig struct {
@@ -1111,7 +1140,10 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if full && (req.AgentID == nil || req.TargetHost == nil || req.TargetPort == nil) {
+	// The protocol cannot be switched to or from http-proxy, so the stored value
+	// stays authoritative for the whole update.
+	isProxyRoute := current.Protocol == storage.ProtocolHTTPProxy
+	if full && (req.AgentID == nil || (!isProxyRoute && (req.TargetHost == nil || req.TargetPort == nil))) {
 		writeAPIError(w, http.StatusBadRequest, "agentId, targetHost and targetPort are required")
 		return
 	}
@@ -1139,8 +1171,15 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		if protocol == "ws" {
 			protocol = "websocket"
 		}
-		if protocol != "http" && protocol != "websocket" {
-			writeAPIError(w, http.StatusBadRequest, "protocol must be http or websocket")
+		if protocol != "http" && protocol != "websocket" && protocol != storage.ProtocolHTTPProxy {
+			writeAPIError(w, http.StatusBadRequest, "protocol must be http, websocket or http-proxy")
+			return
+		}
+		// A tp-* route stores a sentinel target plus a proxy policy where a
+		// reverse-proxy route stores upstream options, so switching in place
+		// would leave either shape half populated.
+		if protocol != current.Protocol && (protocol == storage.ProtocolHTTPProxy || isProxyRoute) {
+			writeAPIError(w, http.StatusBadRequest, "protocol cannot be changed to or from http-proxy; create a new route")
 			return
 		}
 		next.Protocol = protocol
@@ -1163,18 +1202,39 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 			next.PathPrefix = "/"
 		}
 	}
-	if req.TargetHost != nil {
-		next.TargetHost = strings.TrimSpace(*req.TargetHost)
-		if next.TargetHost == "" {
-			writeAPIError(w, http.StatusBadRequest, "targetHost is required")
+	if isProxyRoute {
+		// The sentinel target and the constant prefix are what make a tp-* route
+		// a whole-host endpoint. Letting an update move them would silently turn
+		// it into a reverse-proxy route the proxy entry can no longer serve.
+		if req.TargetHost != nil && strings.TrimSpace(*req.TargetHost) != storage.ProxyTargetWildcard {
+			writeAPIError(w, http.StatusBadRequest, "targetHost is fixed for http-proxy routes")
 			return
 		}
-	}
-	if req.TargetPort != nil && (*req.TargetPort < 1 || *req.TargetPort > 65535) {
-		writeAPIError(w, http.StatusBadRequest, "targetPort must be between 1 and 65535")
-		return
-	} else if req.TargetPort != nil {
-		next.TargetPort = *req.TargetPort
+		if req.TargetPort != nil && *req.TargetPort != 0 {
+			writeAPIError(w, http.StatusBadRequest, "targetPort is fixed for http-proxy routes")
+			return
+		}
+		if req.Config != nil || req.HostHeader != nil || req.TargetScheme != nil || req.TLSServerName != nil {
+			writeAPIError(w, http.StatusBadRequest, "http-proxy routes use dedicated fields; config, hostHeader, targetScheme and tlsServerName must be omitted")
+			return
+		}
+		next.TargetHost = storage.ProxyTargetWildcard
+		next.TargetPort = 0
+		next.PathPrefix = "/"
+	} else {
+		if req.TargetHost != nil {
+			next.TargetHost = strings.TrimSpace(*req.TargetHost)
+			if next.TargetHost == "" {
+				writeAPIError(w, http.StatusBadRequest, "targetHost is required")
+				return
+			}
+		}
+		if req.TargetPort != nil && (*req.TargetPort < 1 || *req.TargetPort > 65535) {
+			writeAPIError(w, http.StatusBadRequest, "targetPort must be between 1 and 65535")
+			return
+		} else if req.TargetPort != nil {
+			next.TargetPort = *req.TargetPort
+		}
 	}
 	if req.PublicPort != nil {
 		if *req.PublicPort < 0 || *req.PublicPort > 65535 {
@@ -1192,7 +1252,56 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		next.Status = status
 	}
 
-	if req.Config != nil || req.HostHeader != nil || req.TargetScheme != nil || req.TLSServerName != nil {
+	if isProxyRoute && (req.AuthMode != nil || req.CredentialID != nil || req.SourceCIDRs != nil ||
+		req.TargetCIDRs != nil || req.TargetPorts != nil || req.AllowPrivateTargets != nil ||
+		req.MaxConcurrentTunnels != nil || req.Description != nil) {
+		// `policy` is deliberately not named `current`: updateTunnel already
+		// takes a `current storage.Tunnel` parameter, and shadowing it would
+		// silently change the meaning of every later `current.` reference.
+		policy, err := proxyRouteConfigOf(next.Config)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "stored proxy route config is invalid")
+			return
+		}
+		if req.AuthMode != nil {
+			policy.AuthMode = strings.ToLower(strings.TrimSpace(*req.AuthMode))
+		}
+		if req.CredentialID != nil {
+			policy.CredentialID = strings.TrimSpace(*req.CredentialID)
+		}
+		// The merged policy is validated, not the request: switching authMode to
+		// basic without resending credentialId must still check the stored
+		// reference instead of leaving an unauthenticated route behind.
+		if credStatus, message := a.validateProxyCredential(r.Context(), p, policy.AuthMode, policy.CredentialID); message != "" {
+			writeAPIError(w, credStatus, message)
+			return
+		}
+		if req.SourceCIDRs != nil {
+			policy.SourceCIDRs = *req.SourceCIDRs
+		}
+		if req.TargetCIDRs != nil {
+			policy.TargetCIDRs = *req.TargetCIDRs
+		}
+		if req.TargetPorts != nil {
+			policy.TargetPorts = *req.TargetPorts
+		}
+		if req.AllowPrivateTargets != nil {
+			policy.AllowPrivateTargets = req.AllowPrivateTargets
+		}
+		if req.MaxConcurrentTunnels != nil {
+			policy.MaxConcurrentTunnels = *req.MaxConcurrentTunnels
+		}
+		if req.Description != nil {
+			policy.Description = *req.Description
+		}
+		encoded, message := normalizeProxyRouteConfig(policy)
+		if message != "" {
+			writeAPIError(w, http.StatusBadRequest, message)
+			return
+		}
+		next.Config = encoded
+	}
+	if !isProxyRoute && (req.Config != nil || req.HostHeader != nil || req.TargetScheme != nil || req.TLSServerName != nil) {
 		config := map[string]any{}
 		if next.Config != "" && next.Config != "{}" {
 			if err := json.Unmarshal([]byte(next.Config), &config); err != nil {
@@ -1225,7 +1334,7 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 
 	a.routeMu.Lock()
 	defer a.routeMu.Unlock()
-	conflict, err := a.tunnelRouteConflict(r.Context(), next.ID, next.Domain, next.PathPrefix)
+	conflict, err := a.tunnelRouteConflict(r.Context(), next.ID, next.Domain, next.PathPrefix, isProxyRoute)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1243,7 +1352,24 @@ func (a *API) updateTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 	writeJSON(w, http.StatusOK, publicTunnel(next))
 }
 
-func (a *API) tunnelRouteConflict(ctx context.Context, id, domain, pathPrefix string) (bool, error) {
+// errRouteConflict is returned from inside the idempotent mutation body so the
+// caller can answer 409 with the established message. It is a sentinel rather
+// than a storage error because the uniqueness rule lives in the application:
+// UNIQUE(domain, path_prefix) cannot see that a tp-* route claims a whole
+// hostname regardless of prefix.
+var errRouteConflict = errors.New("route already exists")
+
+// tunnelRouteConflict reports whether a route would collide with an existing
+// one. id is the route being patched, or empty for a create.
+//
+// domainOnly ignores path_prefix, which is what a tp-* http-proxy route needs:
+// it is a whole-host proxy endpoint whose stored prefix is a constant "/" with
+// no routing meaning. An existing http-proxy route claims its whole hostname for
+// the same reason, and in both directions: OpenResty matches an exact
+// server_name before the tp-* wildcard, so a path-level reverse-proxy route on
+// that domain would silently shadow the proxy endpoint while the
+// UNIQUE(domain, path_prefix) constraint still permits the row.
+func (a *API) tunnelRouteConflict(ctx context.Context, id, domain, pathPrefix string, domainOnly bool) (bool, error) {
 	if domain == "" {
 		return false, nil
 	}
@@ -1252,11 +1378,63 @@ func (a *API) tunnelRouteConflict(ctx context.Context, id, domain, pathPrefix st
 		return false, err
 	}
 	for _, route := range routes {
-		if route.ID != id && strings.EqualFold(route.Domain, domain) && route.PathPrefix == pathPrefix {
+		if route.ID == id || !strings.EqualFold(route.Domain, domain) {
+			continue
+		}
+		if domainOnly || route.Protocol == storage.ProtocolHTTPProxy || route.PathPrefix == pathPrefix {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// validateProxyCredential checks that a basic-auth route references a
+// proxy_basic credential the caller may actually see. The message is empty on
+// success; otherwise the returned status is the code to answer with. Unknown,
+// foreign, disabled, deleted and wrong-typed IDs all share one message so
+// credential IDs cannot be enumerated through the routes endpoint.
+func (a *API) validateProxyCredential(ctx context.Context, p auth.Principal, authMode, credentialID string) (int, string) {
+	if strings.ToLower(strings.TrimSpace(authMode)) != proxyentry.AuthModeBasic {
+		return 0, ""
+	}
+	if a.credentialService == nil {
+		return http.StatusServiceUnavailable, "credential service unavailable"
+	}
+	id := strings.TrimSpace(credentialID)
+	if id == "" {
+		return http.StatusBadRequest, "credentialId is required when authMode is basic"
+	}
+	credential, err := a.credentialService.Get(ctx, p, id)
+	if err != nil {
+		return credentialErrorStatus(err), "credential is not usable"
+	}
+	if credential.Type != storage.CredentialTypeProxyBasic || !credential.Enabled || credential.DeletedAt != nil {
+		return http.StatusBadRequest, "credentialId must reference an enabled proxy_basic credential"
+	}
+	return 0, ""
+}
+
+// buildProxyRoutePolicy is the create-path composition: validate the credential
+// reference, then normalize the whole policy into the stored config JSON. The
+// update path cannot use it because there the policy is "stored config plus
+// pointer overrides" and must be merged before it can be validated.
+func (a *API) buildProxyRoutePolicy(ctx context.Context, p auth.Principal, policy proxyRouteConfig) (string, int, string) {
+	status, message := a.validateProxyCredential(ctx, p, policy.AuthMode, policy.CredentialID)
+	if message != "" {
+		return "", status, message
+	}
+	encoded, message := normalizeProxyRouteConfig(policy)
+	if message != "" {
+		return "", http.StatusBadRequest, message
+	}
+	return encoded, 0, ""
+}
+
+func concurrencyOrZero(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Principal) {
@@ -1265,13 +1443,50 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if req.AgentID == "" || req.TargetHost == "" || req.TargetPort < 1 || req.TargetPort > 65535 {
+	protocol := strings.ToLower(strings.TrimSpace(req.Protocol))
+	isProxyRoute := protocol == storage.ProtocolHTTPProxy
+	if isProxyRoute {
+		// The upstream fields have no meaning on a whole-host proxy endpoint, so
+		// they are refused rather than ignored: a caller who sends them believes
+		// they pin the target, and silently discarding that would be a lie.
+		if strings.TrimSpace(req.TargetHost) != "" && strings.TrimSpace(req.TargetHost) != storage.ProxyTargetWildcard {
+			writeAPIError(w, http.StatusBadRequest, "targetHost must be omitted for http-proxy routes")
+			return
+		}
+		if req.TargetPort != 0 {
+			writeAPIError(w, http.StatusBadRequest, "targetPort must be omitted for http-proxy routes")
+			return
+		}
+		if len(req.Config) > 0 {
+			writeAPIError(w, http.StatusBadRequest, "http-proxy routes use dedicated fields; config must be omitted")
+			return
+		}
+		req.Protocol = storage.ProtocolHTTPProxy
+		req.PathPrefix = "/"
+		req.TargetHost = storage.ProxyTargetWildcard
+		req.TargetPort = 0
+		req.Config = nil
+	}
+	if strings.TrimSpace(req.AgentID) == "" {
+		writeAPIError(w, http.StatusBadRequest, "agentId is required")
+		return
+	}
+	if !isProxyRoute && (req.TargetHost == "" || req.TargetPort < 1 || req.TargetPort > 65535) {
 		writeAPIError(w, http.StatusBadRequest, "agentId, targetHost and valid targetPort are required")
 		return
 	}
+	// Normalizing before validation keeps the stored domain, the conflict check
+	// and the pattern the matcher will later apply to the same bytes.
+	req.Domain = strings.ToLower(strings.TrimSpace(req.Domain))
 	if err := routing.ValidateDomainPattern(req.Domain); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if isProxyRoute {
+		if err := validateProxyRouteDomain(req.Domain); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if _, err := a.service.GetAgent(r.Context(), req.AgentID); err != nil {
 		writeStorageError(w, err)
@@ -1279,28 +1494,34 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 	}
 	a.routeMu.Lock()
 	defer a.routeMu.Unlock()
-	routes, err := a.listAllTunnels(r.Context())
-	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-	for _, existing := range routes {
-		if strings.EqualFold(existing.Domain, req.Domain) && existing.PathPrefix == req.PathPrefix && existing.Domain != "" {
-			writeAPIError(w, http.StatusConflict, "route already exists")
+	var configBytes string
+	if isProxyRoute {
+		encoded, credStatus, message := a.buildProxyRoutePolicy(r.Context(), p, proxyRouteConfig{
+			AuthMode: req.AuthMode, CredentialID: req.CredentialID,
+			SourceCIDRs: req.SourceCIDRs, TargetCIDRs: req.TargetCIDRs, TargetPorts: req.TargetPorts,
+			AllowPrivateTargets:  req.AllowPrivateTargets,
+			MaxConcurrentTunnels: concurrencyOrZero(req.MaxConcurrentTunnels),
+			Description:          req.Description,
+		})
+		if message != "" {
+			writeAPIError(w, credStatus, message)
 			return
 		}
-	}
-	config := req.Config
-	if config == nil {
-		config = map[string]any{}
-	}
-	config["hostHeader"] = strings.TrimSpace(req.HostHeader)
-	config["targetScheme"] = strings.ToLower(strings.TrimSpace(req.TargetScheme))
-	config["tlsServerName"] = strings.TrimSpace(req.TLSServerName)
-	configBytes, message := normalizeUpstreamRouteConfig(config)
-	if message != "" {
-		writeAPIError(w, http.StatusBadRequest, message)
-		return
+		configBytes = encoded
+	} else {
+		config := req.Config
+		if config == nil {
+			config = map[string]any{}
+		}
+		config["hostHeader"] = strings.TrimSpace(req.HostHeader)
+		config["targetScheme"] = strings.ToLower(strings.TrimSpace(req.TargetScheme))
+		config["tlsServerName"] = strings.TrimSpace(req.TLSServerName)
+		encoded, message := normalizeUpstreamRouteConfig(config)
+		if message != "" {
+			writeAPIError(w, http.StatusBadRequest, message)
+			return
+		}
+		configBytes = encoded
 	}
 	v := storage.Tunnel{AgentID: req.AgentID, Protocol: strings.ToLower(req.Protocol), Domain: strings.ToLower(strings.TrimSpace(req.Domain)), PathPrefix: req.PathPrefix, TargetHost: req.TargetHost, TargetPort: req.TargetPort, PublicPort: req.PublicPort, Status: req.Status, Config: configBytes}
 	if v.Status == "" {
@@ -1310,6 +1531,16 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		if a.service == nil {
 			return 0, nil, errors.New("api service unavailable")
 		}
+		// The conflict check belongs inside the idempotent body: a replayed key
+		// must return the stored 201 rather than collide with the route the
+		// first attempt already created.
+		conflict, err := a.tunnelRouteConflict(r.Context(), "", v.Domain, v.PathPrefix, isProxyRoute)
+		if err != nil {
+			return 0, nil, err
+		}
+		if conflict {
+			return 0, nil, errRouteConflict
+		}
 		created, err := a.service.CreateTunnel(r.Context(), v)
 		if err != nil {
 			return 0, nil, err
@@ -1317,6 +1548,10 @@ func (a *API) createTunnel(w http.ResponseWriter, r *http.Request, p auth.Princi
 		a.auditRoute(r.Context(), p, "route.created", created)
 		return http.StatusCreated, publicTunnel(created), nil
 	})
+	if errors.Is(err, errRouteConflict) {
+		writeAPIError(w, http.StatusConflict, errRouteConflict.Error())
+		return
+	}
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1508,8 +1743,64 @@ func publicPolicy(v storage.AgentPolicy) map[string]any {
 	return map[string]any{"id": v.ID, "agentId": v.AgentID, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "protocol": v.Protocol, "allowedCIDRs": nonemptySplit(v.AllowedCIDRs), "allowedPorts": decodeInts(v.AllowedPorts), "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
 }
 func publicTunnel(v storage.Tunnel) map[string]any {
+	if v.Protocol == storage.ProtocolHTTPProxy {
+		return publicProxyTunnel(v)
+	}
 	upstream := publicUpstreamRouteConfig(v)
 	return map[string]any{"id": v.ID, "agentId": v.AgentID, "protocol": v.Protocol, "domain": v.Domain, "pathPrefix": v.PathPrefix, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "publicPort": v.PublicPort, "status": v.Status, "hostHeader": upstream.HostHeader, "targetScheme": upstream.TargetScheme, "tlsServerName": upstream.TLSServerName, "config": json.RawMessage(defaultJSON(v.Config)), "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+}
+
+// publicProxyTunnel renders one tp-* route with its policy flattened next to the
+// routing fields, so the admin UI never has to decode tunnels.config itself. The
+// sentinel target is exposed on purpose: it is why targetHost/targetPort are not
+// editable. proxyUrl is derived from the stored domain and needs no server
+// configuration.
+//
+// hostHeader, targetScheme and tlsServerName are deliberately absent. They have
+// no meaning on a proxy route, and reusing publicUpstreamRouteConfig would echo
+// the "*" sentinel back as the default HostHeader and TLSServerName.
+func publicProxyTunnel(v storage.Tunnel) map[string]any {
+	cfg, err := proxyRouteConfigOf(v.Config)
+	if err != nil {
+		// A row whose config cannot be decoded is still listed: showing the
+		// defaults beats hiding the route, and the data plane refuses it anyway.
+		cfg = proxyRouteConfig{AuthMode: proxyentry.AuthModeNone, AllowPrivateTargets: boolPtr(true)}
+	}
+	allowPrivate := true
+	if cfg.AllowPrivateTargets != nil {
+		allowPrivate = *cfg.AllowPrivateTargets
+	}
+	return map[string]any{
+		"id": v.ID, "agentId": v.AgentID, "protocol": v.Protocol, "domain": v.Domain,
+		"pathPrefix": v.PathPrefix, "targetHost": v.TargetHost, "targetPort": v.TargetPort,
+		"publicPort": v.PublicPort, "status": v.Status,
+		"proxyUrl":     "https://" + v.Domain,
+		"authMode":     cfg.AuthMode,
+		"credentialId": cfg.CredentialID,
+		// The lists are coerced to empty slices so the response carries [] and
+		// never null, which is what the UI binds directly to a multi-select.
+		"sourceCIDRs":          orEmptyStrings(cfg.SourceCIDRs),
+		"targetCIDRs":          orEmptyStrings(cfg.TargetCIDRs),
+		"targetPorts":          orEmptyInts(cfg.TargetPorts),
+		"allowPrivateTargets":  allowPrivate,
+		"maxConcurrentTunnels": cfg.MaxConcurrentTunnels,
+		"description":          cfg.Description,
+		"createdAt":            v.CreatedAt, "updatedAt": v.UpdatedAt,
+	}
+}
+
+func orEmptyStrings(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
+func orEmptyInts(v []int) []int {
+	if v == nil {
+		return []int{}
+	}
+	return v
 }
 
 func publicUpstreamRouteConfig(v storage.Tunnel) upstreamRouteConfig {

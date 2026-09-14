@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"errors"
 	"net/http"
 	"time"
@@ -299,15 +300,39 @@ func (r *credentialSecretRequest) clear() {
 	r.Password, r.PrivateKey, r.Passphrase = "", "", ""
 }
 
-func writeCredentialError(w http.ResponseWriter, err error) {
+// credentialError maps a credential-service error onto the API envelope. ok is
+// false when the error belongs to the storage layer, so the driver text and the
+// unique-constraint -> 409 mapping stay in writeStorageError alone.
+func credentialError(err error) (int, string, bool) {
 	switch {
 	case errors.Is(err, auth.ErrForbidden), errors.Is(err, ErrResourceForbidden):
-		writeAPIError(w, http.StatusForbidden, "forbidden")
+		return http.StatusForbidden, "forbidden", true
 	case errors.Is(err, ErrCredentialInvalid):
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return http.StatusBadRequest, err.Error(), true
 	case errors.Is(err, ErrCredentialSecretUnavailable):
-		writeAPIError(w, http.StatusServiceUnavailable, err.Error())
+		return http.StatusServiceUnavailable, err.Error(), true
+	case errors.Is(err, sql.ErrNoRows):
+		return http.StatusNotFound, "not found", true
 	default:
-		writeStorageError(w, err)
+		return 0, "", false
 	}
+}
+
+// credentialErrorStatus exposes just the status for callers that render their
+// own message. Route validation needs it: an unknown and an unauthorized
+// credential ID must answer identically so IDs cannot be enumerated through
+// /api/v1/routes.
+func credentialErrorStatus(err error) int {
+	if status, _, ok := credentialError(err); ok {
+		return status
+	}
+	return http.StatusInternalServerError
+}
+
+func writeCredentialError(w http.ResponseWriter, err error) {
+	if status, message, ok := credentialError(err); ok {
+		writeAPIError(w, status, message)
+		return
+	}
+	writeStorageError(w, err)
 }

@@ -358,13 +358,16 @@ func TestCredentialAPIStoresProxyBasicUsername(t *testing.T) {
 			ID        string `json:"id"`
 			Type      string `json:"type"`
 			Username  string `json:"username"`
+			PublicKey string `json:"publicKey"`
 			HasSecret bool   `json:"hasSecret"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(create.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	if created.Data.Type != "proxy_basic" || created.Data.Username != "demo" || !created.Data.HasSecret {
+	// The username shares the public_key column, and both halves are non-secret:
+	// the proxy entry needs the username to answer a Basic challenge.
+	if created.Data.Type != "proxy_basic" || created.Data.Username != "demo" || created.Data.PublicKey != "demo" || !created.Data.HasSecret {
 		t.Fatalf("created credential = %+v", created.Data)
 	}
 
@@ -387,5 +390,14 @@ func TestCredentialAPIStoresProxyBasicUsername(t *testing.T) {
 	})
 	if missing.Code != http.StatusBadRequest {
 		t.Fatalf("missing username status = %d: %s", missing.Code, missing.Body.String())
+	}
+
+	// A proxy credential without a password gives the entry nothing to compare a
+	// Basic header against, so it must be refused instead of stored half-built.
+	noSecret := apiJSON(t, handler, http.MethodPost, "/api/v1/credentials", token, "", map[string]any{
+		"name": "no secret", "type": "proxy_basic", "username": "demo2", "enabled": true,
+	})
+	if noSecret.Code != http.StatusBadRequest {
+		t.Fatalf("missing password status = %d: %s", noSecret.Code, noSecret.Body.String())
 	}
 }
