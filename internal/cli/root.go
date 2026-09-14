@@ -74,6 +74,12 @@ type rootOptions struct {
 	webSSHOpenTimeout           time.Duration
 	webSSHIdleTimeout           time.Duration
 	webSSHMaxMessageBytes       int
+	proxyEntryEnabled           bool
+	proxyEntryListen            string
+	proxyEntryDomainSuffix      string
+	proxyEntryConnectTimeout    time.Duration
+	proxyEntryIdleTimeout       time.Duration
+	proxyEntryMaxTunnels        int
 	clientServerURL             string
 	clientToken                 string
 }
@@ -125,6 +131,12 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	flags.DurationVar(&opts.webSSHOpenTimeout, "server.webssh.open_timeout", 0, "WebSSH Agent relay open timeout")
 	flags.DurationVar(&opts.webSSHIdleTimeout, "server.webssh.idle_timeout", 0, "WebSSH browser idle timeout")
 	flags.IntVar(&opts.webSSHMaxMessageBytes, "server.webssh.max_message_bytes", 0, "maximum WebSSH WebSocket message size")
+	flags.BoolVar(&opts.proxyEntryEnabled, "server.proxy_entry.enabled", false, "enable the tp-* managed HTTP proxy entry")
+	flags.StringVar(&opts.proxyEntryListen, "server.proxy_entry.listen", "", "internal plaintext listener for the proxy entry")
+	flags.StringVar(&opts.proxyEntryDomainSuffix, "server.proxy_entry.domain_suffix", "", "domain suffix for tp-* proxy routes")
+	flags.DurationVar(&opts.proxyEntryConnectTimeout, "server.proxy_entry.connect_timeout", 0, "proxy entry stream open timeout")
+	flags.DurationVar(&opts.proxyEntryIdleTimeout, "server.proxy_entry.idle_timeout", 0, "proxy entry tunnel idle timeout")
+	flags.IntVar(&opts.proxyEntryMaxTunnels, "server.proxy_entry.max_concurrent_tunnels", 0, "maximum concurrent proxy tunnels, 0 means unlimited")
 	flags.StringVar(&opts.clientServerURL, "client.server_url", "", "Client WebSocket URL")
 	flags.StringVar(&opts.clientToken, "client.token", "", "Client bearer token")
 	root.AddCommand(factory(opts)...)
@@ -739,6 +751,24 @@ func changedFlags(cmd *cobra.Command, opts *rootOptions) map[string]any {
 	}
 	if flags.Changed("server.webssh.max_message_bytes") {
 		values["server.webssh.max_message_bytes"] = opts.webSSHMaxMessageBytes
+	}
+	if flags.Changed("server.proxy_entry.enabled") {
+		values["server.proxy_entry.enabled"] = opts.proxyEntryEnabled
+	}
+	if flags.Changed("server.proxy_entry.listen") {
+		values["server.proxy_entry.listen"] = opts.proxyEntryListen
+	}
+	if flags.Changed("server.proxy_entry.domain_suffix") {
+		values["server.proxy_entry.domain_suffix"] = opts.proxyEntryDomainSuffix
+	}
+	if flags.Changed("server.proxy_entry.connect_timeout") {
+		values["server.proxy_entry.connect_timeout"] = opts.proxyEntryConnectTimeout
+	}
+	if flags.Changed("server.proxy_entry.idle_timeout") {
+		values["server.proxy_entry.idle_timeout"] = opts.proxyEntryIdleTimeout
+	}
+	if flags.Changed("server.proxy_entry.max_concurrent_tunnels") {
+		values["server.proxy_entry.max_concurrent_tunnels"] = opts.proxyEntryMaxTunnels
 	}
 	if flags.Changed("client.server_url") {
 		values["client.server_url"] = opts.clientServerURL

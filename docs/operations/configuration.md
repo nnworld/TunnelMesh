@@ -187,6 +187,55 @@ TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID=prod-2026-09
 
 浏览器侧的 1 MiB 发送高水位与 64 MiB 接收队列上限同样是内置值（`web/src/webssh/byte-stream.ts`、`web/src/webssh/ssh-client.ts`）。`server.webssh.max_message_bytes` 只限制单个 WebSocket 帧大小，与上述窗口无关，不要用它来“调大传输能力”。
 
+## tp-* HTTP 代理入口
+
+托管路由的 HTTP 代理入口让浏览器/系统直接把 `https://tp-<name>.<domain_suffix>` 当作标准 HTTPS 代理使用，出口 agent、Basic 认证与来源 ACL 全部由管理后台的 `http-proxy` 路由决定，用户机器上不需要安装 `tunnelmesh-client`。
+
+公网侧仍然只有 443：OpenResty 上的 tp-* server 块用打过 `ngx_http_proxy_connect_module` 补丁的内核接管 CONNECT，只搬字节并注入可信头，然后把请求送到下面这个**进程内明文监听**。所有策略判断（路由身份、来源 ACL、Basic 认证、目标校验、并发限额、审计、指标）都在 Server 里完成，Lua 不含任何授权逻辑。部署与渲染步骤见 [OpenResty tp-* 代理入口](../deployment/openresty-proxy-entry.md)，使用方式见 [HTTP 代理入口](../user-guide/http-proxy-entry.md)。
+
+```yaml
+server:
+  proxy_entry:
+    enabled: false
+    listen: 127.0.0.1:8089
+    trusted_proxies: ["127.0.0.1/32", "::1/128"]
+    domain_suffix: tm.example.com
+    connect_timeout: 10s
+    idle_timeout: 300s
+    shutdown_timeout: 30s
+    max_concurrent_tunnels: 512
+    max_header_bytes: 16384
+    auth_backoff_threshold: 5
+```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `server.proxy_entry.enabled` | `false` | 总开关。关闭时不创建内部监听，行为与旧版本完全一致 | 否 |
+| `server.proxy_entry.listen` | `127.0.0.1:8089` | 内部明文监听地址，必须与 OpenResty 模板的 `__INTERNAL_UPSTREAM__` 渲染结果一致 | 否 |
+| `server.proxy_entry.trusted_proxies` | `["127.0.0.1/32","::1/128"]` | 允许写入可信头的对端 CIDR。不在白名单的对端在读请求之前直接断开 | 否 |
+| `server.proxy_entry.domain_suffix` | 空 | tp-* 路由的域名后缀，必须与泛解析 DNS 和通配证书一致 | `enabled=true` 时必填 |
+| `server.proxy_entry.route_header` | `X-TunnelMesh-Route` | 携带路由身份（来自 SNI）的可信头名 | 否 |
+| `server.proxy_entry.client_ip_header` | `X-TunnelMesh-Client-IP` | 携带真实来源 IP 的可信头名；缺失或非法一律 403，绝不回退到对端 IP | 否 |
+| `server.proxy_entry.client_port_header` | `X-TunnelMesh-Client-Port` | 携带真实来源端口的可信头名 | 否 |
+| `server.proxy_entry.connect_timeout` | `10s` | 开流（到 agent 建立目标连接）的超时，超时返回 504 | 否 |
+| `server.proxy_entry.idle_timeout` | `300s` | 隧道双向空闲超时；OpenResty 侧 `read_timeout_ms` 必须等于该值 + 30s | 否 |
+| `server.proxy_entry.shutdown_timeout` | `30s` | 进程退出时等待在途隧道排空的时间，可为 0 | 否 |
+| `server.proxy_entry.max_concurrent_tunnels` | `512` | 全局并发隧道上限，超限返回 503 + `Retry-After: 5`；0 表示不限 | 否 |
+| `server.proxy_entry.max_header_bytes` | `16384` | 单个请求头上限，超出直接断开 | 否 |
+| `server.proxy_entry.auth_backoff_threshold` | `5` | 同一路由连续认证失败达到该次数后进入退避（30s 起翻倍，上限 15m），返回 429 | 否 |
+
+`listen` 不是回环地址时，`trusted_proxies` 不允许出现 `0.0.0.0/0` 或 `::/0`，否则任何主机都能伪造路由身份与来源 IP，配置校验会直接失败。命令行与环境变量等价（`TUNNELMESH_SERVER_PROXY_ENTRY_*`），例如：
+
+```bash
+tunnelmesh-server --server.proxy_entry.enabled=true \
+  --server.proxy_entry.domain_suffix=tm.example.com \
+  --server.proxy_entry.listen=127.0.0.1:8089 \
+  --server.proxy_entry.idle_timeout=300s \
+  --server.proxy_entry.max_concurrent_tunnels=512
+```
+
+改完先用 `tunnelmesh-server check-config` 校验再重启。路由本身（出口 agent、认证方式、来源 ACL、目标限制）不在这个配置文件里，全部由管理后台的托管路由维护，创建后 5 秒内生效，不需要重启 Server 或改 nginx。
+
 ## Agent 连接池
 
 Agent 保持一个 `server_url`，但可以复用同一个逻辑 Agent 身份建立多条物理 WebSocket 连接。默认配置禁用扩容：

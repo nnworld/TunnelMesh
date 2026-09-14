@@ -136,6 +136,28 @@ type ServerConfig struct {
 	Stream             ServerStreamConfig       `mapstructure:"stream" json:"stream" yaml:"stream"`
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
+	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
+}
+
+// ProxyEntryConfig configures the internal plaintext listener that receives the
+// tp-* managed HTTP proxy traffic relayed by OpenResty. OpenResty only moves
+// bytes: every policy decision (route identity, source ACL, Basic auth, target
+// validation, capacity) happens behind this listener, so the listener must stay
+// unreachable from the network unless trusted_proxies is deliberately narrowed.
+type ProxyEntryConfig struct {
+	Enabled              bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	Listen               string        `mapstructure:"listen" json:"listen" yaml:"listen"`
+	TrustedProxies       []string      `mapstructure:"trusted_proxies" json:"trusted_proxies" yaml:"trusted_proxies"`
+	DomainSuffix         string        `mapstructure:"domain_suffix" json:"domain_suffix" yaml:"domain_suffix"`
+	RouteHeader          string        `mapstructure:"route_header" json:"route_header" yaml:"route_header"`
+	ClientIPHeader       string        `mapstructure:"client_ip_header" json:"client_ip_header" yaml:"client_ip_header"`
+	ClientPortHeader     string        `mapstructure:"client_port_header" json:"client_port_header" yaml:"client_port_header"`
+	ConnectTimeout       time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
+	IdleTimeout          time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	ShutdownTimeout      time.Duration `mapstructure:"shutdown_timeout" json:"shutdown_timeout" yaml:"shutdown_timeout"`
+	MaxConcurrentTunnels int           `mapstructure:"max_concurrent_tunnels" json:"max_concurrent_tunnels" yaml:"max_concurrent_tunnels"`
+	MaxHeaderBytes       int           `mapstructure:"max_header_bytes" json:"max_header_bytes" yaml:"max_header_bytes"`
+	AuthBackoffThreshold int           `mapstructure:"auth_backoff_threshold" json:"auth_backoff_threshold" yaml:"auth_backoff_threshold"`
 }
 
 type WebSSHConfig struct {
@@ -478,6 +500,19 @@ func setDefaults(v *viper.Viper) {
 		"server.webssh.open_timeout":                         10 * time.Second,
 		"server.webssh.idle_timeout":                         5 * time.Minute,
 		"server.webssh.max_message_bytes":                    64 << 10,
+		"server.proxy_entry.enabled":                         false,
+		"server.proxy_entry.listen":                          "127.0.0.1:8089",
+		"server.proxy_entry.trusted_proxies":                 []string{"127.0.0.1/32", "::1/128"},
+		"server.proxy_entry.domain_suffix":                   "",
+		"server.proxy_entry.route_header":                    "X-TunnelMesh-Route",
+		"server.proxy_entry.client_ip_header":                "X-TunnelMesh-Client-IP",
+		"server.proxy_entry.client_port_header":              "X-TunnelMesh-Client-Port",
+		"server.proxy_entry.connect_timeout":                 10 * time.Second,
+		"server.proxy_entry.idle_timeout":                    300 * time.Second,
+		"server.proxy_entry.shutdown_timeout":                30 * time.Second,
+		"server.proxy_entry.max_concurrent_tunnels":          512,
+		"server.proxy_entry.max_header_bytes":                16384,
+		"server.proxy_entry.auth_backoff_threshold":          5,
 		"security.allowed_hosts":                             []string{},
 		"security.allowed_origins":                           []string{},
 		"security.allow_legacy_connection_tokens":            false,
@@ -527,6 +562,10 @@ func bindEnvironment(v *viper.Viper) {
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
 		"server.authorization_cache.enabled",
 		"server.webssh.enabled", "server.webssh.ticket_ttl", "server.webssh.session_ttl", "server.webssh.max_active_sessions_per_user", "server.webssh.open_timeout", "server.webssh.idle_timeout", "server.webssh.max_message_bytes",
+		"server.proxy_entry.enabled", "server.proxy_entry.listen", "server.proxy_entry.trusted_proxies", "server.proxy_entry.domain_suffix",
+		"server.proxy_entry.route_header", "server.proxy_entry.client_ip_header", "server.proxy_entry.client_port_header",
+		"server.proxy_entry.connect_timeout", "server.proxy_entry.idle_timeout", "server.proxy_entry.shutdown_timeout",
+		"server.proxy_entry.max_concurrent_tunnels", "server.proxy_entry.max_header_bytes", "server.proxy_entry.auth_backoff_threshold",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
@@ -540,6 +579,7 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateServerStream(cfg.Server.Stream)...)
 	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
 	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
+	problems = append(problems, validateProxyEntry(cfg.Server.ProxyEntry)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
@@ -631,6 +671,50 @@ func validateServerStream(cfg ServerStreamConfig) []string {
 	}
 	if cfg.MaxFramePayload <= 0 || cfg.MaxFramePayload > 1<<20 {
 		problems = append(problems, "server stream max frame payload must be positive and no greater than 1048576")
+	}
+	return problems
+}
+
+// validateProxyEntry mirrors validateWebSSH: a disabled feature contributes no
+// problems, so upgrading never breaks an existing deployment. Once enabled, the
+// listener becomes a trust boundary, hence the loopback/wildcard rule below.
+func validateProxyEntry(cfg ProxyEntryConfig) []string {
+	var problems []string
+	if !cfg.Enabled {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen))
+	if err != nil || port == "" {
+		problems = append(problems, "proxy entry listen must be a host:port value")
+	}
+	if strings.TrimSpace(cfg.DomainSuffix) == "" {
+		problems = append(problems, "proxy entry requires domain_suffix when enabled")
+	} else if !validDynamicSuffix(cfg.DomainSuffix) {
+		problems = append(problems, "proxy entry domain_suffix must be a valid domain")
+	}
+	if len(cfg.TrustedProxies) == 0 {
+		problems = append(problems, "proxy entry requires at least one trusted proxy CIDR")
+	}
+	for _, cidr := range cfg.TrustedProxies {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+			problems = append(problems, "proxy entry trusted proxy "+cidr+" is not a valid CIDR")
+		}
+	}
+	// A non-loopback listener is reachable from the network, so a wildcard
+	// trust list would let any host forge the route and client-IP headers.
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "" {
+		for _, cidr := range cfg.TrustedProxies {
+			trimmed := strings.TrimSpace(cidr)
+			if trimmed == "0.0.0.0/0" || trimmed == "::/0" {
+				problems = append(problems, "proxy entry trusted_proxies must not be 0.0.0.0/0 or ::/0 when listen is not loopback")
+			}
+		}
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.IdleTimeout <= 0 || cfg.ShutdownTimeout < 0 {
+		problems = append(problems, "proxy entry timeouts must be positive (shutdown_timeout may be zero)")
+	}
+	if cfg.MaxConcurrentTunnels < 0 || cfg.MaxHeaderBytes <= 0 || cfg.AuthBackoffThreshold <= 0 {
+		problems = append(problems, "proxy entry limits must be positive (max_concurrent_tunnels may be zero)")
 	}
 	return problems
 }

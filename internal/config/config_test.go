@@ -1150,3 +1150,66 @@ func TestValidateRelayRejectsPartialTLSMaterial(t *testing.T) {
 		t.Fatalf("Validate(disabled relay) error = %v", err)
 	}
 }
+
+func TestProxyEntryDefaultsAndFlagOverride(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	if cfg.Server.ProxyEntry.Enabled {
+		t.Fatal("proxy entry must default to disabled")
+	}
+	if cfg.Server.ProxyEntry.Listen != "127.0.0.1:8089" {
+		t.Fatalf("listen default = %q", cfg.Server.ProxyEntry.Listen)
+	}
+	if got := cfg.Server.ProxyEntry.TrustedProxies; len(got) != 2 || got[0] != "127.0.0.1/32" || got[1] != "::1/128" {
+		t.Fatalf("trusted proxies default = %v", got)
+	}
+	if cfg.Server.ProxyEntry.RouteHeader != "X-TunnelMesh-Route" ||
+		cfg.Server.ProxyEntry.ClientIPHeader != "X-TunnelMesh-Client-IP" ||
+		cfg.Server.ProxyEntry.ClientPortHeader != "X-TunnelMesh-Client-Port" {
+		t.Fatal("trusted header defaults changed")
+	}
+	if cfg.Server.ProxyEntry.ConnectTimeout != 10*time.Second ||
+		cfg.Server.ProxyEntry.IdleTimeout != 300*time.Second ||
+		cfg.Server.ProxyEntry.ShutdownTimeout != 30*time.Second {
+		t.Fatal("timeout defaults changed")
+	}
+	if cfg.Server.ProxyEntry.MaxConcurrentTunnels != 512 ||
+		cfg.Server.ProxyEntry.MaxHeaderBytes != 16384 ||
+		cfg.Server.ProxyEntry.AuthBackoffThreshold != 5 {
+		t.Fatal("limit defaults changed")
+	}
+}
+
+func TestValidateProxyEntryRejectsUnsafeCombinations(t *testing.T) {
+	base := func() config.Config {
+		cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		cfg.Server.ProxyEntry.Enabled = true
+		cfg.Server.ProxyEntry.DomainSuffix = "tm.example.com"
+		return cfg
+	}
+	ok := base()
+	if err := config.Validate(ok); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	missingSuffix := base()
+	missingSuffix.Server.ProxyEntry.DomainSuffix = ""
+	if err := config.Validate(missingSuffix); err == nil {
+		t.Fatal("enabled proxy entry requires domain_suffix")
+	}
+	badCIDR := base()
+	badCIDR.Server.ProxyEntry.TrustedProxies = []string{"10.0.0.0/33"}
+	if err := config.Validate(badCIDR); err == nil {
+		t.Fatal("invalid trusted proxy CIDR must fail")
+	}
+	wildcardTrust := base()
+	wildcardTrust.Server.ProxyEntry.Listen = "0.0.0.0:8089"
+	wildcardTrust.Server.ProxyEntry.TrustedProxies = []string{"0.0.0.0/0"}
+	if err := config.Validate(wildcardTrust); err == nil {
+		t.Fatal("non-loopback listen must not trust 0.0.0.0/0")
+	}
+}
