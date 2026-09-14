@@ -93,6 +93,19 @@ const CredentialTypeSSHPublicKey CredentialType = "ssh_public_key"
 // plaintext never lives in this struct.
 const CredentialTypePassword CredentialType = "password"
 
+// ProtocolHTTPProxy marks a managed route that terminates a forward-proxy
+// request instead of reverse-proxying a fixed target. The row lives in the same
+// tunnels table so route administration, audit and ownership stay unified, but
+// it is resolved by a separate snapshot: the reverse-proxy resolver must never
+// see these rows, or a tp-* hostname would match a path-based route.
+const ProtocolHTTPProxy = "http-proxy"
+
+// ProxyTargetWildcard is the sentinel stored in tunnels.target_host for
+// http-proxy routes, whose real target comes from each request. target_port
+// stores the companion sentinel 0. Both columns are NOT NULL, so a route that
+// has no fixed target still needs a representable value.
+const ProxyTargetWildcard = "*"
+
 // Credential stores a public key only. Browser-side private-key extraction
 // must never send private material to the Server.
 type Credential struct {

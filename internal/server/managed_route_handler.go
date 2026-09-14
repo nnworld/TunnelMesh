@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/proxyentry"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -30,6 +31,14 @@ type ManagedRouteTable struct {
 	resolver      *routing.RouteResolver
 	loadedAt      time.Time
 	lastAttemptAt time.Time
+
+	// proxyRoutes is the tp-* forward-proxy snapshot. It has its own attempt
+	// timestamp on purpose: sharing lastAttemptAt with the resolver would make
+	// each cache look fresh whenever the other one refreshed, silently doubling
+	// the staleness window of both.
+	proxyRoutes    map[string]proxyentry.Route
+	proxyAttemptAt time.Time
+	proxyLoadedAt  time.Time
 }
 
 func NewManagedRouteTable(db *storage.DB, dynamicSuffix string, ttl time.Duration) *ManagedRouteTable {
@@ -87,6 +96,12 @@ func loadManagedRoutes(ctx context.Context, db *storage.DB) ([]routing.Route, er
 			return nil, err
 		}
 		for _, tunnel := range page.Items {
+			if tunnel.Protocol == storage.ProtocolHTTPProxy {
+				// Proxy entries are resolved by ManagedRouteTable.ProxyRoute; they
+				// must never reach the Host/path reverse-proxy resolver, otherwise a
+				// tp-* hostname would also match here with the sentinel target "*".
+				continue
+			}
 			if !managedTunnelActive(tunnel) {
 				continue
 			}
