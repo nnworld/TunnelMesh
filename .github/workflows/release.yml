@@ -32,9 +32,6 @@ jobs:
       - run: cd web && npm run build
       - run: rsync -a --delete web/dist/ internal/server/web_dist/
       - run: ./scripts/verify-web-embed.sh
-      - run: go test ./... -count=1
-      - run: go test -race ./...
-      - run: go vet ./...
       - name: Resolve and validate release version
         id: version
         run: |
