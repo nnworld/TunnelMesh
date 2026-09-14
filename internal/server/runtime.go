@@ -58,6 +58,10 @@ type RuntimeConfig struct {
 	AuthorizationCache config.AuthorizationCacheConfig
 	Downloads          config.DownloadsConfig
 	WebSSH             config.WebSSHConfig
+	// ProxyEntry configures the internal listener that OpenResty relays the
+	// tp-* managed HTTP proxy traffic to. Disabled means the listener is never
+	// created, so upgrading cannot open a new port by accident.
+	ProxyEntry config.ProxyEntryConfig
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
@@ -81,6 +85,7 @@ type ServerRuntime struct {
 	serverNodeLifecycle         *ServerNodeLifecycle
 	relayServer                 *grpc.Server
 	relayListener               net.Listener
+	proxyEntry                  *ProxyEntryListener
 	clientMetadataSweeper       *ClientMetadataSweeper
 	clientMetadataSweeperCancel context.CancelFunc
 	clientMetadataSweeperDone   chan error
@@ -89,6 +94,7 @@ type ServerRuntime struct {
 	websshSweeperDone           chan error
 	config                      RuntimeConfig
 	WebSSHEnabled               bool
+	ProxyEntryEnabled           bool
 	metricsRegistry             *prometheus.Registry
 	metrics                     *observability.Metrics
 	authorizationCacheCleanup   func() error
@@ -280,6 +286,19 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		))
 	}
 	runtime.Credentials = credentialService
+	if runtimeConfig.ProxyEntry.Enabled {
+		// Construction happens here rather than in ServeListener so an invalid
+		// trusted_proxies value fails startup instead of silently leaving the
+		// entry down while OpenResty keeps relaying into a dead port.
+		entryListener, err := NewProxyEntryListener(runtimeConfig.ProxyEntry, runtime.proxyEntryHandler(), runtime.metrics)
+		if err != nil {
+			closeStartup()
+			return nil, fmt.Errorf("server runtime: proxy entry: %w", err)
+		}
+		runtime.proxyEntry = entryListener
+		runtime.ProxyEntryEnabled = true
+		slog.Info("proxy_entry_enabled", "listen", runtimeConfig.ProxyEntry.Listen, "domain_suffix", runtimeConfig.ProxyEntry.DomainSuffix)
+	}
 	runtime.clientMetadataSweeper = NewClientMetadataSweeper(db.ClientInstances(), DefaultClientMetadataSweepInterval)
 	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
 	runtime.clientMetadataSweeperCancel = stopSweeper
@@ -763,6 +782,19 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 		return err
 	}
 	srv := &http.Server{Handler: r.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	// The proxy entry is parented to the caller's context so a SIGTERM stops it
+	// even if shutdown() is never reached, and cancelEntry lets the error paths
+	// stop it immediately.
+	entryCtx, cancelEntry := context.WithCancel(ctx)
+	defer cancelEntry()
+	proxyErrCh := make(chan error, 1)
+	if r.proxyEntry != nil {
+		go func() {
+			if err := r.proxyEntry.Serve(entryCtx); err != nil {
+				proxyErrCh <- fmt.Errorf("server runtime: proxy entry serve failed: %w", err)
+			}
+		}()
+	}
 	relayErrCh := make(chan error, 1)
 	if r.relayServer != nil && r.relayListener != nil {
 		go func() {
@@ -781,6 +813,7 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(serveListener) }()
 	shutdown := func() {
+		cancelEntry()
 		if r.relayServer != nil {
 			r.relayServer.Stop()
 		}
@@ -798,10 +831,31 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	case relayErr := <-relayErrCh:
 		shutdown()
 		return relayErr
+	case proxyErr := <-proxyErrCh:
+		// The entry is a public traffic path: if it cannot serve, the process
+		// must exit so the supervisor restarts it rather than blackholing
+		// every tp-* request.
+		shutdown()
+		return proxyErr
 	case <-ctx.Done():
 		shutdown()
 		return nil
 	}
+}
+
+// proxyEntryHandler returns the handler mounted on the internal proxy entry
+// listener.
+//
+// It is a placeholder until the CONNECT/absolute-form engine lands: answering
+// 501 with a Retry-After hint makes an OpenResty relay that is already
+// forwarding traffic fail loudly and retryably instead of hanging the client.
+func (r *ServerRuntime) proxyEntryHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(`{"code":501,"msg":"proxy entry is not ready","data":null}` + "\n"))
+	})
 }
 
 func loadRelayServerTLS(cfg config.RelayConfig) (*tls.Config, error) {

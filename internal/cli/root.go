@@ -151,12 +151,18 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH, ProxyEntry: cfg.Server.ProxyEntry})
 			if err != nil {
 				return err
 			}
 			defer runtime.Close()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "server starting on %s in %s mode\n", cfg.Server.HTTPAddr, cfg.Mode)
+			// The proxy entry listens on a separate internal port, so operators
+			// need to see where OpenResty must relay to. Nothing is printed when
+			// it is disabled, matching how the other optional listeners behave.
+			if runtime.ProxyEntryEnabled {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "proxy entry listening on %s for *.%s\n", cfg.Server.ProxyEntry.Listen, cfg.Server.ProxyEntry.DomainSuffix)
+			}
 			return runtime.Serve(cmd.Context(), cfg.Server.HTTPAddr)
 		}),
 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
