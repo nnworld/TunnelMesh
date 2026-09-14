@@ -27,6 +27,13 @@ describe('application shell', () => {
     expect(en).toContain("downloads: 'Releases'")
   })
 
+  it('hides the tunnels menu while keeping the route available', () => {
+    const route = router.getRoutes().find(route => route.path === '/tunnels')
+    const shell = readFileSync('src/layouts/AppShell.vue', 'utf-8')
+    expect(route).toBeTruthy()
+    expect(shell).not.toContain("['/tunnels', 'navigation.tunnels']")
+  })
+
   it('contains the responsive mesh navigation shell', () => {
     const source = readFileSync('src/layouts/AppShell.vue', 'utf8')
     expect(source).toContain('mesh-brand')
