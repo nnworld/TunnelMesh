@@ -30,6 +30,16 @@ Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UD
 The table describes common deployment patterns, not every product. Choose TunnelMesh when you need a
 self-hosted control plane and explicit access policy rather than only a point-to-point tunnel.
 
+## Visual proof
+
+![TunnelMesh product demo](docs/assets/demo.gif)
+
+![TunnelMesh admin dashboard](docs/assets/admin-dashboard.png)
+
+![WebSSH terminal](docs/assets/webssh-terminal.png)
+
+![SFTP browser](docs/assets/sftp-browser.png)
+
 > Detailed user, deployment, operations, and protocol documentation is maintained in Chinese under
 > [docs/README.md](docs/README.md).
 
@@ -233,6 +243,15 @@ Public UDP is not supported: UDP only flows from the user side into the internal
 ## Documentation
 
 Full index: [docs/README.md](docs/README.md).
+
+**English entry points**
+
+- [English documentation index](docs/en/README.md)
+- [Production deployment](docs/en/deployment/production.md)
+- [Security hardening](docs/en/operations/security.md)
+- [Agent guide](docs/en/user-guide/agent.md)
+- [Client guide](docs/en/user-guide/client.md)
+- [Server administration](docs/en/user-guide/server-admin.md)
 
 **User guides**
 

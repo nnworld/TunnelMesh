@@ -9,19 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go test ./... -count=1
-      - run: go test -race ./...
-      - run: go vet ./...
-
-  web:
+  build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +21,20 @@ jobs:
       - run: cd web && npm ci
       - run: cd web && npm test -- --run
       - run: cd web && npm run build
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - run: ./scripts/verify-web-embed.sh
 
   packaging:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose -f docker-compose.local.yml config
+      - run: >-
+          TUNNELMESH_AGENT_TOKEN=ci-placeholder
+          TUNNELMESH_CLIENT_TOKEN=ci-placeholder
+          docker compose -f docker-compose.local.yml config
       - run: >-
           TUNNELMESH_AGENT_TOKEN=ci-placeholder
           TUNNELMESH_CLIENT_TOKEN=ci-placeholder

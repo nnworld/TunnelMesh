@@ -14,6 +14,9 @@
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
 | [`api/`](api/) | 接口 | `openapi.yaml` |
+| [`en/`](en/) | 英文读者 | 生产部署、安全加固、三端使用入口 |
+| [`community/`](community/) | 社区与增长 | GitHub 元数据、技术文章、分发计划 |
+| [`assets/`](assets/) | 所有读者 | 管理后台截图、演示 GIF、社交卡片 |
 | [`development/`](development/) | 贡献者 | 测试与验证、文档规范、变更记录索引 |
 | [`superpowers/plans/`](superpowers/plans/)、[`superpowers/specs/`](superpowers/specs/) | 贡献者 | 实施计划与设计规格（时点记录） |
 | [`pull-requests/`](pull-requests/) | 贡献者 | PR 描述记录（时点记录） |
@@ -93,3 +96,11 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 所有部署都应先执行 `check-config`，再执行 `run`。生产环境建议通过环境变量或外部配置文件注入
 敏感配置，公网入口只使用 HTTP/HTTPS/WSS，Server 不监听公网 UDP。
+
+## 英文与社区
+
+- [English documentation](en/README.md)：生产部署、安全加固、Agent、Client、Server 管理
+- [Why TunnelMesh needs a control plane](community/why-tunnelmesh-needs-a-control-plane.md)：技术文章与产品取舍
+- [Distribution plan](community/distribution-plan.md)：三日发布序列与渠道策略
+- [GitHub repository metadata](community/github-metadata.md)：About、Topics、Website 与社交卡片设置
+- [Visual assets](assets/README.md)：截图、GIF 与社交卡片的来源和脱敏检查

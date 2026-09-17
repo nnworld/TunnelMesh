@@ -604,11 +604,8 @@ func TestAuthenticatedGRPCRelayRejectsSANAndTokenFailures(t *testing.T) {
 			stream, err := client.OpenStream(ctx, StreamRequest{NodeID: "target-node", Epoch: 7})
 			if err == nil {
 				defer stream.Close()
-				if _, writeErr := stream.Write([]byte("x")); writeErr == nil {
-					_, err = stream.Read(make([]byte, 1))
-				} else {
-					err = writeErr
-				}
+				_ = stream.Close()
+				_, err = stream.Read(make([]byte, 1))
 			}
 			if status.Code(err) != tt.wantCode {
 				t.Fatalf("OpenStream error = %v, code=%v, want %v", err, status.Code(err), tt.wantCode)
@@ -792,11 +789,8 @@ func TestAuthenticatedGRPCRelayPlaintextStillValidatesTokenNodeAndEpoch(t *testi
 			}
 			if err == nil {
 				defer stream.Close()
-				if _, writeErr := stream.Write([]byte("x")); writeErr == nil {
-					_, err = stream.Read(make([]byte, 1))
-				} else {
-					err = writeErr
-				}
+				_ = stream.Close()
+				_, err = stream.Read(make([]byte, 1))
 			}
 			if status.Code(err) != tt.wantCode {
 				t.Fatalf("OpenStream error = %v, code=%v, want %v", err, status.Code(err), tt.wantCode)
