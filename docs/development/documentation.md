@@ -14,6 +14,9 @@
 | `docs/architecture/adr/` | 架构 | 架构决策记录 | 记录 + 生成索引 |
 | `docs/protocol/` | 协议实现 | WebSocket frame、代理协议模块 | 手工维护 |
 | `docs/api/` | 接口 | `openapi.yaml`，接口行为变更必须同步 | 手工维护 |
+| `docs/en/` | 英文读者 | 生产部署、安全加固、三端使用入口 | 手工维护 |
+| `docs/community/` | 社区与增长 | GitHub 元数据、技术文章、分发计划 | 手工维护 |
+| `docs/assets/` | 所有读者 | 管理后台截图、演示 GIF、社交卡片 | 手工维护 |
 | `docs/development/` | 贡献者 | 测试与验证、文档规范 | 手工维护 |
 | `docs/superpowers/plans/` | 贡献者 | 实施计划（时点记录） | 记录 + 生成索引 |
 | `docs/superpowers/specs/` | 贡献者 | 设计规格（时点记录） | 记录 + 生成索引 |
@@ -70,7 +73,8 @@ python3 scripts/gen_doc_index.py
 
 ## 语言与敏感信息
 
-- 文档正文使用中文；命令、配置键、代码标识符、协议字段和错误码保持英文原文。
+- 文档正文默认使用中文；命令、配置键、代码标识符、协议字段和错误码保持英文原文。
+- `docs/en/` 与 `docs/community/` 面向英文读者和发布传播，可以使用英文；遇到语义冲突时以中文深度文档为准。
 - 文档与示例中不得出现密码、Token、私钥、生产 DSN、完整凭据或未脱敏日志。示例一律使用
   `tunnel.example.com`、`<token from the console>` 这类占位符。
 - 涉及公网入口的示例必须使用真实存在的路径（`/ws/agent`、`/ws/client`、`/ws/tcp`、

@@ -30,6 +30,16 @@ Server 不监听公网 UDP。
 上表描述的是常见部署模式，而不是所有产品。当你需要自托管控制面和显式访问策略，而不只是点对点
 隧道时，TunnelMesh 更适合。
 
+## 界面演示
+
+![TunnelMesh 产品演示](docs/assets/demo.gif)
+
+![TunnelMesh 管理后台](docs/assets/admin-dashboard.png)
+
+![WebSSH 终端](docs/assets/webssh-terminal.png)
+
+![SFTP 文件浏览器](docs/assets/sftp-browser.png)
+
 > 完整文档索引见 [docs/README.md](docs/README.md)。
 
 ## 目录
@@ -226,6 +236,15 @@ make docker-build                                          # 三个镜像
 ## 文档
 
 完整索引：[docs/README.md](docs/README.md)。
+
+**英文入口**
+
+- 简明英文指南：[English documentation](docs/en/README.md)
+- 生产部署：[Production deployment](docs/en/deployment/production.md)
+- 安全加固：[Security hardening](docs/en/operations/security.md)
+- Agent 指南：[Agent guide](docs/en/user-guide/agent.md)
+- Client 指南：[Client guide](docs/en/user-guide/client.md)
+- Server 管理：[Server administration](docs/en/user-guide/server-admin.md)
 
 **用户指南**
 
