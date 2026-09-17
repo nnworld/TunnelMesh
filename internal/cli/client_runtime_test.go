@@ -111,10 +111,12 @@ func TestClientRunUsesOneWebSocketPerAgent(t *testing.T) {
 	listen2 := reserveLoopbackListenAddress(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "client.yaml")
+	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
   server_url: ws://server.example/ws/client
   token: client-secret
+  instance_id_path: ` + identityPath + `
   tunnels:
     - name: socks-a
       protocol: socks5
@@ -322,11 +324,14 @@ func TestClientRunStartsHTTPProxyTunnel(t *testing.T) {
 	defer func() { runClientSessionPool = previous }()
 
 	listen := reserveLoopbackListenAddress(t)
-	path := filepath.Join(t.TempDir(), "client.yaml")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
   server_url: ws://server.example/ws/client
   token: client-secret
+  instance_id_path: ` + identityPath + `
   tunnels:
     - name: http-proxy
       protocol: http-proxy
@@ -424,10 +429,12 @@ func TestClientRunKeepsTunnelsAfterWebSocketReconnect(t *testing.T) {
 	listen := reserveLoopbackListenAddress(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "client.yaml")
+	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
   server_url: ws://server.example/ws/client
   token: client-secret
+  instance_id_path: ` + identityPath + `
   tunnels:
     - name: socks-a
       protocol: socks5

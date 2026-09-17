@@ -12,6 +12,8 @@ docs: accelerate repository discovery
 
 This change repairs clean-checkout CI, adds English UI visual proof, creates concise English guides, records GitHub metadata, and adds a technical article and distribution plan.
 
+Linux CI stability is also improved by isolating Client identity files in test temp directories and reading relay gRPC status after a half-close.
+
 ## User impact
 
 - New visitors can see the real English admin dashboard, Agent/token views, WebSSH terminal, and SFTP browser in the README.
@@ -71,4 +73,3 @@ This change repairs clean-checkout CI, adds English UI visual proof, creates con
 ## Integration status
 
 Local validation is complete except for Docker Compose, which is unavailable locally and delegated to CI. GitHub metadata application remains pending explicit owner confirmation.
-
