@@ -1,15 +1,34 @@
 # TunnelMesh
 
 [![Release](https://img.shields.io/github/v/release/nnworld/TunnelMesh?label=release)](https://github.com/nnworld/TunnelMesh/releases)
+[![CI](https://github.com/nnworld/TunnelMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/nnworld/TunnelMesh/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows-informational)](docs/deployment/binary-release.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 **English** | [简体中文](README.zh-CN.md)
 
-TunnelMesh is a self-hosted tunnel and service-proxy platform written in Go. Agents inside a private
-network dial out over TLS WebSocket; the Server authenticates them, enforces route and target policy,
-and exposes the result as managed HTTP/HTTPS/WebSocket routes, local client forwards, or a browser
-SSH/SFTP console. Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
+**Self-hosted tunnels with a real control plane.**
+
+Put an Agent inside a private network, expose managed HTTP routes or local forwards, and operate everything
+from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
+Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
+
+[Quick start](docs/user-guide/quickstart.md) · [Architecture](docs/architecture/overview.md) ·
+[Docker](docs/deployment/docker.md) · [Security](SECURITY.md) · [中文文档](README.zh-CN.md)
+
+## Why TunnelMesh
+
+| Capability | TunnelMesh | Generic reverse tunnel | Mesh VPN | Managed edge tunnel |
+| --- | --- | --- | --- | --- |
+| Self-hosted control plane | Yes | Varies | Yes | No |
+| Built-in admin console | Yes | Rare | Rare | Yes |
+| Scoped service tokens | Yes | Rare | Varies | Managed |
+| Browser SSH/SFTP | Yes | No | No | Varies |
+| Cluster relay and observability | Yes | Limited | Varies | Managed |
+
+The table describes common deployment patterns, not every product. Choose TunnelMesh when you need a
+self-hosted control plane and explicit access policy rather than only a point-to-point tunnel.
 
 > Detailed user, deployment, operations, and protocol documentation is maintained in Chinese under
 > [docs/README.md](docs/README.md).
@@ -74,28 +93,11 @@ SSH/SFTP console. Public ingress is HTTP/HTTPS/WSS only — the Server never lis
 
 ## Architecture
 
-```
-public internet                                       private network
-───────────────────────────────────────────────────────────────────────────
-Browser · curl · ssh ProxyCommand
-   │ HTTPS / WSS
-   ▼
-┌─────────────────────────────────────────────┐
-│ SERVER — edge + control plane               │
-│  · HTTP/HTTPS/WS ingress, route resolution  │
-│  · /api/v1 + embedded admin SPA (WebSSH)    │
-│  · sessions, streams, policy, audit         │
-│  · SQLite │ MySQL + lease / etcd registry   │
-└───▲──────────────────────────────▲──────────┘
-    │ TLS WebSocket /ws/agent      │ TLS WebSocket /ws/client
-    │                              │
-┌───┴──────────────┐        ┌──────┴───────────┐
-│ AGENT            │        │ CLIENT           │
-│ private network  │        │ user host        │
-└───┬──────────────┘        └──────┬───────────┘
-    │ TCP / UDP / HTTP             │ local :port · SOCKS5 · HTTP proxy
-    ▼                              ▼
-internal services            local applications / ssh
+```mermaid
+flowchart LR
+    User[Browser, curl, or SSH client] -->|HTTPS / WSS| Server[TunnelMesh Server<br/>routes, policy, admin, relay]
+    Server -->|TLS WebSocket| Agent[TunnelMesh Agent<br/>private network]
+    Agent -->|TCP / UDP / HTTP| Service[Internal service]
 ```
 
 Server nodes in cluster mode additionally talk to each other over an authenticated relay
@@ -192,7 +194,8 @@ Managed HTTP routes (explicit or wildcard domains) are created in the console an
 ### Docker
 
 ```sh
-docker compose -f docker-compose.local.yml up --build      # Server + Agent, SQLite
+docker compose -f docker-compose.local.yml up --build      # Server, SQLite
+docker compose -f docker-compose.local.yml --profile agent up -d agent  # after creating an Agent token
 docker compose -f docker-compose.cluster.yml up --build    # two Servers + MySQL
 make docker-build                                          # three tagged images
 ```
@@ -255,13 +258,13 @@ Full index: [docs/README.md](docs/README.md).
 
 **Development and change records**
 
-- [Development docs](docs/development/README.md), [testing and verification](docs/development/testing.md), [documentation conventions](docs/development/documentation.md)
+- [Contributing](CONTRIBUTING.md), [development docs](docs/development/README.md), [testing and verification](docs/development/testing.md), [documentation conventions](docs/development/documentation.md)
 - [Implementation plan index](docs/superpowers/plans/README.md), [design spec index](docs/superpowers/specs/README.md), [PR record index](docs/pull-requests/README.md)
 
 ## Development
 
 Prerequisites: Go 1.23+, Node.js 22 + npm for `web/`, Docker for image builds, and Chrome plus
-`lrzsz` for the WebSSH end-to-end test.
+`lrzsz` for the WebSSH end-to-end test. Contribution workflow: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | Task | Command |
 | --- | --- |

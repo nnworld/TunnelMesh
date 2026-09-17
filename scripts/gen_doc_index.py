@@ -130,6 +130,11 @@ def shorten(title: str, limit: int = 42) -> str:
     return title if len(title) <= limit else title[: limit - 1] + "…"
 
 
+def strip_adr_prefix(title: str, date: str) -> str:
+    """Remove the redundant ADR number from a link label."""
+    return re.sub(r"^ADR\s*" + re.escape(date) + r"[:：]\s*", "", title)
+
+
 def table(headers: list[str], rows: list[list[str]]) -> str:
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
     out += ["| " + " | ".join(row) + " |" for row in rows]
@@ -251,7 +256,7 @@ def render_adr_index(links) -> str:
     rows = [
         [
             r["date"],
-            f"[{re.sub(r'^ADR\s*' + re.escape(r['date']) + r'[:：]\s*', '', r['title'])}]({r['file']})",
+            f"[{strip_adr_prefix(r['title'], r['date'])}]({r['file']})",
             r["status"] or "—",
             link_cell("adr", links[("adr", r["file"])], ["plan", "spec", "pr"]),
         ]

@@ -1,14 +1,34 @@
 # TunnelMesh
 
 [![Release](https://img.shields.io/github/v/release/nnworld/TunnelMesh?label=release)](https://github.com/nnworld/TunnelMesh/releases)
+[![CI](https://github.com/nnworld/TunnelMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/nnworld/TunnelMesh/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows-informational)](docs/deployment/binary-release.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 [English](README.md) | **简体中文**
 
-TunnelMesh 是用 Go 实现的自托管内网穿透与服务代理平台。部署在内网的 Agent 主动通过 TLS WebSocket
-拨出连接，Server 负责认证、执行路由与目标策略，并把结果以托管 HTTP/HTTPS/WebSocket 路由、客户端
-本地转发或浏览器 SSH/SFTP 控制台的形式暴露出来。公网入口只有 HTTP/HTTPS/WSS，Server 不监听公网 UDP。
+**带完整控制面的自托管内网穿透平台。**
+
+在内网部署 Agent，通过托管 HTTP 路由或本地端口转发访问内网服务，并在内置管理后台中完成
+RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口只使用 HTTP/HTTPS/WSS，
+Server 不监听公网 UDP。
+
+[五分钟快速开始](docs/user-guide/quickstart.md) · [架构](docs/architecture/overview.md) ·
+[Docker](docs/deployment/docker.md) · [安全](SECURITY.md) · [English](README.md)
+
+## 为什么选择 TunnelMesh
+
+| 能力 | TunnelMesh | 通用反向隧道 | Mesh VPN | 托管边缘隧道 |
+| --- | --- | --- | --- | --- |
+| 自托管控制面 | 有 | 视项目 | 有 | 无 |
+| 内置管理后台 | 有 | 少见 | 少见 | 有 |
+| Scoped service token | 有 | 少见 | 视项目 | 托管 |
+| 浏览器 SSH/SFTP | 有 | 无 | 无 | 视项目 |
+| 集群 relay 与可观测性 | 有 | 有限 | 视项目 | 托管 |
+
+上表描述的是常见部署模式，而不是所有产品。当你需要自托管控制面和显式访问策略，而不只是点对点
+隧道时，TunnelMesh 更适合。
 
 > 完整文档索引见 [docs/README.md](docs/README.md)。
 
@@ -72,28 +92,11 @@ TunnelMesh 是用 Go 实现的自托管内网穿透与服务代理平台。部�
 
 ## 架构
 
-```
-公网侧                                              内网侧
-───────────────────────────────────────────────────────────────────────────
-浏览器 · curl · ssh ProxyCommand
-   │ HTTPS / WSS
-   ▼
-┌─────────────────────────────────────────────┐
-│ SERVER —— 公网入口与控制面                  │
-│  · HTTP/HTTPS/WS 入口、路由解析             │
-│  · /api/v1 + 内嵌管理后台（WebSSH）         │
-│  · 会话、流、策略、审计                     │
-│  · SQLite │ MySQL + lease / etcd 注册发现   │
-└───▲──────────────────────────────▲──────────┘
-    │ TLS WebSocket /ws/agent      │ TLS WebSocket /ws/client
-    │                              │
-┌───┴──────────────┐        ┌──────┴───────────┐
-│ AGENT            │        │ CLIENT           │
-│ 内网 / 目标主机  │        │ 用户主机         │
-└───┬──────────────┘        └──────┬───────────┘
-    │ TCP / UDP / HTTP             │ 本地 :port · SOCKS5 · HTTP 代理
-    ▼                              ▼
-内网服务                     本地应用 / ssh
+```mermaid
+flowchart LR
+    User[Browser, curl, or SSH client] -->|HTTPS / WSS| Server[TunnelMesh Server<br/>routes, policy, admin, relay]
+    Server -->|TLS WebSocket| Agent[TunnelMesh Agent<br/>private network]
+    Agent -->|TCP / UDP / HTTP| Service[Internal service]
 ```
 
 集群模式下 Server 节点之间还通过带认证的 relay（默认 mTLS）互通，因此连接在任意节点上的 Client
@@ -184,7 +187,8 @@ tunnelmesh-client proxy tcp --agent agent-01 --target-host ssh.internal --target
 ### Docker
 
 ```sh
-docker compose -f docker-compose.local.yml up --build      # Server + Agent，SQLite
+docker compose -f docker-compose.local.yml up --build      # Server，SQLite
+docker compose -f docker-compose.local.yml --profile agent up -d agent  # 创建 Agent token 后启动
 docker compose -f docker-compose.cluster.yml up --build    # 两个 Server + MySQL
 make docker-build                                          # 三个镜像
 ```
@@ -247,13 +251,13 @@ make docker-build                                          # 三个镜像
 
 **开发与变更记录**
 
-- [开发文档入口](docs/development/README.md)、[测试与验证](docs/development/testing.md)、[文档规范](docs/development/documentation.md)
+- [贡献指南](CONTRIBUTING.md)、[开发文档入口](docs/development/README.md)、[测试与验证](docs/development/testing.md)、[文档规范](docs/development/documentation.md)
 - [实施计划索引](docs/superpowers/plans/README.md)、[设计规格索引](docs/superpowers/specs/README.md)、[PR 记录索引](docs/pull-requests/README.md)
 
 ## 开发
 
 前置条件：Go 1.23+，`web/` 需要 Node.js 22 与 npm，镜像构建需要 Docker，WebSSH 端到端测试需要
-Chrome 与 `lrzsz`。
+Chrome 与 `lrzsz`。贡献流程见[贡献指南](CONTRIBUTING.md)。
 
 | 任务 | 命令 |
 | --- | --- |

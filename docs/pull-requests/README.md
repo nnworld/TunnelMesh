@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 13 份记录，按日期倒序排列。
+共 14 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-09-17 | [PR: Improve GitHub growth presentation](2026-09-17-github-growth-optimization.md) | [计划：GitHub Growth Optimization](../superpowers/plans/2026-09-17-github-growth-optimization.md) | [规格：GitHub Growth Optimization](../superpowers/specs/2026-09-17-github-growth-optimization-design.md) |
 | 2026-09-13 | [Managed-route HTTP proxy entry (tp-*)](2026-09-13-managed-route-http-proxy-entry.md) | [计划：托管路由 HTTP 代理入口（tp-*）](../superpowers/plans/2026-09-13-managed-route-http-proxy-entry-implementation.md) | [规格：托管路由 HTTP 代理入口（tp-*）](../superpowers/specs/2026-09-13-managed-route-http-proxy-entry-design.md) |
 | 2026-09-12 | [Admin Remote Servers, WebSSH, and WebSFTP](2026-09-12-admin-webssh-sftp.md) | [计划：Admin WebSSH/SFTP](../superpowers/plans/2026-09-12-admin-webssh-sftp-implementation.md)<br>[计划：WebSSH 大文件传输流控修复](../superpowers/plans/2026-09-12-webssh-bulk-transfer-flow-control.md)<br>[计划：WebSSH 会话管理](../superpowers/plans/2026-09-12-webssh-session-management.md)<br>[计划：WebSSH lrzsz(ZMODEM) 支持与凭据自动认证](../superpowers/plans/2026-09-12-webssh-zmodem-credential-auto-auth.md)<br>[计划：WebSFTP 上传失败修复](../superpowers/plans/2026-09-13-sftp-upload-partial-write.md)<br>[计划：WebSSH 死通道判定窗口与传输尾部关会话止损](../superpowers/plans/2026-09-13-webssh-dead-channel-window.md)<br>[计划：ZMODEM Sentry 生命周期与停滞豁免](../superpowers/plans/2026-09-13-zmodem-sentry-lifecycle-stall-policy.md)<br>[计划：ZMODEM 停滞处置策略与进度节流](../superpowers/plans/2026-09-13-zmodem-stall-channel-policy.md)<br>[计划：ZMODEM 出站写入串行化修复](../superpowers/plans/2026-09-13-zmodem-write-serialization.md) | [规格：管理后台远程服务器与浏览器 SSH/SFTP](../superpowers/specs/2026-09-12-admin-webssh-sftp-design.md) |
 | 2026-09-11 | [PR: Reduce SOCKS5 web-page latency](2026-09-11-socks5-web-page-latency.md) | [计划：SOCKS5 网页首屏延迟优化](../superpowers/plans/2026-09-11-socks5-web-page-latency-implementation.md) | [规格：SOCKS5 网页首屏延迟优化](../superpowers/specs/2026-09-10-socks5-web-page-latency-design.md) |

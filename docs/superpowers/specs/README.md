@@ -7,12 +7,13 @@
 [实施计划](../plans/README.md)分开维护。规则权威来源是
 [AGENTS.md](../../../AGENTS.md)。
 
-共 16 份规格，按日期倒序排列。
+共 17 份规格，按日期倒序排列。
 
 ## 规格清单
 
 | 日期 | 设计规格 | 关联计划 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-17 | [GitHub Growth Optimization Design](2026-09-17-github-growth-optimization-design.md) | [计划：GitHub Growth Optimization](../plans/2026-09-17-github-growth-optimization.md) | [PR：Improve GitHub growth presentation](../../pull-requests/2026-09-17-github-growth-optimization.md) |
 | 2026-09-13 | [托管路由 HTTP 代理入口（tp-*）设计](2026-09-13-managed-route-http-proxy-entry-design.md) | [计划：Client SOCKS5 CONNECT](../plans/2026-09-09-client-socks5-implementation.md)<br>[计划：托管路由 HTTP 代理入口（tp-*）](../plans/2026-09-13-managed-route-http-proxy-entry-implementation.md) | [PR：Managed-route HTTP proxy entry (tp-*)](../../pull-requests/2026-09-13-managed-route-http-proxy-entry.md) |
 | 2026-09-12 | [管理后台远程服务器与浏览器 SSH/SFTP 设计](2026-09-12-admin-webssh-sftp-design.md) | [计划：Admin WebSSH/SFTP](../plans/2026-09-12-admin-webssh-sftp-implementation.md) | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md) |
 | 2026-09-11 | [客户端运行观测与跨平台发布设计](2026-09-11-client-observability-release-design.md) | — | — |

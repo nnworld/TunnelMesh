@@ -23,6 +23,7 @@ services:
     restart: unless-stopped
 
   agent:
+    profiles: ["agent"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -34,6 +35,7 @@ services:
       TUNNELMESH_MODE: local
       TUNNELMESH_AGENT_SERVER_URL: ${TUNNELMESH_AGENT_SERVER_URL:-ws://server/ws/agent}
       TUNNELMESH_AGENT_ID: ${TUNNELMESH_AGENT_ID:-}
+      TUNNELMESH_AGENT_TOKEN: ${TUNNELMESH_AGENT_TOKEN:?set TUNNELMESH_AGENT_TOKEN}
     depends_on:
       - server
     restart: unless-stopped
@@ -51,6 +53,7 @@ services:
       TUNNELMESH_MODE: local
       # Compose 网络内通过服务名解析；localhost 指向 client 容器自身。
       TUNNELMESH_CLIENT_SERVER_URL: ${TUNNELMESH_CLIENT_SERVER_URL:-ws://server/ws/client}
+      TUNNELMESH_CLIENT_TOKEN: ${TUNNELMESH_CLIENT_TOKEN:?set TUNNELMESH_CLIENT_TOKEN}
     depends_on:
       - server
     stdin_open: true

@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 34 份计划，按日期倒序排列。
+共 35 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-17 | [GitHub Growth Optimization Implementation Plan](2026-09-17-github-growth-optimization.md) | [规格：GitHub Growth Optimization](../specs/2026-09-17-github-growth-optimization-design.md) | [PR：Improve GitHub growth presentation](../../pull-requests/2026-09-17-github-growth-optimization.md) |
 | 2026-09-13 | [ZMODEM 出站写入串行化修复实施计划](2026-09-13-zmodem-write-serialization.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md) |
 | 2026-09-13 | [ZMODEM 停滞处置策略与进度节流实施计划](2026-09-13-zmodem-stall-channel-policy.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md) |
 | 2026-09-13 | [ZMODEM Sentry 生命周期与停滞豁免实施计划](2026-09-13-zmodem-sentry-lifecycle-stall-policy.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md) |
