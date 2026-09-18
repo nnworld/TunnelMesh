@@ -16,6 +16,7 @@
 | [`api/`](api/) | 接口 | `openapi.yaml` |
 | [`en/`](en/) | 英文读者 | 生产部署、安全加固、三端使用入口 |
 | [`community/`](community/) | 社区与增长 | GitHub 元数据、技术文章、分发计划 |
+| [`index.md`](index.md) | 文档站入口 | GitHub Pages 双语文档导航 |
 | [`assets/`](assets/) | 所有读者 | 管理后台截图、演示 GIF、社交卡片 |
 | [`development/`](development/) | 贡献者 | 测试与验证、文档规范、变更记录索引 |
 | [`superpowers/plans/`](superpowers/plans/)、[`superpowers/specs/`](superpowers/specs/) | 贡献者 | 实施计划与设计规格（时点记录） |
@@ -99,8 +100,11 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 ## 英文与社区
 
+- [Documentation site](https://nnworld.github.io/TunnelMesh/)：GitHub Pages 文档入口
 - [English documentation](en/README.md)：生产部署、安全加固、Agent、Client、Server 管理
 - [Why TunnelMesh needs a control plane](community/why-tunnelmesh-needs-a-control-plane.md)：技术文章与产品取舍
+- [Comparison with other tunneling models](community/comparison.md)：不同隧道模型的边界与取舍
+- [Roadmap](community/roadmap.md)：当前、下一步和长期方向
 - [Distribution plan](community/distribution-plan.md)：三日发布序列与渠道策略
 - [GitHub repository metadata](community/github-metadata.md)：About、Topics、Website 与社交卡片设置
 - [Visual assets](assets/README.md)：截图、GIF 与社交卡片的来源和脱敏检查

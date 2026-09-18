@@ -14,8 +14,9 @@ Put an Agent inside a private network, expose managed HTTP routes or local forwa
 from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
 Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
 
-[Quick start](docs/user-guide/quickstart.md) · [Architecture](docs/architecture/overview.md) ·
-[Docker](docs/deployment/docker.md) · [Security](SECURITY.md) · [中文文档](README.zh-CN.md)
+[Docs site](https://nnworld.github.io/TunnelMesh/) · [Quick start](docs/user-guide/quickstart.md) · [Architecture](docs/architecture/overview.md) ·
+[Docker](docs/deployment/docker.md) · [Comparison](docs/community/comparison.md) ·
+[Roadmap](docs/community/roadmap.md) · [Security](SECURITY.md) · [中文文档](README.zh-CN.md)
 
 ## Why TunnelMesh
 
@@ -105,9 +106,29 @@ self-hosted control plane and explicit access policy rather than only a point-to
 
 ```mermaid
 flowchart LR
-    User[Browser, curl, or SSH client] -->|HTTPS / WSS| Server[TunnelMesh Server<br/>routes, policy, admin, relay]
-    Server -->|TLS WebSocket| Agent[TunnelMesh Agent<br/>private network]
-    Agent -->|TCP / UDP / HTTP| Service[Internal service]
+    subgraph UserSide [User side]
+        Browser[Browser: admin, WebSSH, SFTP]
+        CLI[curl, SSH, local forward]
+    end
+
+    subgraph Edge [Public edge]
+        Server[TunnelMesh Server<br/>routes, RBAC, tokens, audit, admin API]
+        Relay[Inter-node relay<br/>mTLS gRPC]
+    end
+
+    subgraph Private [Private network]
+        Agent[TunnelMesh Agent<br/>outbound WSS, policy revalidation]
+        Service[TCP / UDP / HTTP service]
+    end
+
+    Store[(SQLite or MySQL<br/>authoritative management data)]
+
+    Browser -->|HTTPS| Server
+    CLI -->|HTTPS / WSS / local forward| Server
+    Server <-->|mTLS relay| Relay
+    Server -->|TLS WebSocket| Agent
+    Agent -->|Policy-checked dial| Service
+    Server <--> Store
 ```
 
 Server nodes in cluster mode additionally talk to each other over an authenticated relay
@@ -127,7 +148,7 @@ curl --fail --silent --show-error --location \
   https://raw.githubusercontent.com/nnworld/TunnelMesh/main/scripts/install.sh \
   --output /tmp/tunnelmesh-install.sh
 less /tmp/tunnelmesh-install.sh
-bash /tmp/tunnelmesh-install.sh --version v1.1.0
+bash /tmp/tunnelmesh-install.sh --version v1.1.1
 ```
 
 The default install directory is `~/.local/bin`; use `--install-dir /usr/local/bin` for a system-wide

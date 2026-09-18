@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 37 份计划，按日期倒序排列。
+共 38 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-18 | [P1–P3 growth and product hardening implementation plan](2026-09-18-p1-p3-growth-product-hardening.md) | — | [PR：P1–P3 growth and product hardening](../../pull-requests/2026-09-18-p1-p3-growth-product-hardening.md) |
 | 2026-09-17 | [P0/P1 Growth Acceleration Implementation Plan](2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../specs/2026-09-17-p0-p1-growth-acceleration-design.md) | [PR：P0/P1 growth acceleration](../../pull-requests/2026-09-17-p0-p1-growth-acceleration.md) |
 | 2026-09-17 | [GitHub Growth Optimization Implementation Plan](2026-09-17-github-growth-optimization.md) | [规格：GitHub Growth Optimization](../specs/2026-09-17-github-growth-optimization-design.md) | [PR：Improve GitHub growth presentation](../../pull-requests/2026-09-17-github-growth-optimization.md) |
 | 2026-09-17 | [GitHub growth install and template plan](2026-09-17-github-growth-install-and-templates.md) | — | [PR：GitHub growth install and templates](../../pull-requests/2026-09-17-github-growth-install-and-templates.md) |

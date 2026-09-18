@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -169,6 +171,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
 			return nil
 		}),
+		doctorServerCommand(opts),
 		configCommand(opts, "init-db", "initialize the configured database", func(cmd *cobra.Command, cfg config.Config) error {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "database initialization requested for %s\n", cfg.Storage.Driver)
 			return nil
@@ -257,6 +260,74 @@ func adminCommand(opts *rootOptions) *cobra.Command {
 	return admin
 }
 
+func doctorServerCommand(opts *rootOptions) *cobra.Command {
+	return configCommand(opts, "doctor", "validate configuration, storage, and readiness", func(cmd *cobra.Command, cfg config.Config) error {
+		// Diagnostics must not create or migrate a database as a side effect.
+		storageConfig := cfg.Storage
+		storageConfig.AutoInit = false
+		db, err := storage.OpenConfig(cmd.Context(), storageConfig)
+		if err != nil {
+			return fmt.Errorf("storage check: %w", err)
+		}
+		defer db.Close()
+		if err := db.Ping(cmd.Context()); err != nil {
+			return fmt.Errorf("storage ping: %w", err)
+		}
+
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration: ok")
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "storage: ok (%s)\n", cfg.Storage.Driver)
+		return nil
+	})
+}
+
+func doctorEndpointCommand(opts *rootOptions, component string) *cobra.Command {
+	return configCommand(opts, "doctor", "validate configuration and Server health", func(cmd *cobra.Command, cfg config.Config) error {
+		serverURL := cfg.Agent.ServerURL
+		if component == "client" {
+			serverURL = cfg.Client.ServerURL
+		}
+		healthURL, err := serverHealthURL(serverURL)
+		if err != nil {
+			return err
+		}
+		request, err := http.NewRequestWithContext(cmd.Context(), http.MethodGet, healthURL, nil)
+		if err != nil {
+			return fmt.Errorf("build health request: %w", err)
+		}
+		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+		if err != nil {
+			return fmt.Errorf("server health check: %w", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode > 299 {
+			return fmt.Errorf("server health check: unexpected status %d", response.StatusCode)
+		}
+
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration: ok")
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "server health: ok")
+		return nil
+	})
+}
+
+func serverHealthURL(serverURL string) (string, error) {
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		return "", fmt.Errorf("parse server URL: %w", err)
+	}
+	switch parsed.Scheme {
+	case "ws":
+		parsed.Scheme = "http"
+	case "wss":
+		parsed.Scheme = "https"
+	default:
+		return "", fmt.Errorf("server URL must use ws:// or wss://")
+	}
+	parsed.Path = "/health/ready"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
 func agentCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh agent", func(cmd *cobra.Command, cfg config.Config) error {
@@ -287,6 +358,7 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
 			return nil
 		}),
+		doctorEndpointCommand(opts, "agent"),
 		configCommand(opts, "id", "print the configured agent identity", func(cmd *cobra.Command, cfg config.Config) error {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), effectiveAgentID(cfg))
 			return nil
@@ -317,6 +389,7 @@ func clientCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
 			return nil
 		}),
+		doctorEndpointCommand(opts, "client"),
 		configCommand(opts, "agent", "inspect an agent", clientShellRun("agent")),
 		configCommand(opts, "stop", "stop a local tunnel", clientShellRun("stop")),
 		configCommand(opts, "status", "show local tunnel status", clientShellRun("status")),
