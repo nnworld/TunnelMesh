@@ -38,6 +38,14 @@ type AccountUserRepository interface {
 	Restore(context.Context, string) error
 }
 
+// UserIdentityWriter covers the schema v14 identity columns. It is a separate
+// interface so the authentication contract implemented by test fakes stays
+// narrow.
+type UserIdentityWriter interface {
+	SetMFARequired(ctx context.Context, userID string, required bool) error
+	SetAuthSource(ctx context.Context, userID string, source AuthSource) error
+}
+
 type TokenRepository interface {
 	Create(context.Context, APIToken) error
 	Get(context.Context, string) (APIToken, error)
@@ -512,18 +520,25 @@ func (r *userRepo) Create(ctx context.Context, v User) error {
 	if v.Role == "" {
 		v.Role = "user"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.CreatedAt), tm(v.UpdatedAt))
+	if v.AuthSource == "" {
+		v.AuthSource = AuthSourceLocal
+	}
+	_, err := r.db.ExecContext(ctx, `INSERT INTO users(id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required) VALUES(?,?,?,?,?,?,?,?,?,?)`, v.ID, v.Username, v.Role, v.PasswordHash, boolInt(v.Disabled), nullableTime(v.DeletedAt), tm(v.CreatedAt), tm(v.UpdatedAt), string(v.AuthSource), boolInt(v.MFARequired))
 	return err
 }
 func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
 	var v User
 	var created, updated string
 	var deleted sql.NullString
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE id=?`
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE id=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
+	var authSource string
+	var mfaRequired int
+	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired)
+	v.AuthSource = normalizeAuthSource(authSource)
+	v.MFARequired = mfaRequired != 0
 	v.DeletedAt = parseTM(deleted)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
@@ -533,11 +548,15 @@ func (r *userRepo) GetByUsername(ctx context.Context, n string) (User, error) {
 	var v User
 	var created, updated string
 	var deleted sql.NullString
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE username=?`
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE username=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated)
+	var authSource string
+	var mfaRequired int
+	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired)
+	v.AuthSource = normalizeAuthSource(authSource)
+	v.MFARequired = mfaRequired != 0
 	v.DeletedAt = parseTM(deleted)
 	v.CreatedAt = parseTime(created)
 	v.UpdatedAt = parseTime(updated)
@@ -560,7 +579,7 @@ func (r *userRepo) Delete(ctx context.Context, id string) error {
 }
 func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[User], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users`
+	q := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users`
 	args := []any{}
 	if c := decodeCursor(cursor); c != "" {
 		q += ` WHERE id>?`
@@ -578,9 +597,13 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
 		var v User
 		var c, u string
 		var deleted sql.NullString
-		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &c, &u); err != nil {
+		var authSource string
+		var mfaRequired int
+		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &c, &u, &authSource, &mfaRequired); err != nil {
 			return Page[User]{}, err
 		}
+		v.AuthSource = normalizeAuthSource(authSource)
+		v.MFARequired = mfaRequired != 0
 		v.DeletedAt = parseTM(deleted)
 		v.CreatedAt = parseTime(c)
 		v.UpdatedAt = parseTime(u)
@@ -615,7 +638,7 @@ func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, curso
 		conditions = append(conditions, `id>?`)
 		args = append(args, decoded)
 	}
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
+	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -627,9 +650,13 @@ func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, curso
 		var user User
 		var deleted sql.NullString
 		var created, updated string
-		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.PasswordHash, &user.Disabled, &deleted, &created, &updated); err != nil {
+		var authSource string
+		var mfaRequired int
+		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.PasswordHash, &user.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired); err != nil {
 			return Page[User]{}, err
 		}
+		user.AuthSource = normalizeAuthSource(authSource)
+		user.MFARequired = mfaRequired != 0
 		user.DeletedAt = parseTM(deleted)
 		user.CreatedAt = parseTime(created)
 		user.UpdatedAt = parseTime(updated)
@@ -655,6 +682,41 @@ func (r *userRepo) SoftDelete(ctx context.Context, id string, when time.Time) er
 func (r *userRepo) Restore(ctx context.Context, id string) error {
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=NULL,disabled=0,updated_at=? WHERE id=?`, tm(now), id)
+	return checkAffected(res, err)
+}
+
+// normalizeAuthSource keeps rows written before schema v14 usable: the column
+// defaults to 'local', and an unexpected value is treated as local rather than
+// escalating an account to an external authentication source.
+func normalizeAuthSource(value string) AuthSource {
+	switch AuthSource(value) {
+	case AuthSourceOIDC:
+		return AuthSourceOIDC
+	case AuthSourceMixed:
+		return AuthSourceMixed
+	default:
+		return AuthSourceLocal
+	}
+}
+
+// SetMFARequired flips the per-account second-factor override. It is separate
+// from Update so a partial User value can never clear the flag by accident.
+func (r *userRepo) SetMFARequired(ctx context.Context, userID string, required bool) error {
+	return withAuthorizationRevision(ctx, r.db, func(exec dbExecutor) error {
+		res, err := exec.ExecContext(ctx, `UPDATE users SET mfa_required=?,updated_at=? WHERE id=?`, boolInt(required), tm(time.Now().UTC()), userID)
+		return checkAffected(res, err)
+	})
+}
+
+// SetAuthSource records where an account authenticates from. Linking an
+// external identity to a local account produces AuthSourceMixed.
+func (r *userRepo) SetAuthSource(ctx context.Context, userID string, source AuthSource) error {
+	switch source {
+	case AuthSourceLocal, AuthSourceOIDC, AuthSourceMixed:
+	default:
+		return fmt.Errorf("invalid auth source %q", source)
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET auth_source=?,updated_at=? WHERE id=?`, string(source), tm(time.Now().UTC()), userID)
 	return checkAffected(res, err)
 }
 

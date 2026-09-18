@@ -8,6 +8,9 @@ Type=simple
 User=tunnelmesh
 Group=tunnelmesh
 WorkingDirectory=/var/lib/tunnelmesh
+# 密钥只能通过环境注入。文件由运维创建，权限 0640 root:tunnelmesh，不进版本库。
+# 前缀 - 表示文件缺失时不阻塞启动：本地模式不需要主密钥也能运行。
+EnvironmentFile=-/etc/tunnelmesh/server.env
 ExecStartPre=+/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml init-node-id
 ExecStartPre=/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml check-config
 ExecStart=/usr/local/bin/tunnelmesh-server --config /etc/tunnelmesh/server.yaml run

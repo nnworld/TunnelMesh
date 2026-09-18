@@ -12,6 +12,10 @@ services:
       TUNNELMESH_STORAGE_DRIVER: sqlite
       TUNNELMESH_STORAGE_SQLITE_PATH: /var/lib/tunnelmesh/tunnelmesh.db
       TUNNELMESH_STORAGE_AUTO_INIT: "true"
+      # 可恢复密文的主密钥；缺失时 OIDC provider 与 service-token secret 的写入
+      # 接口 fail-closed 返回 503。只能由外部环境注入，禁止写入本文件或镜像。
+      TUNNELMESH_TOKEN_ENCRYPTION_KEY: ${TUNNELMESH_TOKEN_ENCRYPTION_KEY:-}
+      TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID: ${TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID:-}
     ports:
       # Server 只有一个监听器（server.http_addr，容器内默认 :80）。
       # 需要 443 时设置 TUNNELMESH_TLS_ENABLED=true 并挂载证书，

@@ -137,6 +137,11 @@ type ServerConfig struct {
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
+	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
+	// header may be believed when resolving a management-API client IP. It is
+	// empty by default, which means the direct peer address is always used and a
+	// spoofed header cannot influence login throttling or audit records.
+	TrustedProxies []string `mapstructure:"trusted_proxies" json:"trusted_proxies" yaml:"trusted_proxies"`
 }
 
 // ProxyEntryConfig configures the internal plaintext listener that receives the
@@ -212,6 +217,8 @@ type SecurityConfig struct {
 	AllowedOrigins []string `mapstructure:"allowed_origins" json:"allowed_origins" yaml:"allowed_origins"`
 	// Deprecated: legacy management connection tokens are removed in v0.3.0.
 	AllowLegacyConnectionTokens bool `mapstructure:"allow_legacy_connection_tokens" json:"allow_legacy_connection_tokens" yaml:"allow_legacy_connection_tokens"`
+	// Auth configures console SSO, MFA, and device trust. See AuthConfig.
+	Auth AuthConfig `mapstructure:"auth" json:"auth" yaml:"auth"`
 }
 
 type TLSConfig struct {
@@ -543,6 +550,11 @@ func setDefaults(v *viper.Viper) {
 		"client.remote_validation.max_entries":               10000,
 		"downloads.github_repository":                        DefaultGitHubRepository,
 	}
+	// The identity block is declared in auth.go next to its validation so the
+	// defaults and the bounds cannot drift apart.
+	for key, value := range authDefaults() {
+		defaults[key] = value
+	}
 	for key, value := range defaults {
 		v.SetDefault(key, value)
 	}
@@ -569,6 +581,7 @@ func bindEnvironment(v *viper.Viper) {
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
+	keys = append(keys, authEnvKeys()...)
 	for _, key := range keys {
 		_ = v.BindEnv(key)
 	}
@@ -590,6 +603,8 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateMetadataSources(cfg.Agent.Metadata)...)
 	problems = append(problems, validateMetadataSources(cfg.Client.Metadata)...)
 	problems = append(problems, validateSecurity(cfg.Security)...)
+	problems = append(problems, validateAuth(cfg.Security.Auth)...)
+	problems = append(problems, validateTrustedProxies(cfg.Server.TrustedProxies)...)
 	problems = append(problems, validateTLS(cfg.TLS)...)
 	problems = append(problems, validateRelay(cfg.Mode, cfg.Node.ID, cfg.Server.Relay)...)
 	problems = append(problems, validateDownloads(cfg.Downloads)...)

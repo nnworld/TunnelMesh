@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -103,15 +102,7 @@ func NewTokenService(db *storage.DB) *TokenService {
 		db: db, tokens: db.ServiceTokens(), users: db.Users(), agents: db.Agents(),
 		nodes: db.Nodes(), policies: db.Policies(), audits: db.Audits(),
 	}
-	if encodedKey := strings.TrimSpace(os.Getenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY")); encodedKey != "" {
-		keyID := strings.TrimSpace(os.Getenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID"))
-		if keyID == "" {
-			keyID = "default"
-		}
-		if store, err := auth.NewSecretStore(encodedKey, keyID); err == nil {
-			service.secretStore = store
-		}
-	}
+	service.secretStore = envSecretStore()
 	return service
 }
 

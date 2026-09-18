@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -98,17 +97,10 @@ type CredentialService struct {
 
 func NewCredentialService(credentials storage.CredentialRepository, agents storage.AgentRepository, audits storage.AuditRepository) *CredentialService {
 	service := &CredentialService{credentials: credentials, agents: agents, audits: audits}
-	// Mirrors TokenService: the encryption key is injected by the environment
-	// or a secret manager and is never persisted by this package.
-	if encodedKey := strings.TrimSpace(os.Getenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY")); encodedKey != "" {
-		keyID := strings.TrimSpace(os.Getenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID"))
-		if keyID == "" {
-			keyID = "default"
-		}
-		if store, err := auth.NewSecretStore(encodedKey, keyID); err == nil {
-			service.secretStore = store
-		}
-	}
+	// The encryption key is injected by the environment or a secret manager and
+	// is never persisted by this package. The lookup is shared with every other
+	// secret consumer so "no key configured" means one thing everywhere.
+	service.secretStore = envSecretStore()
 	return service
 }
 

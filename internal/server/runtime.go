@@ -62,44 +62,54 @@ type RuntimeConfig struct {
 	// tp-* managed HTTP proxy traffic to. Disabled means the listener is never
 	// created, so upgrading cannot open a new port by accident.
 	ProxyEntry config.ProxyEntryConfig
+	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
+	// header may be believed when resolving a management-API client IP for login
+	// throttling and audit. Empty means the direct peer address is always used.
+	TrustedProxies []string
 }
 
 // ServerRuntime is the process-scoped server wiring shared by HTTP handlers
 // and authenticated Agent WebSocket handlers. The caller owns DB lifecycle.
 type ServerRuntime struct {
-	DB                          *storage.DB
-	AgentSessions               *AgentSessionManager
-	AgentConnectionLeases       *AgentConnectionLeaseController
-	ClientSessions              *ClientSessionManager
-	ClientConnectionLeases      *ClientConnectionLeaseController
-	ClientObservability         *ClientObservabilityService
-	API                         *API
-	Auth                        *auth.AuthService
-	Credentials                 *auth.CredentialService
-	ClientAuthorizer            StreamAuthorizer
-	ClientTransport             relay.NodeTransport
-	ClientStreamService         *ClientStreamService
-	LocalAgentRelay             *AgentRelayTransport
-	WebSSHBroker                *WebSSHBroker
-	managedRoutes               *ManagedRouteHandler
-	serverNodeLifecycle         *ServerNodeLifecycle
-	relayServer                 *grpc.Server
-	relayListener               net.Listener
-	proxyEntry                  *ProxyEntryListener
-	proxyEntryService           *ProxyEntry
-	clientMetadataSweeper       *ClientMetadataSweeper
-	clientMetadataSweeperCancel context.CancelFunc
-	clientMetadataSweeperDone   chan error
-	websshSweeper               *WebSSHSweeper
-	websshSweeperCancel         context.CancelFunc
-	websshSweeperDone           chan error
-	config                      RuntimeConfig
-	WebSSHEnabled               bool
-	ProxyEntryEnabled           bool
-	metricsRegistry             *prometheus.Registry
-	metrics                     *observability.Metrics
-	authorizationCacheCleanup   func() error
-	closed                      atomic.Bool
+	DB                     *storage.DB
+	AgentSessions          *AgentSessionManager
+	AgentConnectionLeases  *AgentConnectionLeaseController
+	ClientSessions         *ClientSessionManager
+	ClientConnectionLeases *ClientConnectionLeaseController
+	ClientObservability    *ClientObservabilityService
+	API                    *API
+	Auth                   *auth.AuthService
+	Credentials            *auth.CredentialService
+	ClientAuthorizer       StreamAuthorizer
+	ClientTransport        relay.NodeTransport
+	ClientStreamService    *ClientStreamService
+	LocalAgentRelay        *AgentRelayTransport
+	WebSSHBroker           *WebSSHBroker
+	// Identity carries the SSO, MFA, and device-trust services the management
+	// API depends on. It is exported so an embedder can inspect the wiring.
+	Identity                     *IdentityServices
+	managedRoutes                *ManagedRouteHandler
+	serverNodeLifecycle          *ServerNodeLifecycle
+	relayServer                  *grpc.Server
+	relayListener                net.Listener
+	proxyEntry                   *ProxyEntryListener
+	proxyEntryService            *ProxyEntry
+	clientMetadataSweeper        *ClientMetadataSweeper
+	clientMetadataSweeperCancel  context.CancelFunc
+	clientMetadataSweeperDone    chan error
+	websshSweeper                *WebSSHSweeper
+	websshSweeperCancel          context.CancelFunc
+	websshSweeperDone            chan error
+	authMaintenanceSweeper       *AuthMaintenanceSweeper
+	authMaintenanceSweeperCancel context.CancelFunc
+	authMaintenanceSweeperDone   chan error
+	config                       RuntimeConfig
+	WebSSHEnabled                bool
+	ProxyEntryEnabled            bool
+	metricsRegistry              *prometheus.Registry
+	metrics                      *observability.Metrics
+	authorizationCacheCleanup    func() error
+	closed                       atomic.Bool
 }
 
 // NewServerRuntime creates the server runtime with durable Agent metadata
@@ -207,6 +217,19 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	runtime.metricsRegistry = registry
 	runtime.metrics = observability.NewMetrics(registry)
+	// The identity container is installed after the metrics registry exists so
+	// the login and OIDC handlers publish into the same registry as everything
+	// else. Constructing it cannot fail: a deployment without an encryption key
+	// still gets password login, and only the operations that would have to seal
+	// a secret report secret_storage_unavailable.
+	runtime.Identity = NewIdentityServices(db, authService, IdentityRuntimeConfig{
+		Auth:                 runtimeConfig.Security.Auth,
+		Secrets:              NewSecretProvider(),
+		Metrics:              runtime.metrics,
+		AllowedRedirectBases: AllowedRedirectBasesFromSecurity(runtimeConfig.Security),
+	})
+	runtime.API.SetIdentityServices(runtime.Identity)
+	runtime.API.SetTrustedProxies(runtimeConfig.TrustedProxies)
 	runtime.WebSSHBroker.deps.Metrics = runtime.metrics
 	runtime.API.websshService.SetMetrics(runtime.metrics)
 	if runtimeConfig.WebSSH.Enabled {
@@ -320,6 +343,14 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	go func() {
 		runtime.websshSweeperDone <- runtime.websshSweeper.Run(webSSHSweeperCtx)
 	}()
+	runtime.authMaintenanceSweeper = NewAuthMaintenanceSweeper(db, DefaultAuthMaintenanceSweepInterval, DefaultAuthMaintenanceRetention)
+	runtime.authMaintenanceSweeper.SetGauges(runtime.metrics)
+	authSweeperCtx, stopAuthSweeper := context.WithCancel(context.Background())
+	runtime.authMaintenanceSweeperCancel = stopAuthSweeper
+	runtime.authMaintenanceSweeperDone = make(chan error, 1)
+	go func() {
+		runtime.authMaintenanceSweeperDone <- runtime.authMaintenanceSweeper.Run(authSweeperCtx)
+	}()
 	return runtime, nil
 }
 
@@ -333,7 +364,15 @@ func (r *ServerRuntime) Close() error {
 	if r.WebSSHBroker != nil {
 		r.WebSSHBroker.CloseAll()
 	}
-	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr error
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr error
+	if r.authMaintenanceSweeperCancel != nil {
+		r.authMaintenanceSweeperCancel()
+		if err := <-r.authMaintenanceSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
+			authSweeperErr = err
+		}
+		r.authMaintenanceSweeperCancel = nil
+		r.authMaintenanceSweeperDone = nil
+	}
 	if r.clientMetadataSweeperCancel != nil {
 		r.clientMetadataSweeperCancel()
 		if err := <-r.clientMetadataSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
@@ -370,7 +409,7 @@ func (r *ServerRuntime) Close() error {
 	if r.ClientStreamService != nil {
 		_ = r.ClientStreamService.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr)
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The

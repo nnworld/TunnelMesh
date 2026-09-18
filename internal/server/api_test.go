@@ -4,19 +4,28 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
+// apiTestDSNCounter keeps two fixtures built inside one test from attaching to the
+// same shared-cache in-memory database, which would surface as a unique constraint
+// violation on the seeded accounts.
+var apiTestDSNCounter atomic.Int64
+
 func apiTestServer(t *testing.T) (*API, storage.User, storage.User) {
 	t.Helper()
-	db, err := storage.Open(context.Background(), storage.DriverSQLite, "file:api-test-"+t.Name()+"?mode=memory&cache=shared", true)
+	dsn := fmt.Sprintf("file:api-test-%s-%d?mode=memory&cache=shared", t.Name(), apiTestDSNCounter.Add(1))
+	db, err := storage.Open(context.Background(), storage.DriverSQLite, dsn, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +39,42 @@ func apiTestServer(t *testing.T) (*API, storage.User, storage.User) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewAPI(db, a), admin, user
+	api := NewAPI(db, a)
+	installTestIdentity(t, api, a)
+	return api, admin, user
+}
+
+// installTestIdentity wires the Phase A identity services the same way the server
+// runtime does, so a handler test exercises the production construction path
+// instead of a hand-assembled subset. The encryption key is injected through the
+// environment because that is the only supported production source.
+func installTestIdentity(t *testing.T, api *API, tokens *auth.AuthService) *IdentityServices {
+	t.Helper()
+	return installTestIdentityWith(t, api, tokens, config.DefaultAuthConfig(), IdentityRuntimeConfig{})
+}
+
+// installTestIdentityWith builds the container from an explicit configuration so a
+// test can tighten the throttle budget or point the relying party at a local
+// identity provider without changing the shared default.
+func installTestIdentityWith(t *testing.T, api *API, tokens *auth.AuthService, authConfig config.AuthConfig, extra IdentityRuntimeConfig) *IdentityServices {
+	t.Helper()
+	t.Setenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	t.Setenv("TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID", "test-key")
+	secrets := auth.SecretProviderFromEnv()
+	if !secrets.Available() {
+		t.Fatal("test secret provider is unavailable")
+	}
+	extra.Auth = authConfig
+	extra.Secrets = secrets
+	if len(extra.AllowedRedirectBases) == 0 {
+		extra.AllowedRedirectBases = []string{"https://tm.example.com"}
+	}
+	services := NewIdentityServices(api.DB, tokens, extra)
+	if services == nil {
+		t.Fatal("identity services could not be built")
+	}
+	api.SetIdentityServices(services)
+	return services
 }
 
 func apiJSON(t *testing.T, h http.Handler, method, path, token, idem string, body any) *httptest.ResponseRecorder {
