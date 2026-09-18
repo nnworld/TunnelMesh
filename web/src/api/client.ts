@@ -133,7 +133,10 @@ export type ServiceToken = {
 }
 
 export type TokenPage = { items: ServiceToken[]; nextCursor?: string; hasMore?: boolean }
-export type UserAccount = { id: string; username: string; role: 'user'; disabled: boolean; deletedAt?: string | null; createdAt: string; updatedAt: string }
+// authSource records how the account can sign in; mfaRequired is the per-account
+// override that wins over the global auth policy.
+export type AuthSource = 'local' | 'oidc' | 'mixed'
+export type UserAccount = { id: string; username: string; role: 'user'; disabled: boolean; authSource?: AuthSource; mfaRequired?: boolean; deletedAt?: string | null; createdAt: string; updatedAt: string }
 export type UserPage = { items: UserAccount[]; nextCursor?: string; hasMore?: boolean }
 export type TemporaryPasswordResult = { user: UserAccount; temporaryPassword: string }
 export type DashboardSummary = { agentsTotal:number; agentsOnline:number; activeTunnels:number; managedRoutes:number; validServiceTokens:number; recentEvents:Array<{id:string;action:string;resourceType:string;resourceId:string;createdAt:string}> }
@@ -341,6 +344,9 @@ export function listUsers(params: { status?: 'active'|'deleted'|'all'; cursor?: 
 }
 export function createUser(username: string) { return api<TemporaryPasswordResult>('/users', { method: 'POST', body: JSON.stringify({ username }) }) }
 export function updateUserStatus(id: string, disabled: boolean) { return api<UserAccount>(`/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ disabled }) }) }
+// Kept separate from updateUserStatus so a per-account MFA requirement is an
+// explicit, auditable change instead of a side effect of a status toggle.
+export function updateUserMFARequired(id: string, mfaRequired: boolean) { return api<UserAccount>(`/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ mfaRequired }) }) }
 export function resetUserPassword(id: string) { return api<TemporaryPasswordResult>(`/users/${encodeURIComponent(id)}/reset-password`, { method: 'POST' }) }
 export function deleteUser(id: string) { return api<UserAccount>(`/users/${encodeURIComponent(id)}`, { method: 'DELETE' }) }
 export function restoreUser(id: string) { return api<UserAccount>(`/users/${encodeURIComponent(id)}/restore`, { method: 'POST' }) }
@@ -403,7 +409,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const payload = await response.json().catch(() => ({msg: response.statusText}))
   if (!response.ok) {
     const data = payload.data as {error?: string} | undefined
-    throw new APIError(payload.msg || 'request failed', response.status, payload.code, data?.error)
+    throw new APIError(payload.msg || 'request failed', response.status, payload.code, data?.error, data)
   }
   return payload.data as T
 }
@@ -414,5 +420,8 @@ export class APIError extends Error {
     readonly status: number,
     readonly code: number,
     readonly domain?: string,
+    // The non-secret part of `data`. A stable `domain` string alone cannot
+    // express details such as the `retryAfter` of a throttled login.
+    readonly details?: Record<string, unknown>,
   ) { super(message) }
 }

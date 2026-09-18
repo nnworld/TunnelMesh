@@ -14,7 +14,7 @@ describe('application shell', () => {
     const downloads = router.getRoutes().find(route => route.path === '/downloads')
     const shell = readFileSync('src/layouts/AppShell.vue', 'utf8')
     expect(downloads?.meta.admin).toBe(true)
-    expect(shell).toContain("auth.isAdmin ? [['/servers', 'navigation.servers'], ['/users', 'navigation.users'], ['/audit-logs', 'navigation.audits'], ['/downloads', 'navigation.downloads']]")
+    expect(shell).toContain("auth.isAdmin ? [['/servers', 'navigation.servers'], ['/users', 'navigation.users'], ['/sso-providers', 'navigation.sso'], ['/audit-logs', 'navigation.audits'], ['/downloads', 'navigation.downloads']]")
   })
 
   it('renames the downloads menu entry to release management and keeps it last', () => {

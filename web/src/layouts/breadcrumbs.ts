@@ -17,6 +17,7 @@ export function breadcrumbsFor(path: string): Breadcrumb[] {
     : path === '/servers' ? 'servers.title'
     : path === '/downloads' ? 'downloads.title'
     : path === '/users' ? 'users.title'
+    : path === '/sso-providers' ? 'sso.title'
     : path === '/audit-logs' ? 'audits.title'
     : path === '/account/security' ? 'navigation.security'
     : path.startsWith('/agents/') ? 'agentDetail.title'
