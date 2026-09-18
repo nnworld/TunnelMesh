@@ -1,5 +1,187 @@
 # Schema Upgrade Guide
 
+## v13 to v14
+
+Schema v14 is the enterprise identity foundation: OIDC single sign-on, TOTP MFA
+with recovery codes, revocable trusted devices, and the operator-editable auth
+policy. It adds two columns to `users` and eight new tables. Every statement is
+additive — no existing column is modified, dropped, or rewritten — so the change
+is expand-only.
+
+New columns on `users`:
+
+| Column | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `auth_source` | `VARCHAR(32) NOT NULL` | `'local'` | Where the primary credential comes from: `local`, `oidc`, or `mixed` |
+| `mfa_required` | `INTEGER NOT NULL` | `0` | Per-account second-factor requirement; it is a floor that overrides a globally `disabled` policy |
+
+New tables:
+
+| Table | Primary key | Notable columns and constraints |
+| --- | --- | --- |
+| `auth_settings` | `id INTEGER` (single row, `id=1`) | `mfa_mode VARCHAR(16) DEFAULT 'disabled'`, `device_trust_enabled INTEGER DEFAULT 1`, `device_trust_ttl_seconds INTEGER DEFAULT 2592000`, `allow_trusted_device_bypass INTEGER DEFAULT 1`, `max_trusted_devices INTEGER DEFAULT 10`, `session_token_ttl_seconds INTEGER DEFAULT 0`, `updated_at VARCHAR(32) NOT NULL` |
+| `oidc_providers` | `id VARBINARY(255)` | `name VARCHAR(191) NOT NULL UNIQUE`, `issuer VARCHAR(512)`, `client_id VARCHAR(255)`, `client_secret_ciphertext/nonce/key_id/version` (nullable, sealed), `scopes TEXT`, `redirect_uri VARCHAR(512)`, optional endpoint overrides, `id_token_algs VARCHAR(255) DEFAULT 'RS256'`, `username_claim VARCHAR(64) DEFAULT 'preferred_username'`, `role_mappings TEXT`, `default_role VARCHAR(32) DEFAULT 'user'`, `authoritative_roles`, `auto_create_users`, `fetch_userinfo`, `public_listed`, `enabled`, timestamps |
+| `user_identities` | `id VARBINARY(255)` | `UNIQUE(provider_id, subject)`, `user_id`, `email`, `display_name`, `created_at`, `last_login_at` |
+| `user_mfa` | `user_id VARBINARY(255)` | `secret_ciphertext/nonce/key_id/version NOT NULL` (sealed TOTP secret), `status VARCHAR(16) DEFAULT 'pending'`, `enrolled_at`, `enabled_at`, `last_used_at`, `last_used_step INTEGER DEFAULT -1` (TOTP replay guard) |
+| `user_recovery_codes` | `id VARBINARY(255)` | `code_hash VARBINARY(64) NOT NULL UNIQUE` (SHA-256, never plaintext), `used_at`, `created_at` |
+| `user_devices` | `id VARBINARY(255)` | `token_hash VARBINARY(64) NOT NULL UNIQUE` (SHA-256, never plaintext), `name`, `user_agent`, `ip`, `trusted_at`, `expires_at`, `last_seen_at`, `revoked_at` |
+| `auth_challenges` | `id VARBINARY(255)` | `kind VARCHAR(32)` (`login_mfa`, `oidc_state`, `login_ticket`), `payload_ciphertext/nonce/key_id/version NOT NULL` (sealed), `attempts`, `max_attempts`, `consumed_at`, `expires_at` |
+| `auth_login_attempts` | `bucket_key VARBINARY(255)` | `attempts INTEGER DEFAULT 0`, `window_start`, `blocked_until`, `updated_at`; `bucket_key` is the hex SHA-256 digest of the lowercased username joined with the trimmed client IP by a single separator character, so the table stores no username or IP |
+
+New indexes:
+
+- `idx_oidc_providers_enabled` on `oidc_providers(enabled, public_listed, id)`
+- `idx_user_identities_user` on `user_identities(user_id, id)`
+- `idx_user_recovery_codes_user` on `user_recovery_codes(user_id, id)`
+- `idx_user_devices_user` on `user_devices(user_id, revoked_at, expires_at)`
+- `idx_user_devices_expires` on `user_devices(expires_at)`
+- `idx_auth_challenges_expires` on `auth_challenges(expires_at)`
+- `idx_auth_challenges_kind_user` on `auth_challenges(kind, user_id, id)`
+- `idx_auth_login_attempts_blocked` on `auth_login_attempts(blocked_until)`
+
+As in v12, indexed timestamp columns are `VARCHAR(32)` rather than `TEXT` so
+MySQL can build the index without an explicit key length (`Error 1170`).
+
+Before upgrading:
+
+1. **Back up the database and verify the backup can be restored.** This upgrade
+   is not reversible by application rollback; see "Roll back" below.
+2. Confirm `schema_meta.version=13`.
+3. Confirm both `migrations/incremental/v0013_to_v0014/mysql.sql` and
+   `migrations/incremental/v0013_to_v0014/sqlite.sql` are present, and that every
+   intermediate version from the current one is present too. Cross-version
+   upgrades must run one adjacent step at a time.
+4. Confirm the database account can `ALTER TABLE users`, create tables and
+   indexes, and update `schema_meta`.
+5. Inject `TUNNELMESH_TOKEN_ENCRYPTION_KEY` (base64 or hex, 16/24/32 bytes) and,
+   when rotating keys, `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID` on **every** Server
+   node before starting v14. Without it the Server still starts and password
+   login still works, but MFA enrollment, OIDC provider creation, and every
+   OIDC login fail closed with `503` and `data.error=secret_storage_unavailable`.
+6. Plan for a full-fleet restart rather than a rolling upgrade. See the
+   compatibility note below.
+
+Start the new Server with schema initialization enabled (`storage.auto_init: true`).
+The migration applies the driver-specific statements and advances
+`schema_meta.version` to `14` only after they succeed. MySQL DDL commits
+implicitly, so an interrupted upgrade must be inspected before retrying; the
+runner tolerates duplicate objects from v6 onward, which makes a partially
+applied v14 migration retry-safe. Never advance or decrement
+`schema_meta.version` by hand.
+
+Expected lock impact: the two `ALTER TABLE users ADD COLUMN` statements add
+trailing `NOT NULL DEFAULT` columns, which MySQL 8.0 applies with the `INSTANT`
+algorithm and MySQL 5.6/5.7 with `INPLACE` (table rebuild, concurrent DML
+allowed), so `users` stays usable. All eight new tables are empty on creation
+and their indexes are built inline, which costs no locking on existing data.
+SQLite `ADD COLUMN` rewrites only the stored schema, not the rows, and the
+`CREATE TABLE`/`CREATE INDEX IF NOT EXISTS` statements run inside the migration
+transaction; the pause is negligible. On a large `users` table under MySQL 5.7
+budget for the `INPLACE` rebuild in the same maintenance window used for
+adjacent releases.
+
+Verify:
+
+```sql
+SELECT version FROM schema_meta WHERE id=1;
+-- expected: 14
+
+-- MySQL
+SHOW COLUMNS FROM users LIKE 'auth_source';
+SHOW COLUMNS FROM users LIKE 'mfa_required';
+SHOW TABLES LIKE 'auth_%';
+SHOW TABLES LIKE 'user_%';
+SHOW TABLES LIKE 'oidc_providers';
+SHOW INDEX FROM user_devices;
+
+-- SQLite
+PRAGMA table_info(users);
+SELECT name FROM sqlite_master WHERE type='table' AND name IN
+  ('auth_settings','oidc_providers','user_identities','user_mfa',
+   'user_recovery_codes','user_devices','auth_challenges','auth_login_attempts');
+SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='user_devices';
+```
+
+All eight tables must be present, `users` must carry both new columns, and
+`SELECT COUNT(*) FROM auth_settings` must be `0` until the policy is first read,
+after which exactly one row with `id=1` exists. A fresh deployment seeded from
+`migrations/ddl.sql` produces the same objects at version `14`.
+
+### Compatibility: a v13 binary cannot open a v14 database
+
+The migration statements are additive, but the version gate is strict. A v13
+Server refuses a v14 database before serving any traffic: with
+`storage.auto_init: false` the schema check requires an exact version match and
+fails with `schema version mismatch: database has version 14, application
+requires version 13`; with `auto_init: true` the loader rejects any version above
+its own `SchemaVersion` with the same error. The gate is symmetric: a v14 Server
+against a v13 database fails with `database has version 13, application requires
+version 14` when `auto_init` is off, and with `auto_init` on it runs
+`v0013_to_v0014` — or, if that adjacent script is missing from the embedded
+migrations, reports `missing adjacent migration v0013_to_v0014` and refuses to
+start. Independent of the version number, startup also verifies that all eight
+new tables exist and fails with `schema is missing required table <name>` if any
+is absent.
+
+Consequences for the release:
+
+- There is **no rolling upgrade window** for this release. Take the fleet down,
+  migrate, and start every node on v14. Do not leave a v13 node pointed at the
+  migrated database.
+- Application-level downgrade therefore requires **restoring the pre-upgrade
+  backup**, not reverse DDL. Do not hand-write `DROP TABLE` statements or
+  decrement `schema_meta.version`: a downgrade that keeps v14 rows would leave a
+  v13 Server issuing tokens for accounts whose `mfa_required` and `auth_source`
+  columns it cannot read.
+- Keep `TUNNELMESH_TOKEN_ENCRYPTION_KEY` stable across the whole window.
+  Restoring a backup taken before the key existed leaves sealed secrets that no
+  node can open.
+
+### Feature-level rollback without a deploy
+
+If SSO or MFA misbehaves in production, disable the feature instead of the
+release. Both switches live in the database and take effect on the next login,
+with no restart, no schema change, and no binary rollback:
+
+1. Turn off second-factor enforcement globally:
+
+   ```sql
+   UPDATE auth_settings SET mfa_mode='disabled' WHERE id=1;
+   ```
+
+   Or call `PUT /api/v1/auth/policy` with `{"mfaMode": "disabled", ...}` as an
+   administrator. Per-account `users.mfa_required=1` overrides remain in force by
+   design — they are a floor, not a suggestion. Clear them with
+   `PATCH /api/v1/users/{id}` (`{"mfaRequired": false}`) if an account must be
+   exempted too.
+
+2. Disable every OIDC provider so the login page stops offering SSO and the
+   callback stops resolving:
+
+   ```sql
+   UPDATE oidc_providers SET enabled=0;
+   ```
+
+   Or `PATCH /api/v1/sso/providers/{id}` with `{"enabled": false}` per provider.
+   A disabled provider answers `404 oidc_provider_not_found` on the authorize and
+   callback paths. Accounts whose only credential is an OIDC identity cannot log
+   in while their provider is disabled; re-enable the provider rather than
+   deleting it.
+
+3. Revoke trusted devices if the bypass itself is suspect:
+
+   ```sql
+   UPDATE auth_settings SET allow_trusted_device_bypass=0, device_trust_enabled=0 WHERE id=1;
+   ```
+
+   Disabling device trust invalidates every bypass immediately, without waiting
+   for cookies to expire.
+
+Both `PUT /api/v1/auth/policy` and the provider update write an audit row, so
+the rollback is attributable. Restore by reversing the same two settings; no
+data is lost because disabling never deletes enrollment, recovery-code, or
+identity rows.
+
 ## v12 to v13
 
 Schema v13 adds four nullable columns to `credentials` so a credential can

@@ -140,6 +140,11 @@ node:
 server:
   # 仅监听本机，由 Nginx/Caddy 转发；Agent/Client WebSocket 也走该监听器。
   http_addr: 127.0.0.1:8080
+  # 只有来自 Nginx 的 X-Forwarded-For 才可信，用于登录限流桶和审计 IP。
+  # Server 直接对公网暴露时必须留空，否则客户端可伪造该头自选限流桶。
+  trusted_proxies:
+    - 127.0.0.1/32
+    - ::1/128
   # 必须与 DNS、证书和 Nginx server_name 的动态域名后缀一致，不要写 *。
   dynamic_suffix: apps.example.com
   tcp_bridge:
@@ -194,6 +199,42 @@ security:
   # 启用 WebSSH/SFTP 时还必须包含管理后台的精确 Origin。
   allowed_origins:
     - https://tunnel.example.com
+  # 管理台身份认证。这里只写“进程级默认值与旋钮”：
+  # session_token_ttl / device_trust.enabled / device_trust.bypass_mfa 只在
+  # auth_settings 行首次创建时作为种子写入，之后数据库行是权威来源，
+  # 改这里不会覆盖管理员在后台做出的决定。OIDC 提供商的 issuer、
+  # client id、client secret 和 role mapping 全部存在数据库，不在配置文件中。
+  auth:
+    # 管理台 token 有效期；0 表示沿用升级前的不过期行为。
+    session_token_ttl: 12h
+    login_throttle:
+      max_attempts: 10
+      window: 5m
+      block: 10m
+    mfa:
+      # 会写进 otpauth:// 标签，不能包含冒号。
+      issuer: TunnelMesh
+      digits: 6
+      period: 30s
+      skew: 1
+      challenge_ttl: 5m
+      max_attempts: 5
+      recovery_codes: 10
+    device_trust:
+      enabled: true
+      cookie_name: tm_device
+      cookie_secure: true
+      cookie_same_site: lax
+      # 关掉它表示“每次登录都要二次验证”，但仍保留设备清单与撤销能力。
+      bypass_mfa: true
+    oidc:
+      # 关闭后登录页不再列出 SSO 按钮，GET /api/v1/auth/oidc/providers 返回 404。
+      public_providers: true
+      http_timeout: 10s
+      state_ttl: 10m
+      login_ticket_ttl: 60s
+      jwks_cache_ttl: 1h
+      max_discovery_body_bytes: 1048576
 
 # 后台“发行管理”页展示的仓库，格式 owner/name。
 # 内网镜像可改为 mirror-owner/TunnelMesh，或用
@@ -217,10 +258,16 @@ TUNNELMESH_STORAGE_MYSQL_DSN='db_user:db_password@tcp(mysql.internal.example.com
 TUNNELMESH_STORAGE_MYSQL_TLS=false
 TUNNELMESH_SERVER_RELAY_NODE_TOKEN='replace-with-server-node-service-token'
 
-# 管理台 token reveal 使用；长度为 16/24/32 字节，base64 或 hex。
-TUNNELMESH_TOKEN_ENCRYPTION_KEY='replace-with-aes-256-gcm-key'
+# 管理台 token reveal、SSH 凭据自动认证，以及 SSO/MFA 必需：
+# OIDC client_secret、TOTP 共享密钥和 auth_challenges payload 都用它加密。
+# 长度为 16/24/32 字节，base64 或 hex；集群所有 Server 节点必须完全一致。
+# 未配置时 Server 仍可启动，但 MFA 绑定和 OIDC 提供商创建返回
+# 503 secret_storage_unavailable，不会退化成明文存储。
+TUNNELMESH_TOKEN_ENCRYPTION_KEY="${TUNNELMESH_TOKEN_ENCRYPTION_KEY:?inject from your secret manager}"
+# 可选；轮换密钥时随之更换。未设置时 key id 固定为 default。
+TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID="${TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID:-default}"
 # 多 Server 集群所有节点必须一致，用于跨节点 traceroute 签名。
-TUNNELMESH_TRACE_SIGNING_KEY='replace-with-high-entropy-signing-key'
+TUNNELMESH_TRACE_SIGNING_KEY="${TUNNELMESH_TRACE_SIGNING_KEY:?inject from your secret manager}"
 ```
 
 MySQL 支持 TLS 时改为：
@@ -239,6 +286,70 @@ storage:
 ```bash
 TUNNELMESH_STORAGE_MYSQL_DSN='db_user:db_password@tcp(db.example.com:3306)/tunnelmesh?parseTime=true&tls=true'
 ```
+
+### 在集群上启用 SSO 与 MFA
+
+配置文件只负责种子。真正打开这两项能力是对数据库的两次管理 API 调用，任何 Server 节点都可以执行，
+集群立即一致生效。以下命令中的 secret 一律来自环境变量，示例里只有占位符。
+
+```bash
+# 1) 打开全局两步验证策略（mfaMode: disabled / optional / required）
+curl -sS -X PUT "https://tunnel.example.com/api/v1/auth/policy" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Idempotency-Key: auth-policy-enable-mfa-001' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "mfaMode": "required",
+        "deviceTrustEnabled": true,
+        "deviceTrustTtlSeconds": 2592000,
+        "allowTrustedDeviceBypass": true,
+        "maxTrustedDevices": 10,
+        "sessionTokenTtlSeconds": 43200
+      }'
+
+# 2) 注册 OIDC 提供商。redirectUri 必须精确等于
+#    https://<对外域名>/api/v1/auth/oidc/<name>/callback，
+#    且落在 security.allowed_origins / allowed_hosts 推导出的 base 之内。
+curl -sS -X POST "https://tunnel.example.com/api/v1/sso/providers" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Idempotency-Key: sso-provider-okta-001' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "okta",
+        "displayName": "Okta",
+        "issuer": "https://example.okta.com",
+        "clientId": "'"${OIDC_CLIENT_ID}"'",
+        "clientSecret": "'"${OIDC_CLIENT_SECRET}"'",
+        "scopes": ["openid", "profile", "email", "groups"],
+        "redirectUri": "https://tunnel.example.com/api/v1/auth/oidc/okta/callback",
+        "idTokenAlgs": ["RS256"],
+        "usernameClaim": "preferred_username",
+        "roleMappings": [
+          {"claim": "groups", "value": "tunnelmesh-admins", "role": "admin"}
+        ],
+        "defaultRole": "user",
+        "authoritativeRoles": true,
+        "autoCreateUsers": true,
+        "fetchUserinfo": false,
+        "publicListed": true,
+        "enabled": true
+      }'
+
+# 3) 在不影响用户的前提下验证 issuer discovery 与 JWKS 可达性。
+#    PROVIDER_ID 取第 2 步响应 data.id（不透明 ID，不是 name）。
+PROVIDER_ID='<上一步返回的 data.id>'
+curl -sS -X POST "https://tunnel.example.com/api/v1/sso/providers/${PROVIDER_ID}/test" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Idempotency-Key: sso-provider-okta-test-001'
+```
+
+三条命令里的 `ADMIN_TOKEN`、`OIDC_CLIENT_ID`、`OIDC_CLIENT_SECRET` 都必须先在当前 shell 里从
+Secret Manager 导出；`-d` 用单引号包裹，所以凡是需要展开的字段都写成 `"'"${VAR}"'"` 形式，
+直接写 `"${VAR}"` 会把字面量 `${VAR}` 发出去。
+
+字段取值范围、role mapping 语义和 `data.error` 排障表见
+[单点登录与两步验证](../user-guide/sso-and-mfa.md)；键含义见
+[配置说明](configuration.md#管理台身份认证sso--mfa--受信任设备)。
 
 ## Agent
 

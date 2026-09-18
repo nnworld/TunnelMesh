@@ -8,13 +8,13 @@
 
 | 目录 | 面向 | 内容 |
 | --- | --- | --- |
-| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、托管路由、HTTP 代理入口、SSH over WebSocket |
+| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、SSH over WebSocket |
 | [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、OpenResty 代理入口、systemd/launchd/Windows Service、发行打包 |
 | [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、可观测性、探针、日志、SLO、容量、排障 |
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
 | [`api/`](api/) | 接口 | `openapi.yaml` |
-| [`en/`](en/) | 英文读者 | 生产部署、安全加固、三端使用入口 |
+| [`en/`](en/) | 英文读者 | 生产部署、安全加固、三端使用入口、SSO 与 MFA 指南 |
 | [`community/`](community/) | 社区与增长 | GitHub 元数据、技术文章、分发计划 |
 | [`index.md`](index.md) | 文档站入口 | GitHub Pages 双语文档导航 |
 | [`assets/`](assets/) | 所有读者 | 管理后台截图、演示 GIF、社交卡片 |
@@ -33,6 +33,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [Client 使用帮助](user-guide/client.md)：TCP/UDP/HTTP 转发、SOCKS5、HTTP 代理、发布、`proxy tcp`、隧道管理
 - [Agent 使用帮助](user-guide/agent.md)：注册、连接池运行、受控 metadata 上报、网络与 TLS 要求
 - [Server 管理后台](user-guide/server-admin.md)：Dashboard、账号与语言、Agent 列表与详情、Agent Policy、审计日志、角色与 Service Token
+  - [单点登录与两步验证](user-guide/sso-and-mfa.md)：OIDC 提供商配置与 role mapping、TOTP 绑定与恢复码、受信任设备、认证策略、按 `data.error` 归类的排障表（英文版见 [SSO and MFA](en/user-guide/sso-and-mfa.md)）
   - [远程服务器与浏览器 SSH/SFTP](user-guide/server-admin.md#远程服务器与浏览器-sshsftp)
   - [Client 运行观测与连接管理](user-guide/server-admin.md#client-运行观测与连接管理)
   - [Server 节点与共享令牌](user-guide/server-admin.md#server-节点)
@@ -55,8 +56,8 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 **配置**
 
-- [配置说明](operations/configuration.md)：配置模型、优先级、密钥注入、`auto-init`
-- [Server / Agent / Client 配置示例](operations/config-examples.md)：单机 SQLite、集群 MySQL、集群 etcd
+- [配置说明](operations/configuration.md)：配置模型、优先级、密钥注入、`auto-init`、`security.auth`（SSO / MFA / 受信任设备）与 `server.trusted_proxies`
+- [Server / Agent / Client 配置示例](operations/config-examples.md)：单机 SQLite、集群 MySQL、集群 etcd、启用 SSO 与 MFA 的集群示例
 - [Client 全协议与连接池配置示例](operations/client-configuration-examples.md)
 
 **升级与集群**
@@ -67,7 +68,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 **观测与排障**
 
-- [可观测性与统一 Grafana Dashboard](operations/observability.md)
+- [可观测性与统一 Grafana Dashboard](operations/observability.md)：连接、stream、探针、WebSSH、tp-* 代理入口与身份认证指标及告警阈值
 - Prometheus 抓取示例与规则见 [deploy/prometheus](../deploy/prometheus)，Dashboard 与 provisioning 见 [deploy/grafana](../deploy/grafana)
 - [全链路网络探针](operations/network-probes.md)：逻辑 traceroute 与 TCP/HTTP/UDP 探针
 - [日志位置与查看方式](operations/logging.md)
@@ -102,6 +103,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 - [Documentation site](https://nnworld.github.io/TunnelMesh/)：GitHub Pages 文档入口
 - [English documentation](en/README.md)：生产部署、安全加固、Agent、Client、Server 管理
+- [SSO and MFA](en/user-guide/sso-and-mfa.md)：OIDC 单点登录、TOTP 两步验证、受信任设备与认证策略的英文完整指南
 - [Why TunnelMesh needs a control plane](community/why-tunnelmesh-needs-a-control-plane.md)：技术文章与产品取舍
 - [Comparison with other tunneling models](community/comparison.md)：不同隧道模型的边界与取舍
 - [Roadmap](community/roadmap.md)：当前、下一步和长期方向

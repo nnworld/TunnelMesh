@@ -29,6 +29,8 @@ Server 不监听公网 UDP。
 | 自托管控制面 | 有 | 视项目 | 有 | 无 |
 | 内置管理后台 | 有 | 少见 | 少见 | 有 |
 | Scoped service token | 有 | 少见 | 视项目 | 托管 |
+| 企业级单点登录（OIDC） | 有 | 少见 | 少见 | 托管 |
+| 两步验证与受信任设备 | 有 | 少见 | 视项目 | 托管 |
 | 浏览器 SSH/SFTP | 有 | 无 | 无 | 视项目 |
 | 集群 relay 与可观测性 | 有 | 有限 | 视项目 | 托管 |
 
@@ -93,6 +95,9 @@ Server 不监听公网 UDP。
 **控制面**
 
 - Vue 3 + Element Plus 管理后台，支持 i18n、RBAC 角色、scoped service token、Agent 策略、cursor 分页和结构化审计日志。
+- OIDC 单点登录：authorization code + PKCE（`S256`）、discovery 与 JWKS 缓存、按提供商配置 group→role 映射、首次登录自动置备账号；`alg=none` 与全部 `HS*` 无条件拒绝。
+- TOTP 两步验证：`disabled` / `optional` / `required` 三档全局策略加单账号强制，一次性 `tmrc-` 恢复码只存 SHA-256 摘要，并带 TOTP 重放保护。
+- 可撤销的受信任设备：“信任此浏览器”具备有效期与单账号数量上限，支持自助与管理员撤销，策略关闭后下一次登录即刻失效。
 - 敏感操作（token reveal、带内网明细的逻辑 traceroute）必须携带显式确认头并写入审计。
 
 **扩展与可用性**
@@ -103,6 +108,7 @@ Server 不监听公网 UDP。
 **可观测性与诊断**
 
 - Prometheus 指标、`/health/live`、`/health/ready`、内置 Grafana Dashboard、告警与录制规则、W3C `traceparent` 透传。
+- 身份认证指标使用封闭枚举的低基数标签：管理台登录、二次验证、OIDC 依赖方阶段、受信任设备、待处理 challenge 和被限流的登录桶。
 - Client → Server → Agent → 目标的逻辑 traceroute，以及 TCP/HTTP/UDP 全链路网络探针。
 
 ## 架构
@@ -284,12 +290,14 @@ make docker-build                                          # 三个镜像
 - Agent 指南：[Agent guide](docs/en/user-guide/agent.md)
 - Client 指南：[Client guide](docs/en/user-guide/client.md)
 - Server 管理：[Server administration](docs/en/user-guide/server-admin.md)
+- 单点登录与两步验证（英文）：[Single sign-on and MFA](docs/en/user-guide/sso-and-mfa.md)
 
 **用户指南**
 
 - [Client 使用帮助](docs/user-guide/client.md)：转发、SOCKS5、发布、`proxy tcp`
 - [Agent 使用帮助](docs/user-guide/agent.md)：注册、连接池、metadata allowlist
 - [Server 管理后台](docs/user-guide/server-admin.md)：Agent、路由、token、审计、WebSSH/SFTP、发行管理
+- [单点登录与两步验证](docs/user-guide/sso-and-mfa.md)：OIDC 提供商配置、role mapping、TOTP 绑定、恢复码、受信任设备、认证策略
 - [托管 HTTP 路由](docs/user-guide/managed-http-route.md)：显式域名与通配域名、HTTPS
 - [HTTP 代理入口（tp-*）](docs/user-guide/http-proxy-entry.md)：浏览器/系统代理，免安装 client
 - [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md)：`ProxyCommand` 与 `websocat`
@@ -361,11 +369,13 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 ## 安全模型
 
 - 密码使用 Argon2id；service token 以 hash 存储，仅在满足管理员显式 reveal 需求时额外保存 AES-256-GCM 密文。
+- 恢复码、受信任设备 token 和登录限流桶只保存单向 SHA-256 摘要；OIDC client secret、TOTP 共享密钥和 challenge payload 以 AES-256-GCM 加密，缺少 `TUNNELMESH_TOKEN_ENCRYPTION_KEY` 时 fail-closed 返回 `503 secret_storage_unavailable`。
+- id_token 校验只接受 `RS*`、`PS*`、`ES*` 和 `EdDSA`；`alg=none` 与全部 `HS*` 在保存提供商和校验 token 时各拒绝一次，没有任何开关能打开。
 - token reveal 必须携带 `X-Token-Reveal-Confirm`、`Idempotency-Key` 和 `acknowledgeRisk=true`，响应带 `Cache-Control: no-store` 并写入审计。
 - 所有权限校验在服务端完成，绝不信任客户端传入的 owner、Agent 或 role。
 - Agent metadata 只来自 allowlist 中的文件或环境变量；名称命中敏感模式时清空值并标记 `redacted=true`。
 - 每个目标地址在 Agent 侧再次校验 SSRF、回环、私网、链路本地、CIDR 和端口策略。
-- 日志、指标、审计和普通 traceroute 输出不包含 secret、密码、私钥、完整 `Authorization` header 或会话字节。
+- 日志、指标、审计和普通 traceroute 输出不包含 secret、密码、私钥、完整 `Authorization` header 或会话字节；身份认证指标的标签是封闭枚举，不含用户名、客户端 IP、provider id 或设备 token。
 - 明确不实现：ICMP、TUN/L2 VPN、P2P NAT traversal 和任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路。
 
 ## 仓库结构
@@ -375,7 +385,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 | `cmd/` | 三个可执行文件的进程入口 |
 | `internal/cli/` | 命令行参数、配置加载、子命令 |
 | `internal/config/` | 配置模型、默认值、优先级 |
-| `internal/auth/` | 用户、token、Argon2id、RBAC、管理员恢复 |
+| `internal/auth/` | 用户、token、Argon2id、RBAC、管理员恢复、OIDC 依赖方、TOTP 两步验证、恢复码、受信任设备、认证策略 |
 | `internal/storage/` | 数据库连接、DDL 初始化、版本迁移、Repository 实现 |
 | `internal/registry/` | MySQL lease、etcd 注册发现、epoch fencing |
 | `internal/protocol/` | WebSocket frame、能力协商、stream 状态机、UDP association、traceroute |

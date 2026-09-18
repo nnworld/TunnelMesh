@@ -16,14 +16,54 @@ servers:
 paths:
   /api/v1/auth/login:
     post:
-      summary: Login and issue an opaque bearer token
+      summary: Login with a password and issue an opaque bearer token
+      description: |
+        Public endpoint; no bearer token is required. This is the v2 login entry point and it
+        answers with one of three shapes, all inside the usual `{code,msg,data}` envelope.
+
+        1. Authenticated - `data` carries `token`, `user` and `deviceTrusted`. That is the legacy
+           shape plus `deviceTrusted`, so an existing client or script keeps working unchanged.
+        2. Second factor required - HTTP 200 with `data.mfaRequired=true`, a single-use
+           `challengeId`, the accepted `methods` and `expiresAt`. Complete it with
+           `POST /api/v1/auth/mfa/verify`.
+        3. Throttled - HTTP 429 with `data.error=login_throttled` and a `Retry-After` header in
+           seconds.
+
+        A wrong password, an unknown username, a disabled account, a deleted account and a
+        passwordless SSO-only account all collapse into HTTP 401 `invalid_credentials`, so the
+        response cannot be used to enumerate accounts. An unknown username still costs one
+        Argon2id verification so the two stay indistinguishable by timing. The failure that trips
+        the brute-force block is itself reported as an ordinary 401; only the next request is
+        throttled.
+
+        When `trustDevice` is true and the effective policy allows it, a trusted-device token is
+        issued and set as an HttpOnly cookie whose `Max-Age` never outlives the stored device row.
+        That token is a bearer secret: it is never echoed in a response body, never logged, and
+        there is no reveal endpoint for it. Only its SHA-256 digest is stored. Asking for a
+        trusted device while device trust is disabled is ignored and the login still succeeds with
+        `deviceTrusted=false`. A valid trusted-device cookie presented on this request satisfies
+        the second factor instead of raising a challenge, but only while the policy still allows
+        the bypass.
+      security: []
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/LoginRequest' }
+            schema: {$ref: '#/components/schemas/LoginRequest'}
       responses:
-        '200': { description: Authenticated, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } } }
+        '200':
+          description: Authenticated, or a second factor is required before a session can be issued
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: '#/components/schemas/LoginSuccessEnvelope'}
+                  - {$ref: '#/components/schemas/MFAChallengeEnvelope'}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '401': {description: invalid_credentials, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '405': {description: Method not allowed}
+        '429': {description: 'login_throttled; carries a Retry-After header in seconds', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
   /api/v1/auth/me:
     get:
       security: [{ bearerAuth: [] }]
@@ -34,6 +74,526 @@ paths:
       security: [{ bearerAuth: [] }]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PasswordChangeRequest'}}}}
       responses: {'200': {description: Password changed}, '400': {description: Password policy violation}, '401': {description: Unauthenticated}, '403': {description: Current password is invalid}}
+  /api/v1/auth/mfa/verify:
+    post:
+      summary: Complete an MFA challenge raised by a password or OIDC login
+      description: |
+        Public endpoint. Accepts one current TOTP code or one single-use recovery code against the
+        `challengeId` returned by `POST /api/v1/auth/login`. On success the response is exactly the
+        authenticated-login shape, including a newly issued trusted device when `trustDevice` was
+        requested and the policy allows it.
+
+        The challenge is single-use and bounded by a short TTL and an attempt budget. A wrong code
+        burns one attempt; when the budget is exhausted the challenge dies with
+        `mfa_attempts_exceeded` and the caller must start the login over. Replaying a TOTP step that
+        was already accepted returns `mfa_code_reused`. A missing, expired or already consumed
+        challenge returns `mfa_challenge_invalid`. Only a wrong second factor burns the budget: a
+        missing enrollment is a setup problem and charging it would lock out an account an
+        administrator just forced into required mode.
+
+        The challenge is consumed only after the code verifies, and the consume result is checked,
+        so two racing requests against the same challenge cannot both succeed. The challenge
+        identifier is a bearer secret for the remainder of the login and is never written to the
+        audit log.
+
+        A recovery-code login sets `recoveryCodesExhausted=true` in the success payload when it
+        consumed the last remaining bypass code. That is the only moment the user learns it.
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MFAVerifyRequest'}}}}
+      responses:
+        '200': {description: Authenticated, content: {application/json: {schema: {$ref: '#/components/schemas/LoginSuccessEnvelope'}}}}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '401': {description: 'mfa_code_invalid, mfa_code_reused, mfa_challenge_invalid, mfa_attempts_exceeded, mfa_not_enrolled or invalid_credentials', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/auth/mfa:
+    get:
+      summary: Read the caller's own second-factor status and the policy that applies to it
+      description: |
+        `status` is `none`, `pending` (an enrollment exists but was never confirmed with a live
+        code, so it does not yet satisfy the policy) or `enabled`. `policy.mode` is the global
+        operator setting and `policy.required` is the effective decision for this account: true
+        when the global mode is `required`, when the mode is `optional` and a factor is enabled, or
+        when the account carries the per-account `mfaRequired` override.
+
+        The response never carries the shared secret or any code. `remainingRecoveryCodes` is a
+        count only, because the codes are stored as one-way hashes.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: MFA status, content: {application/json: {schema: {$ref: '#/components/schemas/MFAStatusEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+    delete:
+      summary: Remove the caller's second factor after proving possession of it
+      description: |
+        Requires one live proof of possession in the request body, a current TOTP code or a
+        recovery code, because removing a second factor is the highest-impact self-service action.
+        It also revokes every trusted device for the account, since each one was trusted on the
+        strength of the factor being removed.
+
+        Refused with `mfa_required_by_policy` while the effective policy still demands a second
+        factor, and with `mfa_not_confirmed` while the enrollment is still `pending`. No
+        `Idempotency-Key` is required: this is a self-service mutation, not an administrative one.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MFACodeRequest'}}}}
+      responses:
+        '200': {description: Second factor removed; data.status is none}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare'}
+        '401': {description: 'Unauthenticated, mfa_code_invalid, mfa_code_reused or mfa_not_enrolled'}
+        '405': {description: Method not allowed}
+        '409': {description: mfa_required_by_policy or mfa_not_confirmed}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/mfa/enroll:
+    post:
+      summary: Start a TOTP enrollment and receive the shared secret and recovery codes once
+      description: |
+        Creates a `pending` enrollment and returns the base32 shared secret, an `otpauth://` URL
+        for QR scanning, the recovery codes and the enrollment deadline. The response is
+        `Cache-Control: no-store`.
+
+        The secret and the recovery codes are returned exactly once and are never readable again.
+        The secret is sealed with AES-256-GCM before it reaches storage and the recovery codes are
+        stored as one-way hashes. There is no reveal endpoint for either of them, unlike
+        `POST /api/v1/tokens/{tokenId}/reveal`; losing them means re-enrolling. Neither value ever
+        reaches the audit log, which records only the TOTP digits, period and code count.
+
+        An account that has a local password must re-prove it with `currentPassword`, so a hijacked
+        session cannot be made durable by enrolling an attacker's authenticator. A passwordless
+        SSO-only account has no password to re-prove and may omit the body entirely. Enrollment
+        fails closed with `secret_storage_unavailable` when no encryption key is configured, rather
+        than degrading to plaintext storage.
+      security: [{bearerAuth: []}]
+      requestBody: {required: false, content: {application/json: {schema: {$ref: '#/components/schemas/MFAEnrollRequest'}}}}
+      responses:
+        '200': {description: 'Pending enrollment; response uses Cache-Control no-store', content: {application/json: {schema: {$ref: '#/components/schemas/MFAEnrollmentEnvelope'}}}}
+        '400': {description: 'current_password_required, invalid JSON, or an unknown sub-resource'}
+        '401': {description: Unauthenticated}
+        '403': {description: current_password_invalid}
+        '404': {description: Method not allowed on this sub-resource}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/mfa/enable:
+    post:
+      summary: Confirm a pending enrollment with one live TOTP code
+      description: |
+        Moves `status` from `pending` to `enabled`. The code is verified against the stored secret
+        and the TOTP step is recorded, so replaying a step that was already accepted returns
+        `mfa_code_reused`. A pending enrollment that is never confirmed expires and stops being
+        usable.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MFACodeRequest'}}}}
+      responses:
+        '200': {description: 'Enabled; data carries status and enabledAt'}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare'}
+        '401': {description: 'Unauthenticated, mfa_code_invalid, mfa_code_reused or mfa_not_enrolled'}
+        '404': {description: Method not allowed on this sub-resource}
+        '409': {description: mfa_already_enabled}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/mfa/recovery-codes:
+    post:
+      summary: Replace the recovery codes of an enabled second factor and return the new ones once
+      description: |
+        Requires a current TOTP code, invalidates every previously issued recovery code and returns
+        the new plaintext codes exactly once with `Cache-Control: no-store`. The codes are stored
+        as one-way hashes, so they are never re-readable and there is no reveal endpoint for them.
+        Refused with `mfa_not_confirmed` while the enrollment is still `pending`.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/MFACodeRequest'}}}}
+      responses:
+        '200': {description: 'Replacement codes; response uses Cache-Control no-store', content: {application/json: {schema: {$ref: '#/components/schemas/RecoveryCodesEnvelope'}}}}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare'}
+        '401': {description: 'Unauthenticated, mfa_code_invalid, mfa_code_reused or mfa_not_enrolled'}
+        '404': {description: Method not allowed on this sub-resource}
+        '409': {description: mfa_not_confirmed}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/devices:
+    get:
+      summary: List the caller's own active trusted devices
+      description: |
+        Returns only unrevoked and unexpired devices. `current` marks the device that presented the
+        trusted-device cookie on this request. Neither the device token nor its hash is part of the
+        response.
+
+        The list is bounded by the `maxTrustedDevices` policy, so a single page is always complete:
+        `nextCursor` is always the empty string and `hasMore` is always false. The cursor envelope
+        is still used so callers can treat every list uniformly. This collection accepts GET only.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: One complete page of devices, content: {application/json: {schema: {$ref: '#/components/schemas/DevicePageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/auth/devices/{deviceId}:
+    parameters: [{name: deviceId, in: path, required: true, schema: {type: string}}]
+    patch:
+      summary: Rename one of the caller's trusted devices
+      description: |
+        Sets a user-facing label. Only the caller's own devices may be renamed; any other
+        identifier answers `device_not_found`. A missing device is reported as not found rather
+        than forbidden so an identifier cannot be used to probe whose device it is. The label is
+        truncated to 191 characters and an empty value clears it. No `Idempotency-Key` is required.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DeviceRenameRequest'}}}}
+      responses:
+        '200': {description: 'Renamed; data carries id and name'}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare'}
+        '401': {description: Unauthenticated}
+        '404': {description: device_not_found}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+    delete:
+      summary: Untrust one of the caller's devices
+      description: |
+        Revokes the device and audits the action. When the device making the request is the one
+        being revoked the trusted-device cookie is cleared as well, so a browser cannot keep
+        presenting a dead token. No `Idempotency-Key` is required for this self-service mutation.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: 'Revoked; data carries revoked and id'}
+        '401': {description: Unauthenticated}
+        '404': {description: device_not_found}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+  /api/v1/auth/identities:
+    get:
+      summary: List the external identities linked to the caller's account
+      description: |
+        At most one link per provider, so a single page is always complete: `nextCursor` is the
+        empty string and `hasMore` is false. `subject` is the IdP-side identifier; it is not a
+        credential and is included so an unlink target can be recognised. This collection accepts
+        GET only.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: One complete page of identities, content: {application/json: {schema: {$ref: '#/components/schemas/IdentityPageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/auth/identities/{identityId}:
+    parameters: [{name: identityId, in: path, required: true, schema: {type: string}}]
+    delete:
+      summary: Unlink one external identity from the caller's account
+      description: |
+        Refused with `identity_required_for_login` when the account has no local password and this
+        is its only remaining credential, because the unlink would leave it reachable only through
+        a database edit. An account that keeps a local password and ends with no external link is
+        relabelled `local`, since the mixed label would otherwise be a lie. An identifier that does
+        not belong to the caller answers `identity_not_found`. No `Idempotency-Key` is required.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: 'Unlinked; data carries unlinked and id'}
+        '401': {description: Unauthenticated}
+        '404': {description: identity_not_found}
+        '405': {description: Method not allowed}
+        '409': {description: identity_required_for_login}
+        '503': {description: identity_services_unavailable}
+  /api/v1/auth/oidc/providers:
+    get:
+      summary: List the SSO buttons the public login page may render
+      description: |
+        Public endpoint. Returns only `id`, `name` and `displayName`, and only for providers that
+        are both enabled and flagged `publicListed`. The listing is gated by a process-level switch
+        so a deployment can require users to already know the URL before the existence of its IdP
+        is disclosed. When the switch is off the route answers 404 `not_found` rather than 403, so
+        a disabled feature is indistinguishable from a route that never existed.
+
+        The response is a bare `items` array with no cursor: the set is small and always complete.
+      security: []
+      responses:
+        '200': {description: Public provider list, content: {application/json: {schema: {$ref: '#/components/schemas/PublicOIDCProviderListEnvelope'}}}}
+        '404': {description: 'not_found; the public provider listing is switched off'}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+  /api/v1/auth/oidc/{providerName}/authorize:
+    parameters:
+      - {name: providerName, in: path, required: true, schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$'}, description: Provider slug. It is part of the published redirect URI and is immutable after creation.}
+    get:
+      summary: Begin an OIDC authorization-code login and redirect the browser to the IdP
+      description: |
+        Public endpoint. Answers 302 with a `Location` pointing at the IdP authorization endpoint
+        and `Cache-Control: no-store`, so neither a browser nor a proxy caches a URL that carries a
+        single-use state.
+
+        The state, the nonce and the PKCE verifier are stored encrypted in one challenge row, so
+        any Server node in the cluster can complete the redirect. The challenge identifier doubles
+        as the state value: it is already a 192-bit random token, and reusing it removes a second
+        lookup path that could disagree with the first. The challenge is created with
+        `max_attempts=1`, so a second presentation of the same state must fail rather than retry.
+      security: []
+      responses:
+        '302':
+          description: Redirect to the IdP authorization endpoint
+          headers:
+            Location: {description: 'Absolute IdP authorization URL carrying state, nonce, the PKCE code challenge and the provider redirect_uri', schema: {type: string, format: uri}}
+            Cache-Control: {description: Always no-store, schema: {type: string}}
+        '400': {description: oidc_provider_invalid}
+        '404': {description: oidc_provider_not_found or oidc_provider_disabled}
+        '405': {description: Method not allowed}
+        '502': {description: 'oidc_discovery_failed; the IdP metadata document could not be retrieved'}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/oidc/{providerName}/callback:
+    parameters:
+      - {name: providerName, in: path, required: true, schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$'}}
+      - {name: code, in: query, schema: {type: string}, description: Authorization code issued by the IdP}
+      - {name: state, in: query, schema: {type: string}, description: Challenge identifier minted by the authorize step}
+      - {name: error, in: query, schema: {type: string}, description: IdP-side refusal. When it is present the callback fails without reading code or state.}
+      - {name: error_description, in: query, schema: {type: string}, description: Accepted and deliberately ignored. IdP-controlled text is never reflected onto this origin.}
+    get:
+      summary: Complete the OIDC redirect and hand the browser a single-use ticket or an MFA challenge
+      description: |
+        Public endpoint. Exchanges the code with PKCE, verifies the id_token signature, issuer,
+        audience, nonce and expiry, resolves the local account, and links or just-in-time
+        provisions it. On success it answers 302 to the configured login path with either
+        `?ticket=<single-use>` or, when the account still owes a second factor,
+        `?mfa=<challengeId>`.
+
+        The redirect target is a server constant, never derived from request data or from the
+        provider row, and the value is URL-escaped. That is what makes an open redirect through the
+        callback impossible even if a provider's `redirectUri` points somewhere else. The state row
+        names the provider it was minted for, so a state cannot be replayed into another provider's
+        callback. The state is burned on a token-exchange failure too, so a captured code cannot be
+        retried against this redirect; on the happy path it is consumed only after provisioning
+        succeeds, so a transient database error leaves the redirect retryable inside its TTL.
+
+        Provisioning checks an existing link first, then a username match, then creation. That
+        order makes a username change at the IdP harmless and lets an organisation adopt SSO
+        without re-creating every account. The ticket is a bearer secret: it is never written to
+        the audit log and never appears in a response body.
+      security: []
+      responses:
+        '302':
+          description: Redirect to the login page with a single-use ticket or an MFA challenge id
+          headers:
+            Location: {description: 'Relative login path with exactly one of ticket or mfa set', schema: {type: string}}
+            Cache-Control: {description: Always no-store, schema: {type: string}}
+        '400': {description: oidc_state_invalid or oidc_provider_error, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '401': {description: 'oidc_id_token_invalid, oidc_unsupported_algorithm, oidc_no_matching_key or oidc_claim_missing'}
+        '403': {description: 'oidc_user_not_provisioned when auto-creation is off or the resolved username is not acceptable; account_disabled when the resolved local account is disabled or soft-deleted'}
+        '404': {description: oidc_provider_not_found or oidc_provider_disabled}
+        '405': {description: Method not allowed}
+        '502': {description: 'oidc_token_exchange_failed, oidc_discovery_failed or oidc_jwks_fetch_failed'}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/auth/oidc/exchange:
+    post:
+      summary: Exchange a single-use OIDC login ticket for a console session
+      description: |
+        Public endpoint. A POST rather than a GET so the ticket never lands in browser history, a
+        `Referer` header or a proxy access log. The response is the authenticated-login shape, and
+        a trusted-device cookie is set when the redirect already established trust or when
+        `trustDevice` is requested and the policy allows it.
+
+        The ticket is consumed before the session is issued, so a second exchange of the same
+        ticket finds no live row even when the two requests race. An unknown, expired or already
+        consumed ticket, and one whose account has since been disabled or deleted, all answer 401
+        `login_ticket_invalid`. An MFA challenge is never returned here: the callback redirects to
+        the login page with `mfa=` instead, and the challenge is completed through
+        `POST /api/v1/auth/mfa/verify`.
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCTicketExchangeRequest'}}}}
+      responses:
+        '200': {description: Authenticated, content: {application/json: {schema: {$ref: '#/components/schemas/LoginSuccessEnvelope'}}}}
+        '400': {description: 'Invalid JSON, or a field the handler does not declare'}
+        '401': {description: login_ticket_invalid, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+  /api/v1/auth/policy:
+    get:
+      summary: Read the authoritative authentication policy
+      description: |
+        Administrator-only. Returns the stored `auth_settings` row, which is the single
+        authoritative source: process configuration only seeds it the first time it is read, so an
+        operator decision made through the console survives a restart and a config edit. `updatedAt`
+        is an empty string while the row has never been written.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Current policy, content: {application/json: {schema: {$ref: '#/components/schemas/AuthPolicyEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+    put:
+      summary: Replace the authentication policy
+      description: |
+        Administrator-only and audited with the list of changed field names and their new values,
+        none of which is a secret. The body is a full replacement rather than a patch. Requires
+        `Idempotency-Key`. A replay of the same key by the same user returns the stored response
+        verbatim with its original status code instead of running the update twice. A key that
+        belongs to a different user answers 409 `idempotency_key_conflict`, and one whose first
+        request is still running answers 409 `idempotency_in_progress`; neither is a server
+        defect, so neither is reported as `internal_error`.
+
+        Bounds are enforced so a typo cannot produce a policy that is technically valid and
+        operationally absurd: `deviceTrustTtlSeconds` must be 3600-7776000, `maxTrustedDevices`
+        must be 1-100 and `sessionTokenTtlSeconds` must not be negative, where 0 keeps the
+        historical non-expiring behaviour. `allowTrustedDeviceBypass` requires
+        `deviceTrustEnabled`, because storing a bypass while trust is off would silently grant it
+        the moment trust is re-enabled without anybody re-reading the row. A violation answers 400
+        `auth_policy_invalid` and persists nothing.
+
+        Disabling MFA globally while an account still carries the per-account `mfaRequired`
+        override is allowed: the override is a floor rather than a suggestion and keeps being
+        enforced. Disabling device trust takes effect immediately on every node and revokes every
+        bypass without a token or session change.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AuthPolicyUpdateRequest'}}}}
+      responses:
+        '200': {description: Updated policy, content: {application/json: {schema: {$ref: '#/components/schemas/AuthPolicyEnvelope'}}}}
+        '400': {description: 'auth_policy_invalid, idempotency_key_required or invalid JSON'}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '409': {description: 'idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable}
+  /api/v1/sso/providers:
+    get:
+      summary: List OIDC identity providers
+      description: |
+        Administrator-only cursor page. Every branch of `/api/v1/sso` is admin-gated because a
+        provider row decides who may become an administrator, so a non-admin who could edit one
+        could promote themselves.
+
+        Unlike the public listing this returns the full configuration. The client secret is never
+        part of it; only the `hasSecret` boolean is.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderPageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+    post:
+      summary: Register an OIDC identity provider
+      description: |
+        Administrator-only and audited. Requires `Idempotency-Key`, because a retried request would
+        otherwise create a second provider.
+
+        `name` is a URL-safe slug matching `^[a-z0-9][a-z0-9-]{1,62}$` and becomes part of the
+        published redirect URI, so it is immutable afterwards. The literal `providers` is reserved
+        because the public login router matches that segment before it treats one as a provider
+        name; a provider stored under it would be permanently unreachable, so the name is refused
+        with 400 `oidc_provider_invalid` instead. `scopes` must include `openid`; the
+        stored list is deduplicated with `openid` first, which keeps what an operator reads in the
+        console identical to what the IdP receives. `issuer` must be an absolute https URL and must
+        equal the id_token `iss` claim. `redirectUri` must be an absolute https URL inside one of
+        the server's configured allowed bases, which bounds where an assertion code can be sent
+        even by a compromised administrator. `idTokenAlgs` must be a subset of RS256/384/512,
+        PS256/384/512, ES256/384/512 or EdDSA and defaults to RS256. `defaultRole` must be `admin`
+        or `user`. Endpoints left empty are resolved from discovery at login time. `displayName`
+        defaults to `name` and `usernameClaim` defaults to `preferred_username`. The boolean
+        toggles default to `authoritativeRoles=true`, `autoCreateUsers=true`, `fetchUserinfo=false`,
+        `publicListed=true` and `enabled=true`.
+
+        `clientSecret` is write-only. It is sealed with AES-256-GCM before the row is written, the
+        plaintext is dropped as soon as the request value goes out of scope, and no read API ever
+        returns it: responses carry `hasSecret` instead. Omit it entirely for a public client that
+        authenticates with PKCE alone. There is no reveal endpoint for it, unlike
+        `POST /api/v1/tokens/{tokenId}/reveal`; a lost secret has to be re-entered. Creation fails
+        closed with `secret_storage_unavailable` when no encryption key is configured.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderCreateRequest'}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderEnvelope'}}}}
+        '400': {description: 'oidc_provider_invalid, oidc_role_mapping_invalid, idempotency_key_required or invalid JSON'}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '409': {description: 'conflict (the provider name is already taken), idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+  /api/v1/sso/providers/{providerId}:
+    parameters: [{name: providerId, in: path, required: true, schema: {type: string}, description: Opaque provider ID. The login routes address a provider by name instead.}]
+    get:
+      summary: Read one OIDC identity provider
+      description: Administrator-only. The client secret is not part of the response; `hasSecret` reports whether one is stored.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Provider, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: oidc_provider_not_found}
+        '503': {description: identity_services_unavailable}
+    patch:
+      summary: Partially update one OIDC identity provider
+      description: |
+        Administrator-only and audited with the changed field names plus the idempotency key.
+        Values are deliberately omitted from the audit row, which removes any chance of recording a
+        secret. `PUT` is accepted with the same body and the same semantics. Requires
+        `Idempotency-Key`.
+
+        Every field is optional and an omitted field keeps the stored value instead of switching it
+        off. `name` is immutable because it is part of the published callback URL: supplying a
+        different one answers 400 `oidc_provider_invalid`, while omitting it or repeating the
+        stored value is fine. The reserved literal `providers` is refused here too. An empty or omitted `clientSecret` keeps the stored secret and
+        supplying one reseals it, which requires the encryption key. The merged result is
+        revalidated as a whole before anything is written.
+
+        Disabling the last enabled provider is refused with `oidc_provider_in_use` when at least
+        one account has no other credential, because those accounts would lose every way in.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderUpdateRequest'}}}}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderEnvelope'}}}}
+        '400': {description: 'oidc_provider_invalid, oidc_role_mapping_invalid, idempotency_key_required or invalid JSON'}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: oidc_provider_not_found}
+        '409': {description: 'oidc_provider_in_use, idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
+    delete:
+      summary: Delete one OIDC identity provider
+      description: |
+        Administrator-only and audited. Requires `Idempotency-Key`. Refused with
+        `oidc_provider_in_use` while the provider is the last enabled one and at least one account
+        has no other credential.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: 'Deleted; data carries deleted and id'}
+        '400': {description: idempotency_key_required}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: oidc_provider_not_found}
+        '405': {description: Method not allowed}
+        '409': {description: 'oidc_provider_in_use, idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable}
+  /api/v1/sso/providers/{providerId}/test:
+    parameters: [{name: providerId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Run discovery and a JWKS retrieval against the live IdP
+      description: |
+        Administrator-only connectivity check. Drops any cached metadata first so the report
+        describes this run rather than a previous one, resolves the endpoints, then probes the
+        signing keys. It returns `discoveryOk`, `jwksOk`, the resolved `algorithms` and the
+        resolved `endpoints` map (`authorization`, `token`, `jwks` and optionally `userinfo`), plus
+        an `error` code when a step failed. A connectivity failure is reported inside the 200 body
+        rather than as an HTTP error, because surfacing that failure is the whole point of the
+        call.
+
+        The IdP's own error text is attacker-influenced and is never echoed, so only stable codes
+        and booleans leave the server, and only the booleans are audited. No secret is returned.
+        The call changes no configuration but is still treated as a mutation and requires
+        `Idempotency-Key`, because it produces an outbound request an operator must be able to
+        account for.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: Connectivity report, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderTestEnvelope'}}}}
+        '400': {description: idempotency_key_required}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: oidc_provider_not_found}
+        '405': {description: Method not allowed}
+        '409': {description: 'idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable or secret_storage_unavailable}
   /api/v1/users:
     get:
       summary: List ordinary child accounts
@@ -51,10 +611,20 @@ paths:
   /api/v1/users/{userId}:
     parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
     patch:
-      summary: Enable or disable an ordinary account
+      summary: Toggle an ordinary account's disabled flag or its per-account MFA requirement
+      description: |
+        Administrator-only. Accepts `disabled`, `mfaRequired`, or both; at least one must be
+        present, because a body that changes nothing is a client bug rather than a no-op to accept
+        silently. Each field is a pointer on the wire, so an explicit `false` is distinguishable
+        from an omitted field. Unknown fields are rejected.
+
+        `mfaRequired` is a per-account floor rather than a suggestion: it keeps being enforced even
+        when the global `mfaMode` is `disabled` or `optional`. Setting it on an account that has no
+        second factor yet means that account cannot complete a login until it enrolls, which is the
+        intended way to force enrollment. No `Idempotency-Key` is required for this endpoint.
       security: [{ bearerAuth: [] }]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UserStatusRequest'}}}}
-      responses: {'200': {description: Updated}, '400': {description: Invalid request}, '403': {description: Administrator account is protected}, '404': {description: Not found}, '409': {description: Account is deleted}}
+      responses: {'200': {description: 'Updated account, including mfaRequired and authSource', content: {application/json: {schema: {$ref: '#/components/schemas/UserEnvelope'}}}}, '400': {description: 'Invalid request, or neither disabled nor mfaRequired was supplied'}, '401': {description: Unauthenticated}, '403': {description: Administrator account is protected or administrator required}, '404': {description: Not found}, '409': {description: Account is deleted}}
     delete:
       summary: Logically delete an ordinary account while retaining all related resources
       security: [{ bearerAuth: [] }]
@@ -71,6 +641,127 @@ paths:
       summary: Restore a logically deleted ordinary account
       security: [{ bearerAuth: [] }]
       responses: {'200': {description: Restored}, '403': {description: Administrator account is protected}, '404': {description: Not found}}
+  /api/v1/users/{userId}/devices:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: List another account's active trusted devices
+      description: |
+        Administrator-only. The account is always taken from the path and never from a request
+        body, so an administrator cannot be tricked into acting on an account the URL does not
+        name.
+
+        `current` is false on every row: the administrator is not the subject of the request, so
+        none of these devices belongs to this session. The list is bounded by the
+        `maxTrustedDevices` policy, so one page is always complete and `nextCursor` is always the
+        empty string. Device tokens and their hashes are never returned.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: One complete page of devices, content: {application/json: {schema: {$ref: '#/components/schemas/DevicePageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/users/{userId}/devices/{deviceId}:
+    parameters:
+      - {name: userId, in: path, required: true, schema: {type: string}}
+      - {name: deviceId, in: path, required: true, schema: {type: string}}
+    delete:
+      summary: Untrust one of another account's devices
+      description: |
+        Administrator-only incident-response action for a lost laptop. Audited with the owning
+        account. Revoking an already revoked device succeeds, so the action is safe to retry, but
+        `Idempotency-Key` is still required because this is an administrative mutation.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: 'Revoked; data carries revoked and id'}
+        '400': {description: idempotency_key_required}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: device_not_found}
+        '405': {description: Method not allowed}
+        '409': {description: 'idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable}
+  /api/v1/users/{userId}/mfa:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: Read another account's second-factor status
+      description: |
+        Administrator-only. Returns only `status` (`none`, `pending` or `enabled`) and
+        `remainingRecoveryCodes`. The shared secret, the codes themselves and the enrollment
+        timestamps are never exposed for somebody else's account.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: MFA summary, content: {application/json: {schema: {$ref: '#/components/schemas/AdminMFAStatusEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable}
+  /api/v1/users/{userId}/mfa/reset:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    post:
+      summary: Clear another account's second factor so it can re-enroll
+      description: |
+        Administrator-only lockout recovery for a user who lost their authenticator. Deliberately
+        destructive: it deletes the enrollment, invalidates every recovery code and revokes every
+        device that was trusted under the removed factor, because each of those devices was
+        trusted on the strength of a factor that no longer exists. The account must re-enroll,
+        which is the only way to be sure the person re-enrolling is the account owner.
+
+        Succeeds even when the account had no enrollment, so the call is safe to retry, but
+        `Idempotency-Key` is still required because this is an administrative mutation. Audited
+        with the number of devices revoked.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: 'Reset; data carries reset and userId'}
+        '400': {description: idempotency_key_required}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: Not found}
+        '405': {description: Method not allowed}
+        '409': {description: 'idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable}
+  /api/v1/users/{userId}/identities:
+    parameters: [{name: userId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: List another account's linked external identities
+      description: |
+        Administrator-only. At most one link per provider, so one page is always complete and
+        `nextCursor` is the empty string. `subject` is included because unlinking the wrong row is
+        unrecoverable without it, and a subject is not a credential.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: One complete page of identities, content: {application/json: {schema: {$ref: '#/components/schemas/IdentityPageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '405': {description: Method not allowed}
+        '503': {description: identity_services_unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/users/{userId}/identities/{identityId}:
+    parameters:
+      - {name: userId, in: path, required: true, schema: {type: string}}
+      - {name: identityId, in: path, required: true, schema: {type: string}}
+    delete:
+      summary: Unlink one external identity from another account
+      description: |
+        Administrator-only and audited with the owning account and the fact that an administrator
+        performed it. Refused with `identity_required_for_login` when the account is passwordless
+        and this is its only credential, which is what stops an administrator from locking a
+        colleague out by accident. Requires `Idempotency-Key`.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: 'Unlinked; data carries unlinked and id'}
+        '400': {description: idempotency_key_required}
+        '401': {description: Unauthenticated}
+        '403': {description: Administrator required}
+        '404': {description: identity_not_found or account_not_found}
+        '405': {description: Method not allowed}
+        '409': {description: 'identity_required_for_login, idempotency_key_conflict or idempotency_in_progress'}
+        '500': {description: internal_error}
+        '503': {description: identity_services_unavailable}
   /api/v1/dashboard/summary:
     get:
       summary: Read resource counts and recent events within the current principal's scope
@@ -667,10 +1358,503 @@ components:
     TokenOwnerFilter: {name: owner, in: query, description: Owner user ID; admin-only when it differs from the current user, schema: {type: string}}
   schemas:
     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}
-    LoginRequest: {type: object, required: [username, password], properties: {username: {type: string}, password: {type: string, format: password}}}
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      description: Password login attempt. Unknown fields are rejected rather than ignored. The body is capped at 1 MiB.
+      properties:
+        username: {type: string, description: 'Trimmed and lower-cased for the throttle bucket, so case variants cannot multiply the brute-force budget.'}
+        password: {type: string, format: password, description: 'Write-only. Cleared from memory as soon as the credential check finishes, never placed in a challenge payload, never logged and never echoed back.'}
+        trustDevice: {type: boolean, description: Ask for a long-lived trusted-device token on success. Honoured only while the policy allows the bypass; ignored when device trust is disabled.}
     PasswordChangeRequest: {type: object, additionalProperties: false, required: [currentPassword, newPassword], properties: {currentPassword: {type: string, format: password}, newPassword: {type: string, format: password, minLength: 12, maxLength: 128}}}
     UserCreateRequest: {type: object, additionalProperties: false, required: [username], properties: {username: {type: string, minLength: 3, maxLength: 64, pattern: '^[A-Za-z0-9._-]+$'}}}
-    UserStatusRequest: {type: object, additionalProperties: false, required: [disabled], properties: {disabled: {type: boolean}}}
+    UserStatusRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Administrator-facing account toggles. At least one field must be present; a body that changes nothing is rejected with 400 rather than silently accepted.
+      properties:
+        disabled: {type: boolean, description: Logically disables or re-enables the account. A disabled account cannot log in and its bearer tokens stop validating.}
+        mfaRequired: {type: boolean, description: Per-account second-factor requirement. It is a floor rather than a suggestion and keeps being enforced even when the global mfaMode is disabled or optional. Setting it on an account with no enrollment blocks that account's next login until it enrolls.}
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, username, role, disabled, createdAt, updatedAt, mfaRequired, authSource]
+      description: The only projection of an account row that may reach a response. The password hash and every identity secret stay out of it by construction.
+      properties:
+        id: {type: string}
+        username: {type: string}
+        role: {type: string, enum: [admin, user]}
+        disabled: {type: boolean}
+        deletedAt: {type: string, format: date-time, nullable: true}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        mfaRequired: {type: boolean, description: Per-account second-factor override}
+        authSource: {type: string, enum: [local, oidc, mixed], description: 'Where the primary credential comes from. local is a username/password account, oidc is provisioned by an identity provider, and mixed is a local account that also has at least one linked external identity.'}
+    UserEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/User'}}
+    LoginSuccess:
+      type: object
+      additionalProperties: false
+      required: [token, user, deviceTrusted]
+      description: Authenticated login outcome. A newly trusted device is delivered as an HttpOnly Set-Cookie on the same response rather than in the body, so a script-injection bug in the console cannot read the long-lived credential.
+      properties:
+        token: {type: string, readOnly: true, description: 'Opaque console bearer token, returned once. Only its hash is stored and there is no reveal endpoint for it.'}
+        user: {$ref: '#/components/schemas/User'}
+        deviceTrusted: {type: boolean, description: 'True when this request is covered by a trusted device, either one that already existed or one issued now.'}
+        recoveryCodesExhausted: {type: boolean, description: Present and true only when a recovery-code login just consumed the last remaining bypass code.}
+    LoginSuccessEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/LoginSuccess'}}
+    MFAChallenge:
+      type: object
+      additionalProperties: false
+      required: [mfaRequired, challengeId, methods, expiresAt]
+      description: Returned with HTTP 200 instead of a session when the account still owes a second factor. The presence of `mfaRequired` is what distinguishes this shape from an authenticated login.
+      properties:
+        mfaRequired: {type: boolean, enum: [true]}
+        challengeId: {type: string, description: 'Single-use challenge identifier. It is a bearer secret for the remainder of the login, so it is never written to the audit log.'}
+        methods: {type: array, minItems: 1, items: {type: string, enum: [totp, recovery]}, description: Always contains totp. recovery is added only when the account already has an enabled second factor.}
+        expiresAt: {type: string, format: date-time, description: RFC 3339 UTC deadline of the challenge window}
+    MFAChallengeEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/MFAChallenge'}}
+    MFAVerifyRequest:
+      type: object
+      additionalProperties: false
+      required: [challengeId, code]
+      properties:
+        challengeId: {type: string, description: Value returned by the login or OIDC callback step}
+        code: {type: string, format: password, description: 'Write-only. One current TOTP code or one single-use recovery code. Cleared from memory as soon as the request goes out of scope and never logged.'}
+        trustDevice: {type: boolean, description: Ask for a long-lived trusted-device token on success}
+    MFAEnrollRequest:
+      type: object
+      additionalProperties: false
+      description: The whole body may be omitted by a passwordless SSO-only account, which has no password to re-prove.
+      properties:
+        currentPassword: {type: string, format: password, description: 'Write-only and never stored. Required for an account that has a local password, so a hijacked session cannot be made durable by enrolling an attacker authenticator. Cleared as soon as the request goes out of scope.'}
+    MFACodeRequest:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: {type: string, format: password, description: 'Write-only. One current TOTP code, or a recovery code where the operation accepts one. Cleared as soon as the request goes out of scope and never logged.'}
+    MFAEnrollment:
+      type: object
+      additionalProperties: false
+      required: [secret, otpauthUrl, recoveryCodes, expiresAt]
+      description: |
+        Returned exactly once, at enrollment time, with `Cache-Control: no-store`.
+
+        There is no reveal endpoint for any of these values, unlike
+        `POST /api/v1/tokens/{tokenId}/reveal`. The shared secret is sealed with AES-256-GCM before
+        it reaches storage and the recovery codes are stored as one-way hashes, so neither can be
+        read back by an administrator, by a database dump or by a later API call. Losing them means
+        re-enrolling, or asking an administrator for `POST /api/v1/users/{userId}/mfa/reset`.
+      properties:
+        secret: {type: string, readOnly: true, description: 'Base32 TOTP shared secret. Treat it as a credential: it is returned once and is never re-readable.'}
+        otpauthUrl: {type: string, readOnly: true, description: 'otpauth:// URI for QR scanning. It embeds the same one-time secret, so it must be handled as a secret too.'}
+        recoveryCodes: {type: array, readOnly: true, items: {type: string, format: password}, description: 'Single-use bypass codes, returned once. Only one-way hashes are stored, so they are never re-readable. Regenerating replaces the whole set.'}
+        expiresAt: {type: string, format: date-time, description: RFC 3339 UTC deadline for confirming this pending enrollment}
+    MFAEnrollmentEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/MFAEnrollment'}}
+    MFAStatus:
+      type: object
+      additionalProperties: false
+      required: [status, remainingRecoveryCodes, policy]
+      description: Self-service second-factor status. Never carries the shared secret or any code.
+      properties:
+        status: {type: string, enum: [none, pending, enabled], description: 'pending means an enrollment exists but was never confirmed with a live code, so it does not yet satisfy the policy.'}
+        enabledAt: {type: string, format: date-time, nullable: true}
+        lastUsedAt: {type: string, format: date-time, nullable: true}
+        remainingRecoveryCodes: {type: integer, minimum: 0, description: A count only. The codes themselves are stored as one-way hashes and are never re-readable.}
+        policy: {$ref: '#/components/schemas/EffectiveMFAPolicy'}
+    EffectiveMFAPolicy:
+      type: object
+      additionalProperties: false
+      required: [mode, required]
+      properties:
+        mode: {type: string, enum: [disabled, optional, required], description: The global operator setting}
+        required: {type: boolean, description: 'The effective decision for this account. True when the global mode is required, when it is optional and a factor is enabled, or when the account carries the per-account mfaRequired override.'}
+    MFAStatusEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/MFAStatus'}}
+    AdminMFAStatus:
+      type: object
+      additionalProperties: false
+      required: [status, remainingRecoveryCodes]
+      description: "Administrator view of somebody else's second factor. Deliberately narrower than the self-service status: no timestamps and no policy, because neither is needed to decide whether a reset is warranted."
+      properties:
+        status: {type: string, enum: [none, pending, enabled]}
+        remainingRecoveryCodes: {type: integer, minimum: 0, description: A count only; the codes are never re-readable}
+    AdminMFAStatusEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/AdminMFAStatus'}}
+    RecoveryCodes:
+      type: object
+      additionalProperties: false
+      required: [recoveryCodes]
+      description: "Returned exactly once with `Cache-Control: no-store`. Every previously issued code is invalidated by the same call. There is no reveal endpoint for recovery codes."
+      properties:
+        recoveryCodes: {type: array, readOnly: true, items: {type: string, format: password}, description: 'Replacement plaintext bypass codes. Only one-way hashes are stored, so these values can never be read back.'}
+    RecoveryCodesEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/RecoveryCodes'}}
+    Device:
+      type: object
+      additionalProperties: false
+      required: [id, name, userAgent, ip, trustedAt, expiresAt, current]
+      description: One trusted device. The device token and its SHA-256 digest are never part of this view, and no API can read the token back after the login that issued it.
+      properties:
+        id: {type: string}
+        name: {type: string, maxLength: 191, description: Operator-set label. Empty until PATCH sets one.}
+        userAgent: {type: string, description: User-Agent captured when the device was trusted}
+        ip: {type: string, description: Client address captured when the device was trusted}
+        trustedAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time, description: 'The cookie lifetime is derived from this value, so a browser credential can never outlive the row that authorizes it.'}
+        lastSeenAt: {type: string, format: date-time, nullable: true, description: 'Refreshed at most once per touch-throttle interval, so a busy console does not turn every request into a write.'}
+        current: {type: boolean, description: 'True only on the self-service list, for the device that presented the trusted-device cookie on this request. Always false on the administrator list, where the caller is not the subject.'}
+    DevicePage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      description: The trusted-device list is bounded by the maxTrustedDevices policy, so one page is always complete. `nextCursor` is always the empty string and `hasMore` is always false; the envelope exists so callers can treat every list uniformly.
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Device'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    DevicePageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/DevicePage'}}
+    DeviceRenameRequest:
+      type: object
+      additionalProperties: false
+      description: A body is required, but `name` itself may be empty to clear the label.
+      properties:
+        name: {type: string, maxLength: 191, description: 'Trimmed, then truncated to 191 characters before storage. A longer value is shortened rather than rejected. An empty value clears the label.'}
+    Identity:
+      type: object
+      additionalProperties: false
+      required: [id, providerId, providerName, subject, username, email, displayName, linkedAt]
+      description: One linked external identity. Carries no credential of any kind.
+      properties:
+        id: {type: string}
+        providerId: {type: string}
+        providerName: {type: string, description: Resolved server-side so the console does not have to join providers client-side}
+        subject: {type: string, description: IdP-side subject identifier. It is not a credential and is included because unlinking the wrong row is unrecoverable without it.}
+        username: {type: string, description: The local account username; not stored on the link row}
+        email: {type: string}
+        displayName: {type: string}
+        linkedAt: {type: string, format: date-time}
+        lastLoginAt: {type: string, format: date-time, nullable: true}
+    IdentityPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      description: At most one link per provider, so one page is always complete. `nextCursor` is always the empty string and `hasMore` is always false.
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Identity'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    IdentityPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/IdentityPage'}}
+    PublicOIDCProvider:
+      type: object
+      additionalProperties: false
+      required: [id, name, displayName]
+      description: The only provider fields an unauthenticated caller may see. Deliberately excludes the issuer, client id, endpoints and every toggle.
+      properties:
+        id: {type: string}
+        name: {type: string, description: Provider slug used to build the authorize and callback URLs}
+        displayName: {type: string, description: Label for the login-page button}
+    PublicOIDCProviderList:
+      type: object
+      required: [items]
+      description: A bare list with no cursor. The set of enabled and publicly listed providers is small and always complete.
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/PublicOIDCProvider'}}
+    PublicOIDCProviderListEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/PublicOIDCProviderList'}}
+    OIDCTicketExchangeRequest:
+      type: object
+      additionalProperties: false
+      required: [ticket]
+      properties:
+        ticket: {type: string, format: password, description: 'Write-only single-use value from the callback redirect. It is a bearer secret: it is never written to the audit log, never echoed back, and is consumed before the session is issued.'}
+        trustDevice: {type: boolean, description: Ask for a long-lived trusted-device token on success}
+    AuthPolicyUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [mfaMode, deviceTrustEnabled, deviceTrustTtlSeconds, allowTrustedDeviceBypass, maxTrustedDevices, sessionTokenTtlSeconds]
+      description: Full replacement of the authentication policy. Every field is required because an omitted numeric would fall outside the enforced bounds and be rejected anyway.
+      properties:
+        mfaMode: {type: string, enum: [disabled, optional, required], description: Global second-factor enforcement. optional means an account that has enrolled must use it and one that has not may skip it.}
+        deviceTrustEnabled: {type: boolean, description: 'Master switch for trusted devices. Turning it off revokes every bypass immediately on every node, without a token or session change.'}
+        deviceTrustTtlSeconds: {type: integer, format: int64, minimum: 3600, maximum: 7776000, description: How long a browser stays trusted. One hour to ninety days.}
+        allowTrustedDeviceBypass: {type: boolean, description: 'Lets a trusted device stand in for the second factor. Requires deviceTrustEnabled, because storing a bypass while trust is off would silently grant it the moment trust is re-enabled.'}
+        maxTrustedDevices: {type: integer, minimum: 1, maximum: 100, description: Per-account cap. Issuing a device over the cap revokes the oldest active one.}
+        sessionTokenTtlSeconds: {type: integer, format: int64, minimum: 0, description: Console bearer-token lifetime in seconds. 0 keeps the historical non-expiring behaviour.}
+    AuthPolicy:
+      type: object
+      additionalProperties: false
+      required: [mfaMode, deviceTrustEnabled, deviceTrustTtlSeconds, allowTrustedDeviceBypass, maxTrustedDevices, sessionTokenTtlSeconds, updatedAt]
+      description: The authoritative `auth_settings` row. Process configuration only seeds it the first time it is read.
+      properties:
+        mfaMode: {type: string, enum: [disabled, optional, required]}
+        deviceTrustEnabled: {type: boolean}
+        deviceTrustTtlSeconds: {type: integer, format: int64}
+        allowTrustedDeviceBypass: {type: boolean, description: 'Reported as the conjunction of the stored flag and deviceTrustEnabled, so a bypass can never be read back as active while trust is off.'}
+        maxTrustedDevices: {type: integer}
+        sessionTokenTtlSeconds: {type: integer, format: int64}
+        updatedAt: {type: string, format: date-time, description: 'RFC 3339 UTC timestamp, or the empty string while the row has never been written.'}
+    AuthPolicyEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/AuthPolicy'}}
+    RoleMappingInput:
+      type: object
+      additionalProperties: false
+      required: [claim, role]
+      description: One ordered claim-to-role rule. The first match wins.
+      properties:
+        claim: {type: string, maxLength: 64, description: Claim name to read from the id_token or the userinfo document}
+        value: {type: string, description: Value to compare against. May be empty where the rule only tests for the claim being present.}
+        role: {type: string, enum: [admin, user], description: Lower-cased before storage}
+    RoleMapping:
+      type: object
+      additionalProperties: false
+      required: [claim, value, role]
+      description: |
+        Stored role-mapping rule as it is rendered back by a read API.
+
+        The keys are identical to `RoleMappingInput`, so a rule read from the API can be edited
+        and posted back unchanged. Every field is always present on a read: `value` is the empty
+        string for a presence-only rule rather than being omitted.
+      properties:
+        claim: {type: string}
+        value: {type: string}
+        role: {type: string, enum: [admin, user]}
+    OIDCProviderCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, issuer, clientId, scopes, redirectUri, defaultRole]
+      properties:
+        name: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$', description: URL-safe slug. It becomes part of the published redirect URI and is immutable after creation.}
+        displayName: {type: string, maxLength: 191, description: Defaults to name}
+        issuer: {type: string, format: uri, description: Absolute https URL. Must equal the id_token iss claim.}
+        clientId: {type: string, maxLength: 255, description: Public identifier; not a secret}
+        clientSecret: {type: string, format: password, writeOnly: true, description: 'Write-only, with no length limit of its own beyond the 1 MiB request-body cap. Sealed with AES-256-GCM before it reaches storage and never rendered back by any read API, which reports hasSecret instead. There is no reveal endpoint for it. Omit entirely for a public client that authenticates with PKCE alone.'}
+        scopes: {type: array, minItems: 1, items: {type: string}, description: 'Must include openid. Stored deduplicated with openid first, which keeps what an operator reads identical to what the IdP receives.'}
+        redirectUri: {type: string, format: uri, description: Absolute https URL inside one of the server's configured allowed bases. This is what bounds where an assertion code can be sent even by a compromised administrator.}
+        authorizationEndpoint: {type: string, format: uri, description: Optional absolute http(s) URL. Resolved from discovery when empty.}
+        tokenEndpoint: {type: string, format: uri, description: Optional absolute http(s) URL. Resolved from discovery when empty.}
+        userinfoEndpoint: {type: string, format: uri, description: Optional absolute http(s) URL. Resolved from discovery when empty.}
+        jwksUri: {type: string, format: uri, description: Optional absolute http(s) URL. Resolved from discovery when empty.}
+        idTokenAlgs: {type: array, items: {type: string, enum: [RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512, EdDSA]}, description: 'Accepted id_token signature algorithms. Defaults to RS256. None and the HS* family are rejected, so a token signed with the client secret can never be accepted.'}
+        usernameClaim: {type: string, maxLength: 64, description: Claim that resolves to the local username. Defaults to preferred_username.}
+        roleMappings: {type: array, items: {$ref: '#/components/schemas/RoleMappingInput'}, description: Ordered claim-to-role rules. The first match wins.}
+        defaultRole: {type: string, enum: [admin, user], description: 'Role for a just-in-time provisioned account when no mapping matches. Required, because an empty value is neither.'}
+        authoritativeRoles: {type: boolean, default: true, description: When true the IdP may change an existing account's role on login}
+        autoCreateUsers: {type: boolean, default: true, description: When true an unknown subject is provisioned on first login}
+        fetchUserinfo: {type: boolean, default: false, description: When true the userinfo endpoint is called in addition to verifying the id_token}
+        publicListed: {type: boolean, default: true, description: When true the provider appears in the unauthenticated listing that renders the login-page buttons}
+        enabled: {type: boolean, default: true}
+    OIDCProviderUpdateRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial update. Every field is optional and an omitted field keeps the stored value rather
+        than switching it off, which is why the toggles are nullable. The merged result is
+        revalidated as a whole before anything is written. `PUT` accepts the same body.
+      properties:
+        name: {type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$', description: Immutable. Omit it or repeat the stored value; supplying a different one is rejected with oidc_provider_invalid.}
+        displayName: {type: string, maxLength: 191}
+        issuer: {type: string, format: uri}
+        clientId: {type: string, maxLength: 255}
+        clientSecret: {type: string, format: password, writeOnly: true, description: 'Write-only. Empty or omitted keeps the stored secret. Supplying one reseals it and requires the encryption key. Never rendered back by any read API and there is no reveal endpoint for it.'}
+        scopes: {type: array, minItems: 1, items: {type: string}, description: Must include openid}
+        redirectUri: {type: string, format: uri}
+        authorizationEndpoint: {type: string, format: uri}
+        tokenEndpoint: {type: string, format: uri}
+        userinfoEndpoint: {type: string, format: uri}
+        jwksUri: {type: string, format: uri}
+        idTokenAlgs: {type: array, items: {type: string, enum: [RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512, EdDSA]}}
+        usernameClaim: {type: string, maxLength: 64}
+        roleMappings: {type: array, items: {$ref: '#/components/schemas/RoleMappingInput'}, description: Replaces the whole ordered list rather than merging into it}
+        defaultRole: {type: string, enum: [admin, user]}
+        authoritativeRoles: {type: boolean}
+        autoCreateUsers: {type: boolean}
+        fetchUserinfo: {type: boolean}
+        publicListed: {type: boolean}
+        enabled: {type: boolean, description: Turning this off on the last enabled provider is refused with oidc_provider_in_use while any account has no other credential}
+    OIDCProvider:
+      type: object
+      additionalProperties: false
+      required: [id, name, displayName, issuer, clientId, scopes, redirectUri, authorizationEndpoint, tokenEndpoint, userinfoEndpoint, jwksUri, idTokenAlgs, usernameClaim, roleMappings, defaultRole, authoritativeRoles, autoCreateUsers, fetchUserinfo, publicListed, enabled, hasSecret, createdAt, updatedAt]
+      description: |
+        Full provider configuration as an administrator sees it.
+
+        The client secret is not part of this view in any form: not the plaintext, not the
+        ciphertext, not the nonce, not the key id and not the version. `hasSecret` is the only
+        signal, and there is no reveal endpoint for an SSO client secret. A lost secret must be
+        re-entered through `PATCH /api/v1/sso/providers/{providerId}`.
+      properties:
+        id: {type: string}
+        name: {type: string, description: Immutable slug used by the authorize and callback routes}
+        displayName: {type: string}
+        issuer: {type: string, format: uri}
+        clientId: {type: string}
+        scopes: {type: array, items: {type: string}, description: 'Stored order, with openid first'}
+        redirectUri: {type: string, format: uri}
+        authorizationEndpoint: {type: string, format: uri, description: Empty when it is resolved from discovery at login time}
+        tokenEndpoint: {type: string, format: uri, description: Empty when it is resolved from discovery at login time}
+        userinfoEndpoint: {type: string, format: uri, description: Empty when it is resolved from discovery at login time}
+        jwksUri: {type: string, format: uri, description: Empty when it is resolved from discovery at login time}
+        idTokenAlgs: {type: array, items: {type: string}, description: 'Canonical spellings, never empty'}
+        usernameClaim: {type: string}
+        roleMappings: {type: array, items: {$ref: '#/components/schemas/RoleMapping'}, description: Ordered rules; the first match wins}
+        defaultRole: {type: string, enum: [admin, user]}
+        authoritativeRoles: {type: boolean}
+        autoCreateUsers: {type: boolean}
+        fetchUserinfo: {type: boolean}
+        publicListed: {type: boolean}
+        enabled: {type: boolean}
+        hasSecret: {type: boolean, description: True when an encrypted client secret is stored. The secret itself is never returned.}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    OIDCProviderEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/OIDCProvider'}}
+    OIDCProviderPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/OIDCProvider'}}
+        nextCursor: {type: string, description: Opaque. Pass it back as the cursor query parameter to read the next page.}
+        hasMore: {type: boolean}
+    OIDCProviderPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/OIDCProviderPage'}}
+    OIDCProviderTest:
+      type: object
+      additionalProperties: false
+      required: [discoveryOk, jwksOk, algorithms, endpoints, error]
+      description: |
+        Connectivity report. A failure is carried inside the 200 body rather than as an HTTP error,
+        because surfacing the failure is the point of the call.
+
+        The IdP's own error text is attacker-influenced and is never echoed; only the stable codes
+        below appear. No secret is returned.
+      properties:
+        discoveryOk: {type: boolean, description: True when the metadata document was retrieved and parsed}
+        jwksOk: {type: boolean, description: True when the signing keys were fetched. Only attempted after discovery succeeds.}
+        algorithms: {type: array, items: {type: string}, description: The stored allowlist in canonical spelling}
+        endpoints: {type: object, additionalProperties: {type: string}, description: 'Resolved endpoints keyed by authorization, token, jwks and optionally userinfo. Empty when discovery failed.'}
+        error: {type: string, enum: ['', oidc_discovery_failed, oidc_jwks_fetch_failed, oidc_relying_party_unavailable], description: Empty on success}
+    OIDCProviderTestEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/OIDCProviderTest'}}
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      description: |
+        The `data` payload of every error response. `code` and `msg` in the envelope carry the HTTP
+        status and its reason phrase, so clients must branch on `data.error` rather than on prose.
+
+        The enumeration below is the complete set of stable snake_case codes the identity surface
+        can produce. A handful of older branches still emit human-readable prose in the same field
+        (`not found`, `method not allowed`, `invalid JSON`, `admin role required`); clients should
+        treat an unlisted value as opaque and fall back to the HTTP status.
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code
+          enum:
+            - unauthenticated
+            - invalid_credentials
+            - login_throttled
+            - mfa_challenge_invalid
+            - mfa_attempts_exceeded
+            - mfa_code_invalid
+            - mfa_code_reused
+            - mfa_not_enrolled
+            - mfa_not_confirmed
+            - mfa_already_enabled
+            - mfa_required_by_policy
+            - current_password_required
+            - current_password_invalid
+            - device_trust_disabled
+            - device_not_found
+            - identity_not_found
+            - identity_required_for_login
+            - account_not_found
+            - oidc_state_invalid
+            - oidc_provider_error
+            - login_ticket_invalid
+            - oidc_user_not_provisioned
+            - oidc_provider_not_found
+            - oidc_provider_disabled
+            - oidc_provider_invalid
+            - oidc_provider_in_use
+            - oidc_discovery_failed
+            - oidc_jwks_fetch_failed
+            - oidc_token_exchange_failed
+            - oidc_upstream_error
+            - oidc_id_token_invalid
+            - oidc_unsupported_algorithm
+            - oidc_no_matching_key
+            - oidc_claim_missing
+            - oidc_role_mapping_invalid
+            - auth_policy_invalid
+            - username_invalid
+            - last_admin_protected
+            - admin_account_protected
+            - forbidden
+            - conflict
+            - not_found
+            - secret_storage_unavailable
+            - identity_services_unavailable
+            - idempotency_key_required
+            - idempotency_key_conflict
+            - idempotency_in_progress
+            - account_disabled
+            - internal_error
+    ApiErrorEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/ApiError'}}
     CredentialCreateRequest:
       type: object
       additionalProperties: false
