@@ -29,6 +29,8 @@ Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UD
 | Self-hosted control plane | Yes | Varies | Yes | No |
 | Built-in admin console | Yes | Rare | Rare | Yes |
 | Scoped service tokens | Yes | Rare | Varies | Managed |
+| Enterprise SSO (OIDC) | Yes | Rare | Rare | Managed |
+| MFA and trusted devices | Yes | Rare | Varies | Managed |
 | Browser SSH/SFTP | Yes | No | No | Varies |
 | Cluster relay and observability | Yes | Limited | Varies | Managed |
 
@@ -94,6 +96,9 @@ self-hosted control plane and explicit access policy rather than only a point-to
 **Control plane**
 
 - Vue 3 + Element Plus admin console with i18n, RBAC roles, scoped service tokens, Agent policy, cursor-paginated APIs, and a structured audit log.
+- OIDC single sign-on — authorization-code flow with PKCE (`S256`), discovery and JWKS caching, per-provider group-to-role mappings, and just-in-time provisioning. `alg=none` and every `HS*` are rejected unconditionally.
+- TOTP multi-factor authentication — `disabled` / `optional` / `required` policy modes plus a per-account override, one-time `tmrc-` recovery codes stored as SHA-256 digests, and a TOTP replay guard.
+- Revocable trusted devices — "remember this browser" with a bounded lifetime, a per-account cap, self-service and admin revocation, and a policy kill switch that invalidates every bypass on the next login.
 - Sensitive operations (token reveal, logical traceroute with internal details) require explicit confirmation headers and are audited.
 
 **Scale and availability**
@@ -104,6 +109,7 @@ self-hosted control plane and explicit access policy rather than only a point-to
 **Observability and diagnostics**
 
 - Prometheus metrics, `/health/live`, `/health/ready`, a bundled Grafana dashboard, alert and recording rules, and W3C `traceparent` propagation.
+- Identity metrics with bounded low-cardinality labels: console logins, second-factor verifications, OIDC relying-party stages, trusted devices, pending challenges, and blocked login buckets.
 - Logical traceroute across Client → Server → Agent → target, plus TCP/HTTP/UDP network probes.
 
 ## Architecture
@@ -292,12 +298,14 @@ Full index: [docs/README.md](docs/README.md).
 - [Agent guide](docs/en/user-guide/agent.md)
 - [Client guide](docs/en/user-guide/client.md)
 - [Server administration](docs/en/user-guide/server-admin.md)
+- [Single sign-on and MFA](docs/en/user-guide/sso-and-mfa.md)
 
 **User guides**
 
 - [Client usage](docs/user-guide/client.md) — forwards, SOCKS5, publishing, `proxy tcp`
 - [Agent usage](docs/user-guide/agent.md) — registration, connection pool, metadata allowlist
 - [Server admin console](docs/user-guide/server-admin.md) — Agents, routes, tokens, audit, WebSSH/SFTP, releases
+- [SSO and MFA](docs/user-guide/sso-and-mfa.md) — OIDC provider setup, role mapping, TOTP enrollment, recovery codes, trusted devices, auth policy
 - [Managed HTTP routes](docs/user-guide/managed-http-route.md) — explicit and wildcard domains, HTTPS
 - [HTTP proxy entry](docs/user-guide/http-proxy-entry.md) — browser/OS proxy without installing the client
 - [SSH over WebSocket](docs/user-guide/tcp-over-websocket-ssh.md) — `ProxyCommand` and `websocat`
@@ -372,11 +380,13 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 ## Security model
 
 - Passwords use Argon2id; service tokens are stored as hashes, with optional AES-256-GCM ciphertext kept only to satisfy an explicit admin reveal.
+- Recovery codes, trusted-device tokens, and login throttle buckets are stored one-way (SHA-256); OIDC client secrets, TOTP shared secrets, and challenge payloads are sealed with AES-256-GCM and fail closed with `503 secret_storage_unavailable` when `TUNNELMESH_TOKEN_ENCRYPTION_KEY` is absent.
+- id_token verification accepts only `RS*`, `PS*`, `ES*`, and `EdDSA`; `alg=none` and every `HS*` are rejected at configuration time and again at verification, with no override.
 - Token reveal requires `X-Token-Reveal-Confirm`, an `Idempotency-Key`, `acknowledgeRisk=true`, returns `Cache-Control: no-store`, and writes an audit record.
 - All authorization is enforced server-side; client-supplied owner, Agent, or role values are never trusted.
 - Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
 - Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
-- Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes.
+- Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes. Identity metric labels are a closed enumeration that excludes usernames, client IPs, provider ids, and device tokens.
 - Deliberately not implemented: ICMP, TUN/L2 VPN, P2P NAT traversal, and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path.
 
 ## Repository layout
@@ -386,7 +396,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 | `cmd/` | process entry points for the three binaries |
 | `internal/cli/` | flags, config loading, subcommands |
 | `internal/config/` | config model, defaults, precedence |
-| `internal/auth/` | users, tokens, Argon2id, RBAC, admin recovery |
+| `internal/auth/` | users, tokens, Argon2id, RBAC, admin recovery, OIDC relying party, TOTP MFA, recovery codes, trusted devices, auth policy |
 | `internal/storage/` | database access, DDL bootstrap, migrations, repositories |
 | `internal/registry/` | MySQL lease, etcd discovery, epoch fencing |
 | `internal/protocol/` | WebSocket frames, capability negotiation, stream state machine, UDP association, traceroute |

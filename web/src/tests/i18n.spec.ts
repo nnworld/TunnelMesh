@@ -72,6 +72,61 @@ describe('locale preferences', () => {
       expect(Object.keys(locale.credentials.types).sort()).toContainEqual('proxyBasic')
     }
   })
+
+  // The existing equality check reports two large arrays on failure; this one
+  // names the drift, so a key added to only one locale is obvious in CI output.
+  it('reports no missing or extra key path between the two locales', () => {
+    const zh = messageKeys(zhCN)
+    const en = messageKeys(enUS)
+    expect(zh.filter(key => !en.includes(key))).toEqual([])
+    expect(en.filter(key => !zh.includes(key))).toEqual([])
+    expect(zh).toHaveLength(en.length)
+  })
+
+  it('translates every SSO, MFA, device, and identity key in both locales', () => {
+    for (const locale of [zhCN, enUS]) {
+      for (const key of [
+        'trustDevice', 'ssoTitle', 'mfaTitle', 'mfaDescription', 'mfaCode', 'mfaHint', 'verify',
+        'backToPassword', 'throttled', 'throttledWait', 'recoveryExhausted', 'ticketInvalid',
+        'mfaErrorInvalid', 'mfaErrorExceeded', 'mfaErrorChallenge', 'mfaErrorNotEnrolled', 'mfaErrorReused',
+      ]) expect(Object.keys(locale.auth), key).toContainEqual(key)
+
+      for (const group of ['mfa', 'devices', 'identities']) expect(Object.keys(locale.security), group).toContainEqual(group)
+      for (const key of [
+        'statusNone', 'statusPending', 'statusEnabled', 'policyRequiredHint', 'remainingCodes', 'enroll', 'enable',
+        'disable', 'regenerate', 'enrollOtpauth', 'enrollSecret', 'copy', 'recoveryAck', 'recoveryTitle',
+        'requiredByPolicy', 'currentPasswordRequired', 'codeInvalid',
+      ]) expect(Object.keys(locale.security.mfa), key).toContainEqual(key)
+      for (const key of ['name', 'ip', 'userAgent', 'current', 'rename', 'revoke', 'notFound', 'empty']) {
+        expect(Object.keys(locale.security.devices), key).toContainEqual(key)
+      }
+      for (const key of ['provider', 'subject', 'account', 'unlink', 'empty', 'requiredForLogin', 'notFound']) {
+        expect(Object.keys(locale.security.identities), key).toContainEqual(key)
+      }
+
+      for (const key of [
+        'title', 'description', 'create', 'edit', 'name', 'issuer', 'clientId', 'clientSecret', 'secretStored',
+        'secretNotStored', 'secretKept', 'secretPlaceholderKeep', 'scopes', 'scopesRequired', 'redirectUri',
+        'idTokenAlgs', 'invalidAlgs', 'invalidName', 'invalidIssuer', 'invalidRedirectUri', 'invalidClientId',
+        'invalidMapping', 'usernameClaim', 'roleMappings', 'defaultRole', 'autoCreateUsers', 'publicListed',
+        'authoritativeRoles', 'enabled', 'test', 'testTitle', 'testDiscoveryOk', 'testJwksOk', 'testAlgorithms',
+        'testEndpoints', 'testOk', 'testFailed', 'delete', 'deleteConfirm', 'policyTitle', 'policyMfaMode',
+        'policyDeviceTrust', 'policyAllowBypass', 'policyDeviceTtl', 'policyMaxDevices', 'policySessionTtl',
+        'policySave', 'policyLoadFailed', 'policyUpdateFailed',
+      ]) expect(Object.keys(locale.sso), key).toContainEqual(key)
+
+      for (const key of ['mfaRequired', 'resetMFA', 'confirmResetMFA', 'mfaReset', 'mfaRequiredUpdated']) {
+        expect(Object.keys(locale.users), key).toContainEqual(key)
+      }
+      expect(Object.keys(locale.navigation)).toContainEqual('sso')
+      expect(Object.keys(locale.errors)).toContainEqual('secretStorageUnavailable')
+    }
+  })
+
+  it('interpolates the throttle countdown in both locales', () => {
+    expect(zhCN.auth.throttledWait).toContain('{seconds}')
+    expect(enUS.auth.throttledWait).toContain('{seconds}')
+  })
 })
 
 function messageKeys(value: unknown, prefix = ''): string[] {

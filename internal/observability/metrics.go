@@ -55,6 +55,12 @@ type Metrics struct {
 	proxyEntryTunnelDuration  *prometheus.HistogramVec
 	proxyEntryAuthFailures    *prometheus.CounterVec
 	proxyEntryACLDenied       *prometheus.CounterVec
+	authLoginTotal            *prometheus.CounterVec
+	authMFAVerifyTotal        *prometheus.CounterVec
+	authOIDCStepTotal         *prometheus.CounterVec
+	authTrustedDevices        *prometheus.GaugeVec
+	authPendingChallenges     *prometheus.GaugeVec
+	authLoginBlockedBuckets   *prometheus.GaugeVec
 	activeMu                  sync.Mutex
 	activeConnections         map[string]int
 	activeStreams             map[string]int
@@ -140,6 +146,28 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		proxyEntryACLDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tunnelmesh_proxy_entry_acl_denied_total", Help: "Total managed proxy requests denied by the source ACL.",
 		}, []string{"route"}),
+		// The identity families are labelled only by a closed set of normalized
+		// values. A username, IP, provider id, or challenge id would make the
+		// cardinality attacker-controlled and would leak account names into the
+		// metrics endpoint, which is readable without a management session.
+		authLoginTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_auth_login_total", Help: "Total management console login attempts by method and result.",
+		}, []string{"method", "result"}),
+		authMFAVerifyTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_auth_mfa_verify_total", Help: "Total second factor verifications by factor and result.",
+		}, []string{"method", "result"}),
+		authOIDCStepTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tunnelmesh_auth_oidc_step_total", Help: "Total OIDC relying party steps by stage and result.",
+		}, []string{"step", "result"}),
+		authTrustedDevices: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tunnelmesh_auth_trusted_devices", Help: "Current trusted devices across all accounts.",
+		}, nil),
+		authPendingChallenges: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tunnelmesh_auth_pending_challenges", Help: "Current unconsumed authentication challenges.",
+		}, nil),
+		authLoginBlockedBuckets: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tunnelmesh_auth_login_blocked_buckets", Help: "Current login throttle buckets in the blocked state.",
+		}, nil),
 		activeConnections:      make(map[string]int),
 		activeStreams:          make(map[string]int),
 		agentConnectionStates:  make(map[string]bool),
@@ -150,6 +178,9 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 	// one line per feature area and appending here keeps the proxy entry
 	// collectors reviewable as a unit.
 	reg.MustRegister(m.proxyEntryRequests, m.proxyEntryTunnels, m.proxyEntryTunnelDuration, m.proxyEntryAuthFailures, m.proxyEntryACLDenied)
+	// Registered as its own call so the identity families stay reviewable as a
+	// unit next to the bounded-label comment above.
+	reg.MustRegister(m.authLoginTotal, m.authMFAVerifyTotal, m.authOIDCStepTotal, m.authTrustedDevices, m.authPendingChallenges, m.authLoginBlockedBuckets)
 	return m
 }
 
@@ -468,4 +499,133 @@ func (m *Metrics) ObserveProxyEntryAuthFailure(route, reason string) {
 // CIDR allowlist.
 func (m *Metrics) ObserveProxyEntryACLDenied(route string) {
 	m.proxyEntryACLDenied.WithLabelValues(label(route)).Inc()
+}
+
+// NormalizeAuthLoginMethod keeps the login method label inside the documented
+// set. Anything else is reported as "unknown" so a new entry point is visible in
+// the metrics rather than silently folded into an existing one.
+func NormalizeAuthLoginMethod(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "password", "oidc":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// NormalizeAuthLoginResult maps a login outcome onto the documented result set.
+func NormalizeAuthLoginResult(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "success", "failure", "mfa_required", "throttled":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// NormalizeAuthMFAMethod keeps the second-factor label inside totp and recovery.
+func NormalizeAuthMFAMethod(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "totp", "recovery":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// NormalizeAuthMFAResult maps a verification outcome onto the documented set.
+// "invalid" covers a wrong code and an unusable challenge alike on purpose: the
+// distinction would identify which accounts have a live challenge pending.
+func NormalizeAuthMFAResult(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "success", "invalid", "expired", "attempts_exceeded":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// NormalizeAuthOIDCStep keeps the relying-party stage label inside the
+// documented set.
+func NormalizeAuthOIDCStep(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "discovery", "jwks", "token", "id_token", "provision":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// NormalizeAuthOIDCResult maps an OIDC step outcome onto ok or error.
+func NormalizeAuthOIDCResult(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ok", "error":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
+}
+
+// AuthLogin counts one management console login attempt.
+func (m *Metrics) AuthLogin(method, result string) {
+	if m == nil {
+		return
+	}
+	m.authLoginTotal.WithLabelValues(NormalizeAuthLoginMethod(method), NormalizeAuthLoginResult(result)).Inc()
+}
+
+// AuthMFAVerify counts one second-factor verification.
+func (m *Metrics) AuthMFAVerify(method, result string) {
+	if m == nil {
+		return
+	}
+	m.authMFAVerifyTotal.WithLabelValues(NormalizeAuthMFAMethod(method), NormalizeAuthMFAResult(result)).Inc()
+}
+
+// AuthOIDCStep counts one relying-party stage, which is what makes a partially
+// broken IdP configuration diagnosable: discovery succeeding while token
+// exchange fails points at the client credentials rather than the network.
+func (m *Metrics) AuthOIDCStep(step, result string) {
+	if m == nil {
+		return
+	}
+	m.authOIDCStepTotal.WithLabelValues(NormalizeAuthOIDCStep(step), NormalizeAuthOIDCResult(result)).Inc()
+}
+
+// SetAuthTrustedDevices records the current trusted-device population. A sudden
+// drop means a sweep or a mass revocation; a steady climb toward the per-account
+// cap means the cap is too low for the fleet.
+func (m *Metrics) SetAuthTrustedDevices(value float64) {
+	if m == nil {
+		return
+	}
+	m.authTrustedDevices.WithLabelValues().Set(nonNegative(value))
+}
+
+// SetAuthPendingChallenges records unconsumed login challenges. Growth without a
+// matching login rate indicates an abandoned or attacked login page.
+func (m *Metrics) SetAuthPendingChallenges(value float64) {
+	if m == nil {
+		return
+	}
+	m.authPendingChallenges.WithLabelValues().Set(nonNegative(value))
+}
+
+// SetAuthBlockedBuckets records how many username+IP buckets are currently
+// blocked by the login throttle. It is the earliest signal of a credential
+// stuffing attempt.
+func (m *Metrics) SetAuthBlockedBuckets(value float64) {
+	if m == nil {
+		return
+	}
+	m.authLoginBlockedBuckets.WithLabelValues().Set(nonNegative(value))
+}
+
+// nonNegative clamps a gauge sample. A negative count is a counting bug, and
+// publishing one would make a rate() expression over the series meaningless.
+func nonNegative(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

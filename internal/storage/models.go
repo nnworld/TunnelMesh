@@ -13,6 +13,183 @@ type User struct {
 	DeletedAt    *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// AuthSource records where the primary credential comes from. MFARequired
+	// is a per-account override that wins over the global policy.
+	AuthSource  AuthSource
+	MFARequired bool
+}
+
+// AuthSource identifies the credential origin of an account.
+type AuthSource string
+
+const (
+	// AuthSourceLocal is a username/password account created by an administrator
+	// or by the bootstrap flow.
+	AuthSourceLocal AuthSource = "local"
+	// AuthSourceOIDC is a just-in-time provisioned account that has no local
+	// password. Its PasswordHash is PasswordHashNone.
+	AuthSourceOIDC AuthSource = "oidc"
+	// AuthSourceMixed is a local account that also has at least one linked
+	// external identity, so both login paths work.
+	AuthSourceMixed AuthSource = "mixed"
+)
+
+// PasswordHashNone is stored for accounts that must never authenticate with a
+// local password. It is not a valid Argon2id PHC string, so verification always
+// fails without needing a nullable column that SQLite cannot add in place.
+const PasswordHashNone = "*"
+
+// MFAMode is the global second-factor enforcement policy.
+type MFAMode string
+
+const (
+	MFAModeDisabled MFAMode = "disabled"
+	MFAModeOptional MFAMode = "optional"
+	MFAModeRequired MFAMode = "required"
+)
+
+// MFAStatus distinguishes an unconfirmed enrollment from an active one. A
+// pending enrollment never satisfies an MFA requirement.
+type MFAStatus string
+
+const (
+	MFAStatusPending MFAStatus = "pending"
+	MFAStatusEnabled MFAStatus = "enabled"
+)
+
+// ChallengeKind identifies the purpose of a short-lived auth_challenges row.
+type ChallengeKind string
+
+const (
+	ChallengeKindLoginMFA    ChallengeKind = "login_mfa"
+	ChallengeKindOIDCState   ChallengeKind = "oidc_state"
+	ChallengeKindLoginTicket ChallengeKind = "login_ticket"
+)
+
+// AuthSettings is the runtime authentication policy. It is a singleton row that
+// an administrator owns; process configuration only seeds the first value.
+type AuthSettings struct {
+	MFAMode                  MFAMode
+	DeviceTrustEnabled       bool
+	DeviceTrustTTLSeconds    int64
+	AllowTrustedDeviceBypass bool
+	MaxTrustedDevices        int
+	SessionTokenTTLSeconds   int64
+	UpdatedAt                time.Time
+}
+
+// OIDCProvider is one configured identity provider. ClientSecretCiphertext and
+// ClientSecretNonce are base64-encoded AES-GCM values produced by the secret
+// store; the plaintext secret is never persisted or returned.
+type OIDCProvider struct {
+	ID                     string
+	Name                   string
+	DisplayName            string
+	Issuer                 string
+	ClientID               string
+	ClientSecretCiphertext string
+	ClientSecretNonce      string
+	ClientSecretKeyID      string
+	ClientSecretVersion    int
+	Scopes                 string
+	RedirectURI            string
+	AuthorizationEndpoint  string
+	TokenEndpoint          string
+	UserinfoEndpoint       string
+	JWKSURI                string
+	IDTokenAlgs            string
+	UsernameClaim          string
+	RoleMappings           string
+	DefaultRole            string
+	AuthoritativeRoles     bool
+	AutoCreateUsers        bool
+	FetchUserinfo          bool
+	PublicListed           bool
+	Enabled                bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// HasSecret reports whether a client secret is stored for this provider.
+func (p OIDCProvider) HasSecret() bool { return p.ClientSecretCiphertext != "" }
+
+// UserIdentity links one external subject to one local account.
+type UserIdentity struct {
+	ID          string
+	UserID      string
+	ProviderID  string
+	Subject     string
+	Email       string
+	DisplayName string
+	CreatedAt   time.Time
+	LastLoginAt *time.Time
+}
+
+// UserMFA holds the encrypted TOTP enrollment for one account.
+type UserMFA struct {
+	UserID           string
+	SecretCiphertext string
+	SecretNonce      string
+	SecretKeyID      string
+	SecretVersion    int
+	Status           MFAStatus
+	EnrolledAt       time.Time
+	EnabledAt        *time.Time
+	LastUsedAt       *time.Time
+	// LastUsedStep is the replay guard: a TOTP counter value may only be
+	// accepted once, so a code replayed inside the skew window is rejected.
+	LastUsedStep int64
+	UpdatedAt    time.Time
+}
+
+// UserRecoveryCode stores one single-use bypass code as a one-way hash.
+type UserRecoveryCode struct {
+	ID        string
+	UserID    string
+	CodeHash  string
+	UsedAt    *time.Time
+	CreatedAt time.Time
+}
+
+// UserDevice is a trusted browser or API client. Only the token hash is stored.
+type UserDevice struct {
+	ID         string
+	UserID     string
+	TokenHash  string
+	Name       string
+	UserAgent  string
+	IP         string
+	TrustedAt  time.Time
+	ExpiresAt  time.Time
+	LastSeenAt *time.Time
+	RevokedAt  *time.Time
+}
+
+// AuthChallenge is short-lived encrypted state shared by every cluster node so
+// a login, OIDC redirect, or ticket exchange can finish on any node.
+type AuthChallenge struct {
+	ID                string
+	Kind              ChallengeKind
+	UserID            string
+	PayloadCiphertext string
+	PayloadNonce      string
+	PayloadKeyID      string
+	PayloadVersion    int
+	Attempts          int
+	MaxAttempts       int
+	ConsumedAt        *time.Time
+	ExpiresAt         time.Time
+	CreatedAt         time.Time
+}
+
+// AuthLoginAttempt is one brute-force counter bucket. The key is a hash of the
+// username and client IP, so neither value is recoverable from the table.
+type AuthLoginAttempt struct {
+	BucketKey    string
+	Attempts     int
+	WindowStart  time.Time
+	BlockedUntil *time.Time
+	UpdatedAt    time.Time
 }
 
 type APIToken struct {

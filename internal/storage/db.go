@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 13
+	SchemaVersion = 14
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -48,14 +48,26 @@ type DB struct {
 	credentials            CredentialRepository
 	remoteServers          RemoteServerRepository
 	webSSHSessions         WebSSHSessionRepository
+	authSettings           AuthSettingsRepository
+	oidcProviders          OIDCProviderRepository
+	userIdentities         UserIdentityRepository
+	userMFA                UserMFARepository
+	userRecoveryCodes      UserRecoveryCodeRepository
+	userDevices            UserDeviceRepository
+	authChallenges         AuthChallengeRepository
+	authLoginAttempts      AuthLoginAttemptRepository
 	metrics                *observability.Metrics
 }
 
 // AccountRepositories are transaction-bound repositories used for account
 // lifecycle changes and their audit record.
 type AccountRepositories struct {
-	Users  AccountUserRepository
-	Audits AuditRepository
+	Users AccountUserRepository
+	// Identity covers the schema v14 identity columns. It is part of the same
+	// transaction so an administrator flipping the per-account second-factor
+	// override and its audit row commit together.
+	Identity UserIdentityWriter
+	Audits   AuditRepository
 }
 
 func (d *DB) AccountTransaction(ctx context.Context, fn func(AccountRepositories) error) error {
@@ -67,9 +79,11 @@ func (d *DB) AccountTransaction(ctx context.Context, fn func(AccountRepositories
 	if _, err := tx.ExecContext(ctx, `UPDATE schema_meta SET version=version WHERE id=1`); err != nil {
 		return err
 	}
+	boundUsers := &userRepo{db: tx, driver: d.driver, lockReads: true}
 	repos := AccountRepositories{
-		Users:  &userRepo{db: tx, driver: d.driver, lockReads: true},
-		Audits: &auditRepo{db: tx},
+		Users:    boundUsers,
+		Identity: boundUsers,
+		Audits:   &auditRepo{db: tx},
 	}
 	if err := fn(repos); err != nil {
 		return err
@@ -292,6 +306,14 @@ func newDB(db *sql.DB, driver string) *DB {
 		credentials:            NewCredentialRepository(db),
 		remoteServers:          NewRemoteServerRepository(db),
 		webSSHSessions:         NewWebSSHSessionRepository(db),
+		authSettings:           NewAuthSettingsRepository(db),
+		oidcProviders:          NewOIDCProviderRepository(db),
+		userIdentities:         NewUserIdentityRepository(db),
+		userMFA:                NewUserMFARepository(db),
+		userRecoveryCodes:      NewUserRecoveryCodeRepository(db),
+		userDevices:            NewUserDeviceRepository(db),
+		authChallenges:         NewAuthChallengeRepository(db),
+		authLoginAttempts:      NewAuthLoginAttemptRepository(db),
 	}
 }
 
@@ -369,6 +391,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			if driver == DriverMySQL {
 				script = migrations.V12ToV13MySQL
 			}
+		case 13:
+			script = migrations.V13ToV14SQLite
+			if driver == DriverMySQL {
+				script = migrations.V13ToV14MySQL
+			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
 		}
@@ -435,7 +462,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases"} {
+	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
@@ -549,6 +576,37 @@ func (d *DB) RemoteServers() RemoteServerRepository {
 func (d *DB) WebSSHSessions() WebSSHSessionRepository {
 	return d.webSSHSessions
 }
+
+// AuthSettings exposes the runtime authentication policy singleton.
+func (d *DB) AuthSettings() AuthSettingsRepository { return d.authSettings }
+
+// OIDCProviders exposes the configured identity providers.
+func (d *DB) OIDCProviders() OIDCProviderRepository { return d.oidcProviders }
+
+// UserIdentities exposes the external-subject to account links.
+func (d *DB) UserIdentities() UserIdentityRepository { return d.userIdentities }
+
+// UserMFA exposes the encrypted TOTP enrollments.
+func (d *DB) UserMFA() UserMFARepository { return d.userMFA }
+
+// UserRecoveryCodes exposes the single-use MFA bypass code hashes.
+func (d *DB) UserRecoveryCodes() UserRecoveryCodeRepository { return d.userRecoveryCodes }
+
+// UserDevices exposes the trusted-device token hashes.
+func (d *DB) UserDevices() UserDeviceRepository { return d.userDevices }
+
+// AuthChallenges exposes the short-lived encrypted login flow state.
+func (d *DB) AuthChallenges() AuthChallengeRepository { return d.authChallenges }
+
+// AuthLoginAttempts exposes the cluster-safe login brute-force counter.
+func (d *DB) AuthLoginAttempts() AuthLoginAttemptRepository { return d.authLoginAttempts }
+
+// UserIdentityWriter exposes the schema v14 identity column writers.
+func (d *DB) UserIdentityWriter() UserIdentityWriter { return d.users.(UserIdentityWriter) }
+
+// Admins exposes the administrator census used by last-admin protection.
+func (d *DB) Admins() AdminCounter { return d.users.(AdminCounter) }
+
 func (d *DB) AuthorizationRevisions() AuthorizationRevisionRepository {
 	return d.authorizationRevisions
 }

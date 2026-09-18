@@ -663,3 +663,164 @@ func TestSQLiteV12ToV13CredentialSecretMigration(t *testing.T) {
 	}
 	db2.Close()
 }
+
+// TestSQLiteV13ToV14IdentityMigration emulates a v13 database by removing the
+// identity tables and the two users columns, then asserts the adjacent
+// migration recreates them, preserves existing rows, defaults the new columns,
+// and is safe to run twice.
+func TestSQLiteV13ToV14IdentityMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v13-to-v14.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	statements := []string{
+		`INSERT INTO users(id,username,role,password_hash,disabled,created_at,updated_at,auth_source,mfa_required)
+		 VALUES('user-legacy','legacy','admin','$argon2id$v=19$m=65536,t=3,p=2$c2FsdA$aGFzaA',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','local',0)`,
+		`DROP TABLE auth_settings`,
+		`DROP TABLE oidc_providers`,
+		`DROP TABLE user_identities`,
+		`DROP TABLE user_mfa`,
+		`DROP TABLE user_recovery_codes`,
+		`DROP TABLE user_devices`,
+		`DROP TABLE auth_challenges`,
+		`DROP TABLE auth_login_attempts`,
+		`DROP INDEX idx_users_role_deleted`,
+		`CREATE TABLE users_v13 (
+		    id VARBINARY(255) PRIMARY KEY,
+		    username VARCHAR(191) NOT NULL UNIQUE,
+		    role VARCHAR(32) NOT NULL,
+		    password_hash VARCHAR(255) NOT NULL,
+		    disabled INTEGER NOT NULL DEFAULT 0,
+		    deleted_at VARCHAR(32),
+		    created_at TEXT NOT NULL,
+		    updated_at TEXT NOT NULL
+		)`,
+		`INSERT INTO users_v13(id,username,role,password_hash,disabled,created_at,updated_at)
+		 SELECT id,username,role,password_hash,disabled,created_at,updated_at FROM users`,
+		`DROP TABLE users`,
+		`ALTER TABLE users_v13 RENAME TO users`,
+		`CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id)`,
+		// schema_meta has no row after the raw DDL, so insert the source version
+		// to exercise the v13 -> v14 step.
+		`DELETE FROM schema_meta WHERE id=1`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,13)`,
+	}
+	for _, statement := range statements {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v13 schema: %v (%s)", err, statement)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v13 to v14: %v", err)
+	}
+	defer db.Close()
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+	user, err := db.Users().GetByUsername(context.Background(), "legacy")
+	if err != nil {
+		t.Fatalf("legacy user after migration: %v", err)
+	}
+	if user.Role != "admin" || user.AuthSource != AuthSourceLocal || user.MFARequired {
+		t.Fatalf("legacy user = %+v, want preserved admin with local auth source", user)
+	}
+	for _, table := range []string{
+		"auth_settings", "oidc_providers", "user_identities", "user_mfa",
+		"user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts",
+	} {
+		var name string
+		if err := db.SQL().QueryRowContext(context.Background(),
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name); err != nil {
+			t.Fatalf("table %s missing after migration: %v", table, err)
+		}
+	}
+	// A second open must be a no-op: the migration is retry-safe.
+	db2, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("reopen migrated database: %v", err)
+	}
+	defer db2.Close()
+	if version, err := db2.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version after reopen = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+}
+
+// TestSQLiteFreshSchemaMatchesIncrementalIdentityChain builds one database from
+// the full DDL and another by replaying the v13 -> v14 incremental script over a
+// v13 base, then asserts both expose the same identity columns. This is the guard
+// that keeps migrations/ddl.sql and migrations/incremental from drifting.
+func TestSQLiteFreshSchemaMatchesIncrementalIdentityChain(t *testing.T) {
+	columns := func(t *testing.T, dsn, table string) map[string]bool {
+		t.Helper()
+		raw, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		rows, err := raw.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]bool{}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			out[name] = true
+		}
+		if len(out) == 0 {
+			t.Fatalf("table %s has no columns", table)
+		}
+		return out
+	}
+	dir := t.TempDir()
+	fresh := "file:" + filepath.Join(dir, "fresh.sqlite")
+	if _, err := OpenSQLite(context.Background(), fresh, true); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := "file:" + filepath.Join(dir, "upgraded.sqlite")
+	raw, err := sql.Open("sqlite", upgraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DELETE FROM schema_meta WHERE id=1`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_meta(id,version) VALUES(1,14)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"users", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts"} {
+		want := columns(t, fresh, table)
+		got := columns(t, upgraded, table)
+		if len(want) != len(got) {
+			t.Fatalf("table %s column count differs: full DDL %d, incremental %d", table, len(want), len(got))
+		}
+		for name := range want {
+			if !got[name] {
+				t.Fatalf("table %s is missing column %s after the incremental chain", table, name)
+			}
+		}
+	}
+}

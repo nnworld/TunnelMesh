@@ -63,8 +63,8 @@ func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T
 }
 
 func TestMySQLV11ToV12WebSSHMigrationsAreAdjacent(t *testing.T) {
-	if SchemaVersion != 13 {
-		t.Fatalf("SchemaVersion = %d, want 13", SchemaVersion)
+	if SchemaVersion != 14 {
+		t.Fatalf("SchemaVersion = %d, want 14", SchemaVersion)
 	}
 	if !strings.Contains(migrations.V11ToV12SQLite, "CREATE TABLE IF NOT EXISTS credentials") {
 		t.Fatal("SQLite migration lacks credentials")
@@ -316,4 +316,77 @@ func assertMySQLIndexColumns(t *testing.T, db *sql.DB, index string, want []stri
 		t.Fatal(err)
 	}
 	assertStringSlice(t, index+" columns", got, want)
+}
+
+// The v14 identity tables must be additive in both dialects: SQLite cannot
+// rewrite a column, so the users change may only append, and every indexed
+// timestamp must stay VARCHAR(32) so MySQL can build the index without an
+// explicit key length.
+func TestMySQLV13ToV14IdentityMigrationIsAdjacent(t *testing.T) {
+	for _, script := range []string{migrations.V13ToV14MySQL, migrations.V13ToV14SQLite} {
+		for _, forbidden := range []string{"DROP COLUMN", "MODIFY COLUMN", "DROP TABLE", "JSON", "ON DUPLICATE KEY"} {
+			if strings.Contains(strings.ToUpper(script), forbidden) {
+				t.Fatalf("identity migration must be additive only; found %q", forbidden)
+			}
+		}
+		for _, table := range []string{
+			"auth_settings", "oidc_providers", "user_identities", "user_mfa",
+			"user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts",
+		} {
+			if !strings.Contains(script, "CREATE TABLE IF NOT EXISTS "+table) {
+				t.Fatalf("identity migration lacks table %s", table)
+			}
+		}
+		for _, fragment := range []string{
+			"expires_at VARCHAR(32) NOT NULL",
+			"revoked_at VARCHAR(32)",
+			"blocked_until VARCHAR(32)",
+			"created_at VARCHAR(32) NOT NULL",
+		} {
+			if !strings.Contains(script, fragment) {
+				t.Fatalf("identity migration must use index-compatible timestamps; missing %q", fragment)
+			}
+		}
+	}
+	for _, column := range []string{"auth_source", "mfa_required"} {
+		if !strings.Contains(migrations.V13ToV14MySQL, column) {
+			t.Fatalf("MySQL v13 to v14 migration lacks %s", column)
+		}
+		if !strings.Contains(migrations.V13ToV14SQLite, "ADD COLUMN "+column) {
+			t.Fatalf("SQLite v13 to v14 migration lacks ADD COLUMN %s", column)
+		}
+		if !strings.Contains(migrations.DDL, column) {
+			t.Fatalf("full DDL lacks %s", column)
+		}
+	}
+	// MySQL cannot create an index named with IF NOT EXISTS, so the MySQL script
+	// must use the bare form while SQLite keeps the retry-safe form.
+	if strings.Contains(migrations.V13ToV14MySQL, "CREATE INDEX IF NOT EXISTS") {
+		t.Fatal("MySQL migration must not use CREATE INDEX IF NOT EXISTS")
+	}
+	if !strings.Contains(migrations.V13ToV14SQLite, "CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires") {
+		t.Fatal("SQLite migration lacks the retry-safe challenge expiry index")
+	}
+	// The full DDL and the incremental script must define the same tables.
+	for _, table := range []string{
+		"auth_settings", "oidc_providers", "user_identities", "user_mfa",
+		"user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts",
+	} {
+		if !strings.Contains(migrations.DDL, "CREATE TABLE IF NOT EXISTS "+table) {
+			t.Fatalf("full DDL lacks table %s", table)
+		}
+	}
+}
+
+func TestMySQLIdentityRepositoryContract(t *testing.T) {
+	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
+	}
+	db, err := OpenMySQL(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runIdentityRepositoryContract(t, db)
 }

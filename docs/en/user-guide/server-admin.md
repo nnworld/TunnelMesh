@@ -12,7 +12,7 @@ The dashboard shows high-level counts and recent activity, including:
 - Valid service tokens.
 - Recent audit events.
 
-Use the sidebar to move between Agents, Clients, routes, tokens, remote servers, credentials, Server nodes, users, audit logs, downloads, WebSSH, and SFTP.
+Use the sidebar to move between Agents, Clients, routes, tokens, remote servers, credentials, Server nodes, users, single sign-on, audit logs, downloads, WebSSH, and SFTP.
 
 ## Agent lifecycle
 
@@ -23,6 +23,25 @@ Use the sidebar to move between Agents, Clients, routes, tokens, remote servers,
 5. Monitor online state and metadata from the Agent detail page.
 
 For connection-pool deployments, inspect per-instance health, active streams, and lease state.
+
+## Single sign-on, MFA, and trusted devices
+
+Administrators configure OIDC identity providers and the global authentication policy from
+**Single sign-on** in the sidebar. Every user manages their own TOTP enrollment, one-time recovery
+codes, trusted devices, and linked identities from **Security** in the avatar menu.
+
+From the **Child accounts** page an administrator can also force MFA on one account (`mfaRequired`),
+inspect that account's MFA status, trusted devices, and external identity links, and run `mfa/reset`
+to recover a user who lost their authenticator.
+
+Before enabling either feature, inject `TUNNELMESH_TOKEN_ENCRYPTION_KEY` (identical on every node in a
+cluster) and set `security.allowed_origins` or `security.allowed_hosts` — the OIDC callback allowlist is
+derived from them, and no provider can be registered while both are empty. Without the key, MFA
+enrollment and provider creation fail closed with `503 secret_storage_unavailable` rather than storing
+plaintext.
+
+The full workflow, field ranges, login sequences, and a troubleshooting table keyed by `data.error` are
+in [Single sign-on and multi-factor authentication](sso-and-mfa.md).
 
 ## Token creation and reveal
 
@@ -74,6 +93,7 @@ Expose Prometheus metrics from the Server and monitor:
 - Stream success and latency.
 - Relay and cluster status.
 - Proxy-entry requests and denials.
+- Console logins, second-factor verifications, OIDC relying-party stages, trusted devices, pending challenges, and blocked login buckets.
 
 Do not place tokens, credentials, target addresses, or client IPs in metric labels.
 

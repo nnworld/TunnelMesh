@@ -37,7 +37,7 @@ import type { SupportedLocale } from '../i18n'
 const auth = useAuthStore(); const preferences = usePreferencesStore(); const router = useRouter(); const { t } = useI18n(); const mobileOpen = ref(false)
 const menuItems = () => [
   ['/', 'navigation.dashboard'], ['/agents', 'navigation.agents'], ['/clients', 'navigation.clients'], ['/routes', 'navigation.routes'], ['/tokens', 'navigation.tokens'], ['/remote-servers', 'navigation.remoteServers'], ['/credentials', 'navigation.credentials'],
-  ...(auth.isAdmin ? [['/servers', 'navigation.servers'], ['/users', 'navigation.users'], ['/audit-logs', 'navigation.audits'], ['/downloads', 'navigation.downloads']] : []),
+  ...(auth.isAdmin ? [['/servers', 'navigation.servers'], ['/users', 'navigation.users'], ['/sso-providers', 'navigation.sso'], ['/audit-logs', 'navigation.audits'], ['/downloads', 'navigation.downloads']] : []),
 ]
 const NavigationMenu = defineComponent({ emits: ['click'], setup(_, { emit }) { return () => h(ElMenu, { router: true, defaultActive: router.currentRoute.value.path }, () => menuItems().map(([path, key]) => h(ElMenuItem, { index: path, onClick: () => emit('click') }, () => t(key)))) } })
 function changeLocale(value: SupportedLocale) { preferences.setLocale(value) }

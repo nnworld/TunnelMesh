@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h } from 'vue'
 import { APIError, api } from '../api/client'
-import { accountErrorMessage } from '../i18n/errors'
+import { accountErrorMessage, authErrorMessage } from '../i18n/errors'
 import { formatDateTime } from '../i18n/format'
 import { breadcrumbsFor } from '../layouts/breadcrumbs'
 import StatusTag from '../components/StatusTag.vue'
@@ -63,6 +63,20 @@ describe('frontend design-system contracts', () => {
     setAppLocale('en-US')
     expect(accountErrorMessage(new APIError('Forbidden', 403, 403, 'current_password_invalid'))).toBe('Current password is incorrect')
     expect(accountErrorMessage(new Error('network down'))).toBe('Operation failed. Please try again.')
+  })
+
+  // The identity surface maps a stable data.error code onto one translated
+  // sentence everywhere it can appear: the login page, account security and
+  // SSO administration. Without the mapping a 403 would fall through to the
+  // raw server message and render differently per locale.
+  it('localizes the identity error codes added with SSO and MFA', async () => {
+    const { setAppLocale } = await import('../i18n')
+    setAppLocale('zh-CN')
+    expect(authErrorMessage(new APIError('Forbidden', 403, 403, 'account_disabled'))).toBe('账号已被管理员停用，请联系管理员')
+    expect(authErrorMessage(new APIError('Forbidden', 403, 403, 'oidc_user_not_provisioned'))).toBe('该单点登录身份尚未在本系统开户，请联系管理员')
+    setAppLocale('en-US')
+    expect(accountErrorMessage(new APIError('Conflict', 409, 409, 'idempotency_key_conflict'))).toBe('That idempotency key belongs to another request. Submit again.')
+    expect(accountErrorMessage(new APIError('Conflict', 409, 409, 'idempotency_in_progress'))).toBe('The same request is still running. Check the result shortly.')
   })
 
   it('renders a normalized status tag', () => {

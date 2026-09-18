@@ -331,6 +331,150 @@ WebSocket 握手始终要求请求带且只带一个合法 `Origin` 头，与白
 
 `allow_legacy_connection_tokens` 是唯一的例外开关：Agent 连接默认只接受 `agent` 类型 service token。设为 `true` 时旧版管理登录 token 也可用于运维接管，该路径写入弃用审计日志，并且计划在 v0.3.0 移除。仅在有存量 Agent 尚未换发 service token 的迁移窗口内临时开启，迁移完成后必须改回 `false`。Client 连接不受该开关影响。
 
+## 管理台身份认证（SSO / MFA / 受信任设备）
+
+管理后台的单点登录、TOTP 两步验证和受信任设备由 `security.auth` 段配置：
+
+```yaml
+server:
+  # 反向代理地址白名单；只有来自这些地址的 X-Forwarded-For 才可信。
+  # 默认空列表：始终使用直连对端地址，伪造头无法影响登录限流和审计。
+  trusted_proxies: []
+
+security:
+  auth:
+    # 管理台 bearer token 有效期；0 表示沿用历史行为（不过期）。
+    session_token_ttl: 0s
+    login_throttle:
+      # 同一 username+IP 桶在 window 内允许失败的次数，超过后封禁 block。
+      max_attempts: 10
+      window: 5m
+      block: 10m
+    mfa:
+      # 验证器 App 显示的标签，会写进 otpauth:// URL，不能包含冒号。
+      issuer: TunnelMesh
+      digits: 6
+      period: 30s
+      # 接受的前后时间步数；0 表示只接受当前步。
+      skew: 1
+      # 登录二次验证 challenge 的有效期与最大尝试次数。
+      challenge_ttl: 5m
+      max_attempts: 5
+      # 每次绑定发放的一次性恢复码数量。
+      recovery_codes: 10
+    device_trust:
+      enabled: true
+      cookie_name: tm_device
+      cookie_secure: true
+      # lax / strict / none；none 必须同时开启 cookie_secure。
+      cookie_same_site: lax
+      # 未过期的受信任设备是否可以跳过二次验证。
+      bypass_mfa: true
+    oidc:
+      # 是否在登录页公开列出可用的身份提供商按钮。
+      public_providers: true
+      http_timeout: 10s
+      state_ttl: 10m
+      # 回调后换取会话的一次性 ticket 有效期，硬性上限 300s。
+      login_ticket_ttl: 60s
+      jwks_cache_ttl: 1h
+      # 依赖方所有 HTTP 响应体上限（discovery / JWKS / userinfo / token 共用）。
+      max_discovery_body_bytes: 1048576
+```
+
+### 字段参考
+
+| 键 | 类型 | 默认值 | 取值范围 | 含义 |
+| --- | --- | --- | --- | --- |
+| `security.auth.session_token_ttl` | duration | `0s` | ≥ 0 | 管理台 bearer token 有效期。`0` 保留升级前的“不过期”行为 |
+| `security.auth.login_throttle.max_attempts` | int | `10` | 1–1000 | 单个 username+IP 桶在一个 window 内允许的失败次数 |
+| `security.auth.login_throttle.window` | duration | `5m` | 1s–24h | 失败计数窗口 |
+| `security.auth.login_throttle.block` | duration | `10m` | 1s–24h | 超过阈值后的封禁时长，响应带 `Retry-After` |
+| `security.auth.mfa.issuer` | string | `TunnelMesh` | ≤ 64 字符，禁止 `:` | otpauth 标签中显示的发行方名称 |
+| `security.auth.mfa.digits` | int | `6` | `6` 或 `8` | TOTP 位数 |
+| `security.auth.mfa.period` | duration | `30s` | 15s–120s | TOTP 时间步长 |
+| `security.auth.mfa.skew` | int | `1` | 0–2 | 允许的前后时间步数，用于容忍客户端时钟漂移 |
+| `security.auth.mfa.challenge_ttl` | duration | `5m` | 30s–30m | 登录二次验证 challenge 的有效期 |
+| `security.auth.mfa.max_attempts` | int | `5` | 1–20 | 单个 challenge 允许的验证次数 |
+| `security.auth.mfa.recovery_codes` | int | `10` | 1–50 | 每次绑定发放的一次性恢复码数量 |
+| `security.auth.device_trust.enabled` | bool | `true` | — | 是否允许签发受信任设备（仅作为数据库首启种子） |
+| `security.auth.device_trust.cookie_name` | string | `tm_device` | ≤ 64 字符，合法 cookie token | 受信任设备 cookie 名称 |
+| `security.auth.device_trust.cookie_secure` | bool | `true` | — | cookie 是否只通过 HTTPS 发送 |
+| `security.auth.device_trust.cookie_same_site` | string | `lax` | `lax`/`strict`/`none` | cookie SameSite 属性；`none` 必须搭配 `cookie_secure: true` |
+| `security.auth.device_trust.bypass_mfa` | bool | `true` | — | 未过期的受信任设备是否跳过二次验证（仅作为首启种子） |
+| `security.auth.oidc.public_providers` | bool | `true` | — | 是否公开 `GET /api/v1/auth/oidc/providers`；关闭后返回 `404` |
+| `security.auth.oidc.http_timeout` | duration | `10s` | ≤ 5m | 访问 issuer discovery、JWKS、token 和 userinfo 端点的超时 |
+| `security.auth.oidc.state_ttl` | duration | `10m` | ≤ 1h | authorization state / nonce / PKCE verifier 的有效期 |
+| `security.auth.oidc.login_ticket_ttl` | duration | `60s` | ≤ 300s | 回调后换取会话的一次性 ticket 有效期 |
+| `security.auth.oidc.jwks_cache_ttl` | duration | `1h` | ≤ 24h | JWKS 公钥缓存时长 |
+| `security.auth.oidc.max_discovery_body_bytes` | int64 | `1048576` | 1024–16777216 | 依赖方**所有** HTTP 响应体的字节上限。实际覆盖 discovery、JWKS、userinfo 与 token 四个端点（共用同一限制），键名里的 `discovery` 是历史命名；超限直接判为失败，不会截断后继续解析 |
+| `server.trusted_proxies` | []string | `[]` | 每项为 IP 或 CIDR | 允许被信任 `X-Forwarded-For` 的反向代理地址 |
+
+所有叶子键都可用环境变量覆盖：前缀 `TUNNELMESH_`，点号换成下划线，例如
+`TUNNELMESH_SECURITY_AUTH_MFA_ISSUER`、`TUNNELMESH_SECURITY_AUTH_LOGIN_THROTTLE_BLOCK`、
+`TUNNELMESH_SERVER_TRUSTED_PROXIES`。这些键没有对应的命令行参数。
+
+未设置的叶子在加载时补齐默认值；已设置但越界的值不会被静默改写，而是由 `check-config` 直接报错。
+`security.auth.mfa.skew: 0` 是合法取值，表示“只接受当前时间步”，不会被当作未配置。
+
+`server.trusted_proxies` 只影响管理 API 的客户端 IP 解析（登录限流桶、审计记录、受信任设备的
+`ip` 字段）。它独立于 `server.proxy_entry.trusted_proxies`（tp-* 代理入口专用，默认
+`127.0.0.1/32`、`::1/128`），两者不要混用。Server 直接对公网暴露时必须保持
+`server.trusted_proxies` 为空，否则任何客户端都能伪造 `X-Forwarded-For` 自选限流桶。经过
+Nginx 反代时应只填写反代实际来源网段，例如 `["127.0.0.1/32", "::1/128"]`。
+
+### 配置只是种子，数据库才是权威
+
+**`security.auth` 中的策略项只在首次启动时写入 `auth_settings` 表；此后数据库行是唯一权威来源。**
+
+具体来说：
+
+- `session_token_ttl`、`device_trust.enabled`、`device_trust.bypass_mfa` 会在 `auth_settings`
+  行缺失时作为种子写入一次（`mfa_mode` 固定以 `disabled` 起播，保证升级后的部署行为与升级前完全一致）。
+- 管理员通过 `PUT /api/v1/auth/policy` 或后台“单点登录”页修改策略后，**再改配置文件或环境变量都不会生效**，
+  重新部署也不会把数据库里的决定覆盖回去。
+- 设备有效期与单账号最大设备数没有配置键，只能由 `auth_settings.device_trust_ttl_seconds`
+  （1 小时–90 天，默认 30 天）和 `auth_settings.max_trusted_devices`（1–100，默认 10）决定。
+- OIDC 提供商的 issuer、client id、client secret、role mapping 全部存在 `oidc_providers` 表，
+  配置文件里没有任何 per-provider 键。
+- TOTP 参数（`issuer`、`digits`、`period`）在绑定时即固化进 otpauth URL，修改配置只影响之后的新绑定，
+  不会追溯已绑定账号。
+
+需要临时全量关闭两步验证时，改数据库而不是改配置：把 `auth_settings.mfa_mode` 置为 `disabled`
+并停用所有 OIDC 提供商即可，无需重新发布。步骤见
+[Schema 升级与回滚](schema-upgrades.md#v13-to-v14)。
+
+### 身份密钥与 fail-closed
+
+SSO 与 MFA 需要存储可恢复的秘密：OIDC `client_secret`、TOTP 共享密钥、登录 challenge payload
+（state / nonce / PKCE verifier）和 login ticket。它们复用 service token reveal 的同一把密钥：
+
+```bash
+# base64（RawStd / Std）或 hex，解码后必须是 16、24 或 32 字节；只能由环境变量或 Secret Manager 注入
+export TUNNELMESH_TOKEN_ENCRYPTION_KEY='<from your secret manager>'
+# 可选；未设置时 key id 固定为 default。轮换密钥时必须同步更换
+export TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID='<key id from your secret manager>'
+```
+
+未配置该密钥时 Server 仍能启动，密码登录和已绑定账号的 MFA 校验也照常工作，但任何需要落盘秘密的
+操作会 fail-closed：
+
+- `POST /api/v1/auth/mfa/enroll`（MFA 绑定）返回 `503`，`data.error=secret_storage_unavailable`；
+- `POST /api/v1/sso/providers` 和 `PUT/PATCH /api/v1/sso/providers/{id}` 在**请求带了非空
+  `clientSecret` 时**返回 `503`，`data.error=secret_storage_unavailable`。只靠 PKCE 的公共客户端
+  （`clientSecret` 留空）可以创建，因为它没有需要落盘的秘密；
+- 但**任何 OIDC 登录都不可用**：authorize 需要创建加密的 state challenge，`ChallengeStore.Create`
+  在密钥不可用时直接 fail-closed，所以 `GET /api/v1/auth/oidc/<provider>/authorize` 也返回 `503`；
+- 已存有 client secret 的提供商在密钥缺失或 key id 不匹配时无法解析，同样返回 `503`。
+
+系统不会退化成明文存储。集群中所有 Server 节点必须配置同一把密钥和同一个 key id，否则一个节点
+签发的 challenge 或 ticket 在另一个节点上无法解密。
+
+`TUNNELMESH_TRACE_SIGNING_KEY` 与身份认证无关，只用于跨节点 traceroute hop 签名链校验；集群所有
+Server/relay 节点同样必须一致。两个密钥都不得写入提交的配置文件、日志或工单。
+
+完整的启用流程、后台操作和排障表见[单点登录与两步验证](../user-guide/sso-and-mfa.md)。
+
 ## 发行下载源
 
 管理后台“发行管理”页展示的仓库地址来自 `downloads.github_repository`：
@@ -384,5 +528,11 @@ relay 证书字段有两种合法状态：
 Set `TUNNELMESH_TOKEN_ENCRYPTION_KEY` to a base64 or hexadecimal AES key (16, 24, or 32 bytes) and optionally set `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`. The key must come from an environment-injected secret or secret manager and must not be committed to a file or database. New and rotated service tokens are encrypted with AES-GCM. Existing hash-only tokens cannot be revealed and must be rotated. Secret reveal is administrator-only, audited, requires `X-Token-Reveal-Confirm` plus `Idempotency-Key`, and returns `Cache-Control: no-store`.
 
 The same key and key id also encrypt the SSH credential secrets (password, or private key plus passphrase) used by browser SSH/SFTP auto-authentication; see [WebSSH/SFTP 会话](#websshsftp-会话). Credential secrets are never exposed by a list or detail API and are decrypted only for the credential owner at session-creation time.
+
+The same key and key id also seal the console identity secrets: OIDC `client_secret`, the TOTP shared
+secret, and every `auth_challenges` payload (OIDC state/nonce/PKCE verifier and the post-callback login
+ticket). Without it, MFA enrollment and OIDC provider creation fail closed with `503` and
+`data.error=secret_storage_unavailable` instead of storing plaintext; see
+[管理台身份认证](#管理台身份认证sso--mfa--受信任设备).
 
 For multi-server deployments set the same high-entropy `TUNNELMESH_TRACE_SIGNING_KEY` on every server/relay node so hop signatures can be verified across the cluster. It is never returned in traceroute output.

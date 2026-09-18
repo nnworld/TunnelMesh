@@ -7,13 +7,17 @@
         <el-table :data="page.items">
           <el-table-column prop="username" :label="t('users.username')" min-width="180" />
           <el-table-column :label="t('users.status')" width="120"><template #default="{ row }"><StatusTag :kind="row.deletedAt ? 'info' : row.disabled ? 'warning' : 'success'" :label="row.deletedAt ? t('users.deleted') : row.disabled ? t('users.disabled') : t('users.active')" /></template></el-table-column>
+          <!-- Per-account MFA requirement: it wins over the global auth policy, so
+               it is an explicit switch instead of a side effect of another edit. -->
+          <el-table-column :label="t('users.mfaRequired')" width="140"><template #default="{ row }"><el-switch v-model="row.mfaRequired" :disabled="Boolean(row.deletedAt)" :data-test="`mfa-required-${row.id}`" @change="value => toggleMfaRequired(row, value)" /></template></el-table-column>
           <el-table-column :label="t('users.createdAt')" min-width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
-          <el-table-column :label="t('users.actions')" width="330" fixed="right">
+          <el-table-column :label="t('users.actions')" width="420" fixed="right">
             <template #default="{ row }">
               <template v-if="row.deletedAt"><el-button link type="primary" @click="restore(row)">{{ t('users.restore') }}</el-button></template>
               <template v-else>
                 <el-button link @click="toggle(row)">{{ row.disabled ? t('users.enable') : t('users.disable') }}</el-button>
                 <el-button link @click="reset(row)">{{ t('users.resetPassword') }}</el-button>
+                <el-button link type="warning" :data-test="`reset-mfa-${row.id}`" @click="resetMfa(row)">{{ t('users.resetMFA') }}</el-button>
                 <el-button link type="danger" @click="remove(row)">{{ t('users.delete') }}</el-button>
               </template>
             </template>
@@ -39,7 +43,8 @@ import StatusTag from '../components/StatusTag.vue'
 import OneTimePasswordDialog from '../components/OneTimePasswordDialog.vue'
 import { useFormatDateTime } from '../i18n/format'
 import { accountErrorMessage } from '../i18n/errors'
-import { createUser, deleteUser, listUsers, resetUserPassword, restoreUser, updateUserStatus, type UserAccount, type UserPage } from '../api/client'
+import { createUser, deleteUser, listUsers, resetUserPassword, restoreUser, updateUserMFARequired, updateUserStatus, type UserAccount, type UserPage } from '../api/client'
+import { resetUserMFA } from '../api/auth'
 
 const { t } = useI18n()
 const status = ref<'active' | 'deleted' | 'all'>('active')
@@ -78,6 +83,30 @@ async function toggle(row: UserAccount) {
 async function reset(row: UserAccount) {
   try { await ElMessageBox.confirm(t('users.confirmReset')); const result = await resetUserPassword(row.id); temporaryPassword.value = result.temporaryPassword; temporaryOpen.value = true }
   catch (error) { reportActionError(error) }
+}
+
+// The switch is optimistic; a rejected update is rolled back so the table never
+// claims a requirement the server did not accept.
+async function toggleMfaRequired(row: UserAccount, value: string | number | boolean) {
+  const next = Boolean(value)
+  try {
+    const updated = await updateUserMFARequired(row.id, next)
+    row.mfaRequired = Boolean(updated.mfaRequired)
+    ElMessage.success(t('users.mfaRequiredUpdated'))
+  } catch (error) {
+    row.mfaRequired = !next
+    reportActionError(error)
+  }
+}
+
+// Resetting clears the enrollment and every trusted device, so it is confirmed
+// explicitly and carries an idempotency key like every other admin mutation.
+async function resetMfa(row: UserAccount) {
+  try {
+    await ElMessageBox.confirm(t('users.confirmResetMFA'), t('users.resetMFA'), { type: 'warning' })
+    await resetUserMFA(row.id, crypto.randomUUID())
+    ElMessage.success(t('users.mfaReset'))
+  } catch (error) { reportActionError(error) }
 }
 
 async function remove(row: UserAccount) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 func (a *API) changeOwnPassword(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -51,21 +52,35 @@ func (a *API) handleUsers(w http.ResponseWriter, r *http.Request, principal auth
 		writeAPIError(w, http.StatusNotFound, "not found")
 		return
 	}
-	if len(parts) == 2 {
+	if len(parts) >= 2 {
 		switch parts[1] {
 		case "reset-password":
-			if r.Method == http.MethodPost {
+			if len(parts) == 2 && r.Method == http.MethodPost {
 				a.resetUserPassword(w, r, principal, userID)
 				return
 			}
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
 		case "restore":
-			if r.Method == http.MethodPost {
+			if len(parts) == 2 && r.Method == http.MethodPost {
 				a.restoreUser(w, r, principal, userID)
 				return
 			}
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		case "devices":
+			a.handleUserDevices(w, r, principal, userID, parts[2:])
+			return
+		case "mfa":
+			a.handleUserMFA(w, r, principal, userID, parts[2:])
+			return
+		case "identities":
+			a.handleUserIdentities(w, r, principal, userID, parts[2:])
+			return
+		default:
+			writeAPIError(w, http.StatusNotFound, "not found")
+			return
 		}
-		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
 	}
 	if len(parts) != 1 {
 		writeAPIError(w, http.StatusNotFound, "not found")
@@ -116,18 +131,39 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request, principal auth.
 	writeJSON(w, http.StatusCreated, map[string]any{"user": publicUser(user), "temporaryPassword": temporaryPassword})
 }
 
+// updateUserStatus applies the administrator-facing account toggles. Each field
+// is a pointer so an absent field is distinguishable from an explicit false, and
+// at least one must be present; a body that changes nothing is a client bug
+// rather than a no-op to silently accept.
 func (a *API) updateUserStatus(w http.ResponseWriter, r *http.Request, principal auth.Principal, userID string) {
 	var request struct {
-		Disabled *bool `json:"disabled"`
+		Disabled    *bool `json:"disabled"`
+		MFARequired *bool `json:"mfaRequired"`
 	}
-	if err := decodeJSON(r, &request); err != nil || request.Disabled == nil {
-		writeAPIError(w, http.StatusBadRequest, "disabled is required")
+	if err := decodeJSON(r, &request); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	user, err := a.accounts.SetDisabled(r.Context(), principal.UserID, userID, *request.Disabled)
-	if err != nil {
-		writeAccountError(w, err)
+	if request.Disabled == nil && request.MFARequired == nil {
+		writeAPIError(w, http.StatusBadRequest, "disabled or mfaRequired is required")
 		return
+	}
+	ctx := r.Context()
+	var (
+		user storage.User
+		err  error
+	)
+	if request.Disabled != nil {
+		if user, err = a.accounts.SetDisabled(ctx, principal.UserID, userID, *request.Disabled); err != nil {
+			writeAccountError(w, err)
+			return
+		}
+	}
+	if request.MFARequired != nil {
+		if user, err = a.accounts.SetMFARequired(ctx, principal.UserID, userID, *request.MFARequired); err != nil {
+			writeAccountError(w, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, publicUser(user))
 }

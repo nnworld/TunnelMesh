@@ -25,6 +25,14 @@ services:
       TUNNELMESH_STORAGE_MYSQL_DSN: ${TUNNELMESH_STORAGE_MYSQL_DSN:?set a TLS MySQL DSN}
       TUNNELMESH_STORAGE_MYSQL_TLS: "true"
       TUNNELMESH_STORAGE_MYSQL_CA: /run/secrets/mysql-ca.pem
+      # 可恢复密文的主密钥（service-token secret、OIDC client secret）。缺失时
+      # 相关写入接口 fail-closed 返回 503 secret_storage_unavailable，不会静默
+      # 降级成只存哈希。只能由外部环境注入，禁止写入本文件、镜像或配置仓库。
+      # 轮换前必须保证所有节点读到同一个 KEY_ID，否则旧密文无法解密。
+      TUNNELMESH_TOKEN_ENCRYPTION_KEY: ${TUNNELMESH_TOKEN_ENCRYPTION_KEY:-}
+      TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID: ${TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID:-}
+      # traceroute hop 签名链校验密钥，集群内所有 Server/relay 节点必须一致。
+      TUNNELMESH_TRACE_SIGNING_KEY: ${TUNNELMESH_TRACE_SIGNING_KEY:-}
       TUNNELMESH_NODE_ID: server-1
       TUNNELMESH_REGISTRY_TYPE: ${TUNNELMESH_REGISTRY_TYPE:-database}
       TUNNELMESH_REGISTRY_ENDPOINTS: ${TUNNELMESH_REGISTRY_ENDPOINTS:-}

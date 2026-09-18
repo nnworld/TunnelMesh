@@ -90,14 +90,37 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (Log
 	if err != nil || u.Disabled || u.DeletedAt != nil || !verifyPassword(password, u.PasswordHash) {
 		return LoginResult{}, ErrInvalidCredentials
 	}
-	plain, err := randomToken(32)
+	plain, err := s.IssueToken(ctx, u.ID, 0)
 	if err != nil {
-		return LoginResult{}, fmt.Errorf("generate token: %w", err)
-	}
-	if err := s.tokens.Create(ctx, storage.APIToken{UserID: u.ID, TokenHash: hashToken(plain)}); err != nil {
 		return LoginResult{}, err
 	}
 	return LoginResult{User: u, Token: plain}, nil
+}
+
+// IssueToken creates one console bearer token. A non-positive ttl reproduces the
+// historical non-expiring token so existing callers and previously issued
+// sessions keep working; a positive ttl is what an operator-set session lifetime
+// uses. Only the one-way hash is persisted.
+func (s *AuthService) IssueToken(ctx context.Context, userID string, ttl time.Duration) (string, error) {
+	if s == nil || s.tokens == nil {
+		return "", errors.New("token repository is required")
+	}
+	if strings.TrimSpace(userID) == "" {
+		return "", errors.New("user id is required")
+	}
+	plain, err := randomToken(32)
+	if err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	token := storage.APIToken{UserID: userID, TokenHash: hashToken(plain)}
+	if ttl > 0 {
+		expiresAt := time.Now().UTC().Add(ttl)
+		token.ExpiresAt = &expiresAt
+	}
+	if err := s.tokens.Create(ctx, token); err != nil {
+		return "", err
+	}
+	return plain, nil
 }
 
 func (s *AuthService) ValidateToken(ctx context.Context, plain string) (Principal, error) {

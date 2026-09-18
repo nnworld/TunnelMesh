@@ -26,7 +26,7 @@
 - 每个角色只允许有一份模板来源：安装脚本只做占位符替换，不得内联生成第二份模板。历史上
   client 用 checked-in 模板、server/agent 用脚本内联生成，结果 client 分支原样拷贝模板并
   静默忽略调用方传入的配置路径，Windows 的日志目录也与文档不一致。
-- 模板与脚本中不得出现 Token、密码、私钥或生产 DSN；敏感值只通过配置文件或环境变量注入。
+- 模板与脚本中不得出现 Token、密码、私钥或生产 DSN；敏感值只通过配置文件或环境变量注入。SSO / MFA 所需的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY` 同样只走环境注入，见[身份密钥注入](#身份密钥注入sso--mfa-必需)。
 - `openresty/tunnelmesh-proxy.conf.example` 占位符：`__LISTEN__`、`__SERVER_NAME_REGEX__`、
   `__SSL_CERT__`、`__SSL_CERT_KEY__`、`__LUA_FILE__`、`__INTERNAL_UPSTREAM__`、`__EDGE_ALLOW__`。
 - `openresty/tunnelmesh_proxy_entry.lua` 的 `CONFIG` 表用行尾标记定位替换：`-- __TM_INTERNAL_HOST__`、
@@ -44,6 +44,35 @@
 - Dashboard 变量与面板筛选标签必须一一对应：`cluster`→`cluster`、`node_id`→`node_id`、
   `component`→`component`、`agent_id`→`agent_id`。该契约由
   `deploy/grafana/dashboard_schema_test.go` 守护，新增变量时同步更新测试里的 `variableLabels`。
+
+## 身份密钥注入（SSO / MFA 必需）
+
+启用管理台单点登录或两步验证时，Server 进程必须能读到 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`。它同时
+服务三类可恢复秘密：service token reveal、浏览器 SSH/SFTP 凭据自动认证，以及 OIDC `client_secret`、
+TOTP 共享密钥和 `auth_challenges` payload（state、nonce、PKCE verifier、login ticket）。缺失时
+Server 仍能启动、密码登录照常，但 MFA 绑定与 OIDC 提供商创建返回 `503 secret_storage_unavailable`，
+不会退化成明文存储。
+
+`deploy/` 下的产物**刻意不携带任何密钥值**，但已经预留了注入通道；密钥值必须由部署方从
+Secret Manager 注入。两种形态的做法：
+
+| 形态 | 预留通道 | 部署方需要做什么 |
+| --- | --- | --- |
+| systemd（`deploy/systemd/tunnelmesh-server.service`） | unit 已带 `EnvironmentFile=-/etc/tunnelmesh/server.env`（前缀 `-` 表示文件缺失不阻塞启动） | 创建环境文件即可，不要用 drop-in 改 unit，也不要把密钥写进 unit 或 YAML：<br>`sudo install -o root -g tunnelmesh -m 0640 /dev/null /etc/tunnelmesh/server.env`，写入 `TUNNELMESH_TOKEN_ENCRYPTION_KEY=...`（集群再加 `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`、`TUNNELMESH_TRACE_SIGNING_KEY`），然后 `sudo systemctl restart tunnelmesh-server` |
+| Compose（`docker-compose.cluster.yml`、`docker-compose.local.yml`） | 两份编排都已把 `TUNNELMESH_TOKEN_ENCRYPTION_KEY` 与 `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`（集群还包含 `TUNNELMESH_TRACE_SIGNING_KEY`）以 `${VAR:-}` 形式透传给 Server | 在 `.env`（已 gitignore）或编排层导出这些变量。这里刻意用 `${VAR:-}` 而不是 `${VAR:?}`：未启用 SSO/MFA 的部署不应因为缺少身份密钥而无法启动，缺失时由 Server 在写入路径 fail-closed 返回 `503`。要求「缺失即启动失败」的部署，可在自己的 override 文件中改成 `:?` |
+
+集群中所有 Server 节点必须配置**完全一致**的密钥与 `TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID`（未设置时
+key id 固定为 `default`），否则一个节点签发的 challenge 或 login ticket 在另一个节点上无法解密，
+表现为跨节点的 SSO 登录间歇性失败。密钥文件权限与 `client.env` 同级（`0640`，属主 root、属组
+tunnelmesh），不进发布归档、不进镜像层、不进日志。
+
+`TUNNELMESH_TRACE_SIGNING_KEY` 同样必须在所有 Server/relay 节点一致，但它只用于跨节点 traceroute hop
+签名，与身份认证无关，两者不要混为一谈。
+
+模板与脚本中不得出现密钥值这条既有约定对身份密钥同样适用；密钥只能通过环境注入。取值范围、
+轮换注意事项和 fail-closed 行为见
+[配置说明](../docs/operations/configuration.md#管理台身份认证sso--mfa--受信任设备)，启用流程见
+[单点登录与两步验证](../docs/user-guide/sso-and-mfa.md)。
 
 ## 证书目录
 

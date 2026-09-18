@@ -27,9 +27,10 @@ var (
 var accountUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{3,64}$`)
 
 type AccountService struct {
-	users  storage.AccountUserRepository
-	audits storage.AuditRepository
-	tx     func(context.Context, func(storage.AccountRepositories) error) error
+	users    storage.AccountUserRepository
+	identity storage.UserIdentityWriter
+	audits   storage.AuditRepository
+	tx       func(context.Context, func(storage.AccountRepositories) error) error
 }
 
 func NewAccountService(source any, repos ...any) *AccountService {
@@ -45,12 +46,18 @@ func bindAccountRepository(service *AccountService, source any) {
 	switch value := source.(type) {
 	case *storage.DB:
 		service.users, _ = value.Users().(storage.AccountUserRepository)
+		service.identity, _ = value.Users().(storage.UserIdentityWriter)
 		service.audits = value.Audits()
 		service.tx = value.AccountTransaction
 	case storage.AccountUserRepository:
 		service.users = value
 	case storage.AuditRepository:
 		service.audits = value
+	}
+	// The identity writer is checked after the type switch so a *storage.DB, which
+	// satisfies both interfaces, is not shadowed by the narrower case.
+	if service.identity == nil {
+		service.identity, _ = source.(storage.UserIdentityWriter)
 	}
 }
 
@@ -191,6 +198,30 @@ func (s *AccountService) RestoreChild(ctx context.Context, actorUserID, userID s
 	})
 }
 
+// SetMFARequired flips the per-account second-factor override. It is a floor
+// rather than a suggestion: an administrator can protect one account even while
+// the global policy is disabled, and ResolvePolicy keeps enforcing the flag.
+//
+// The write goes through SetMFARequired on the repository instead of Update so a
+// partially populated User value can never clear the column by accident.
+func (s *AccountService) SetMFARequired(ctx context.Context, actorUserID, userID string, required bool) (storage.User, error) {
+	return s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
+		if user.DeletedAt != nil {
+			return "", ErrAccountDeleted
+		}
+		if repos.Identity == nil {
+			return "", errors.New("account identity repository is required")
+		}
+		if err := repos.Identity.SetMFARequired(ctx, user.ID, required); err != nil {
+			return "", err
+		}
+		if required {
+			return "account.mfa_required", nil
+		}
+		return "account.mfa_optional", nil
+	})
+}
+
 func (s *AccountService) mutateChild(ctx context.Context, actorUserID, userID string, mutate func(storage.AccountRepositories, *storage.User) (string, error)) (storage.User, error) {
 	var result storage.User
 	err := s.withTransaction(ctx, func(repos storage.AccountRepositories) error {
@@ -221,7 +252,7 @@ func (s *AccountService) withTransaction(ctx context.Context, work func(storage.
 	if s.tx != nil {
 		return s.tx(ctx, work)
 	}
-	return work(storage.AccountRepositories{Users: s.users, Audits: s.audits})
+	return work(storage.AccountRepositories{Users: s.users, Identity: s.identity, Audits: s.audits})
 }
 
 // updateAccountUser refreshes the timestamp at the service boundary so callers
@@ -244,11 +275,13 @@ func validateAccountPassword(password string) error {
 
 func createAccountAudit(ctx context.Context, audits storage.AuditRepository, actorUserID, action string, user storage.User) error {
 	details, err := json.Marshal(struct {
-		UserID   string `json:"userId"`
-		Username string `json:"username"`
-		Disabled bool   `json:"disabled"`
-		Deleted  bool   `json:"deleted"`
-	}{UserID: user.ID, Username: user.Username, Disabled: user.Disabled, Deleted: user.DeletedAt != nil})
+		UserID      string `json:"userId"`
+		Username    string `json:"username"`
+		Disabled    bool   `json:"disabled"`
+		Deleted     bool   `json:"deleted"`
+		MFARequired bool   `json:"mfaRequired"`
+		AuthSource  string `json:"authSource"`
+	}{UserID: user.ID, Username: user.Username, Disabled: user.Disabled, Deleted: user.DeletedAt != nil, MFARequired: user.MFARequired, AuthSource: string(user.AuthSource)})
 	if err != nil {
 		return err
 	}

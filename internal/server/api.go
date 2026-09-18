@@ -55,6 +55,10 @@ type API struct {
 	websshCloser        WebSSHConnectionCloseService
 	localNodeID         string
 	downloads           config.DownloadsConfig
+	identity            *IdentityServices
+	// trustedProxyList decides whether X-Forwarded-For is believed. It is empty by
+	// default, which means the direct peer address is always used.
+	trustedProxyList []string
 }
 
 // apiService is the application layer between HTTP handlers and storage. It
@@ -121,6 +125,17 @@ func (a *API) SetWebSSHConnectionCloser(closer WebSSHConnectionCloseService) {
 
 // SetWebSSHLocalNodeID propagates the runtime node identity into ticket
 // creation so cluster ownership is recorded before a browser connects.
+// SetTrustedProxies installs the reverse-proxy addresses whose X-Forwarded-For
+// header may be believed when resolving a management-API client IP. The list is
+// empty by default, which means the direct peer address is always used and a
+// spoofed header cannot influence login throttling or audit records.
+func (a *API) SetTrustedProxies(proxies []string) {
+	if a == nil {
+		return
+	}
+	a.trustedProxyList = append([]string(nil), proxies...)
+}
+
 func (a *API) SetWebSSHLocalNodeID(localNodeID string) {
 	if a == nil {
 		return
@@ -291,8 +306,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "/"
 	}
-	if path == "/api/v1/auth/login" && r.Method == http.MethodPost {
-		a.login(w, r)
+	// The unauthenticated identity surface is matched before the bearer check so
+	// login, the MFA step, and the OIDC redirect endpoints stay reachable without
+	// a session. Everything else under /auth/ falls through to the authenticated
+	// dispatch below.
+	if a.handlePublicAuth(w, r, path) {
 		return
 	}
 	if !strings.HasPrefix(path, "/api/v1/") {
@@ -310,15 +328,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"service": "tunnelmesh"})
 		return
 	}
-	if parts[0] == "auth" && len(parts) == 2 && parts[1] == "me" {
-		writeJSON(w, http.StatusOK, map[string]any{"id": p.UserID, "username": p.Username, "role": p.Role})
-		return
-	}
-	if parts[0] == "auth" && len(parts) == 2 && parts[1] == "password" {
-		a.changeOwnPassword(w, r, p)
-		return
-	}
 	switch parts[0] {
+	case "auth":
+		a.handleAuth(w, r, p, parts[1:])
+	case "sso":
+		a.handleSSO(w, r, p, parts[1:])
 	case "credentials":
 		a.handleCredentials(w, r, p, parts[1:])
 	case "remote-servers":
@@ -390,23 +404,6 @@ func (a *API) authenticate(r *http.Request) (auth.Principal, error) {
 		return auth.Principal{}, auth.ErrUnauthenticated
 	}
 	return a.Auth.ValidateToken(r.Context(), bearerToken(r))
-}
-
-func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	result, err := a.Auth.Login(r.Context(), req.Username, req.Password)
-	if err != nil {
-		writeAPIError(w, http.StatusUnauthorized, "invalid credentials")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"token": result.Token, "user": publicUser(result.User)})
 }
 
 func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Principal, parts []string) {
@@ -1637,6 +1634,15 @@ func publicAudit(v storage.AuditLog) map[string]any {
 	}
 }
 
+// Idempotency replay conflicts. The message text is preserved verbatim because
+// writeStorageError matches on it for the legacy endpoints; the sentinels let the
+// identity handlers map the same condition to a stable 409 code instead of an
+// opaque 500.
+var (
+	ErrIdempotencyKeyConflict = errors.New("idempotency key belongs to another user")
+	ErrIdempotencyInProgress  = errors.New("idempotency request is in progress")
+)
+
 func (a *API) mutate(r *http.Request, p auth.Principal, fn func() (int, any, error)) (int, []byte, error) {
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if key != "" && len(key) <= 255 && a.idem != nil {
@@ -1647,16 +1653,16 @@ func (a *API) mutate(r *http.Request, p auth.Principal, fn func() (int, any, err
 			}
 			if !claimed {
 				if rec.UserID != "" && rec.UserID != p.UserID {
-					return 0, nil, fmt.Errorf("idempotency key belongs to another user")
+					return 0, nil, ErrIdempotencyKeyConflict
 				}
 				if rec.StatusCode == 102 {
-					return 0, nil, fmt.Errorf("idempotency request is in progress")
+					return 0, nil, ErrIdempotencyInProgress
 				}
 				return rec.StatusCode, []byte(rec.Response), nil
 			}
 		} else if rec, err := a.idem.Get(r.Context(), key); err == nil {
 			if rec.UserID != "" && rec.UserID != p.UserID {
-				return 0, nil, fmt.Errorf("idempotency key belongs to another user")
+				return 0, nil, ErrIdempotencyKeyConflict
 			}
 			return rec.StatusCode, []byte(rec.Response), nil
 		}
@@ -1733,8 +1739,13 @@ func decodeInts(s string) []int {
 	}
 	return out
 }
+
+// publicUser is the only projection of a user row that may reach a response. The
+// password hash and every identity secret stay out of it by construction, and the
+// two identity fields are included so an administrator can see at a glance how an
+// account signs in and whether it carries a second-factor requirement.
 func publicUser(v storage.User) map[string]any {
-	return map[string]any{"id": v.ID, "username": v.Username, "role": v.Role, "disabled": v.Disabled, "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+	return map[string]any{"id": v.ID, "username": v.Username, "role": v.Role, "disabled": v.Disabled, "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt, "mfaRequired": v.MFARequired, "authSource": string(v.AuthSource)}
 }
 func publicAgent(v storage.Agent) map[string]any {
 	return map[string]any{"id": v.ID, "name": v.Name, "ownerUserId": v.OwnerUserID, "capabilities": decodeStrings(v.Capabilities), "enabled": v.Enabled, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}

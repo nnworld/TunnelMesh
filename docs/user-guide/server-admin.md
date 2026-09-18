@@ -30,7 +30,26 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 管理员可在“子账号”中创建、启用、禁用、重置密码、逻辑删除和恢复普通账号。创建/重置返回的临时密码只显示一次，响应使用 `Cache-Control: no-store`，不要写入工单、日志或浏览器存储。删除只设置 `deleted_at` 和禁用状态，Agent、路由、隧道、Token 与审计记录都会保留；恢复会清空 `deleted_at`。已删除用户名不能复用，管理员账号不能被这些接口操作。
 
-本期 Schema 从 v5 升至 v6。启用 `auto_init` 时会执行 `migrations/incremental/v0005_to_v0006/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限。回滚应用时保留新增可空列，不执行破坏性反向 DDL。
+当前 Schema 版本为 v14。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
+
+## 单点登录、两步验证与受信任设备
+
+管理后台的企业身份能力集中在两个入口：管理员在左侧菜单**单点登录**（`/sso-providers`）配置 OIDC
+提供商与全局认证策略；所有用户在右上角头像菜单**安全设置**（`/account/security`）绑定 TOTP 两步验证、
+保存一次性恢复码、查看和撤销自己的受信任设备、管理已关联的单点登录账号。
+
+管理员还可以在**子账号**页对单个账号强制两步验证（`mfaRequired`），在账号详情侧查看其 MFA 状态、
+受信任设备和外部身份关联，并执行 `mfa/reset` 帮助丢失验证器的用户恢复登录。
+
+启用前必须先注入 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（集群所有节点一致），并确保
+`security.allowed_origins` 或 `security.allowed_hosts` 已配置——OIDC 回调地址白名单由它们推导，
+两者都为空时无法注册任何提供商。缺少密钥时 MFA 绑定与提供商创建返回
+`503 secret_storage_unavailable`，不会退化成明文存储。
+
+完整操作流程、字段取值范围、登录时序和按 `data.error` 归类的排障表见
+[单点登录与两步验证](sso-and-mfa.md)。配置键含义见
+[配置说明](../operations/configuration.md#管理台身份认证sso--mfa--受信任设备)，身份指标见
+[可观测性](../operations/observability.md#身份认证sso--mfa--受信任设备)。
 
 ## Agent 列表与详情
 

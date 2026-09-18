@@ -4,7 +4,7 @@ layout: home
 
 # TunnelMesh documentation
 
-TunnelMesh is a self-hosted tunneling platform with a built-in admin console, scoped service tokens, RBAC, Agent policy, audit logs, and observability.
+TunnelMesh is a self-hosted tunneling platform with a built-in admin console, OIDC single sign-on, TOTP multi-factor authentication, revocable trusted devices, scoped service tokens, RBAC, Agent policy, audit logs, and observability.
 
 ## Start here
 
@@ -17,6 +17,8 @@ TunnelMesh is a self-hosted tunneling platform with a built-in admin console, sc
 ## By component
 
 - [Server administration](user-guide/server-admin.md)
+- [Single sign-on and MFA](en/user-guide/sso-and-mfa.md) — English guide
+- [单点登录与两步验证](user-guide/sso-and-mfa.md) — 中文完整参考
 - [Agent](user-guide/agent.md)
 - [Client](user-guide/client.md)
 
@@ -24,6 +26,7 @@ TunnelMesh is a self-hosted tunneling platform with a built-in admin console, sc
 
 - [Configuration](operations/configuration.md)
 - [Observability](operations/observability.md)
+- [Security hardening (English)](en/operations/security.md)
 - [Troubleshooting](operations/troubleshooting.md)
 - [Schema upgrades](operations/schema-upgrades.md)
 

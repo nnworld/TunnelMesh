@@ -191,3 +191,30 @@ func writeNativeTLSCertificate(t *testing.T) (string, string, *x509.CertPool) {
 	roots.AddCert(certificate)
 	return certFile, keyFile, roots
 }
+
+func TestPreflightNativeTLSValidatesMaterialWithoutBinding(t *testing.T) {
+	certFile, keyFile, _ := writeNativeTLSCertificate(t)
+	_, otherKeyFile, _ := writeNativeTLSCertificate(t)
+
+	if err := PreflightNativeTLS(config.TLSConfig{Enabled: false}); err != nil {
+		t.Fatalf("disabled native TLS should be a no-op, got %v", err)
+	}
+	if err := PreflightNativeTLS(config.TLSConfig{Enabled: true, CertFile: certFile, KeyFile: keyFile, MinVersion: "1.2"}); err != nil {
+		t.Fatalf("valid material failed preflight: %v", err)
+	}
+	for name, cfg := range map[string]config.TLSConfig{
+		"missing files":       {Enabled: true, MinVersion: "1.2"},
+		"unsupported version": {Enabled: true, CertFile: certFile, KeyFile: keyFile, MinVersion: "1.0"},
+		"unreadable cert":     {Enabled: true, CertFile: filepath.Join(t.TempDir(), "absent.crt"), KeyFile: keyFile, MinVersion: "1.3"},
+		"mismatched pair":     {Enabled: true, CertFile: certFile, KeyFile: otherKeyFile, MinVersion: "1.2"},
+	} {
+		if err := PreflightNativeTLS(cfg); err == nil {
+			t.Fatalf("%s: expected preflight to fail", name)
+		}
+	}
+	// A mismatched pair must keep the wording the CLI startup contract asserts on.
+	err := PreflightNativeTLS(config.TLSConfig{Enabled: true, CertFile: certFile, KeyFile: otherKeyFile, MinVersion: "1.2"})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "native tls certificate") {
+		t.Fatalf("mismatched pair error = %v, want it to mention the native TLS certificate", err)
+	}
+}
