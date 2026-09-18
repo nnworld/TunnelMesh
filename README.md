@@ -14,9 +14,13 @@ Put an Agent inside a private network, expose managed HTTP routes or local forwa
 from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
 Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
 
-[Docs site](https://nnworld.github.io/TunnelMesh/) · [Quick start](docs/user-guide/quickstart.md) · [Architecture](docs/architecture/overview.md) ·
-[Docker](docs/deployment/docker.md) · [Comparison](docs/community/comparison.md) ·
-[Roadmap](docs/community/roadmap.md) · [Security](SECURITY.md) · [中文文档](README.zh-CN.md)
+[Docs site](https://nnworld.github.io/TunnelMesh/) ·
+[Quick start](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
+[Architecture](https://nnworld.github.io/TunnelMesh/architecture/overview.html) ·
+[Docker](https://nnworld.github.io/TunnelMesh/deployment/docker.html) ·
+[Comparison](https://nnworld.github.io/TunnelMesh/community/comparison.html) ·
+[Roadmap](https://nnworld.github.io/TunnelMesh/community/roadmap.html) ·
+[Security](SECURITY.md) · [中文文档](README.zh-CN.md)
 
 ## Why TunnelMesh
 

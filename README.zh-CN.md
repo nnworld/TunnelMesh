@@ -14,9 +14,13 @@
 RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口只使用 HTTP/HTTPS/WSS，
 Server 不监听公网 UDP。
 
-[文档站](https://nnworld.github.io/TunnelMesh/) · [五分钟快速开始](docs/user-guide/quickstart.md) · [架构](docs/architecture/overview.md) ·
-[Docker](docs/deployment/docker.md) · [对比](docs/community/comparison.md) ·
-[路线图](docs/community/roadmap.md) · [安全](SECURITY.md) · [English](README.md)
+[文档站](https://nnworld.github.io/TunnelMesh/) ·
+[五分钟快速开始](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
+[架构](https://nnworld.github.io/TunnelMesh/architecture/overview.html) ·
+[Docker](https://nnworld.github.io/TunnelMesh/deployment/docker.html) ·
+[对比](https://nnworld.github.io/TunnelMesh/community/comparison.html) ·
+[路线图](https://nnworld.github.io/TunnelMesh/community/roadmap.html) ·
+[安全](SECURITY.md) · [English](README.md)
 
 ## 为什么选择 TunnelMesh
 
