@@ -120,6 +120,21 @@ source for management data. See [architecture overview](docs/architecture/overvi
 
 ### Install
 
+For Linux or macOS, download the installer, review it, and install a checksum-verified release:
+
+```sh
+curl --fail --silent --show-error --location \
+  https://raw.githubusercontent.com/nnworld/TunnelMesh/main/scripts/install.sh \
+  --output /tmp/tunnelmesh-install.sh
+less /tmp/tunnelmesh-install.sh
+bash /tmp/tunnelmesh-install.sh --version v1.1.0
+```
+
+The default install directory is `~/.local/bin`; use `--install-dir /usr/local/bin` for a system-wide
+install. Without `--version`, the installer resolves and installs the latest stable release. To register
+systemd or launchd services, use the platform installer included in the
+[release archive](https://github.com/nnworld/TunnelMesh/releases) or the deployment guides.
+
 Download a prebuilt archive for Linux, macOS, or Windows from
 [GitHub Releases](https://github.com/nnworld/TunnelMesh/releases), or build from source
 (Go 1.23+, Node.js 22):

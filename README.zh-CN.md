@@ -117,6 +117,20 @@ flowchart LR
 
 ### 安装
 
+Linux 或 macOS 可以先下载并审查安装脚本，再安装经过 SHA256 校验的发行包：
+
+```sh
+curl --fail --silent --show-error --location \
+  https://raw.githubusercontent.com/nnworld/TunnelMesh/main/scripts/install.sh \
+  --output /tmp/tunnelmesh-install.sh
+less /tmp/tunnelmesh-install.sh
+bash /tmp/tunnelmesh-install.sh --version v1.1.0
+```
+
+默认安装到 `~/.local/bin`；如需系统级安装可传 `--install-dir /usr/local/bin`。不传 `--version`
+时安装最新稳定版。注册 systemd 或 launchd 服务时，请使用
+[发行包](https://github.com/nnworld/TunnelMesh/releases) 内的平台安装脚本，或参考部署文档。
+
 从 [GitHub Releases](https://github.com/nnworld/TunnelMesh/releases) 下载 Linux、macOS 或 Windows
 预编译包，或从源码构建（Go 1.23+、Node.js 22）：
 

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/nnworld/TunnelMesh/tree/main/docs
+    about: Check the user, deployment, operations, and architecture guides before opening an issue.
+  - name: Discussions
+    url: https://github.com/nnworld/TunnelMesh/discussions
+    about: Ask usage questions or share deployment feedback with the community.
+  - name: Security policy
+    url: https://github.com/nnworld/TunnelMesh/blob/main/SECURITY.md
+    about: Report vulnerabilities privately instead of opening a public issue.
