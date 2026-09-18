@@ -22,7 +22,7 @@
     "zmodem.js": "^0.1.10"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.1",
+    "@vitejs/plugin-vue": "^6.0.9",
     "jsdom": "^26.0.0",
     "typescript": "^7.0.2",
     "unplugin-vue-components": "^32.1.0",
