@@ -18,6 +18,24 @@ flowchart LR
 - A browser
 - About 2 GB of free memory
 
+## Diagnose a first-run problem
+
+Each binary has a `doctor` command that validates its configuration without starting
+long-lived tunnels. The Server also opens and pings its configured database; Agent and
+Client call the Server's unauthenticated `/health/ready` endpoint with a five-second
+timeout and never send the service token.
+
+```sh
+tunnelmesh-server --config server.yaml doctor
+tunnelmesh-agent --config agent.yaml doctor
+tunnelmesh-client --config client.yaml doctor
+```
+
+For the Linux/macOS installer, `--dry-run --version vX.Y.Z` prints the exact release
+URLs and install paths without network access or writes. `--print-checksum --version
+vX.Y.Z` downloads and verifies the archive checksum, prints it, and exits without
+installing files.
+
 ## Start the Server with Docker
 
 ```sh

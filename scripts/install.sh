@@ -8,10 +8,13 @@ readonly LATEST_API_URL="https://api.github.com/repos/${REPOSITORY}/releases/lat
 VERSION="latest"
 INSTALL_DIR="${HOME}/.local/bin"
 WORK_DIR=""
+DRY_RUN=0
+PRINT_CHECKSUM=0
 
 usage() {
   cat >&2 <<'EOF'
 Usage: install.sh [--version vMAJOR.MINOR.PATCH] [--install-dir DIR]
+                 [--dry-run] [--print-checksum]
 
 Downloads a TunnelMesh release archive, verifies its SHA256 checksum, and copies the
 three binaries to the requested directory. The default is a user-local install.
@@ -28,6 +31,14 @@ while [[ $# -gt 0 ]]; do
       INSTALL_DIR="${2:?missing install directory}"
       shift 2
       ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --print-checksum)
+      PRINT_CHECKSUM=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -39,6 +50,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$DRY_RUN" -eq 1 && "$PRINT_CHECKSUM" -eq 1 ]]; then
+  echo "--dry-run and --print-checksum cannot be used together" >&2
+  exit 2
+fi
+if [[ "$DRY_RUN" -eq 1 && "$VERSION" == "latest" ]]; then
+  echo "--dry-run requires --version because latest-tag resolution needs a network request" >&2
+  exit 2
+fi
 
 cleanup() {
   if [[ -n "$WORK_DIR" ]]; then
@@ -107,6 +127,17 @@ archive="tunnelmesh-${VERSION}-${GOOS}-${GOARCH}.tar.gz"
 archive_url="${RELEASE_BASE_URL}/download/${VERSION}/${archive}"
 checksums_url="${RELEASE_BASE_URL}/download/${VERSION}/SHA256SUMS"
 
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "dry-run: no network request or file write will be performed"
+  echo "version: ${VERSION}"
+  echo "platform: ${GOOS}/${GOARCH}"
+  echo "archive: ${archive_url}"
+  echo "checksums: ${checksums_url}"
+  echo "install directory: ${INSTALL_DIR}"
+  echo "binaries: tunnelmesh-server tunnelmesh-agent tunnelmesh-client"
+  exit 0
+fi
+
 WORK_DIR="$(mktemp -d)"
 extract_dir="${WORK_DIR}/extract"
 mkdir -p "$extract_dir"
@@ -127,6 +158,11 @@ if [[ "$actual_checksum" != "$expected_checksum" ]]; then
   echo "expected: ${expected_checksum}" >&2
   echo "actual:   ${actual_checksum}" >&2
   exit 1
+fi
+
+if [[ "$PRINT_CHECKSUM" -eq 1 ]]; then
+  echo "verified checksum: ${actual_checksum}"
+  exit 0
 fi
 
 tar -xzf "${WORK_DIR}/${archive}" -C "$extract_dir"

@@ -74,3 +74,19 @@ func TestInstallScriptSupportsOnlyReleasePlatforms(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallScriptSupportsSafetyModes(t *testing.T) {
+	script := readInstallScript(t)
+	required := []string{
+		"--dry-run",
+		"--print-checksum",
+		"dry-run: no network request or file write will be performed",
+		"verified checksum:",
+	}
+
+	for _, want := range required {
+		if !strings.Contains(script, want) {
+			t.Errorf("install.sh is missing safety-mode requirement %q", want)
+		}
+	}
+}

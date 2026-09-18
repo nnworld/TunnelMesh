@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,16 +15,137 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tunnelmesh/tunnelmesh/internal/cli"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 func TestServerRootExposesConfigurationCommands(t *testing.T) {
 	root := cli.NewServerRoot()
-	for _, name := range []string{"run", "check-config", "init-db", "init-node-id", "print-config", "admin"} {
+	for _, name := range []string{"run", "check-config", "doctor", "init-db", "init-node-id", "print-config", "admin"} {
 		if root.CommandPath() == "" {
 			t.Fatal("root command has no path")
 		}
 		if findCommand(root, name) == nil {
 			t.Fatalf("server root missing %q command", name)
+		}
+	}
+}
+
+func TestAllRootsExposeDoctorCommand(t *testing.T) {
+	roots := map[string]func() *cobra.Command{
+		"server": cli.NewServerRoot,
+		"agent":  cli.NewAgentRoot,
+		"client": cli.NewClientRoot,
+	}
+
+	for name, factory := range roots {
+		t.Run(name, func(t *testing.T) {
+			if findCommand(factory(), "doctor") == nil {
+				t.Fatalf("%s root missing doctor command", name)
+			}
+		})
+	}
+}
+
+func TestServerDoctorValidatesStorage(t *testing.T) {
+	dir := t.TempDir()
+	databasePath := filepath.Join(dir, "doctor.db")
+	db, err := storage.OpenConfig(context.Background(), config.StorageConfig{
+		Driver:   storage.DriverSQLite,
+		AutoInit: true,
+		SQLite:   config.SQLiteConfig{Path: databasePath},
+	})
+	if err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configFile := filepath.Join(dir, "server.yaml")
+	contents := "mode: local\nstorage:\n  driver: sqlite\n  auto_init: true\n  sqlite:\n    path: " + databasePath + "\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := cli.NewServerRoot()
+	root.SetArgs([]string{"doctor", "--config", configFile})
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("doctor Execute() error = %v", err)
+	}
+	for _, want := range []string{"configuration: ok", "storage: ok (sqlite)"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("doctor output %q does not contain %q", output.String(), want)
+		}
+	}
+}
+
+func TestServerDoctorDoesNotInitializeMissingSchema(t *testing.T) {
+	dir := t.TempDir()
+	databasePath := filepath.Join(dir, "missing.db")
+	if err := os.WriteFile(databasePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configFile := filepath.Join(dir, "server.yaml")
+	contents := "mode: local\nstorage:\n  driver: sqlite\n  auto_init: true\n  sqlite:\n    path: " + databasePath + "\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := cli.NewServerRoot()
+	root.SetArgs([]string{"doctor", "--config", configFile})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.ExecuteContext(context.Background()); err == nil {
+		t.Fatal("doctor unexpectedly succeeded with a missing schema")
+	}
+	info, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("doctor modified missing database; size = %d", info.Size())
+	}
+}
+
+func TestAgentDoctorChecksUnauthenticatedHealthEndpoint(t *testing.T) {
+	var requestPath string
+	var authorizationHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		authorizationHeader = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "agent.yaml")
+	serverURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/agent"
+	contents := "mode: local\nagent:\n  server_url: " + serverURL + "\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := cli.NewAgentRoot()
+	root.SetArgs([]string{"doctor", "--config", configFile})
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("doctor Execute() error = %v", err)
+	}
+	if requestPath != "/health/ready" {
+		t.Fatalf("health path = %q, want /health/ready", requestPath)
+	}
+	if authorizationHeader != "" {
+		t.Fatalf("doctor sent Authorization header %q", authorizationHeader)
+	}
+	for _, want := range []string{"configuration: ok", "server health: ok"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("doctor output %q does not contain %q", output.String(), want)
 		}
 	}
 }

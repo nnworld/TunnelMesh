@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 16 份记录，按日期倒序排列。
+共 17 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-09-18 | [P1–P3 growth and product hardening](2026-09-18-p1-p3-growth-product-hardening.md) | [计划：P1–P3 growth and product hardening implem…](../superpowers/plans/2026-09-18-p1-p3-growth-product-hardening.md) | — |
 | 2026-09-17 | [P0/P1 growth acceleration](2026-09-17-p0-p1-growth-acceleration.md) | [计划：P0/P1 Growth Acceleration](../superpowers/plans/2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../superpowers/specs/2026-09-17-p0-p1-growth-acceleration-design.md) |
 | 2026-09-17 | [PR: Improve GitHub growth presentation](2026-09-17-github-growth-optimization.md) | [计划：GitHub Growth Optimization](../superpowers/plans/2026-09-17-github-growth-optimization.md) | [规格：GitHub Growth Optimization](../superpowers/specs/2026-09-17-github-growth-optimization-design.md) |
 | 2026-09-17 | [GitHub growth install and templates](2026-09-17-github-growth-install-and-templates.md) | [计划：GitHub growth install and template plan](../superpowers/plans/2026-09-17-github-growth-install-and-templates.md) | — |

@@ -14,8 +14,9 @@
 RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口只使用 HTTP/HTTPS/WSS，
 Server 不监听公网 UDP。
 
-[五分钟快速开始](docs/user-guide/quickstart.md) · [架构](docs/architecture/overview.md) ·
-[Docker](docs/deployment/docker.md) · [安全](SECURITY.md) · [English](README.md)
+[文档站](https://nnworld.github.io/TunnelMesh/) · [五分钟快速开始](docs/user-guide/quickstart.md) · [架构](docs/architecture/overview.md) ·
+[Docker](docs/deployment/docker.md) · [对比](docs/community/comparison.md) ·
+[路线图](docs/community/roadmap.md) · [安全](SECURITY.md) · [English](README.md)
 
 ## 为什么选择 TunnelMesh
 
@@ -104,9 +105,29 @@ Server 不监听公网 UDP。
 
 ```mermaid
 flowchart LR
-    User[Browser, curl, or SSH client] -->|HTTPS / WSS| Server[TunnelMesh Server<br/>routes, policy, admin, relay]
-    Server -->|TLS WebSocket| Agent[TunnelMesh Agent<br/>private network]
-    Agent -->|TCP / UDP / HTTP| Service[Internal service]
+    subgraph UserSide [用户侧]
+        Browser[浏览器：管理后台、WebSSH、SFTP]
+        CLI[curl、SSH、本地转发]
+    end
+
+    subgraph Edge [公网入口]
+        Server[TunnelMesh Server<br/>路由、RBAC、Token、审计、管理 API]
+        Relay[节点间 relay<br/>mTLS gRPC]
+    end
+
+    subgraph Private [内网]
+        Agent[TunnelMesh Agent<br/>出站 WSS、策略二次校验]
+        Service[TCP / UDP / HTTP 服务]
+    end
+
+    Store[(SQLite 或 MySQL<br/>权威管理数据)]
+
+    Browser -->|HTTPS| Server
+    CLI -->|HTTPS / WSS / 本地转发| Server
+    Server <-->|mTLS relay| Relay
+    Server -->|TLS WebSocket| Agent
+    Agent -->|策略校验后拨号| Service
+    Server <--> Store
 ```
 
 集群模式下 Server 节点之间还通过带认证的 relay（默认 mTLS）互通，因此连接在任意节点上的 Client
@@ -124,7 +145,7 @@ curl --fail --silent --show-error --location \
   https://raw.githubusercontent.com/nnworld/TunnelMesh/main/scripts/install.sh \
   --output /tmp/tunnelmesh-install.sh
 less /tmp/tunnelmesh-install.sh
-bash /tmp/tunnelmesh-install.sh --version v1.1.0
+bash /tmp/tunnelmesh-install.sh --version v1.1.1
 ```
 
 默认安装到 `~/.local/bin`；如需系统级安装可传 `--install-dir /usr/local/bin`。不传 `--version`
