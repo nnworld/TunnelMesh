@@ -148,6 +148,13 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 func serverCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh server", func(cmd *cobra.Command, cfg config.Config) error {
+			// Certificate material is validated before storage is opened: reading a
+			// local key pair is cheap, while OpenConfig can run a full schema
+			// migration. Checking TLS first keeps `run` failing fast and stops a
+			// missing certificate from being reported as a storage timeout.
+			if err := server.PreflightNativeTLS(cfg.TLS); err != nil {
+				return err
+			}
 			db, err := storage.OpenConfig(cmd.Context(), cfg.Storage)
 			if err != nil {
 				return err

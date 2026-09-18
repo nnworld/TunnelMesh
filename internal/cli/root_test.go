@@ -424,3 +424,29 @@ func findCommand(root *cobra.Command, name string) *cobra.Command {
 	}
 	return nil
 }
+
+// TestServerRunValidatesNativeTLSBeforeOpeningStorage pins the startup order.
+// Certificate material is a cheap local file read, while opening storage can run
+// a full schema migration and per-table verification. Reporting the TLS problem
+// first keeps `run` failing fast and keeps the diagnostic independent of
+// database latency, which matters because schema growth keeps making the storage
+// step slower.
+func TestServerRunValidatesNativeTLSBeforeOpeningStorage(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "server.yaml")
+	// The SQLite path points into a directory that does not exist, so opening
+	// storage would also fail. The TLS error must win because it is checked first.
+	contents := "mode: local\nstorage:\n  driver: sqlite\n  sqlite:\n    path: " + filepath.Join(dir, "missing-dir", "runtime.db") + "\nserver:\n  http_addr: 127.0.0.1:0\ntls:\n  enabled: true\n  cert_file: " + filepath.Join(dir, "missing.crt") + "\n  key_file: " + filepath.Join(dir, "missing.key") + "\n  min_version: \"1.2\"\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := cli.NewServerRoot()
+	root.SetArgs([]string{"run", "--config", configFile})
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "native tls certificate") {
+		t.Fatalf("Execute() error = %v, want native TLS certificate load failure before storage is opened", err)
+	}
+}
