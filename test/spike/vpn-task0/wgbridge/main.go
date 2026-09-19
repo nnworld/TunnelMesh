@@ -77,7 +77,11 @@ func main() {
 	if listenPort == 0 {
 		fail("could not read the server's WireGuard listen port", nil)
 	}
-	fmt.Printf("OK: wireguard-go accepted an in-memory tun.Device; server listening on UDP 127.0.0.1:%d\n", listenPort)
+	// conn.NewDefaultBind() opens ListenPacket(ctx, network, ":"+port), i.e. a
+	// wildcard bind on every interface -- not a loopback bind. 127.0.0.1 is only
+	// the endpoint the client is told to dial. Phase 1 must carry this into the
+	// deployment docs: the VPN data plane holds a wildcard UDP port.
+	fmt.Printf("OK: wireguard-go accepted an in-memory tun.Device; server bound to UDP :%d (wildcard), client endpoint 127.0.0.1:%d\n", listenPort, listenPort)
 
 	if err := serverDev.IpcSet(fmt.Sprintf("public_key=%s\nallowed_ip=%s/32\n", hex.EncodeToString(clientPub), clientVPNIP)); err != nil {
 		fail("server IpcSet peer", err)

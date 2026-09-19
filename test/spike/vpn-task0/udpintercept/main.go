@@ -74,7 +74,18 @@ func main() {
 	ep.InjectInbound(ipv4.ProtocolNumber, buildUDP(reqBody))
 
 	select {
-	case raw := <-egressOf(ep, 3*time.Second):
+	case raw := <-egressOf(ep, 2*time.Second):
+		// egressOf closes its channel on timeout, which delivers a nil slice to
+		// this case rather than falling through to the outer time.After. Guard it
+		// explicitly: a nil raw would panic inside header.IPv4 and replace the
+		// intended diagnostic with a goroutine dump -- and the empty-egress case
+		// is precisely the regression this probe exists to catch.
+		if len(raw) == 0 {
+			mu.Lock()
+			fmt.Printf("FAIL: no reply egressed; handlerCalls=%d captured=%s\n", handlerCalls, summarizeCaptured())
+			mu.Unlock()
+			os.Exit(1)
+		}
 		ip := header.IPv4(raw)
 		uh := header.UDP(raw[ip.HeaderLength():])
 		body := raw[ip.HeaderLength()+header.UDPMinimumSize:]
@@ -93,24 +104,71 @@ func main() {
 		if uh.SourcePort() != serverPt || uh.DestinationPort() != clientPt {
 			fail(fmt.Sprintf("reply ports %d -> %d", uh.SourcePort(), uh.DestinationPort()))
 		}
-		// Positively assert the stack did not answer the peer with an ICMP
-		// port-unreachable: consuming the datagram by returning true must keep it
-		// out of HandleUnknownDestinationPacket entirely. The egress queue is
-		// drained in order, so an ICMP reply would have been this packet instead.
+		// The reply itself must be UDP, not an ICMP error.
 		if ip.TransportProtocol() != udp.ProtocolNumber {
 			fail(fmt.Sprintf("egress packet is IP protocol %d, want %d (UDP)",
 				ip.TransportProtocol(), udp.ProtocolNumber))
 		}
-		fmt.Printf("PASS: netstack consumed UDP %s and emitted the reply (%d bytes, IP proto %d) towards the peer; no ICMP port-unreachable generated\n",
+		// Checking only the first dequeued packet cannot prove the ABSENCE of a
+		// second one: the reply is written from a goroutine, so ordering against a
+		// hypothetical ICMP is not guaranteed. Drain for a further window and fail
+		// on anything else, which is what actually backs the "no ICMP
+		// port-unreachable" claim -- returning true from the handler must keep the
+		// datagram out of HandleUnknownDestinationPacket entirely.
+		if extra := drainFor(ep, 300*time.Millisecond); len(extra) > 0 {
+			for _, pkt := range extra {
+				if header.IPv4(pkt).TransportProtocol() == icmpv4ProtocolNumber {
+					fail(fmt.Sprintf("stack emitted an ICMP reply (%d bytes) despite the handler consuming the datagram", len(pkt)))
+				}
+			}
+			fail(fmt.Sprintf("%d unexpected extra egress packet(s) after the reply", len(extra)))
+		}
+		fmt.Printf("PASS: netstack consumed UDP %s and emitted the reply (%d bytes, IP proto %d) towards the peer; nothing else egressed in the following 300ms, so no ICMP port-unreachable was generated\n",
 			cap0[0], len(raw), ip.TransportProtocol())
 		fmt.Printf("      transport handler invoked %d time(s); no socket, route or address setup needed\n", calls)
 		return
 	case <-time.After(3 * time.Second):
 		mu.Lock()
-		fmt.Printf("FAIL: no reply egressed; handlerCalls=%d captured=%v\n", handlerCalls, captured)
+		fmt.Printf("FAIL: no reply egressed; handlerCalls=%d captured=%s\n", handlerCalls, summarizeCaptured())
 		mu.Unlock()
 		os.Exit(1)
 	}
+}
+
+// summarizeCaptured renders the handler capture log for a FAIL diagnostic. A
+// regression can make the handler re-enter itself indefinitely (injecting the
+// reply back inbound re-delivers it to this same handler), so the slice is
+// unbounded; print a short prefix plus the total rather than 100k entries.
+// The caller must hold mu.
+func summarizeCaptured() string {
+	const maxEntries = 3
+	if len(captured) <= maxEntries {
+		return fmt.Sprintf("%v", captured)
+	}
+	return fmt.Sprintf("%v ... (%d entries total)", captured[:maxEntries], len(captured))
+}
+
+// icmpv4ProtocolNumber is IP protocol 1, the number an ICMP port-unreachable
+// would carry. Spelled out rather than pulled from a gVisor constant so the
+// assertion cannot silently track a renamed symbol.
+const icmpv4ProtocolNumber = 1
+
+// drainFor collects every packet that reaches the outbound queue within the
+// window, so the caller can assert that nothing unexpected followed the reply.
+func drainFor(ep *channel.Endpoint, window time.Duration) [][]byte {
+	var out [][]byte
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		pkt := ep.Read()
+		if pkt == nil {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		raw := pkt.ToView().AsSlice()
+		pkt.DecRef()
+		out = append(out, raw)
+	}
+	return out
 }
 
 // egressOf returns the raw bytes of the next packet the stack (or we) put on

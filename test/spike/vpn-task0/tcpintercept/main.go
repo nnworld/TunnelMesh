@@ -115,6 +115,12 @@ func main() {
 		report("FAIL: no SYN-ACK egressed within 5s")
 	}
 	close(stop)
+	// A RST-ACK would also carry ack=clientISN+1 and the same tuple, so check the
+	// flags before calling this packet a SYN-ACK. It could never make Accept
+	// return, but the intermediate OK line must not name a packet it did not verify.
+	if synAck.tcp().Flags()&header.TCPFlagSyn == 0 {
+		report(fmt.Sprintf("FAIL: reply flags 0x%02x are not SYN-ACK", uint8(synAck.tcp().Flags())))
+	}
 	if synAck.AckNumber() != clientISN+1 {
 		report(fmt.Sprintf("FAIL: SYN-ACK ack=%d, want %d", synAck.AckNumber(), clientISN+1))
 	}

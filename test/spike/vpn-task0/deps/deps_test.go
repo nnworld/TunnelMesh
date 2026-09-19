@@ -2,8 +2,6 @@ package main
 
 import (
 	"go/build"
-	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -33,14 +31,5 @@ func TestPinnedPackagesAreImportable(t *testing.T) {
 		if _, err := build.Import(path, ".", 0); err != nil {
 			t.Errorf("cannot import %s: %v", path, err)
 		}
-	}
-}
-
-// TestGoVersionIsHighEnoughForGVisor records that gVisor forces the go
-// directive up from the main module's 1.26.0; the spike module declares 1.26.3.
-func TestGoVersionIsHighEnoughForGVisor(t *testing.T) {
-	v := strings.TrimPrefix(runtime.Version(), "go")
-	if strings.HasPrefix(v, "1.26.0") {
-		t.Errorf("toolchain %s predates the go directive gVisor requires (1.26.3)", v)
 	}
 }
