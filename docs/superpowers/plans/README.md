@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 39 份计划，按日期倒序排列。
+共 40 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-19 | [VPN 网关 Task 0 可行性验证 Implementation Plan](2026-09-19-vpn-task0-feasibility.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | — |
 | 2026-09-18 | [SSO, MFA, and device trust implementation plan (Phase A)](2026-09-18-sso-mfa-device-trust-implementation.md) | [规格：Enterprise capability roadmap design](../specs/2026-09-18-enterprise-capability-roadmap-design.md)<br>[规格：SSO, MFA, and device trust design (Phase …](../specs/2026-09-18-sso-mfa-device-trust-design.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [P1–P3 growth and product hardening implementation plan](2026-09-18-p1-p3-growth-product-hardening.md) | — | [PR：P1–P3 growth and product hardening](../../pull-requests/2026-09-18-p1-p3-growth-product-hardening.md) |
 | 2026-09-17 | [P0/P1 Growth Acceleration Implementation Plan](2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../specs/2026-09-17-p0-p1-growth-acceleration-design.md) | [PR：P0/P1 growth acceleration](../../pull-requests/2026-09-17-p0-p1-growth-acceleration.md) |
