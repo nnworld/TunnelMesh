@@ -1507,3 +1507,94 @@ wgbridge=203；gVisor module cache 102M；TCP 探针二进制 6,454,034 B；当�
 - 后端拒绝模型覆盖（`gpt-5.6-luna` 返回"模型不存在"），故所有子代理继承会话模型；
   据此将独立评审集中在四个探针任务与最终整分支评审，Task 1（纯依赖钉定与转写）由控制方
   逐字节核验替代。以上均记录于 `.superpowers/sdd/2026-09-19-vpn-task0-feasibility/progress.md`。
+
+---
+
+## 补记计划（2026-09-19 最终评审后追加第二轮，只记录已验证事实）
+
+本节同样依据 `docs/development/documentation.md` 的"时点记录不可改写"条款追加：计划正文与第一轮
+补记原样保留，本轮修正与新增实测只在此追加。凡与第一轮补记冲突的数字，以本节为准。
+
+整分支评审范围为 `6d3ddec..9c8515d`（评审 diff 存于
+`.superpowers/sdd/2026-09-19-vpn-task0-feasibility/review-6d3ddec..9c8515d.diff`），
+结论 **APPROVED WITH MINOR FINDINGS**：1 项 Important + 7 项 Minor。8 项发现逐条独立复核均为真，
+全部已修复并复验；未触发 spec §2.2 中止判据，Task 1-4 的 PASS 结论不变。
+
+### 评审发现与本轮修正
+
+1. **[Important] `REPORT.md` Task 4 的 grep 证据块是照抄计划 Expected，未复跑。** 计划 Expected 为
+   行 1/41/131/132，第一轮补记修正 2 之后真实命中已下移为 **1/43/137/138**。命中数一致（4 处），
+   `CreateTUN` 与 `os.OpenFile` 仍为 0 命中，结论不变；但"与计划 Expected 完全一致"的表述不成立。
+   已就地更正为真实输出，并写明行号下移的原因（`capNetAdmin()` 的 import/注释 + 本轮 `OK` 行注释）。
+2. **[Minor] Task 4 的 `OK` 行称 server 监听 `127.0.0.1:<port>`，实为通配绑定。**
+   `conn.NewDefaultBind()` 走 `ListenPacket(ctx, network, ":"+port)`，绑定所有接口；`127.0.0.1`
+   只是告知客户端去拨的 endpoint。输出行已改写为 `server bound to UDP :<port> (wildcard),
+   client endpoint 127.0.0.1:<port>`，并把"VPN 数据面持有一个通配 UDP 端口、暴露面由部署方负责"
+   列为阶段 1 部署文档必须承载的事实。
+3. **[Minor] Task 3 "无 ICMP port-unreachable" 的论据不成立。** 原注释称"出向队列按序排空，
+   所以 ICMP 若存在就会是这一包"，但回包由 handler 内的 goroutine 写出，与假想 ICMP 的先后无序。
+   改为 `drainFor(ep, 300ms)` 正向证明回包之后再无任何包出向，并新增 `icmpv4ProtocolNumber = 1`
+   常量，出现 IP proto 1 直接 FAIL。输出行相应改写为 "nothing else egressed in the following 300ms"。
+4. **[Minor] `egressOf` 超时路径会 panic 而非报告。** 它在超时时关闭 channel，向 `select` 投递
+   nil slice，`header.IPv4(nil)` 随即 panic，把预期诊断换成 goroutine dump——而"出向队列为空"
+   恰是本探针要防的回归。内层超时改为 2s（严格小于外层 3s），并显式判空走同一条 FAIL 分支。
+5. **[Minor] Task 2 的 `OK` 行在校验 SYN 标志之前就断言收到 SYN-ACK。** RST-ACK 同样携带
+   `ack=clientISN+1` 且四元组相同。已加 `flags&header.TCPFlagSyn == 0 → FAIL`；修正后复跑输出
+   逐字未变，说明原结论本就正确，缺的只是证据强度。
+6. **[Minor] `deps/deps_test.go` 的 `TestGoVersionIsHighEnoughForGVisor` 测的是本机工具链，
+   不是本 Task 的任何设计主张**，且 `go.mod` 的 `go 1.26.3` 指令已由工具链强制。已删除该测试
+   （连带清理 `runtime`/`strings` import）。**第一轮补记中"2 个测试全通过"的记录随之过期：
+   现为 1 个测试 `TestPinnedPackagesAreImportable`。**
+7. **[Minor] `REPORT.md` Task 6 的 "gVisor 模块体积 102M" 是本机 `gvisor.dev/` 目录合计值。**
+   被钉死的 revision 实占 **21M**，另 81M 是撰写计划时实验过、已被否决的 `@latest`
+   （`v0.0.0-20260919054224-26f3455a4cb9`）留下的本地残留，与本方案无关。**第一轮补记中的同一
+   数字随之过期。**
+8. **[Minor] FAIL 诊断直接打印 `captured` 全量。** 回归场景下该切片无界（实测 339019 条），
+   诊断输出反而不可读。已加 `summarizeCaptured()`：最多打印 3 条 + 总条数。
+
+`go.sum` 本轮新增 50 行，全部是 `/go.mod h1:` 哈希（闭合模块图所需），`go.mod` 的 require 版本
+一条未变；主模块 `go.mod`/`go.sum` 依旧零改动（`git status --porcelain go.mod go.sum` 为空）。
+
+### 本轮复验与回归证据
+
+- 五个探针复跑：`deps` PASS、`tcpintercept` PASS、`udpintercept` PASS、`wgbridge` PASS、
+  `icmpsock` SKIP（darwin 上无效，不构成 PASS）；`go test ./deps -count=1` → `ok ... 0.407s`。
+- `gofmt -l .` 无输出；`go vet ./...` 与 `GOOS=linux go vet ./...` 均干净；
+  仓库根 `go build ./...` 与 `go vet ./...` 通过。
+- 防回归证明（在 `mktemp -d` 副本中改代码复跑，**未入库**）：把 `emitReply` 的 `WritePackets`
+  换成 `InjectInbound`，探针输出 `FAIL: no reply egressed; handlerCalls=339019 captured=[...]
+  ... (339019 entries total)`、`exit status 1`、**0 次 panic**、0 段 goroutine dump。
+  即第 3、4、8 项修正确实生效，且"用 `InjectInbound` 发回程"的错误写法不会静默通过。
+- 依赖影响数据复测未变：模块 96 条，`go list -deps` tcp=169 / udp=162 / wg=203，
+  TCP 探针二进制 6,454,034 B，`tunnelmesh-server` 39,442,898 B。
+
+### 本轮新增实测（已写入 `REPORT.md` 回流清单第 3、7 项）
+
+以下两项均用一次性 scratch 程序在 `mktemp -d` 副本中实测，**未入库**：
+
+- **同一 (addr,port) 的并发注册语义。** 32 个 goroutine 抢一个全新 tuple（198.51.100.9:9090），
+  连续 3 次结果完全一致：`AddProtocolAddress` 恰好 1 个成功、31 个返回
+  `*tcpip.ErrDuplicateAddress`（`duplicate address`）；`ListenTCP` 恰好 1 个成功、31 个返回
+  `bind tcp 198.51.100.9:9090: port is in use`。→ 阶段 4 的钩子必须按 (addr,port) 做
+  singleflight/去重，把这两个错误当作"别的流已建好"**成功**返回；失败方绝不能 `RemoveAddress`
+  或关闭监听器，否则会拆掉赢家的地址与监听器、中断正在服务的流。另：`tcpip.Error` 不实现
+  `error`，`errors.As` 无法编译（vet 直接报错），判别只能用类型断言——与回流清单第 5 项一致。
+- **`channel.Endpoint.WritePackets` 不做 MTU 校验。** 把 2028 字节的 IPv4+UDP 包写到 MTU=1420 的
+  链路端点，返回 `n=1 err=<nil>` 并原样出队（源码 `pkg/tcpip/link/channel/channel.go:278-291`
+  只入队，唯一错误路径是 `ErrNoBufferSpace`）。→ spec 已规定超限 UDP 直接丢弃，网关必须自己执行，
+  不能指望链路层兜底。
+
+### 评审顺带发现的仓库既有问题（不在本分支修复）
+
+四项均早于本分支、不属于 Task 0 范围，已记入 `REPORT.md` 同名小节，此处只作索引：
+CI 缺 Go 门禁（`ci.yml` 在 `setup-go` 之后没有任何 `go build`/`go vet`/`go test`）；
+`Dockerfile` 第 3 行 `ARG GO_VERSION=1.23` 落后于 `go.mod` 的 `go 1.26.0`；
+`.dockerignore` 未排除 `test/`；根模块路径 `github.com/tunnelmesh/tunnelmesh` 与远端
+`nnworld/TunnelMesh` 不一致。
+
+### 门禁状态（未变）
+
+- Task 1-4 PASS，Server 侧设计成立，可进入 spec §15 阶段 1。
+- Task 5 仍为**未在 Linux 执行**；回流清单第 8 项（非 root、`--cap-drop=ALL` 的 Linux 容器复跑
+  Task 2-4 并回填 capability 实测值）仍未完成。二者依旧是阶段 7（Agent ICMP）与"特权主张"
+  对外表述的开工门禁，不阻塞阶段 1-6。
