@@ -18,6 +18,17 @@ tp-* 代理入口的冒烟同样不在 `go test` 与 `npm test` 中，需要 doc
 `TM_PROXY_E2E_NGINX=1` 或前置条件缺失时打印原因并以 0 退出。修改 `deploy/openresty/` 下任一产物后
 发布前必须跑一次，详见 [test/e2e/proxy-entry/README.md](../../test/e2e/proxy-entry/README.md)。
 
+## CI 门禁范围
+
+`.github/workflows/ci.yml` 的 `build-test` job 依次执行前端 `npm ci`、`npm test -- --run`、
+`npm run build`，然后执行 `go build ./...`、`go vet ./...`、`go test ./... -count=1`，
+最后用 `./scripts/verify-web-embed.sh` 校验嵌入产物。Go 步骤必须排在 `npm run build` 之后：
+`internal/server/web_dist` 不入库，而 `internal/server/web_test.go` 会断言嵌入内容非空且包含
+`index.html`，缺少前端构建产物时 `go build`/`go test` 都会失败。
+
+`go test -race ./...` **不在 CI 中运行**，成本原因见下一节；它仍是 `AGENTS.md`「必须执行的验证」
+要求的提交前本地门禁，PR 记录的测试证据必须写明实际执行结果。
+
 ## race 测试的超时要求
 
 `go test -race ./...` 需要显式放宽超时：`internal/server` 单包在 `-race` 下约需 8-10 分钟，

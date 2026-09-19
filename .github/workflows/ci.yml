@@ -25,6 +25,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1
       - run: ./scripts/verify-web-embed.sh
 
   packaging:
