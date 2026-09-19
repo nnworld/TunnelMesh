@@ -15,3 +15,9 @@ wireguard-go 自身 pin 的 `v0.0.0-20250503011706-39ed1f5ac29c`。不要执行
     for p in deps tcpintercept udpintercept wgbridge icmpsock; do
       go run ./$p; echo "$p exit=$?"
     done
+
+## 结论
+
+见 `REPORT.md`。本目录为一次性验证产物，不被主模块引用；保留它是为了让上述结论可复现。
+`icmpsock` 需在 Linux 上运行，且需要 root 一次性设置 `net.ipv4.ping_group_range`；
+其余四个探针在任意平台、任意权限下都应 PASS。
