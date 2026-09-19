@@ -39,7 +39,7 @@
 - spike 代码是一次性产物，**不得被 `internal/`、`cmd/` 或 `web/` 下任何文件 import**。
 - 探针一律用 `go run ./<pkg>` 或 `go vet ./<pkg>` 验证，**不要用裸的 `go build ./<pkg>`**：spike 模块根下每个包目录名与默认输出二进制同名，`go build ./deps` 会报 `build output "deps" already exists and is a directory`。需要产物时显式指定 `-o`（Task 6 Step 1 就是这么做的）。
 - 本计划**不得修改任何生产文件**，不得修改 `AGENTS.md`，不得改写 `docs/` 下任何活文档（约束反转与文档改写是阶段 1 的独立计划）。
-- 全部 netstack/WireGuard 探针必须在**没有 `/dev/net/tun`、没有 `CAP_NET_ADMIN`、非 root** 的环境下运行成功。这是本设计的核心主张，Task 4 必须显式记录运行环境。
+- Task 1-4 的 netstack/WireGuard 探针必须在**没有 `/dev/net/tun`、没有 `CAP_NET_ADMIN`、非 root** 的环境下运行成功。这是本设计的核心主张，Task 4 必须显式记录运行环境。Task 5 不受此约束：**探针进程本身**仍是非特权的，但它验证的能力由宿主机一次性 `net.ipv4.ping_group_range` 门控，因此设置该 sysctl 需要 root——这正是设计要向用户交代的唯一宿主前置条件，不是探针自身的特权需求。
 - Task 5 必须在 **Linux** 上运行。macOS 的 ICMP datagram socket 语义与 `net.ipv4.ping_group_range` 无关，在 macOS 上的结果无效，不得写入报告；探针在非 Linux 上输出 `SKIP` 并以退出码 0 结束，报告必须注明"未在 Linux 执行"而不是当作 PASS。
 - 已核实可用的依赖基线（Task 1 必须原样钉死，不得 `@latest`）：
 
