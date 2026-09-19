@@ -1438,3 +1438,72 @@ git commit -m "docs(spike): record vpn task 0 feasibility report"
 - Task 5 Step 4 会修改宿主机的 `net.ipv4.ping_group_range`。这是一次性 sysctl 且**不持久**（重启后回到默认 `1 0`）。若在共享主机上执行，验证完成后应恢复原值：`sudo sysctl -w net.ipv4.ping_group_range="1 0"`，并在报告中记录已恢复。
 - 若 Task 1 触发中止判据，本计划的全部产出仅为 spike 代码与一份 FAIL 报告；此时 spec §2.2 要求上报用户并重新决策，**阶段 1 的文档改写不得开工**，否则仓库会声称支持尚不存在的能力。
 - 本计划执行完成后，spike 目录**保留**在仓库中（不删除），以便阶段 3-6 的实现者随时复现结论；它不参与 `go test ./...`，也不进入发布产物。
+
+---
+
+## 补记计划（2026-09-19 执行后追加，只记录已验证事实）
+
+本节依据 `docs/development/documentation.md` 的"时点记录不可改写"条款追加：计划正文原样保留，
+执行中发现的偏差与实测结论只在此追加，不回改上文。
+
+### 执行结果
+
+| Task | 结论 | 提交 |
+| --- | --- | --- |
+| Task 1 | PASS：gVisor 钉定生效，`go run ./deps` 与 2 个测试全通过，主模块 `go.mod`/`go.sum` 无改动 | `58deb92` |
+| Task 2 | PASS：任意目标 TCP 终结成立，连续 7 次运行输出逐字节一致 | `589a818` |
+| Task 3 | PASS：UDP 消费与 `WritePackets` 回程成立，连续 3 次运行一致 | `00fcde6` |
+| Task 4 | PASS：内存 TUN 上的 WireGuard 握手 + TCP 往返成立，连续 3 次运行通过 | `bfd9b14` |
+| Task 5 | **未在 Linux 执行**（本环境 darwin/arm64，无 Linux 主机与任何容器运行时）；代码级验证完成：`go vet`、`GOOS=linux go vet`、linux/amd64+arm64 交叉编译、`gofmt`、与计划代码块 `diff` 为空 | `c87a72f` |
+| Task 6 | 完成：`REPORT.md` 定稿，依赖影响数据采集完毕 | 见本次提交 |
+
+执行环境：darwin/arm64，macOS 14.6（Darwin 23.6.0），非容器，`id -u` = 501，`/dev/net/tun` 不存在。
+无任何 Task 触发 spec §2.2 中止判据，netstack 方案存活。
+
+依赖影响实测：spike 模块依赖 96 条；`go list -deps` 包数 tcpintercept=169、udpintercept=162、
+wgbridge=203；gVisor module cache 102M；TCP 探针二进制 6,454,034 B；当前 `tunnelmesh-server`
+二进制 39,442,898 B。
+
+### 执行中对探针代码的修正（与本计划上文代码块的偏差）
+
+上文代码块在沙箱中验证时遗留了三处缺陷，执行阶段发现并修正。**修正后的仓库代码是权威版本**，
+上文代码块保留原样以维持时点记录：
+
+1. `udpintercept/main.go`：删除声明但从未使用的 `icmpGenerated` 变量（死状态，且它的名字长度导致
+   `var` 块对齐被 `gofmt` 判为不合规）；改为新增一条**有实义的正向断言**——
+   `ip.TransportProtocol() != udp.ProtocolNumber` 即失败。这把 Task 3 正文原本只是"声称"的
+   "栈不会回 ICMP port-unreachable"变成了被断言的事实（实测回程包 IP proto = 17）。
+2. `wgbridge/main.go`：原文的 `CAP_NET_ADMIN=none` 是 `Printf` 里的**硬编码字面量，不是测量值**，
+   在 macOS 上会被误读为已取证。改为 `capNetAdmin()`：Linux 上读 `/proc/self/status` 的 `CapEff`
+   并测试第 12 位（命中则输出 `PRESENT ... -- the claim is NOT evidenced`），非 Linux 如实输出
+   `n/a (only Linux exposes a capability mask)`。同时把手写的 `splitLines`/`cutPrefix` 换成
+   `strings.Split`/`strings.CutPrefix` + `strconv.Atoi`。
+3. `tcpintercept/main.go`、`udpintercept/main.go`、`wgbridge/main.go` 三个文件执行 `gofmt -w`
+   （仅空白对齐，`gofmt -d` 确认零语义变更）。`deps/`、`icmpsock/` 本就合规。
+
+修正后复验：`gofmt -l .` 无输出；`go vet ./...` 与 `GOOS=linux go vet ./...` 均干净；
+五个探针全部按预期 PASS/SKIP。
+
+### 执行阶段新增、须回流阶段 1 的实测发现
+
+已写入 `test/spike/vpn-task0/REPORT.md` 的"必须回流到阶段 1 的设计修正"第 7-9 项：
+
+7. **每个新四元组的首个 SYN 必然被丢弃**（钩子只在 demux 未命中时触发，而监听器注册是异步的），
+   因此生产建连延迟包含一次客户端 RTO（Linux 初始 RTO 1s）。`vpn_flows.go` 必须预算或规避。
+   此项影响用户可感知的首连延迟，须在阶段 4 设计中明确取舍。
+8. **Server 侧特权主张尚未在 Linux 上取证**：macOS 上"`/dev/net/tun` 不存在"平凡为真，
+   `CAP_NET_ADMIN` 亦无法测量。必须在非 root、`--cap-drop=ALL` 的 Linux 容器中复跑 Task 2-4，
+   把 `grep Cap /proc/self/status` 实际值回填报告，方可对外声称特权主张已取证。
+9. **Task 5 待补跑**，命令已原样写入 `REPORT.md`；阶段 7（Agent ICMP）开工前必须关闭。
+
+第 7-9 项构成阶段 7 与"特权主张对外表述"的开工门禁，但**不阻塞**阶段 1-6 的 Server 侧工作。
+
+### 流程记录
+
+- 按 `superpowers:subagent-driven-development` 执行：Task 1 单独派发（关键路径阻塞项），
+  Task 2-5 在 `go.mod` 就位后并行派发（四个独立包目录，无文件重叠）。
+- 并行派发时**提交动作由控制方按序执行**，实现者不碰 git，以规避同一工作树内并发
+  `git add`/`git commit` 争用索引。
+- 后端拒绝模型覆盖（`gpt-5.6-luna` 返回"模型不存在"），故所有子代理继承会话模型；
+  据此将独立评审集中在四个探针任务与最终整分支评审，Task 1（纯依赖钉定与转写）由控制方
+  逐字节核验替代。以上均记录于 `.superpowers/sdd/2026-09-19-vpn-task0-feasibility/progress.md`。
