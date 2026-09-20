@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 14
+	SchemaVersion = 15
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -396,6 +396,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			if driver == DriverMySQL {
 				script = migrations.V13ToV14MySQL
 			}
+		case 14:
+			script = migrations.V14ToV15SQLite
+			if driver == DriverMySQL {
+				script = migrations.V14ToV15MySQL
+			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
 		}
@@ -462,7 +467,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts"} {
+	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts", "vpn_peers", "vpn_ip_leases"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
