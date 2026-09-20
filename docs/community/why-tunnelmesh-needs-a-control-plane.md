@@ -40,7 +40,7 @@ TunnelMesh has four main pieces:
 3. **Client** — local TCP, UDP, HTTP, SOCKS5, or HTTP-proxy listener on a user workstation.
 4. **Relay** — mTLS-authenticated forwarding between Server nodes when the Client and Agent land on different nodes.
 
-The Agent never exposes a public listener. Public ingress is HTTP/HTTPS/WSS only, and the Server does not expose public UDP.
+The Agent never exposes a public listener; public ingress is HTTP/HTTPS/WSS. An embedded WireGuard gateway that adds exactly one public UDP port on the Server is approved by [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) and in progress, and it changes nothing here: the Agent still dials out.
 
 ## Security model
 

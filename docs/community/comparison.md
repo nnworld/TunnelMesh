@@ -10,7 +10,7 @@ This page compares deployment models, not every feature of every product. Produc
 | Admin console | Built in | Rare | Rare | Vendor console |
 | Access policy | Server-side RBAC, scoped service tokens, Agent CIDR/port policy | Usually per-tunnel config | Usually network-level policy | Vendor plan and policy features |
 | Audit | Structured audit logs | Varies | Varies | Vendor plan and logs |
-| Public ingress | HTTP/HTTPS/WSS only | Protocol-specific | Network-level | Vendor edge |
+| Public ingress | HTTP/HTTPS/WSS (WireGuard UDP in progress) | Protocol-specific | Network-level | Vendor edge |
 | Private-network component | Agent | Server or client | Mesh node | Edge connector |
 | Local user component | Client or browser SSH/SFTP | Client | VPN client | Usually none |
 | Deployment model | Server, Agent, optional Client | Usually one server and one client | Full mesh or partial mesh | Managed service |
@@ -51,4 +51,4 @@ Choose a different model when you need:
 
 ## Honest trade-offs
 
-TunnelMesh intentionally does not implement ICMP, TUN/L2 VPN, P2P NAT traversal, or arbitrary remote command execution. Its public Server ingress is HTTP/HTTPS/WSS only; UDP is supported for internal forwarding and local client listeners, not as a public Server listener.
+TunnelMesh intentionally does not implement P2P NAT traversal or arbitrary remote command execution, and it never forwards L2 Ethernet frames. Its public Server ingress is HTTP/HTTPS/WSS today, with UDP supported for internal forwarding and local client listeners. An embedded WireGuard gateway that adds one public UDP port and carries TCP, UDP and ICMP echo to a chosen egress Agent is approved by [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) and in progress; it is not part of a current release, and source addresses are rewritten to the Agent host rather than preserved end to end.
