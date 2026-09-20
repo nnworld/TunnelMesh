@@ -189,3 +189,16 @@ TUN/L2 VPN」这组工程约束，使规格 §15 的阶段 3-8 可以合法落�
 收敛到绿灯 0，仓库与文档门禁全绿。PR 复审与合并待进行。阶段 2（Task 0 可行性验证）已完成；
 阶段 3-8（`internal/vpn/` 数据面、管理 API 与 Schema v15、前端、Agent ICMP、发布打包、运维文档）
 尚未开工，且以本 PR 合并为前提。
+
+## 补记（2026-09-20，撰写阶段 3 计划时发现）
+
+按「时点记录不可改写」原则，上文原文保持不变，此处只追加更正：
+
+- 「发布步骤」第 4 条把抬高 `Dockerfile` 的 `ARG GO_VERSION` 挂在**阶段 3**，与规格 §15 的阶段划分不符。
+  规格 §15 的阶段是：3 = Schema v15、4 = 纯逻辑与管理 API、5 = 管理后台、6 = Server 数据面、
+  7 = Agent ICMP 扩展、8 = 可观测性与部署。`gvisor.dev/gvisor` 与 `golang.zx2c4.com/wireguard`
+  由 **阶段 6**（`//go:build vpn` 数据面）引入，因此 `Dockerfile` 的工具链抬升属阶段 6 的发布步骤；
+  **阶段 3 不新增任何 Go 依赖**（`go.mod`/`go.sum` 零改动），不需要动 `Dockerfile`。
+- 「Reviewer 关注点」中「阶段 3 引入 gVisor」同此更正。
+- 该更正已在阶段 3 的实施计划（`docs/superpowers/plans/2026-09-20-vpn-phase3-schema-v15.md`，
+  在阶段 3 分支上交付）的「非目标」小节以正确形式固化；此处不写成链接，避免本分支出现指向未合并文件的死链。
