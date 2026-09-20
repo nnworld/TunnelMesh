@@ -16,6 +16,7 @@
 | 编号 | 标题 | 状态 | 关联记录 |
 | --- | --- | --- | --- |
 | 0001 | [Separate scoped service credentials from management sessions](0001-scoped-service-tokens.md) | Accepted | — |
+| 0002 | [Open a public UDP ingress for an embedded VPN gateway](0002-public-ingress-and-embedded-vpn.md) | Accepted | [规格：内嵌 VPN 网关（WireGuard）](../../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md) |
 
 ## 新增 ADR 的步骤
 
