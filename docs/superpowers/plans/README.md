@@ -14,7 +14,7 @@
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
-| 2026-09-20 | [VPN 网关 阶段 1：约束反转与 ADR 0002 Implementation Plan](2026-09-20-vpn-phase1-constraint-reversal.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | — |
+| 2026-09-20 | [VPN 网关 阶段 1：约束反转与 ADR 0002 Implementation Plan](2026-09-20-vpn-phase1-constraint-reversal.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 1：约束反转与 ADR 0002](../../pull-requests/2026-09-20-vpn-phase1-constraint-reversal.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-19 | [VPN 网关 Task 0 可行性验证 Implementation Plan](2026-09-19-vpn-task0-feasibility.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 Task 0：设计规格与可行性验证 spike](../../pull-requests/2026-09-19-vpn-task0-feasibility.md) |
 | 2026-09-18 | [SSO, MFA, and device trust implementation plan (Phase A)](2026-09-18-sso-mfa-device-trust-implementation.md) | [规格：Enterprise capability roadmap design](../specs/2026-09-18-enterprise-capability-roadmap-design.md)<br>[规格：SSO, MFA, and device trust design (Phase …](../specs/2026-09-18-sso-mfa-device-trust-design.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [P1–P3 growth and product hardening implementation plan](2026-09-18-p1-p3-growth-product-hardening.md) | — | [PR：P1–P3 growth and product hardening](../../pull-requests/2026-09-18-p1-p3-growth-product-hardening.md) |

@@ -13,7 +13,7 @@
 
 | 日期 | 设计规格 | 关联计划 | 关联 PR / ADR |
 | --- | --- | --- | --- |
-| 2026-09-19 | [内嵌 VPN 网关（WireGuard）设计](2026-09-19-embedded-vpn-gateway-design.md) | — | — |
+| 2026-09-19 | [内嵌 VPN 网关（WireGuard）设计](2026-09-19-embedded-vpn-gateway-design.md) | — | [ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-18 | [SSO, MFA, and device trust design (Phase A)](2026-09-18-sso-mfa-device-trust-design.md) | [计划：SSO, MFA, and device trust implementation…](../plans/2026-09-18-sso-mfa-device-trust-implementation.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [Enterprise capability roadmap design](2026-09-18-enterprise-capability-roadmap-design.md) | [计划：SSO, MFA, and device trust implementation…](../plans/2026-09-18-sso-mfa-device-trust-implementation.md) | — |
 | 2026-09-17 | [P0/P1 Growth Acceleration Design](2026-09-17-p0-p1-growth-acceleration-design.md) | [计划：P0/P1 Growth Acceleration](../plans/2026-09-17-p0-p1-growth-acceleration-implementation.md) | [PR：P0/P1 growth acceleration](../../pull-requests/2026-09-17-p0-p1-growth-acceleration.md) |

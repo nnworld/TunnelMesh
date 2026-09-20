@@ -97,7 +97,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - 集群模式使用 MySQL 管理数据；注册发现默认使用 MySQL lease，也可以切换到 etcd。
 
 所有部署都应先执行 `check-config`，再执行 `run`。生产环境建议通过环境变量或外部配置文件注入
-敏感配置，公网入口只使用 HTTP/HTTPS/WSS，Server 不监听公网 UDP。
+敏感配置。公网入口以 HTTP/HTTPS/WSS 为主；内嵌 VPN 网关启用后会额外监听一个公网 UDP 端口（[ADR 0002](architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中，当前版本尚未提供）。
 
 ## 英文与社区
 
