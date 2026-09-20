@@ -12,7 +12,7 @@
 
 Put an Agent inside a private network, expose managed HTTP routes or local forwards, and operate everything
 from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
-Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
+Public ingress is HTTP/HTTPS/WSS. An embedded WireGuard VPN gateway that adds one public UDP port is approved by [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) and landing in phases; it is not available yet.
 
 [Docs site](https://nnworld.github.io/TunnelMesh/) ·
 [Quick start](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
@@ -387,7 +387,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
 - Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
 - Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes. Identity metric labels are a closed enumeration that excludes usernames, client IPs, provider ids, and device tokens.
-- Deliberately not implemented: ICMP, TUN/L2 VPN, P2P NAT traversal, and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path.
+- Deliberately not implemented: P2P NAT traversal and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through an embedded WireGuard gateway is approved by [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) and in progress; L2 frames are never forwarded.
 
 ## Repository layout
 
