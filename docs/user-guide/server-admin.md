@@ -102,7 +102,7 @@ Routes 页面支持将某个域名/路径绑定到 Agent 的目标主机和端�
 <agent-id>-<ip-encoding>-<port>.apps.example.com
 ```
 
-IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/443，不提供公网 UDP。
+IP 和端口使用明文编码，便于排查；动态域名复用 Server 既有的 80/443 入口，不需要为每个 Agent 新开端口。
 
 ## Tunnel 状态
 

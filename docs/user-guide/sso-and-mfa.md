@@ -504,7 +504,7 @@ client secret，也不写 IdP 返回的 `error_description`。提供商更新只
 
 ## 明确不支持
 
-以下能力刻意不在本期范围内，请勿据此设计流程：ICMP、TUN/L2 VPN、P2P NAT 穿透、任意远程命令执行。
+以下能力刻意不在本期范围内，请勿据此设计流程：P2P NAT 穿透、任意远程命令执行。ICMP echo 与内嵌 WireGuard VPN 网关属于独立特性（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），同样不在本期范围内，也不与身份认证交互。
 SSH 支持仅限既有的 stdio/WebSocket 代理链路，不会扩展成通用命令执行接口。WebAuthn/Passkey、
 短信与邮件 OTP、SCIM 用户同步、SAML 也尚未实现；当前唯一的联合登录协议是 OIDC，唯一的第二因子
 是 TOTP 加一次性恢复码。

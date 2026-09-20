@@ -1,6 +1,6 @@
 # 代理协议模块
 
-TunnelMesh 的公网入口继续只监听 HTTP/HTTPS/WebSocket。内部会话通过能力协商启用具体模块，并由 service token scope、Agent policy、目标 CIDR/端口白名单、超时和配额共同约束。
+代理模块的公网入口是 HTTP/HTTPS/WebSocket；内嵌 VPN 网关的 WireGuard 端点是独立入口，不经代理模块（见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。内部会话通过能力协商启用具体模块，并由 service token scope、Agent policy、目标 CIDR/端口白名单、超时和配额共同约束。
 
 当前协议基础包括：
 
@@ -47,4 +47,4 @@ legacy 子协议不启用 `OPEN_STREAM.Window` 语义，仍使用有界队列和
 
 ## 限制与安全
 
-代理模块不会执行任意远程命令，也不实现 ICMP、TUN/L2 VPN 或 P2P NAT traversal。所有目标地址在 Agent 侧再次校验，解析结果重新进行私网/回环/链路本地限制检查。错误日志只记录协议、错误码和 trace id，不记录认证头或会话字节。
+代理模块不会执行任意远程命令，也不实现 P2P NAT traversal。ICMP echo 与内存态 TUN 属于独立的 VPN 网关数据面（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），不经代理模块。所有目标地址在 Agent 侧再次校验，解析结果重新进行私网/回环/链路本地限制检查。错误日志只记录协议、错误码和 trace id，不记录认证头或会话字节。

@@ -191,7 +191,7 @@ tp-* 块用正则 `server_name` 匹配 `tp-<name>.<domain_suffix>`，两块互�
 - 静态资源默认由 Server 透传，Server 已固定 `.wasm` 的 `Content-Type: application/wasm`。若改为 Nginx 直接托管 `web/dist`，必须在 `types` 中补充 `application/wasm wasm;`，否则浏览器会拒绝 WASM 流式编译并回退到更慢的 ArrayBuffer 实例化。
 - `/metrics` 不建议暴露公网；优先让 Prometheus 访问 Server 内网管理地址。
 - 显式泛域名只允许单层 `tm-<name>.tunnel.example.com`；动态域名使用 `<agent>-<a>-<b>-<c>-<d>-<port>.<server.dynamic_suffix>`。Nginx 正则中的后缀必须与 `server.dynamic_suffix`、wildcard DNS 和证书一致；正则只做域名形状筛选，IP 八位组范围、端口范围、危险地址和 Agent 策略由 Server 再次校验。
-- 泛域名只解决 HTTP/HTTPS/WSS 路由，不提供公网 UDP 监听。
+- 泛域名只解决 HTTP/HTTPS/WSS 路由；VPN 网关的公网 UDP 端口不经 Nginx，需在云安全组与主机防火墙上单独放行（见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
 - tp-* server 块禁止 `http2`：`ngx.req.socket(true)` 在 HTTP/2 下游不可用，proxy_connect 模块的 Known Issues 也明确不支持 HTTP/2 的 CONNECT。
 - tp-* 的 `location /` 必须显式写 `proxy_set_header Proxy-Authorization $http_proxy_authorization;`：它是 hop-by-hop 头，Nginx 默认不转发给上游，漏掉这一行会让所有非 CONNECT 的代理请求返回 407。
 - 不能用 `proxy_connect;` + `proxy_pass` 做链式转发：模块 README 明确 “Any `location {}` block, `upstream {}` block and any other standard backend/upstream directives, such as `proxy_pass`, do not impact the functionality of this module.”，模块会自己直连目标，路由身份与 `Proxy-Authorization` 全部丢失。本项目的做法是**不启用** `proxy_connect;` 指令，只用补丁提供的 `$connect_host`/`$connect_port` 变量与 server 级 `access_by_lua_file`，把 CONNECT 原样搬到 Server 的内部入口（`server.proxy_entry.listen`），策略全部由 Server 执行。

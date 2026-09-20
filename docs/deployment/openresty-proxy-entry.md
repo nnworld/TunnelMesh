@@ -8,7 +8,7 @@
 
 ## 为什么必须是 OpenResty
 
-公网入口只允许 HTTP/HTTPS/WebSocket，而浏览器与操作系统的 HTTPS 代理会先发 `CONNECT`。纯 nginx
+tp-* 代理入口只处理 HTTP/HTTPS/WebSocket，而浏览器与操作系统的 HTTPS 代理会先发 `CONNECT`。纯 nginx
 做不到“按 SNI 选路由再把 CONNECT 搬进 Server”：CONNECT 跳过 location 匹配，`proxy_pass` 与
 `proxy_connect;` 链式转发又会丢掉路由身份和 `Proxy-Authorization`。可行方案只有打过
 `ngx_http_proxy_connect_module` 补丁的 OpenResty 内核 + server 级 `access_by_lua_file`，用补丁

@@ -45,7 +45,7 @@ tunnelmesh-client --config tunnelmesh.yaml status
 | `proxy tcp` | TCP | stdin/stdout ↔ Agent 内网服务 | 用于 SSH `ProxyCommand` 和 websocat |
 | `tunnel status/stop` | - | 本地隧道管理 | 查看或停止配置的隧道 |
 
-公网 Server 入口不开放公网 UDP；UDP 仅支持通过 `forward udp` 从用户侧发起到 Agent 内网。
+Client 的 UDP 能力是 `forward udp`：由用户侧发起、经 Server 到达 Agent 内网。Server 另有独立的 WireGuard VPN 网关入口（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），不经 Client。
 
 ## 4. TCP 转发
 
@@ -71,7 +71,7 @@ tunnelmesh-client forward udp \
   --target-port 53
 ```
 
-公网入口不直接监听 UDP；需要公网 UDP 时，应在目标网络内放置 UDP 网关，再通过 TCP/HTTP 或其他受支持入口接入。
+`forward udp` 的监听端口在用户本机，公网侧没有与之对应的 UDP 监听；需要让公网用户访问内网 UDP 服务时，可在目标网络内放置 UDP 网关，再通过 TCP/HTTP 等受支持入口接入，或等待内嵌 VPN 网关交付（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
 
 ## 6. TCP 和 UDP 同时转发
 
@@ -443,7 +443,7 @@ tunnelmesh-client forward socks5 \
 - 凭据只从环境变量读取，不要写入配置文件或命令行参数。
 - RFC 1929 用户名和密码各自最多 255 字节。
 - `BIND`、`UDP ASSOCIATE` 和 GSSAPI 不支持。
-- Server 公网入口不新增 SOCKS5 监听，公网仍只提供 HTTP/HTTPS/WebSocket。
+- Server 公网入口不新增 SOCKS5 监听；SOCKS5 只作为 Client 的本地入口存在。
 
 ### 远程校验
 
