@@ -3,9 +3,12 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -283,5 +286,151 @@ func TestSQLiteAutoInitDisabledRejectsMissingVPNTables(t *testing.T) {
 				t.Fatalf("error = %v, want it to name %s", err, table)
 			}
 		})
+	}
+}
+
+// vpnPeerFixture returns a complete, valid peer record. Every validation case
+// mutates exactly one field so a failure names the rule that broke.
+func vpnPeerFixture() VPNPeer {
+	return VPNPeer{
+		Name:                "edge-gateway",
+		OwnerID:             "user-1",
+		PublicKey:           "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		VPNIP:               "10.66.0.2",
+		NodeID:              "node-1",
+		AgentID:             "agent-1",
+		AllowedIPs:          "10.10.0.0/16",
+		AllowedPorts:        "22,443",
+		AllowPrivateTargets: true,
+		ICMPEnabled:         true,
+		MaxConcurrentFlows:  128,
+		Status:              VPNPeerStatusActive,
+	}
+}
+
+func TestVPNPeerModelDefaultsAndValidation(t *testing.T) {
+	if err := validateVPNPeer(vpnPeerFixture()); err != nil {
+		t.Fatalf("a complete peer record must validate: %v", err)
+	}
+	// All three persisted statuses are legal, so a caller that reads a row back
+	// and re-validates it never trips on a value the database already holds.
+	for _, status := range []VPNPeerStatus{VPNPeerStatusActive, VPNPeerStatusDisabled, VPNPeerStatusRevoked} {
+		peer := vpnPeerFixture()
+		peer.Status = status
+		if err := validateVPNPeer(peer); err != nil {
+			t.Fatalf("status %q must validate: %v", status, err)
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*VPNPeer)
+	}{
+		{"empty owner", func(peer *VPNPeer) { peer.OwnerID = "" }},
+		{"blank name", func(peer *VPNPeer) { peer.Name = "   " }},
+		{"empty public key", func(peer *VPNPeer) { peer.PublicKey = "" }},
+		{"empty vpn ip", func(peer *VPNPeer) { peer.VPNIP = "" }},
+		{"empty node", func(peer *VPNPeer) { peer.NodeID = "" }},
+		{"empty agent", func(peer *VPNPeer) { peer.AgentID = "" }},
+		{"empty status", func(peer *VPNPeer) { peer.Status = "" }},
+		{"unknown status", func(peer *VPNPeer) { peer.Status = VPNPeerStatus("paused") }},
+		{"negative flow cap", func(peer *VPNPeer) { peer.MaxConcurrentFlows = -1 }},
+		{"negative rate limit", func(peer *VPNPeer) { peer.PacketRateLimit = -1 }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			peer := vpnPeerFixture()
+			testCase.mutate(&peer)
+			if err := validateVPNPeer(peer); err == nil {
+				t.Fatalf("validateVPNPeer(%+v) = nil, want an error", peer)
+			}
+		})
+	}
+	// A sealed private key is all-or-nothing: AES-GCM ciphertext without its
+	// nonce can never be opened, so the pair is rejected together rather than
+	// stored as an unusable row. The key id stays optional because
+	// TUNNELMESH_TOKEN_ENCRYPTION_KEY_ID is optional by design.
+	peer := vpnPeerFixture()
+	peer.PrivateKeyCiphertext = "sealed-ciphertext"
+	if err := validateVPNPeer(peer); err == nil {
+		t.Fatal("private key ciphertext without its nonce must be rejected")
+	}
+	peer.PrivateKeyNonce = "sealed-nonce"
+	if err := validateVPNPeer(peer); err != nil {
+		t.Fatalf("a sealed private key without a key id must validate: %v", err)
+	}
+	peer = vpnPeerFixture()
+	peer.PrivateKeyNonce = "orphan-nonce"
+	if err := validateVPNPeer(peer); err == nil {
+		t.Fatal("a private key nonce without its ciphertext must be rejected")
+	}
+}
+
+func vpnIPLeaseFixture() VPNIPLease {
+	return VPNIPLease{
+		NodeID:      "node-1",
+		Subnet:      "10.66.0.0/24",
+		LeaseHolder: "holder-1",
+		TTL:         time.Minute,
+	}
+}
+
+func TestVPNIPLeaseModelValidation(t *testing.T) {
+	if err := validateVPNIPLease(vpnIPLeaseFixture()); err != nil {
+		t.Fatalf("a complete lease must validate: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*VPNIPLease)
+	}{
+		{"empty node", func(lease *VPNIPLease) { lease.NodeID = "" }},
+		{"blank subnet", func(lease *VPNIPLease) { lease.Subnet = "  " }},
+		{"empty holder", func(lease *VPNIPLease) { lease.LeaseHolder = "" }},
+		{"negative allocated count", func(lease *VPNIPLease) { lease.AllocatedCount = -1 }},
+		{"negative epoch", func(lease *VPNIPLease) { lease.Epoch = -1 }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			lease := vpnIPLeaseFixture()
+			testCase.mutate(&lease)
+			if err := validateVPNIPLease(lease); err == nil {
+				t.Fatalf("validateVPNIPLease(%+v) = nil, want an error", lease)
+			}
+		})
+	}
+	// A non-positive TTL must default to one minute, matching leaseRepo, so no
+	// caller can write a lease that is already expired and instantly stealable.
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		if got := vpnIPLeaseTTL(ttl); got != time.Minute {
+			t.Fatalf("vpnIPLeaseTTL(%v) = %v, want %v", ttl, got, time.Minute)
+		}
+	}
+	if got := vpnIPLeaseTTL(90 * time.Second); got != 90*time.Second {
+		t.Fatalf("vpnIPLeaseTTL(90s) = %v, want it unchanged", got)
+	}
+}
+
+// TestVPNSentinelErrorsAreDistinct keeps the four v15 sentinels separable: a
+// caller that maps one of them to an HTTP status must not accidentally match
+// another through error wrapping.
+func TestVPNSentinelErrorsAreDistinct(t *testing.T) {
+	sentinels := []error{ErrVPNPeerConflict, ErrVPNPeerRevoked, ErrVPNIPLeaseHeld, ErrVPNIPLeaseStaleEpoch}
+	for i, target := range sentinels {
+		if target == nil {
+			t.Fatalf("sentinel %d is nil", i)
+		}
+		if !errors.Is(target, target) {
+			t.Fatalf("%v does not match itself", target)
+		}
+		for j, other := range sentinels {
+			if i == j {
+				continue
+			}
+			if errors.Is(target, other) {
+				t.Fatalf("%v must not match %v", target, other)
+			}
+			if errors.Is(fmt.Errorf("wrapped: %w", target), other) {
+				t.Fatalf("a wrapped %v must not match %v", target, other)
+			}
+		}
 	}
 }

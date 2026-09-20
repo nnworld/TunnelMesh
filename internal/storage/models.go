@@ -591,6 +591,74 @@ type IdempotencyRecord struct {
 	ExpiresAt  *time.Time
 }
 
+// VPNPeerStatus is the lifecycle state of a VPN peer. Revoked is terminal: a
+// revoked peer is never reactivated, it is replaced by a new peer with a new
+// key pair, so an operator cannot silently revive a key that was retired.
+type VPNPeerStatus string
+
+const (
+	VPNPeerStatusActive   VPNPeerStatus = "active"
+	VPNPeerStatusDisabled VPNPeerStatus = "disabled"
+	VPNPeerStatusRevoked  VPNPeerStatus = "revoked"
+)
+
+// VPNPeer is the persistence record for one WireGuard peer. AllowedIPs and
+// AllowedPorts are opaque canonical text produced by internal/vpn (phase 4);
+// storage never parses them, so the encoding has exactly one owner.
+// PrivateKey* mirror credentials.SecretCiphertext: sealed by auth.SecretStore,
+// never plaintext, and empty until the key is sealed.
+type VPNPeer struct {
+	ID                   string
+	Name                 string
+	OwnerID              string
+	PublicKey            string
+	PrivateKeyCiphertext string
+	PrivateKeyNonce      string
+	PrivateKeyKeyID      string
+	PrivateKeyVersion    int
+	VPNIP                string
+	NodeID               string
+	AgentID              string
+	AllowedIPs           string
+	AllowedPorts         string
+	AllowPrivateTargets  bool
+	ICMPEnabled          bool
+	MaxConcurrentFlows   int
+	PacketRateLimit      int
+	ExpiresAt            *time.Time
+	Status               VPNPeerStatus
+	Description          string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+// VPNPeerFilter scopes List. OwnerUserID is applied inside the SQL WHERE clause
+// so permission filtering happens within pagination semantics, never after it.
+type VPNPeerFilter struct {
+	OwnerUserID string
+	NodeID      string
+	AgentID     string
+	Status      VPNPeerStatus
+	Keyword     string
+}
+
+// VPNIPLease is one node's claim on a /24 carved out of server.vpn.ip_pool.
+// AllocatedCount is a derived counter for metrics and fast exhaustion checks;
+// the authoritative fact that a /32 is taken is vpn_peers.UNIQUE(node_id,
+// vpn_ip), so a lost counter can never hand the same address to two peers.
+type VPNIPLease struct {
+	ID             string
+	NodeID         string
+	Subnet         string
+	AllocatedCount int
+	LeaseHolder    string
+	LeaseExpiresAt time.Time
+	Epoch          int64
+	AcquiredAt     time.Time
+	UpdatedAt      time.Time
+	TTL            time.Duration // not persisted; bounds LeaseExpiresAt on acquire/renew
+}
+
 type Page[T any] struct {
 	Items      []T
 	NextCursor string

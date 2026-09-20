@@ -113,6 +113,39 @@ type WebSSHSessionRepository interface {
 	CloseActiveByNode(context.Context, string, time.Time, string) (int64, error)
 }
 
+var ErrVPNPeerConflict = errors.New("vpn peer already exists")
+var ErrVPNPeerRevoked = errors.New("vpn peer is already revoked")
+var ErrVPNIPLeaseHeld = errors.New("vpn ip subnet lease is held by another node")
+var ErrVPNIPLeaseStaleEpoch = errors.New("vpn ip lease epoch is stale")
+
+// VPNPeerRepository persists the peers the embedded VPN gateway hands out. It
+// has no Delete on purpose: a peer is revoked, which keeps the public key and
+// the address it held auditable instead of silently freeing them for reuse.
+type VPNPeerRepository interface {
+	Create(context.Context, VPNPeer) (VPNPeer, error)
+	Get(context.Context, string) (VPNPeer, error)
+	GetByPublicKey(context.Context, string) (VPNPeer, error)
+	GetByNodeAndIP(context.Context, string, string) (VPNPeer, error)
+	Update(context.Context, VPNPeer) error
+	SetStatus(context.Context, string, VPNPeerStatus, time.Time) error
+	List(context.Context, VPNPeerFilter, string, int) (Page[VPNPeer], error)
+	ListByNode(context.Context, string) ([]VPNPeer, error)
+	CountByNode(context.Context, string) (int, error)
+	CountByOwner(context.Context, string) (int, error)
+}
+
+// VPNIPLeaseRepository arbitrates which server node owns which /24 of the VPN
+// address pool. Every mutation is fenced by epoch so a node that lost its lease
+// cannot keep allocating from a subnet another node already took over.
+type VPNIPLeaseRepository interface {
+	AcquireSubnet(context.Context, VPNIPLease) (VPNIPLease, error)
+	Renew(context.Context, string, string, string, int64, time.Duration) error
+	Release(context.Context, string, string, string, int64) error
+	Get(context.Context, string, string) (VPNIPLease, error)
+	ListByHolder(context.Context, string) ([]VPNIPLease, error)
+	AddAllocated(context.Context, string, string, string, int64, int) (int, error)
+}
+
 var ErrServiceTokenRevoked = errors.New("service token is already revoked")
 var ErrServiceTokenExpired = errors.New("service token is already expired")
 
