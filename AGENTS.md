@@ -8,7 +8,7 @@ TunnelMesh 是一个 Go 实现的内网穿透与服务代理平台，包含三�
 - `tunnelmesh-agent`：部署在被访问主机或内网中的代理节点。
 - `tunnelmesh-client`：用户侧客户端，负责本地端口转发、发布和 stdio/SSH 代理。
 
-公网入口默认只使用 HTTP/HTTPS/WebSocket；公网 UDP 不作为服务端监听能力。内部转发支持 TCP、UDP、HTTP 和 WebSocket 场景。
+公网入口以 HTTP/HTTPS/WebSocket 为主；启用内嵌 VPN 网关（见 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)）时，Server 额外监听一个公网 UDP 端口作为 WireGuard 端点，该端口不经反向代理、不参与 HTTP 路由，必须独立放行、限流与监控。内部转发支持 TCP、UDP、HTTP 和 WebSocket 场景。
 
 ## 技术基线
 
@@ -145,7 +145,8 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 - `includeSensitive=true` 仅管理员可用；`includeSecrets=true` 不得通过 traceroute 返回，必须使用独立 reveal API。
 - Agent 上报 metadata 只能来自 allowlist 的文件/环境变量项；名称匹配敏感模式时必须清空值并标记 `redacted=true`。
 - 所有目标地址在 Agent 侧再次进行 SSRF、回环、私网、链路本地、CIDR 和端口策略校验。
-- 继续不实现：ICMP、TUN/L2 VPN、P2P NAT traversal、任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路，不能扩展为通用命令执行 API。
+- 继续不实现：P2P NAT traversal、任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路，不能扩展为通用命令执行 API。
+- VPN 数据面按 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) 实现：WireGuard 端点与内存态 TUN（gVisor netstack）运行在 `tunnelmesh-server` 进程内，不打开 `/dev/net/tun`、不要求 `CAP_NET_ADMIN`、不转发 L2 以太网帧；ICMP 只支持 echo（Agent 侧非特权 ping socket），Server 不主动构造其它 ICMP 类型；重依赖用 `//go:build vpn` 隔离，`server.vpn.enabled` 为 false 时不创建任何 VPN 资源。该能力分阶段实施，交付前活文档不得宣称可用。
 
 ### 协议演进约束
 
