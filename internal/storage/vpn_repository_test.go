@@ -434,3 +434,516 @@ func TestVPNSentinelErrorsAreDistinct(t *testing.T) {
 		}
 	}
 }
+
+// newVPNTestDB returns a database only this test can see. The shared in-memory
+// contract database would let another test's rows leak into the pagination and
+// count assertions below, so the VPN contract uses a private file.
+func newVPNTestDB(t *testing.T) *DB {
+	t.Helper()
+	db, err := OpenSQLite(context.Background(), "file:"+filepath.Join(t.TempDir(), "vpn.sqlite"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestSQLiteVPNPeerRepositoryContract(t *testing.T) {
+	runVPNPeerRepositoryContract(t, newVPNTestDB(t))
+}
+
+func mustCreateVPNPeer(t *testing.T, db *DB, peer VPNPeer) VPNPeer {
+	t.Helper()
+	created, err := db.VPNPeers().Create(context.Background(), peer)
+	if err != nil {
+		t.Fatalf("create vpn peer %s: %v", peer.ID, err)
+	}
+	return created
+}
+
+// vpnPeerIDs drains every page of a List call and returns the peer IDs in page
+// order. Draining matters: a filter that leaks rows shows up on a later page,
+// not on the first one.
+func vpnPeerIDs(t *testing.T, db *DB, filter VPNPeerFilter, limit int) []string {
+	t.Helper()
+	var ids []string
+	cursor := ""
+	for {
+		page, err := db.VPNPeers().List(context.Background(), filter, cursor, limit)
+		if err != nil {
+			t.Fatalf("list vpn peers: %v", err)
+		}
+		for _, peer := range page.Items {
+			ids = append(ids, peer.ID)
+		}
+		if !page.HasMore || page.NextCursor == "" {
+			return ids
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// assertVPNPeerIDs compares ID sets, ignoring order, and names the difference so
+// a leaking or over-narrow filter is obvious from the failure alone.
+func assertVPNPeerIDs(t *testing.T, label string, got []string, want ...string) {
+	t.Helper()
+	gotSet := map[string]bool{}
+	for _, id := range got {
+		gotSet[id] = true
+	}
+	wantSet := map[string]bool{}
+	for _, id := range want {
+		wantSet[id] = true
+	}
+	if len(gotSet) != len(got) {
+		t.Fatalf("%s returned duplicate rows: %v", label, got)
+	}
+	for _, id := range want {
+		if !gotSet[id] {
+			t.Fatalf("%s is missing %s; got %v, want %v", label, id, got, want)
+		}
+	}
+	for _, id := range got {
+		if !wantSet[id] {
+			t.Fatalf("%s returned unexpected row %s; got %v, want %v", label, id, got, want)
+		}
+	}
+}
+
+// assertVPNPeerIDsInOrder is assertVPNPeerIDs for callers that promise a stable
+// ordering, which is what lets a gateway rebuild a config without re-sorting.
+func assertVPNPeerIDsInOrder(t *testing.T, label string, got []string, want ...string) {
+	t.Helper()
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("%s order = %v, want %v", label, got, want)
+	}
+}
+
+func assertVPNPeerEqual(t *testing.T, want, got VPNPeer) {
+	t.Helper()
+	if got.ID != want.ID || got.Name != want.Name || got.OwnerID != want.OwnerID ||
+		got.PublicKey != want.PublicKey || got.PrivateKeyCiphertext != want.PrivateKeyCiphertext ||
+		got.PrivateKeyNonce != want.PrivateKeyNonce || got.PrivateKeyKeyID != want.PrivateKeyKeyID ||
+		got.PrivateKeyVersion != want.PrivateKeyVersion || got.VPNIP != want.VPNIP ||
+		got.NodeID != want.NodeID || got.AgentID != want.AgentID ||
+		got.AllowedIPs != want.AllowedIPs || got.AllowedPorts != want.AllowedPorts ||
+		got.AllowPrivateTargets != want.AllowPrivateTargets || got.ICMPEnabled != want.ICMPEnabled ||
+		got.MaxConcurrentFlows != want.MaxConcurrentFlows || got.PacketRateLimit != want.PacketRateLimit ||
+		got.Status != want.Status || got.Description != want.Description {
+		t.Fatalf("peer round trip mismatch:\nwant %+v\ngot  %+v", want, got)
+	}
+	switch {
+	case want.ExpiresAt == nil && got.ExpiresAt != nil:
+		t.Fatalf("peer %s expires_at = %v, want nil", got.ID, *got.ExpiresAt)
+	case want.ExpiresAt != nil && got.ExpiresAt == nil:
+		t.Fatalf("peer %s expires_at = nil, want %v", got.ID, *want.ExpiresAt)
+	case want.ExpiresAt != nil && !got.ExpiresAt.Equal(*want.ExpiresAt):
+		t.Fatalf("peer %s expires_at = %v, want %v", got.ID, *got.ExpiresAt, *want.ExpiresAt)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) || !got.UpdatedAt.Equal(want.UpdatedAt) {
+		t.Fatalf("peer %s timestamps = %v/%v, want %v/%v", got.ID, got.CreatedAt, got.UpdatedAt, want.CreatedAt, want.UpdatedAt)
+	}
+}
+
+// runVPNPeerRepositoryContract asserts the behaviour that must hold on both
+// SQLite and MySQL: round-trip fidelity of every column, the two unique
+// constraints, the terminal revoked state, permission filtering inside
+// pagination, and the derived counters. SQLite runs it against a private file
+// database; MySQL runs the same function against a database shared with the
+// other contract tests, so every assertion is scoped to IDs created here.
+func runVPNPeerRepositoryContract(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	peers := db.VPNPeers()
+
+	t.Run("round trip", func(t *testing.T) {
+		expires := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+		sealed := VPNPeer{
+			ID: "vpn-peer-roundtrip-sealed", Name: "sealed-gateway", OwnerID: "vpn-user-roundtrip",
+			PublicKey: "vpn-roundtrip-sealed-key", PrivateKeyCiphertext: "sealed-ciphertext",
+			PrivateKeyNonce: "sealed-nonce", PrivateKeyKeyID: "key-1", PrivateKeyVersion: 3,
+			VPNIP: "10.66.1.2", NodeID: "vpn-node-roundtrip", AgentID: "vpn-agent-roundtrip",
+			AllowedIPs: "10.10.0.0/16,192.168.0.0/24", AllowedPorts: "22,443,8080-8090",
+			AllowPrivateTargets: true, ICMPEnabled: true, MaxConcurrentFlows: 256, PacketRateLimit: 1000,
+			ExpiresAt: &expires, Status: VPNPeerStatusActive, Description: "sealed round trip",
+		}
+		created, err := peers.Create(ctx, sealed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created.CreatedAt.IsZero() || created.UpdatedAt.IsZero() {
+			t.Fatalf("Create must fill timestamps, got %+v", created)
+		}
+		if created.CreatedAt.Location() != time.UTC || created.UpdatedAt.Location() != time.UTC {
+			t.Fatalf("timestamps must be UTC, got %v and %v", created.CreatedAt, created.UpdatedAt)
+		}
+		sealed.CreatedAt, sealed.UpdatedAt = created.CreatedAt, created.UpdatedAt
+		byID, err := peers.Get(ctx, sealed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, sealed, byID)
+		byKey, err := peers.GetByPublicKey(ctx, sealed.PublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, sealed, byKey)
+		byIP, err := peers.GetByNodeAndIP(ctx, sealed.NodeID, sealed.VPNIP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, sealed, byIP)
+
+		// The other legal shape: no expiry and no sealed private key, which is
+		// how a peer looks before the gateway stores its key material.
+		open := VPNPeer{
+			ID: "vpn-peer-roundtrip-open", Name: "open-gateway", OwnerID: "vpn-user-roundtrip",
+			PublicKey: "vpn-roundtrip-open-key", VPNIP: "10.66.1.3", NodeID: "vpn-node-roundtrip",
+			AgentID: "vpn-agent-roundtrip", AllowedIPs: "0.0.0.0/0", AllowedPorts: "",
+			MaxConcurrentFlows: 128, Status: VPNPeerStatusDisabled,
+		}
+		openCreated, err := peers.Create(ctx, open)
+		if err != nil {
+			t.Fatal(err)
+		}
+		open.CreatedAt, open.UpdatedAt = openCreated.CreatedAt, openCreated.UpdatedAt
+		got, err := peers.Get(ctx, open.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, open, got)
+		if got.ExpiresAt != nil {
+			t.Fatalf("expires_at = %v, want nil", *got.ExpiresAt)
+		}
+		if got.PrivateKeyCiphertext != "" || got.PrivateKeyNonce != "" || got.PrivateKeyKeyID != "" || got.PrivateKeyVersion != 0 {
+			t.Fatalf("unsealed private key columns = %q/%q/%q/%d, want all empty",
+				got.PrivateKeyCiphertext, got.PrivateKeyNonce, got.PrivateKeyKeyID, got.PrivateKeyVersion)
+		}
+		// AllowedIPs and AllowedPorts are opaque text owned by internal/vpn, so
+		// storage must return them byte for byte instead of re-rendering them.
+		if got.AllowedIPs != "0.0.0.0/0" || got.AllowedPorts != "" {
+			t.Fatalf("opaque policy text = %q/%q, want it unchanged", got.AllowedIPs, got.AllowedPorts)
+		}
+		if byID.AllowedIPs != sealed.AllowedIPs || byID.AllowedPorts != sealed.AllowedPorts {
+			t.Fatalf("opaque policy text = %q/%q, want %q/%q", byID.AllowedIPs, byID.AllowedPorts, sealed.AllowedIPs, sealed.AllowedPorts)
+		}
+		if _, err := peers.Get(ctx, "vpn-peer-absent"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("Get on an unknown peer err = %v, want sql.ErrNoRows", err)
+		}
+		if _, err := peers.GetByPublicKey(ctx, "vpn-absent-key"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("GetByPublicKey on an unknown key err = %v, want sql.ErrNoRows", err)
+		}
+		if _, err := peers.GetByNodeAndIP(ctx, sealed.NodeID, "10.66.1.254"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("GetByNodeAndIP on an unknown address err = %v, want sql.ErrNoRows", err)
+		}
+	})
+
+	t.Run("generated id and timestamps", func(t *testing.T) {
+		created, err := peers.Create(ctx, VPNPeer{
+			Name: "generated", OwnerID: "vpn-user-generated", PublicKey: "vpn-generated-key",
+			VPNIP: "10.66.7.2", NodeID: "vpn-node-generated", AgentID: "vpn-agent-generated",
+			AllowedIPs: "10.10.0.0/16", AllowedPorts: "443", Status: VPNPeerStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(created.ID, "vpn-peer-") {
+			t.Fatalf("generated ID = %q, want a vpn-peer- prefix", created.ID)
+		}
+		if created.CreatedAt.IsZero() || !created.CreatedAt.Equal(created.UpdatedAt) {
+			t.Fatalf("generated timestamps = %v/%v, want equal non-zero UTC values", created.CreatedAt, created.UpdatedAt)
+		}
+		got, err := peers.Get(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, created, got)
+	})
+
+	t.Run("unique constraints", func(t *testing.T) {
+		base := VPNPeer{
+			ID: "vpn-peer-unique-1", Name: "unique-1", OwnerID: "vpn-user-unique",
+			PublicKey: "vpn-unique-key-1", VPNIP: "10.66.2.2", NodeID: "vpn-node-unique",
+			AgentID: "vpn-agent-unique", AllowedIPs: "10.10.0.0/16", AllowedPorts: "443",
+			Status: VPNPeerStatusActive,
+		}
+		if _, err := peers.Create(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		duplicateKey := base
+		duplicateKey.ID, duplicateKey.VPNIP, duplicateKey.NodeID = "vpn-peer-unique-2", "10.66.2.3", "vpn-node-unique-other"
+		if _, err := peers.Create(ctx, duplicateKey); !errors.Is(err, ErrVPNPeerConflict) {
+			t.Fatalf("duplicate public key err = %v, want ErrVPNPeerConflict", err)
+		}
+		duplicateIP := base
+		duplicateIP.ID, duplicateIP.PublicKey = "vpn-peer-unique-3", "vpn-unique-key-3"
+		if _, err := peers.Create(ctx, duplicateIP); !errors.Is(err, ErrVPNPeerConflict) {
+			t.Fatalf("duplicate node and address err = %v, want ErrVPNPeerConflict", err)
+		}
+		// The same address on another node is legal: UNIQUE(node_id, vpn_ip)
+		// scopes the pool per node, which is what lets every node carve its own
+		// /24 out of a shared ip_pool without coordinating addresses.
+		otherNode := base
+		otherNode.ID, otherNode.PublicKey, otherNode.NodeID = "vpn-peer-unique-4", "vpn-unique-key-4", "vpn-node-unique-2"
+		if _, err := peers.Create(ctx, otherNode); err != nil {
+			t.Fatalf("the same vpn_ip on another node must succeed: %v", err)
+		}
+	})
+
+	t.Run("update", func(t *testing.T) {
+		created, err := peers.Create(ctx, VPNPeer{
+			ID: "vpn-peer-update", Name: "before", OwnerID: "vpn-user-update",
+			PublicKey: "vpn-update-key", VPNIP: "10.66.3.2", NodeID: "vpn-node-update",
+			AgentID: "vpn-agent-update", AllowedIPs: "10.10.0.0/16", AllowedPorts: "443",
+			MaxConcurrentFlows: 64, PacketRateLimit: 10, Status: VPNPeerStatusActive, Description: "before",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		expires := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+		rotated := created
+		rotated.Name = "after"
+		rotated.PrivateKeyCiphertext, rotated.PrivateKeyNonce = "rotated-ciphertext", "rotated-nonce"
+		rotated.PrivateKeyKeyID, rotated.PrivateKeyVersion = "key-2", 7
+		rotated.VPNIP = "10.66.3.9"
+		rotated.AllowedIPs, rotated.AllowedPorts = "172.16.0.0/12", "22"
+		rotated.AllowPrivateTargets, rotated.ICMPEnabled = true, true
+		rotated.MaxConcurrentFlows, rotated.PacketRateLimit = 512, 0
+		rotated.ExpiresAt, rotated.Description = &expires, "after"
+		rotated.UpdatedAt = created.UpdatedAt.Add(time.Second)
+		if err := peers.Update(ctx, rotated); err != nil {
+			t.Fatal(err)
+		}
+		got, err := peers.Get(ctx, rotated.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertVPNPeerEqual(t, rotated, got)
+		if !got.UpdatedAt.After(created.UpdatedAt) {
+			t.Fatalf("updated_at = %v, want it after %v", got.UpdatedAt, created.UpdatedAt)
+		}
+		// The address moved, so the old one must stop resolving; a stale lookup
+		// would route traffic to a peer that no longer owns the address.
+		if _, err := peers.GetByNodeAndIP(ctx, rotated.NodeID, "10.66.3.2"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("the previous vpn_ip must no longer resolve, err = %v", err)
+		}
+		moved, err := peers.GetByNodeAndIP(ctx, rotated.NodeID, rotated.VPNIP)
+		if err != nil || moved.ID != rotated.ID {
+			t.Fatalf("GetByNodeAndIP after the move = %+v, err = %v", moved, err)
+		}
+		missing := rotated
+		missing.ID = "vpn-peer-update-absent"
+		if err := peers.Update(ctx, missing); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("updating an unknown peer err = %v, want sql.ErrNoRows", err)
+		}
+	})
+
+	t.Run("status transitions", func(t *testing.T) {
+		created, err := peers.Create(ctx, VPNPeer{
+			ID: "vpn-peer-status", Name: "status", OwnerID: "vpn-user-status",
+			PublicKey: "vpn-status-key", VPNIP: "10.66.4.2", NodeID: "vpn-node-status",
+			AgentID: "vpn-agent-status", AllowedIPs: "10.10.0.0/16", AllowedPorts: "443",
+			Status: VPNPeerStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := peers.SetStatus(ctx, created.ID, VPNPeerStatusDisabled, now); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := peers.Get(ctx, created.ID); err != nil || got.Status != VPNPeerStatusDisabled {
+			t.Fatalf("status = %q, err = %v, want disabled", got.Status, err)
+		}
+		if err := peers.SetStatus(ctx, created.ID, VPNPeerStatusActive, now.Add(time.Second)); err != nil {
+			t.Fatalf("disabled back to active must be allowed: %v", err)
+		}
+		if err := peers.SetStatus(ctx, created.ID, VPNPeerStatusRevoked, now.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// Revoked is terminal. The guard lives in the SQL WHERE clause rather
+		// than in a read-modify-write, so two concurrent revocations cannot race
+		// one of them back to active.
+		if err := peers.SetStatus(ctx, created.ID, VPNPeerStatusActive, now.Add(3*time.Second)); !errors.Is(err, ErrVPNPeerRevoked) {
+			t.Fatalf("reactivating a revoked peer err = %v, want ErrVPNPeerRevoked", err)
+		}
+		if got, err := peers.Get(ctx, created.ID); err != nil || got.Status != VPNPeerStatusRevoked {
+			t.Fatalf("status = %q, err = %v, want it to stay revoked", got.Status, err)
+		}
+		if err := peers.SetStatus(ctx, "vpn-peer-status-absent", VPNPeerStatusActive, now); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("SetStatus on an unknown peer err = %v, want sql.ErrNoRows", err)
+		}
+	})
+
+	t.Run("list filters within pagination", func(t *testing.T) {
+		// The MySQL contract database is shared with the other contract tests,
+		// so the admin view is asserted as baseline+6 rather than a literal 6.
+		// On SQLite the baseline is zero and the assertion is exactly six.
+		baseline := len(vpnPeerIDs(t, db, VPNPeerFilter{}, 100))
+		const ownerA, ownerB = "vpn-page-owner-a", "vpn-page-owner-b"
+		var aIDs, bIDs []string
+		for i := 1; i <= 3; i++ {
+			a := mustCreateVPNPeer(t, db, VPNPeer{
+				ID: fmt.Sprintf("vpn-peer-page-a-%d", i), Name: fmt.Sprintf("page-a-%d", i), OwnerID: ownerA,
+				PublicKey: fmt.Sprintf("vpn-page-a-key-%d", i), VPNIP: fmt.Sprintf("10.66.5.%d", i),
+				NodeID: "vpn-node-page-a", AgentID: "vpn-agent-page", AllowedIPs: "10.10.0.0/16",
+				AllowedPorts: "443", Status: VPNPeerStatusActive,
+			})
+			aIDs = append(aIDs, a.ID)
+			b := mustCreateVPNPeer(t, db, VPNPeer{
+				ID: fmt.Sprintf("vpn-peer-page-b-%d", i), Name: fmt.Sprintf("page-b-%d", i), OwnerID: ownerB,
+				PublicKey: fmt.Sprintf("vpn-page-b-key-%d", i), VPNIP: fmt.Sprintf("10.66.5.%d", i+10),
+				NodeID: "vpn-node-page-b", AgentID: "vpn-agent-page", AllowedIPs: "10.10.0.0/16",
+				AllowedPorts: "443", Status: VPNPeerStatusActive,
+			})
+			bIDs = append(bIDs, b.ID)
+		}
+		first, err := peers.List(ctx, VPNPeerFilter{OwnerUserID: ownerA}, "", 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(first.Items) != 2 {
+			t.Fatalf("first page has %d rows, want 2", len(first.Items))
+		}
+		if !first.HasMore || first.NextCursor == "" {
+			t.Fatalf("first page = %+v, want HasMore and a cursor", first)
+		}
+		for _, peer := range first.Items {
+			if peer.OwnerID != ownerA {
+				t.Fatalf("the first page leaked a row owned by %q", peer.OwnerID)
+			}
+		}
+		second, err := peers.List(ctx, VPNPeerFilter{OwnerUserID: ownerA}, first.NextCursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(second.Items) != 1 || second.Items[0].ID != aIDs[2] {
+			t.Fatalf("second page = %+v, want only %s", second.Items, aIDs[2])
+		}
+		if second.HasMore || second.NextCursor != "" {
+			t.Fatalf("second page = %+v, want the end of the result set", second)
+		}
+		if second.Items[0].OwnerID != ownerA {
+			t.Fatalf("the second page leaked a row owned by %q", second.Items[0].OwnerID)
+		}
+		// Draining A's pages must yield exactly A's three peers and none of B's:
+		// the owner filter has to be part of the WHERE clause, because filtering
+		// after pagination silently truncates a user's own result set.
+		gotA := vpnPeerIDs(t, db, VPNPeerFilter{OwnerUserID: ownerA}, 2)
+		assertVPNPeerIDs(t, "owner A pages", gotA, aIDs...)
+		gotB := vpnPeerIDs(t, db, VPNPeerFilter{OwnerUserID: ownerB}, 2)
+		assertVPNPeerIDs(t, "owner B pages", gotB, bIDs...)
+		if total := len(vpnPeerIDs(t, db, VPNPeerFilter{}, 10)); total != baseline+6 {
+			t.Fatalf("the unfiltered admin view has %d rows, want %d (baseline %d plus the 6 created here)", total, baseline+6, baseline)
+		}
+	})
+
+	t.Run("filter combinations", func(t *testing.T) {
+		const owner = "vpn-filter-owner"
+		for _, spec := range []struct {
+			id, name, description, node, agent string
+			ip                                 string
+			status                             VPNPeerStatus
+		}{
+			{"vpn-peer-filter-1", "alpha-gateway", "primary", "vpn-filter-node-x", "vpn-filter-agent-x", "10.66.8.2", VPNPeerStatusActive},
+			{"vpn-peer-filter-2", "beta-gateway", "secondary", "vpn-filter-node-x", "vpn-filter-agent-y", "10.66.8.3", VPNPeerStatusDisabled},
+			{"vpn-peer-filter-3", "gamma-edge", "alpha-backup", "vpn-filter-node-y", "vpn-filter-agent-x", "10.66.8.4", VPNPeerStatusActive},
+		} {
+			mustCreateVPNPeer(t, db, VPNPeer{
+				ID: spec.id, Name: spec.name, Description: spec.description, OwnerID: owner,
+				PublicKey: "vpn-filter-key-" + spec.id, VPNIP: spec.ip, NodeID: spec.node, AgentID: spec.agent,
+				AllowedIPs: "10.10.0.0/16", AllowedPorts: "443", Status: spec.status,
+			})
+		}
+		cases := []struct {
+			label  string
+			filter VPNPeerFilter
+			want   []string
+		}{
+			{"status active", VPNPeerFilter{OwnerUserID: owner, Status: VPNPeerStatusActive}, []string{"vpn-peer-filter-1", "vpn-peer-filter-3"}},
+			{"status disabled", VPNPeerFilter{OwnerUserID: owner, Status: VPNPeerStatusDisabled}, []string{"vpn-peer-filter-2"}},
+			{"unknown status", VPNPeerFilter{OwnerUserID: owner, Status: VPNPeerStatus("paused")}, nil},
+			{"node", VPNPeerFilter{OwnerUserID: owner, NodeID: "vpn-filter-node-x"}, []string{"vpn-peer-filter-1", "vpn-peer-filter-2"}},
+			{"agent", VPNPeerFilter{OwnerUserID: owner, AgentID: "vpn-filter-agent-x"}, []string{"vpn-peer-filter-1", "vpn-peer-filter-3"}},
+			{"keyword in name", VPNPeerFilter{OwnerUserID: owner, Keyword: "gamma"}, []string{"vpn-peer-filter-3"}},
+			{"keyword in description", VPNPeerFilter{OwnerUserID: owner, Keyword: "alpha"}, []string{"vpn-peer-filter-1", "vpn-peer-filter-3"}},
+			{"owner and status and node", VPNPeerFilter{OwnerUserID: owner, Status: VPNPeerStatusActive, NodeID: "vpn-filter-node-x"}, []string{"vpn-peer-filter-1"}},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.label, func(t *testing.T) {
+				assertVPNPeerIDs(t, testCase.label, vpnPeerIDs(t, db, testCase.filter, 50), testCase.want...)
+			})
+		}
+		// An unknown status must narrow to nothing. Degrading to "return
+		// everything" would turn a typo in a filter into a cross-tenant read.
+		t.Run("unknown status returns nothing", func(t *testing.T) {
+			page, err := peers.List(ctx, VPNPeerFilter{OwnerUserID: owner, Status: VPNPeerStatus("paused")}, "", 50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Items) != 0 || page.HasMore {
+				t.Fatalf("unknown status page = %+v, want an empty result set", page)
+			}
+		})
+		// An over-long keyword must be truncated and still execute, so a hostile
+		// filter value cannot build an oversized query.
+		t.Run("over long keyword is bounded", func(t *testing.T) {
+			page, err := peers.List(ctx, VPNPeerFilter{OwnerUserID: owner, Keyword: strings.Repeat("x", 4096)}, "", 50)
+			if err != nil {
+				t.Fatalf("an over-long keyword must still execute: %v", err)
+			}
+			if len(page.Items) != 0 {
+				t.Fatalf("an over-long keyword matched %d rows, want none", len(page.Items))
+			}
+		})
+	})
+
+	t.Run("list by node and counts", func(t *testing.T) {
+		const node, owner = "vpn-list-node", "vpn-list-owner"
+		for i, spec := range []struct {
+			id     string
+			status VPNPeerStatus
+		}{
+			{"vpn-peer-list-1", VPNPeerStatusActive},
+			{"vpn-peer-list-2", VPNPeerStatusDisabled},
+			{"vpn-peer-list-3", VPNPeerStatusRevoked},
+		} {
+			mustCreateVPNPeer(t, db, VPNPeer{
+				ID: spec.id, Name: fmt.Sprintf("list-%d", i+1), OwnerID: owner,
+				PublicKey: "vpn-list-key-" + spec.id, VPNIP: fmt.Sprintf("10.66.6.%d", i+2),
+				NodeID: node, AgentID: "vpn-list-agent", AllowedIPs: "10.10.0.0/16",
+				AllowedPorts: "443", Status: spec.status,
+			})
+		}
+		// A revoked peer keeps its row for audit but must never be handed to the
+		// gateway again, so ListByNode drops it while CountByOwner keeps it.
+		got, err := peers.ListByNode(ctx, node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, peer := range got {
+			ids = append(ids, peer.ID)
+		}
+		assertVPNPeerIDsInOrder(t, "ListByNode", ids, "vpn-peer-list-1", "vpn-peer-list-2")
+		if count, err := peers.CountByNode(ctx, node); err != nil || count != 2 {
+			t.Fatalf("CountByNode = %d, err = %v, want 2", count, err)
+		}
+		// CountByOwner deliberately includes revoked peers: whether a revoked
+		// peer still consumes quota is a phase 4 product decision, and the
+		// storage layer reports the fact instead of pre-deciding it.
+		if count, err := peers.CountByOwner(ctx, owner); err != nil || count != 3 {
+			t.Fatalf("CountByOwner = %d, err = %v, want 3", count, err)
+		}
+		empty, err := peers.ListByNode(ctx, "vpn-node-absent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(empty) != 0 {
+			t.Fatalf("ListByNode on an unknown node = %v, want an empty slice", empty)
+		}
+		if count, err := peers.CountByNode(ctx, "vpn-node-absent"); err != nil || count != 0 {
+			t.Fatalf("CountByNode on an unknown node = %d, err = %v, want 0", count, err)
+		}
+	})
+}

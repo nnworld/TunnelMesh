@@ -393,6 +393,22 @@ func TestMySQLIdentityRepositoryContract(t *testing.T) {
 	runIdentityRepositoryContract(t, db)
 }
 
+// TestMySQLVPNRepositoryContract runs the v15 VPN repositories against a real
+// MySQL server so a driver-specific SQL error cannot slip through the SQLite
+// run. It is skipped when no server is configured.
+func TestMySQLVPNRepositoryContract(t *testing.T) {
+	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
+	}
+	db, err := OpenMySQL(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runVPNPeerRepositoryContract(t, db)
+}
+
 // vpnSchemaIndexes are the five secondary indexes schema v15 adds. The names are
 // asserted literally because the upgrade runbook and ops tooling refer to them.
 var vpnSchemaIndexes = []string{
