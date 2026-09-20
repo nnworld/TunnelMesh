@@ -377,7 +377,7 @@ CREATE INDEX idx_vpn_ip_leases_expires ON vpn_ip_leases(lease_expires_at);
 **阶段 4+ 新增任何变长列前必须重算该预算**，守卫测试会在超标时直接红灯。
 
 `declared_var_sum`（MySQL 的 65,535 字节声明上限，TEXT/BLOB 不计）：`vpn_peers` 4,520、
-`vpn_ip_leases` 1,405，均远低于上限。
+`vpn_ip_leases` 1,421，均远低于上限。
 
 ### 双方言脚本差异
 
@@ -504,7 +504,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 `internal/storage/client_repository_test.go`、`internal/storage/mysql_test.go`、
 `internal/storage/vpn_repository_test.go`（迁移与等价测试部分）
 
-- [ ] **Step 1: 先写失败测试**
+- [x] **Step 1: 先写失败测试**
 
   在 `internal/storage/vpn_repository_test.go` 新增 4 个测试，在 `internal/storage/mysql_test.go` 新增 3 个：
 
@@ -552,12 +552,12 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Expected: **编译失败**，`undefined: migrations.V14ToV15MySQL`（以及 `V14ToV15SQLite`）。
   这是本任务的红灯基线，必须实测并把首行错误原文记进提交信息或 PR 记录。
 
-- [ ] **Step 2: 写增量脚本**
+- [x] **Step 2: 写增量脚本**
 
   新建 `migrations/incremental/v0014_to_v0015/mysql.sql` 与 `sqlite.sql`，
   内容为「DDL 定稿」小节的头注释 + 两张表 + 5 个索引（索引形式按方言区分）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
   1. `migrations/embed.go` 末尾追加：
      `//go:embed incremental/v0014_to_v0015/mysql.sql` → `var V14ToV15MySQL string`；
@@ -568,7 +568,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   4. `internal/storage/db.go:465` 的表清单末尾追加 `"vpn_peers", "vpn_ip_leases"`。
   5. `migrations/ddl.sql` 第 379 行后插入「DDL 定稿」小节的两张表与 5 个索引（裸 `CREATE INDEX` 形式）。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
   Run: `go test ./internal/storage/ -run 'VPN|SchemaVersionIs|Migration|AutoInit' -count=1`
   Expected: 全部 `PASS`；`TestMySQLV14ToV15VPNMigration` 与 `TestMySQLVPNRepositoryContract` 输出
@@ -576,7 +576,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Run: `go test ./internal/storage/ -count=1`
   Expected: `ok`，无 FAIL（其余既有测试必须不受影响）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
   `git add migrations internal/storage/db.go internal/storage/client_repository_test.go internal/storage/mysql_test.go internal/storage/vpn_repository_test.go`
   `git commit -m "feat(storage): add schema v15 vpn tables"`
@@ -585,7 +585,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 
 **Files:** `internal/storage/models.go`、`internal/storage/repository.go`、`internal/storage/vpn_repository_test.go`
 
-- [ ] **Step 1: 先写失败测试**
+- [x] **Step 1: 先写失败测试**
 
   在 `vpn_repository_test.go` 新增 `TestVPNPeerModelDefaultsAndValidation`：
   断言 `validateVPNPeer`（Task 3 实现，本步只声明期望行为）对以下输入返回错误——
@@ -600,7 +600,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Expected: **编译失败**，`undefined: VPNPeer`（以及 `VPNPeerStatus`、`VPNIPLease`、`validateVPNPeer`、
   `ErrVPNPeerConflict`）。记录红灯原文。
 
-- [ ] **Step 2: 最小实现**
+- [x] **Step 2: 最小实现**
 
   按「接口定稿」小节把 `VPNPeerStatus` 常量、`VPNPeer`、`VPNPeerFilter`、`VPNIPLease` 加进 `models.go`
   （放在 `Credential`/`RemoteServer` 之后、`Page[T]` 之前，保持领域分组）；
@@ -609,7 +609,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   在 `vpn_peer_repository.go` 里写 `validateVPNPeer`、在 `vpn_ip_lease_repository.go` 里写 `validateVPNIPLease`
   （本任务只建文件与校验函数，Repository 方法体在 Task 3/4 实现）。
 
-- [ ] **Step 3: 跑绿**
+- [x] **Step 3: 跑绿**
 
   Run: `go test ./internal/storage/ -run 'VPNPeerModel|VPNIPLeaseModel' -count=1` → Expected: `ok`
   Run: `go vet ./internal/storage/` → Expected: 无输出
@@ -617,7 +617,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   所以不得在本任务里加 accessor（否则编译不过）。若 `go vet` 报未使用函数，把校验函数留到 Task 3/4 一起提交，
   并在提交信息里说明原因。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
   `git commit -m "feat(storage): model vpn peers and ip leases"`
 
@@ -626,7 +626,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 **Files:** `internal/storage/vpn_peer_repository.go`、`internal/storage/db.go`（struct/构造/accessor）、
 `internal/storage/vpn_repository_test.go`、`internal/storage/mysql_test.go`（接线已有门控测）
 
-- [ ] **Step 1: 先写失败测试**
+- [x] **Step 1: 先写失败测试**
 
   在 `vpn_repository_test.go` 新增 `runVPNPeerRepositoryContract(t *testing.T, db *DB)` 与
   `TestSQLiteVPNPeerRepositoryContract`（用 `newVPNTestDB(t)`，即 `OpenSQLite(ctx, "file:"+t.TempDir()+"/vpn.sqlite", true)`）。
@@ -662,7 +662,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Run: `go test ./internal/storage/ -run 'VPNPeerRepository' -count=1`
   Expected: **编译失败**，`db.VPNPeers undefined`。记录红灯原文。
 
-- [ ] **Step 2: 最小实现**
+- [x] **Step 2: 最小实现**
 
   `vpn_peer_repository.go` 照 `credential_repository.go` 结构实现：
   `vpnPeerColumns` 常量（21 列，顺序与 DDL 一致）、`vpnPeerRepo{db *sql.DB}`、
@@ -680,13 +680,13 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
     `RowsAffected==0` 时先 `Get` 判断是「不存在」还是「已吊销」，分别返回 `sql.ErrNoRows` 与 `ErrVPNPeerRevoked`。
   - `db.go` 三处接线（struct 字段、`newRepositories`、accessor）。
 
-- [ ] **Step 3: 跑绿**
+- [x] **Step 3: 跑绿**
 
   Run: `go test ./internal/storage/ -run 'VPNPeerRepository' -count=1` → Expected: `ok`
   Run: `go test ./internal/storage/ -count=1` → Expected: `ok`，无 FAIL
   Run: `go test ./internal/storage/ -run 'VPNPeerRepository' -race -count=1` → Expected: `ok`
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
   `git commit -m "feat(storage): add vpn peer repository"`
 
@@ -695,7 +695,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 **Files:** `internal/storage/vpn_ip_lease_repository.go`、`internal/storage/db.go`（struct/构造/accessor）、
 `internal/storage/vpn_repository_test.go`、`internal/storage/mysql_test.go`
 
-- [ ] **Step 1: 先写失败测试**
+- [x] **Step 1: 先写失败测试**
 
   在 `vpn_repository_test.go` 新增 `runVPNIPLeaseRepositoryContract(t, db)`、
   `TestSQLiteVPNIPLeaseRepositoryContract`、`TestSQLiteConcurrentVPNIPLeaseAcquireHasSingleOwner`。
@@ -727,7 +727,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Run: `go test ./internal/storage/ -run 'VPNIPLease' -count=1`
   Expected: **编译失败**，`db.VPNIPLeases undefined`。记录红灯原文。
 
-- [ ] **Step 2: 最小实现**
+- [x] **Step 2: 最小实现**
 
   `vpn_ip_lease_repository.go` 照 `leaseRepo.RegisterConnection`（`repository.go:1878`）实现：
   `vpnIPLeaseColumns` 常量、`vpnIPLeaseRepo{db *sql.DB; driver string}`、
@@ -741,13 +741,13 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   - 每次重试重新读取当前行，避免用过期的 `oldEpoch` 做 CAS。
   - `db.go` 三处接线；`newRepositories` 里用 `NewVPNIPLeaseRepositoryWithDriver(db, driver)`。
 
-- [ ] **Step 3: 跑绿**
+- [x] **Step 3: 跑绿**
 
   Run: `go test ./internal/storage/ -run 'VPNIPLease' -count=1` → Expected: `ok`
   Run: `go test ./internal/storage/ -run 'VPNIPLease' -race -count=1` → Expected: `ok`（并发单赢家测在 `-race` 下必须干净）
   Run: `go test ./internal/storage/ -count=1` → Expected: `ok`
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
   `git commit -m "feat(storage): add vpn ip lease repository"`
 
@@ -755,7 +755,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 
 **Files:** `docs/operations/schema-upgrades.md`、`docs/user-guide/server-admin.md`、`docs/deployment/binary-release.md`
 
-- [ ] **Step 1: `docs/operations/schema-upgrades.md` 新增 `## v14 to v15`**
+- [x] **Step 1: `docs/operations/schema-upgrades.md` 新增 `## v14 to v15`**
 
   插在第 3 行 `## v13 to v14` 之前，结构照 v13→v14 章节，必须包含：
 
@@ -807,13 +807,13 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
       `applySchemaStatements` 自 v6 起容忍重复对象，因此修复前置状态后重跑同一脚本是安全的；
       `schema_meta.version` 只在整段脚本成功后推进，失败时保持 14。
 
-- [ ] **Step 2: 同步另外两处版本陈述**
+- [x] **Step 2: 同步另外两处版本陈述**
 
   - `docs/user-guide/server-admin.md:33`：「当前 Schema 版本为 v14」→「v15」。
   - `docs/deployment/binary-release.md:54`：「当前值为 13」→「当前值为 15」
     （前置核实结论 11：该值原本已滞后一位）。
 
-- [ ] **Step 3: 校验**
+- [x] **Step 3: 校验**
 
   Run: `rg -n 'v14|v15|当前值为' docs/operations/schema-upgrades.md docs/user-guide/server-admin.md docs/deployment/binary-release.md`
   Expected: 新版本陈述一致；`docs/operations/configuration.md:445` 等身份特性锚点未被改动
@@ -821,7 +821,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
   Run: `go test ./scripts/ -count=1`
   Expected: `ok`（阶段 1 的文档主张守卫测试仍然绿灯；本阶段不得重新引入被 ADR 0002 反转的主张）。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
   `git commit -m "docs(operations): document the v15 schema upgrade"`
 
@@ -829,7 +829,7 @@ accessor `func (d *DB) VPNPeers() VPNPeerRepository`、`func (d *DB) VPNIPLeases
 
 **Files:** `docs/pull-requests/2026-09-20-vpn-phase3-schema-v15.md`、四份生成的索引 README
 
-- [ ] **Step 1: 全量门禁**
+- [x] **Step 1: 全量门禁**
 
 ```bash
 go build ./...
@@ -844,7 +844,7 @@ git diff --check
   本阶段不改前端，若目录缺失先执行 `cd web && npm ci && npm run build && cd ..` 再跑。
   MySQL 侧测试必须如实记录为 SKIP（Global Constraint 12）。
 
-- [ ] **Step 2: 双方言一致性专项核验**
+- [x] **Step 2: 双方言一致性专项核验**
 
 ```bash
 # 全量 DDL 建库与 v14→v15 增量升级必须得到同一 Schema（SQLite 侧已由 Task 1 的等价测覆盖）
@@ -859,7 +859,7 @@ go test ./internal/storage/ -run 'DialectSafe' -v -count=1
   `TUNNELMESH_TEST_MYSQL_DSN='user:pass@tcp(host:3306)/tm_test?parseTime=true' go test ./internal/storage/ -run 'MySQL' -count=1`
   并把真实输出写进 PR 记录。
 
-- [ ] **Step 3: 写 PR 记录**
+- [x] **Step 3: 写 PR 记录**
 
   新增 `docs/pull-requests/2026-09-20-vpn-phase3-schema-v15.md`，覆盖 `AGENTS.md` 要求的全部小节
   （标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全与授权影响、测试证据、发布步骤、
@@ -867,13 +867,13 @@ go test ./internal/storage/ -run 'DialectSafe' -v -count=1
   测试证据必须写明：每个任务的红灯原文（`undefined: migrations.V14ToV15MySQL` 等）、
   绿灯输出、SKIP 项与原因、以及 `SchemaVersion` 14→15 的断言更新点。
 
-- [ ] **Step 4: 重新生成索引并确认幂等**
+- [x] **Step 4: 重新生成索引并确认幂等**
 
   Run: `python3 scripts/gen_doc_index.py && python3 scripts/gen_doc_index.py && git status --porcelain`
   Expected: 第一次生成后 `docs/pull-requests/README.md`（共 21 份记录）、
   `docs/superpowers/plans/README.md`、`docs/superpowers/specs/README.md` 出现关联；第二次无新 diff。
 
-- [ ] **Step 5: 时点记录零改写核验**
+- [x] **Step 5: 时点记录零改写核验**
 
 ```bash
 BASE=codex/vpn-phase1-constraint-reversal
@@ -883,7 +883,7 @@ git diff --name-status "$BASE"..HEAD -- docs/superpowers docs/pull-requests docs
   Expected: 只出现 `A`（本计划、本阶段 PR 记录）与生成索引的 `M`；
   **不得出现任何既有 spec/plan/PR 记录或已接受 ADR 被 `M`**。
 
-- [ ] **Step 6: 提交并（获授权后）推送**
+- [x] **Step 6: 提交并（获授权后）推送**
 
 ```bash
 git add docs/pull-requests/2026-09-20-vpn-phase3-schema-v15.md docs/pull-requests/README.md \
