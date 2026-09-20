@@ -1,5 +1,220 @@
 # Schema Upgrade Guide
 
+## v14 to v15
+
+Schema v15 is the storage foundation for the embedded VPN gateway approved in
+[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) and
+described in
+[the embedded VPN gateway spec](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md).
+It adds two tables and five indexes and touches no existing table: every
+statement is a `CREATE TABLE` or a `CREATE INDEX`, so the change is expand-only
+and carries no `ALTER TABLE` cost. No API route, configuration key or frontend
+asset changes in this release — the gateway itself lands in later phases, and
+until then both tables stay empty.
+
+New tables:
+
+| Table | Primary key | Notable columns and constraints |
+| --- | --- | --- |
+| `vpn_peers` | `id VARBINARY(255)` | `public_key VARCHAR(64) NOT NULL UNIQUE` (the WireGuard handshake identity); `UNIQUE(node_id, vpn_ip)` (an address is unique inside one node's pool, not globally, because every node carves its own `/24` out of the shared pool); `private_key_ciphertext TEXT` with `private_key_nonce VARCHAR(64)`, `private_key_key_id VARCHAR(64)` and `private_key_version INTEGER`, all nullable and sealed by `auth.SecretStore`, never plaintext; `allowed_ips TEXT NOT NULL` and `allowed_ports TEXT NOT NULL`, opaque canonical text owned by `internal/vpn` that storage never parses; `allow_private_targets`, `icmp_enabled`, `max_concurrent_flows DEFAULT 128`, `packet_rate_limit`; `expires_at VARCHAR(32)`; `status VARCHAR(32) NOT NULL` (`active`, `disabled`, `revoked` — `revoked` is terminal and no delete path exists); `description VARCHAR(255)`; `created_at`, `updated_at` |
+| `vpn_ip_leases` | `id VARBINARY(255)` | `UNIQUE(node_id, subnet)` (one holder per `/24`); `allocated_count INTEGER DEFAULT 0`, a derived counter for metrics and fast exhaustion checks — the authoritative fact that an address is taken is `vpn_peers.UNIQUE(node_id, vpn_ip)`; `lease_holder VARBINARY(255)`; `lease_expires_at VARCHAR(32) NOT NULL`; `epoch INTEGER DEFAULT 0`, which fences a node that lost its lease out of renew, release and counter updates; `acquired_at`, `updated_at` |
+
+There is deliberately **no `vpn_flows` table**. Per-flow runtime state stays in
+memory and is exported only as low-cardinality metrics: one row per flow would
+put an unbounded, high-churn table on the management database, and it would
+invite high-cardinality Prometheus labels, which the observability constraints
+forbid. See §7.1 of the design spec.
+
+New indexes:
+
+- `idx_vpn_peers_owner` on `vpn_peers(owner_id, id)`
+- `idx_vpn_peers_node` on `vpn_peers(node_id, status)`
+- `idx_vpn_peers_expires` on `vpn_peers(expires_at)`
+- `idx_vpn_ip_leases_holder` on `vpn_ip_leases(lease_holder, lease_expires_at)`
+- `idx_vpn_ip_leases_expires` on `vpn_ip_leases(lease_expires_at)`
+
+As in v12 and v14, indexed timestamp columns are `VARCHAR(32)` rather than `TEXT`
+so MySQL can build the index without an explicit key length (`Error 1170`).
+
+### MySQL 5.6 row and index budgets
+
+MySQL 5.6 is a supported deployment target and its defaults are stricter than
+later releases: the Antelope file format with `COMPACT` rows and
+`innodb_large_prefix=OFF` caps an index key at **767 bytes**, and keeps at most a
+768-byte prefix of every variable-length column inline, which caps the inline
+part of a row at **8126 bytes**. Both tables were sized against those limits:
+
+| Budget | Limit | `vpn_peers` | `vpn_ip_leases` |
+| --- | --- | --- | --- |
+| Widest index key | 767 bytes | 510 (`idx_vpn_peers_owner`) | 511 (`UNIQUE(node_id, subnet)`) |
+| Inline row size | 8126 bytes | 6460 | 1421 |
+
+`TestVPNMigrationsFitMySQL56Budgets` recomputes both rows of that table from the
+DDL text on every `go test` run and needs no MySQL server, so the budgets are a
+build gate rather than a note in this document. **Recompute them before adding
+any variable-length column to either table.** Under `utf8mb4` a `VARCHAR(n)`
+costs `n × 4` bytes in every index it appears in, and a `TEXT` column costs 788
+bytes of the inline budget whether or not it is ever filled.
+
+Two widths look inconsistent with the rest of the schema and are not:
+
+- `private_key_nonce` is `VARCHAR(64)`, where `user_mfa`, `auth_challenges` and
+  `oidc_providers` use `TEXT` for the same concept. An AES-GCM nonce is 12 bytes
+  (16 base64 characters), so `TEXT` would charge 788 bytes of the inline budget
+  instead of 256.
+- `private_key_key_id` is `VARCHAR(64)` rather than the `VARCHAR(128)` used by
+  the identity and credential tables, for the same reason.
+
+Do not normalize either column back to the older width without recomputing the
+budget: the guard test fails when the row stops fitting, and on a real 5.6 server
+the failure would be a `CREATE TABLE` that silently truncates or refuses.
+
+### Before upgrading
+
+1. **Back up the database and verify the backup can be restored.** This upgrade
+   is not reversible by application rollback; see "Roll back" below.
+2. Confirm `schema_meta.version=14`. **v14 is the minimum source version**: the
+   repository only maintains adjacent incremental scripts, so a database at v13
+   or earlier must be upgraded to v14 first.
+3. Confirm both `migrations/incremental/v0014_to_v0015/mysql.sql` and
+   `migrations/incremental/v0014_to_v0015/sqlite.sql` are present, and that every
+   intermediate version from the current one is present too. Cross-version
+   upgrades must run one adjacent step at a time.
+4. Confirm the database account can `CREATE TABLE`, `CREATE INDEX` and update
+   `schema_meta`. This release needs no `ALTER` privilege, but the account still
+   needs it for any earlier step in the chain.
+5. **No new environment variable is required.** `TUNNELMESH_VPN_NODE_PRIVATE_KEY`
+   belongs to a later phase and does not exist yet; `TUNNELMESH_TOKEN_ENCRYPTION_KEY`
+   keeps its v14 meaning and is still only used by the identity and credential
+   features. Nothing in v15 reads a secret that is not already configured.
+6. Plan for a full-fleet restart rather than a rolling upgrade. See the
+   compatibility note below.
+
+Start the new Server with schema initialization enabled
+(`storage.auto_init: true`). The migration applies the driver-specific
+statements and advances `schema_meta.version` to `15` only after they succeed.
+
+### Lock impact and capacity
+
+This release creates two empty tables and five indexes over them. No existing
+table is read, rebuilt or locked, so there is no lock window and no replication
+cost on existing data; on MySQL the elapsed time is whatever the instance needs
+for two small DDL statements, normally seconds. SQLite runs the statements
+inside the migration transaction with the same negligible pause as previous
+releases.
+
+Contrast with v13 to v14, which ran `ALTER TABLE users ADD COLUMN`: MySQL 5.6
+and 5.7 apply that with the `INPLACE` algorithm, which still rebuilds `users` and
+blocks concurrent DML for the duration (recorded in that section below). **v15
+contains no `ALTER` at all, so that cost does not exist here.** Keeping the VPN
+storage in two new tables instead of extending existing ones is what buys that.
+
+Ongoing storage cost is one `vpn_peers` row per peer (on the order of 1 KB) and
+one `vpn_ip_leases` row per node per `/24`. Neither table grows with traffic:
+flows are never persisted.
+
+### Gray release
+
+Upgrade one Server node first and watch `schema_meta.version`, the health
+endpoint and the critical paths — login, Agent registration, managed routes and
+`tp-*` host routing — before rolling the rest of the fleet.
+
+Because `internal/storage/db.go` refuses to open a database whose
+`schema_meta.version` is higher than the binary's `SchemaVersion`, **this is not
+a window in which old and new nodes can run side by side**: once any node has
+migrated the database to v15, an un-upgraded node that restarts fails to start.
+Complete the fleet inside one maintenance window, exactly as for v13 to v14.
+
+### Verify
+
+```sql
+SELECT version FROM schema_meta WHERE id=1;
+-- expected: 15
+
+-- MySQL
+SHOW TABLES LIKE 'vpn\_%';
+SHOW INDEX FROM vpn_peers;
+SHOW INDEX FROM vpn_ip_leases;
+
+-- SQLite
+SELECT name FROM sqlite_master WHERE type='table' AND name IN
+  ('vpn_peers','vpn_ip_leases');
+SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN
+  ('vpn_peers','vpn_ip_leases') AND name LIKE 'idx_vpn_%';
+```
+
+Both tables and all five `idx_vpn_*` indexes must be present, plus the two
+inline unique constraints. `requireSchemaTables` checks the two table names at
+startup, so a Server that boots at all has passed part of this verification.
+Both tables must be empty (`SELECT COUNT(*)`) unless a later phase has already
+been deployed. Finish with a smoke test of the health endpoint and the critical
+paths listed above, and confirm the upgrade log contains no DSN, password or
+token.
+
+A fresh deployment seeded from `migrations/ddl.sql` produces the same objects at
+version `15`; `TestSQLiteFreshSchemaMatchesIncrementalVPNChain` asserts that the
+full DDL and the incremental chain agree on every column and index.
+
+### Compatibility: a v14 binary cannot open a v15 database
+
+The migration statements are additive, but the version gate is strict. A v14
+Server refuses a v15 database before serving any traffic: with
+`storage.auto_init: false` the schema check requires an exact version match and
+fails with `schema version mismatch: database has version 15, application
+requires version 14`; with `auto_init: true` the loader rejects any version above
+its own `SchemaVersion` with the same error. The gate is symmetric: a v15 Server
+against a v14 database fails with `database has version 14, application requires
+version 15` when `auto_init` is off, and with `auto_init` on it runs
+`v0014_to_v0015` — or, if that adjacent script is missing from the embedded
+migrations, reports `missing adjacent migration v0014_to_v0015` and refuses to
+start. Independent of the version number, startup also verifies that both new
+tables exist and fails with `schema is missing required table <name>` if either
+is absent.
+
+### Roll back
+
+The two new tables are invisible to a v14 binary: v14 code neither reads nor
+writes them, so **no reverse DDL is needed**. That does not make downgrade free,
+because a v14 binary still refuses to open a database stamped `15`. The supported
+paths are therefore:
+
+1. **Restore the pre-upgrade backup** — the only path that returns the fleet to
+   v14 with its data intact.
+2. **Fix forward** on v15. Preferred whenever the problem is in application code
+   rather than in the migration, since the migration itself cannot corrupt
+   existing data.
+
+Never hand-run `UPDATE schema_meta SET version=14`. That leaves v15 tables
+present under a v14 version number, which the next upgrade attempt misreads, and
+it defeats the very gate that makes the failure mode above detectable.
+
+If a downgrade must keep production data, an operator may drop the two tables
+after confirming by hand that both are empty — `SELECT COUNT(*) FROM vpn_peers`
+and `SELECT COUNT(*) FROM vpn_ip_leases`. This is a human decision taken with a
+backup in hand; the application never drops a table on its own, and dropping a
+non-empty `vpn_peers` destroys peer records that no other table can rebuild.
+
+### Five-minute stop-loss
+
+This release ships no runtime switch — `server.vpn.*` does not exist yet — so
+there is nothing to turn off. The stop-loss is: halt the rollout, leave the
+migrated database as it is, roll the binary back to the pre-upgrade version, and
+continue from "Roll back" above. Because the migration is additive-only, nodes
+that have not been touched yet keep serving normally for the whole window, and a
+fleet that is only partly upgraded stays up as long as no un-upgraded node
+restarts.
+
+### If the upgrade fails
+
+MySQL DDL commits implicitly, so an interrupted run can leave one table created
+and the other missing. `applySchemaStatements` tolerates duplicate objects from v6
+onward, which makes re-running the same `v0014_to_v0015` script safe once the
+blocking condition is cleared; `schema_meta.version` only advances after the whole
+script succeeds and stays at `14` otherwise. Inspect the error, fix the cause —
+almost always a missing `CREATE` privilege or an existing object with the same
+name — and re-run the same script. Do not edit a published incremental script to
+work around a failure: the fix belongs in the next schema version.
+
 ## v13 to v14
 
 Schema v14 is the enterprise identity foundation: OIDC single sign-on, TOTP MFA

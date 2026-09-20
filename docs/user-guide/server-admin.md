@@ -30,7 +30,7 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 管理员可在“子账号”中创建、启用、禁用、重置密码、逻辑删除和恢复普通账号。创建/重置返回的临时密码只显示一次，响应使用 `Cache-Control: no-store`，不要写入工单、日志或浏览器存储。删除只设置 `deleted_at` 和禁用状态，Agent、路由、隧道、Token 与审计记录都会保留；恢复会清空 `deleted_at`。已删除用户名不能复用，管理员账号不能被这些接口操作。
 
-当前 Schema 版本为 v14。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
+当前 Schema 版本为 v15。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
 
 ## 单点登录、两步验证与受信任设备
 
