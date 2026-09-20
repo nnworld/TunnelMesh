@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -946,4 +947,409 @@ func runVPNPeerRepositoryContract(t *testing.T, db *DB) {
 			t.Fatalf("CountByNode on an unknown node = %d, err = %v, want 0", count, err)
 		}
 	})
+}
+
+func TestSQLiteVPNIPLeaseRepositoryContract(t *testing.T) {
+	runVPNIPLeaseRepositoryContract(t, newVPNTestDB(t))
+}
+
+func assertVPNLeaseSubnetsInOrder(t *testing.T, got []VPNIPLease, want ...string) {
+	t.Helper()
+	var subnets []string
+	for _, lease := range got {
+		subnets = append(subnets, lease.Subnet)
+	}
+	if strings.Join(subnets, ",") != strings.Join(want, ",") {
+		t.Fatalf("lease order = %v, want %v", subnets, want)
+	}
+}
+
+// runVPNIPLeaseRepositoryContract asserts the fencing rules that keep two server
+// nodes from allocating VPN addresses out of the same /24. SQLite runs it against
+// a private file database; MySQL runs the same function against the shared
+// contract database, so every case uses node and subnet IDs created here.
+func runVPNIPLeaseRepositoryContract(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	leases := db.VPNIPLeases()
+
+	t.Run("first acquire", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-first", "10.66.10.0/24", "vpn-lease-holder-first"
+		acquired, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if acquired.ID == "" {
+			t.Fatal("a fresh lease must be given an ID")
+		}
+		if acquired.Epoch != 1 {
+			t.Fatalf("epoch = %d, want 1 for a fresh lease", acquired.Epoch)
+		}
+		if acquired.AllocatedCount != 0 {
+			t.Fatalf("allocated count = %d, want 0 for a fresh lease", acquired.AllocatedCount)
+		}
+		if acquired.LeaseHolder != holder {
+			t.Fatalf("holder = %q, want %q", acquired.LeaseHolder, holder)
+		}
+		if acquired.AcquiredAt.IsZero() || acquired.UpdatedAt.IsZero() {
+			t.Fatalf("acquired lease must carry timestamps: %+v", acquired)
+		}
+		if acquired.AcquiredAt.Location() != time.UTC || acquired.UpdatedAt.Location() != time.UTC {
+			t.Fatalf("timestamps must be UTC, got %v and %v", acquired.AcquiredAt, acquired.UpdatedAt)
+		}
+		// The expiry must follow the requested TTL, not the one-minute default,
+		// otherwise a node that asks for a long lease silently loses it.
+		if drift := acquired.LeaseExpiresAt.Sub(acquired.AcquiredAt.Add(time.Hour)); drift > time.Second || drift < -time.Second {
+			t.Fatalf("lease expires %v after acquisition, want about one hour", acquired.LeaseExpiresAt.Sub(acquired.AcquiredAt))
+		}
+		stored, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.ID != acquired.ID || stored.Epoch != acquired.Epoch || stored.LeaseHolder != acquired.LeaseHolder ||
+			stored.AllocatedCount != acquired.AllocatedCount || !stored.LeaseExpiresAt.Equal(acquired.LeaseExpiresAt) {
+			t.Fatalf("stored lease = %+v, want it to match %+v", stored, acquired)
+		}
+		if stored.TTL <= 0 || stored.TTL > time.Hour {
+			t.Fatalf("Get must derive the remaining TTL, got %v", stored.TTL)
+		}
+		if _, err := leases.Get(ctx, node, "10.66.99.0/24"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("Get on an unknown subnet err = %v, want sql.ErrNoRows", err)
+		}
+		// A lease with no identity cannot be fenced, so it is rejected at the
+		// boundary instead of creating a row nobody can renew.
+		if _, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: "10.66.21.0/24", TTL: time.Hour}); err == nil {
+			t.Fatal("acquiring without a holder must fail")
+		}
+	})
+
+	t.Run("reacquire and refused takeover", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-reacquire", "10.66.18.0/24", "vpn-lease-holder-reacquire"
+		first, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := leases.AddAllocated(ctx, node, subnet, holder, first.Epoch, 5); err != nil {
+			t.Fatal(err)
+		}
+		// The same holder re-acquiring a live lease is a renewal, not a
+		// conflict: a restarting node must be able to reclaim its own subnet
+		// without waiting for the old lease to expire.
+		again, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.Epoch != first.Epoch+1 {
+			t.Fatalf("epoch = %d, want %d after a re-acquire", again.Epoch, first.Epoch+1)
+		}
+		if again.AllocatedCount != 5 {
+			t.Fatalf("a re-acquire cleared the counter: %d, want 5", again.AllocatedCount)
+		}
+		// Another holder while the lease is live is the fence that stops two
+		// nodes allocating from the same /24.
+		if _, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: "vpn-lease-holder-intruder", TTL: time.Hour}); !errors.Is(err, ErrVPNIPLeaseHeld) {
+			t.Fatalf("takeover of a live lease err = %v, want ErrVPNIPLeaseHeld", err)
+		}
+		untouched, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if untouched.Epoch != again.Epoch || untouched.LeaseHolder != holder {
+			t.Fatalf("a refused takeover modified the lease: %+v", untouched)
+		}
+		if !untouched.LeaseExpiresAt.Equal(again.LeaseExpiresAt) {
+			t.Fatalf("a refused takeover moved the expiry from %v to %v", again.LeaseExpiresAt, untouched.LeaseExpiresAt)
+		}
+	})
+
+	t.Run("expired takeover keeps the counter", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-expired", "10.66.19.0/24", "vpn-lease-holder-expired"
+		first, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := leases.AddAllocated(ctx, node, subnet, holder, first.Epoch, 3); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		taken, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: "vpn-lease-holder-successor", TTL: time.Hour})
+		if err != nil {
+			t.Fatalf("an expired lease must be takeable: %v", err)
+		}
+		if taken.Epoch != first.Epoch+1 {
+			t.Fatalf("takeover epoch = %d, want %d", taken.Epoch, first.Epoch+1)
+		}
+		if taken.LeaseHolder != "vpn-lease-holder-successor" {
+			t.Fatalf("holder = %q, want the successor", taken.LeaseHolder)
+		}
+		// The takeover inherits the counter: the peers already configured on
+		// this subnet are still there, so the new node must see them instead of
+		// believing the subnet is empty and handing an address out twice.
+		if taken.AllocatedCount != 3 {
+			t.Fatalf("takeover lost the allocation counter: %d, want 3", taken.AllocatedCount)
+		}
+	})
+
+	t.Run("epoch fencing", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-fence", "10.66.11.0/24", "vpn-lease-holder-fence"
+		acquired, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := acquired.Epoch - 1
+		if err := leases.Renew(ctx, node, subnet, holder, stale, time.Hour); !errors.Is(err, ErrVPNIPLeaseStaleEpoch) {
+			t.Fatalf("Renew with a stale epoch err = %v, want ErrVPNIPLeaseStaleEpoch", err)
+		}
+		if err := leases.Release(ctx, node, subnet, holder, stale); !errors.Is(err, ErrVPNIPLeaseStaleEpoch) {
+			t.Fatalf("Release with a stale epoch err = %v, want ErrVPNIPLeaseStaleEpoch", err)
+		}
+		if _, err := leases.AddAllocated(ctx, node, subnet, holder, stale, 1); !errors.Is(err, ErrVPNIPLeaseStaleEpoch) {
+			t.Fatalf("AddAllocated with a stale epoch err = %v, want ErrVPNIPLeaseStaleEpoch", err)
+		}
+		// A forged holder is fenced the same way even though the epoch matches:
+		// owning the lease is holder plus epoch, never epoch alone.
+		if err := leases.Renew(ctx, node, subnet, "vpn-lease-holder-forged", acquired.Epoch, time.Hour); !errors.Is(err, ErrVPNIPLeaseStaleEpoch) {
+			t.Fatalf("Renew by a forged holder err = %v, want ErrVPNIPLeaseStaleEpoch", err)
+		}
+		before, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := leases.Renew(ctx, node, subnet, holder, acquired.Epoch, 2*time.Hour); err != nil {
+			t.Fatalf("Renew with the current epoch must succeed: %v", err)
+		}
+		after, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Renew only buys time. Moving the epoch would fence the renewing node
+		// out of its own lease, and clearing the counter would lose the record
+		// of addresses already handed out.
+		if after.Epoch != before.Epoch {
+			t.Fatalf("Renew changed the epoch from %d to %d", before.Epoch, after.Epoch)
+		}
+		if after.AllocatedCount != before.AllocatedCount {
+			t.Fatalf("Renew changed the allocated count from %d to %d", before.AllocatedCount, after.AllocatedCount)
+		}
+		if !after.LeaseExpiresAt.After(before.LeaseExpiresAt) {
+			t.Fatalf("Renew did not extend the expiry: %v then %v", before.LeaseExpiresAt, after.LeaseExpiresAt)
+		}
+		if !after.UpdatedAt.After(before.UpdatedAt) {
+			t.Fatalf("Renew did not advance updated_at: %v then %v", before.UpdatedAt, after.UpdatedAt)
+		}
+		if err := leases.Renew(ctx, node, "10.66.98.0/24", holder, acquired.Epoch, time.Hour); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("Renew on an unknown subnet err = %v, want sql.ErrNoRows", err)
+		}
+		if err := leases.Release(ctx, node, "10.66.98.0/24", holder, acquired.Epoch); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("Release on an unknown subnet err = %v, want sql.ErrNoRows", err)
+		}
+	})
+
+	t.Run("release hands the subnet back", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-release", "10.66.12.0/24", "vpn-lease-holder-release"
+		acquired, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := leases.AddAllocated(ctx, node, subnet, holder, acquired.Epoch, 2); err != nil {
+			t.Fatal(err)
+		}
+		if err := leases.Release(ctx, node, subnet, holder, acquired.Epoch); err != nil {
+			t.Fatal(err)
+		}
+		released, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Release must not delete the row or clear the counter: the peers that
+		// already hold addresses on this subnet outlive the lease that allocated
+		// them, and the row is the audit trail for that.
+		if released.AllocatedCount != 2 {
+			t.Fatalf("allocated count after release = %d, want 2", released.AllocatedCount)
+		}
+		if released.Epoch != acquired.Epoch {
+			t.Fatalf("release changed the epoch from %d to %d", acquired.Epoch, released.Epoch)
+		}
+		if !released.LeaseExpiresAt.Before(time.Now().UTC()) {
+			t.Fatalf("released lease expires at %v, want an instant in the past", released.LeaseExpiresAt)
+		}
+		taken, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: "vpn-lease-holder-release-2", TTL: time.Minute})
+		if err != nil {
+			t.Fatalf("a released subnet must be takeable immediately: %v", err)
+		}
+		if taken.Epoch != acquired.Epoch+1 {
+			t.Fatalf("takeover epoch = %d, want %d", taken.Epoch, acquired.Epoch+1)
+		}
+		if taken.AllocatedCount != 2 {
+			t.Fatalf("takeover lost the allocation counter: %d, want 2", taken.AllocatedCount)
+		}
+	})
+
+	t.Run("allocated counter", func(t *testing.T) {
+		const node, subnet, holder = "vpn-lease-node-count", "10.66.13.0/24", "vpn-lease-holder-count"
+		acquired, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: holder, TTL: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Releasing an address that was never allocated must fail rather than
+		// drive the counter negative, which would make a subnet look like it has
+		// free capacity it does not have.
+		if _, err := leases.AddAllocated(ctx, node, subnet, holder, acquired.Epoch, -1); err == nil {
+			t.Fatal("decrementing a zero counter must fail")
+		}
+		if got, err := leases.Get(ctx, node, subnet); err != nil || got.AllocatedCount != 0 {
+			t.Fatalf("allocated count = %d, err = %v, want it to stay 0", got.AllocatedCount, err)
+		}
+		for want := 1; want <= 3; want++ {
+			got, err := leases.AddAllocated(ctx, node, subnet, holder, acquired.Epoch, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("AddAllocated(+1) returned %d, want %d", got, want)
+			}
+		}
+		got, err := leases.AddAllocated(ctx, node, subnet, holder, acquired.Epoch, -1)
+		if err != nil || got != 2 {
+			t.Fatalf("AddAllocated(-1) = %d, err = %v, want 2", got, err)
+		}
+		stored, err := leases.Get(ctx, node, subnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.AllocatedCount != 2 {
+			t.Fatalf("stored allocated count = %d, want 2", stored.AllocatedCount)
+		}
+		// A forged holder must not be able to move another node's counter.
+		if _, err := leases.AddAllocated(ctx, node, subnet, "vpn-lease-holder-forged", acquired.Epoch, 1); !errors.Is(err, ErrVPNIPLeaseStaleEpoch) {
+			t.Fatalf("AddAllocated by a forged holder err = %v, want ErrVPNIPLeaseStaleEpoch", err)
+		}
+		if _, err := leases.AddAllocated(ctx, node, "10.66.97.0/24", holder, acquired.Epoch, 1); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("AddAllocated on an unknown subnet err = %v, want sql.ErrNoRows", err)
+		}
+	})
+
+	t.Run("list by holder", func(t *testing.T) {
+		const holder, other = "vpn-lease-holder-list", "vpn-lease-holder-list-other"
+		for _, subnet := range []string{"10.66.14.0/24", "10.66.15.0/24"} {
+			if _, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: "vpn-lease-node-list", Subnet: subnet, LeaseHolder: holder, TTL: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: "vpn-lease-node-list", Subnet: "10.66.20.0/24", LeaseHolder: other, TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := leases.ListByHolder(ctx, holder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("ListByHolder returned %d leases, want 2", len(got))
+		}
+		assertVPNLeaseSubnetsInOrder(t, got, "10.66.14.0/24", "10.66.15.0/24")
+		for _, lease := range got {
+			if lease.LeaseHolder != holder {
+				t.Fatalf("ListByHolder leaked a lease held by %q", lease.LeaseHolder)
+			}
+			if lease.TTL <= 0 {
+				t.Fatalf("ListByHolder must derive the remaining TTL, got %v", lease.TTL)
+			}
+		}
+		// An unknown holder is an empty result, not an error: a node that has
+		// never leased a subnet asks this on every start.
+		empty, err := leases.ListByHolder(ctx, "vpn-lease-holder-absent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if empty == nil {
+			t.Fatal("ListByHolder must return an empty slice rather than nil")
+		}
+		if len(empty) != 0 {
+			t.Fatalf("ListByHolder on an unknown holder = %v, want an empty slice", empty)
+		}
+	})
+
+	t.Run("unique constraint is enforced by the database", func(t *testing.T) {
+		const node, subnet = "vpn-lease-node-unique", "10.66.16.0/24"
+		if _, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: "vpn-lease-holder-unique", TTL: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+		// Inserted directly, bypassing the repository, so this proves the
+		// guarantee lives in the schema and not only in the compare-and-set.
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_, err := db.SQL().ExecContext(ctx, `INSERT INTO vpn_ip_leases(id,node_id,subnet,allocated_count,lease_holder,lease_expires_at,epoch,acquired_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			"vpn-ip-lease-duplicate", node, subnet, 0, "vpn-lease-holder-unique-2", now, 1, now, now)
+		if err == nil {
+			t.Fatal("a second row for the same node and subnet must be rejected by UNIQUE(node_id, subnet)")
+		}
+		if !isDuplicateError(err) {
+			t.Fatalf("err = %v, want a duplicate key error", err)
+		}
+	})
+}
+
+// TestSQLiteConcurrentVPNIPLeaseAcquireHasSingleOwner is the race the epoch
+// compare-and-set exists for: several nodes notice the same expired lease at the
+// same time and all try to take it over. Exactly one may win, and the winner
+// must advance the epoch so the losers stay fenced out afterwards.
+func TestSQLiteConcurrentVPNIPLeaseAcquireHasSingleOwner(t *testing.T) {
+	db := newVPNTestDB(t)
+	ctx := context.Background()
+	leases := db.VPNIPLeases()
+	const node, subnet = "vpn-lease-node-race", "10.66.17.0/24"
+	first, err := leases.AcquireSubnet(ctx, VPNIPLease{NodeID: node, Subnet: subnet, LeaseHolder: "vpn-lease-holder-initial", TTL: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	const contenders = 8
+	results := make(chan VPNIPLease, contenders)
+	errs := make(chan error, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			lease, err := leases.AcquireSubnet(ctx, VPNIPLease{
+				NodeID: node, Subnet: subnet,
+				LeaseHolder: fmt.Sprintf("vpn-lease-holder-%d", i), TTL: time.Minute,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- lease
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	var winners []VPNIPLease
+	for lease := range results {
+		winners = append(winners, lease)
+	}
+	if len(winners) != 1 {
+		t.Fatalf("successful holders = %d, want exactly one", len(winners))
+	}
+	if winners[0].Epoch != first.Epoch+1 {
+		t.Fatalf("takeover epoch = %d, want %d", winners[0].Epoch, first.Epoch+1)
+	}
+	losers := 0
+	for err := range errs {
+		if !errors.Is(err, ErrVPNIPLeaseHeld) {
+			t.Fatalf("losing holder err = %v, want ErrVPNIPLeaseHeld", err)
+		}
+		losers++
+	}
+	if losers != contenders-1 {
+		t.Fatalf("losers = %d, want %d", losers, contenders-1)
+	}
+	stored, err := leases.Get(ctx, node, subnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.LeaseHolder != winners[0].LeaseHolder || stored.Epoch != winners[0].Epoch {
+		t.Fatalf("stored lease = %+v, want the winner %+v", stored, winners[0])
+	}
 }

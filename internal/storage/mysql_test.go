@@ -407,6 +407,7 @@ func TestMySQLVPNRepositoryContract(t *testing.T) {
 	}
 	defer db.Close()
 	runVPNPeerRepositoryContract(t, db)
+	runVPNIPLeaseRepositoryContract(t, db)
 }
 
 // vpnSchemaIndexes are the five secondary indexes schema v15 adds. The names are

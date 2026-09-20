@@ -57,6 +57,7 @@ type DB struct {
 	authChallenges         AuthChallengeRepository
 	authLoginAttempts      AuthLoginAttemptRepository
 	vpnPeers               VPNPeerRepository
+	vpnIPLeases            VPNIPLeaseRepository
 	metrics                *observability.Metrics
 }
 
@@ -316,6 +317,7 @@ func newDB(db *sql.DB, driver string) *DB {
 		authChallenges:         NewAuthChallengeRepository(db),
 		authLoginAttempts:      NewAuthLoginAttemptRepository(db),
 		vpnPeers:               NewVPNPeerRepository(db),
+		vpnIPLeases:            NewVPNIPLeaseRepositoryWithDriver(db, driver),
 	}
 }
 
@@ -587,6 +589,9 @@ func (d *DB) WebSSHSessions() WebSSHSessionRepository {
 // VPNPeers exposes the WireGuard peer records the embedded VPN gateway hands
 // out to users.
 func (d *DB) VPNPeers() VPNPeerRepository { return d.vpnPeers }
+
+// VPNIPLeases exposes the per-node claim on the VPN address pool.
+func (d *DB) VPNIPLeases() VPNIPLeaseRepository { return d.vpnIPLeases }
 
 // AuthSettings exposes the runtime authentication policy singleton.
 func (d *DB) AuthSettings() AuthSettingsRepository { return d.authSettings }
