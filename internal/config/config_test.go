@@ -1219,3 +1219,276 @@ func TestValidateProxyEntryAllowsWildcardTrustedProxies(t *testing.T) {
 		t.Fatalf("valid IPv6 wildcard trusted proxy config rejected: %v", err)
 	}
 }
+
+// vpnDocumentedExample is the server.vpn block from the embedded VPN gateway
+// design spec §8, verbatim. Loading it in a test is what keeps the documentation
+// and the loader honest: if a key is renamed here and not in the spec, or the
+// spec advertises a key the loader ignores, this test fails.
+const vpnDocumentedExample = `mode: local
+server:
+  vpn:
+    enabled: true
+    listen: "0.0.0.0:51820"
+    endpoint_host: "gw-1.mesh.example.com"
+    ip_pool: "10.64.0.0/16"
+    node_subnet_size: 24
+    mtu: 1420
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+`
+
+func loadVPNFile(t *testing.T, body string) config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vpn.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	return cfg
+}
+
+func TestVPNDefaults(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	vpn := cfg.Server.VPN
+	if vpn.Enabled {
+		t.Fatal("server.vpn must default to disabled so an upgrade changes nothing")
+	}
+	if vpn.Listen != "0.0.0.0:51820" {
+		t.Errorf("listen default = %q", vpn.Listen)
+	}
+	if vpn.EndpointHost != "gw-1.mesh.example.com" {
+		t.Errorf("endpoint_host default = %q", vpn.EndpointHost)
+	}
+	if vpn.IPPool != "10.64.0.0/16" {
+		t.Errorf("ip_pool default = %q", vpn.IPPool)
+	}
+	if vpn.NodeSubnetSize != 24 {
+		t.Errorf("node_subnet_size default = %d", vpn.NodeSubnetSize)
+	}
+	if vpn.MTU != 1420 {
+		t.Errorf("mtu default = %d", vpn.MTU)
+	}
+	if vpn.MaxPeers != 0 || vpn.MaxFlowsTotal != 0 || vpn.PacketRatePerPeer != 0 {
+		t.Errorf("the zero-means-unlimited defaults changed: max_peers=%d max_flows_total=%d packet_rate_per_peer=%d",
+			vpn.MaxPeers, vpn.MaxFlowsTotal, vpn.PacketRatePerPeer)
+	}
+	if vpn.MaxFlowsPerPeer != 128 {
+		t.Errorf("max_flows_per_peer default = %d", vpn.MaxFlowsPerPeer)
+	}
+	if vpn.ConnectTimeout != 10*time.Second || vpn.IdleTimeout != 120*time.Second || vpn.ShutdownTimeout != 15*time.Second {
+		t.Errorf("timeout defaults changed: %s %s %s", vpn.ConnectTimeout, vpn.IdleTimeout, vpn.ShutdownTimeout)
+	}
+	if !vpn.ICMPEnabled {
+		t.Error("icmp_enabled must default to true so the capability is governed by agent negotiation, not by a silent default")
+	}
+	if vpn.ICMPTimeout != 5*time.Second || vpn.ICMPMaxConcurrent != 64 {
+		t.Errorf("icmp defaults changed: %s %d", vpn.ICMPTimeout, vpn.ICMPMaxConcurrent)
+	}
+	// The defaults must themselves be a valid configuration. A shipped default
+	// that fails Validate would make every operator's first "enabled: true" an
+	// exercise in guessing which key is wrong.
+	enabled := cfg
+	enabled.Server.VPN.Enabled = true
+	if err := config.Validate(enabled); err != nil {
+		t.Fatalf("the documented defaults must validate once enabled: %v", err)
+	}
+}
+
+func TestValidateVPNAcceptsTheDocumentedExample(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	if !cfg.Server.VPN.Enabled {
+		t.Fatal("the documented example enables the gateway")
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the documented example must validate: %v", err)
+	}
+}
+
+// TestValidateVPNSkipsEverythingWhenDisabled is the upgrade safety property. A
+// deployment that never touches server.vpn must keep loading even if the keys it
+// inherited from an example file are nonsense.
+func TestValidateVPNSkipsEverythingWhenDisabled(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cfg.Server.VPN.Enabled = false
+	cfg.Server.VPN.Listen = "not-a-listen-address"
+	cfg.Server.VPN.EndpointHost = ""
+	cfg.Server.VPN.IPPool = "10.64.0.0/33"
+	cfg.Server.VPN.NodeSubnetSize = 99
+	cfg.Server.VPN.MTU = 1
+	cfg.Server.VPN.MaxPeers = -5
+	cfg.Server.VPN.ICMPTimeout = 0
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("a disabled gateway must contribute no problems: %v", err)
+	}
+}
+
+func TestValidateVPNRejectsBadValues(t *testing.T) {
+	base := func() config.Config {
+		cfg := loadVPNFile(t, vpnDocumentedExample)
+		if err := config.Validate(cfg); err != nil {
+			t.Fatalf("baseline must validate: %v", err)
+		}
+		return cfg
+	}
+	cases := map[string]func(*config.Config){
+		"listen without a port":   func(c *config.Config) { c.Server.VPN.Listen = "0.0.0.0" },
+		"empty listen":            func(c *config.Config) { c.Server.VPN.Listen = "" },
+		"empty endpoint host":     func(c *config.Config) { c.Server.VPN.EndpointHost = "" },
+		"endpoint host with port": func(c *config.Config) { c.Server.VPN.EndpointHost = "gw-1.mesh.example.com:51820" },
+		"endpoint host invalid":   func(c *config.Config) { c.Server.VPN.EndpointHost = "not a host" },
+		"empty ip pool":           func(c *config.Config) { c.Server.VPN.IPPool = "" },
+		"ip pool not a cidr":      func(c *config.Config) { c.Server.VPN.IPPool = "10.64.0.0" },
+		"ip pool bad prefix":      func(c *config.Config) { c.Server.VPN.IPPool = "10.64.0.0/33" },
+		"ip pool ipv6":            func(c *config.Config) { c.Server.VPN.IPPool = "fd00::/64" },
+		"ip pool link local":      func(c *config.Config) { c.Server.VPN.IPPool = "169.254.0.0/16" },
+		"ip pool multicast":       func(c *config.Config) { c.Server.VPN.IPPool = "224.0.0.0/4" },
+		// One typo turning a /8 into 65536 subnets is a startup memory
+		// exhaustion vector, so the count cap must surface at load time.
+		"ip pool too many subnets": func(c *config.Config) {
+			c.Server.VPN.IPPool = "10.0.0.0/8"
+			c.Server.VPN.NodeSubnetSize = 24
+		},
+		"subnet size equal to pool":   func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 16 },
+		"subnet size wider than pool": func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 8 },
+		"subnet size above /30":       func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 31 },
+		"subnet size zero":            func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 0 },
+		"mtu zero":                    func(c *config.Config) { c.Server.VPN.MTU = 0 },
+		"mtu below the floor":         func(c *config.Config) { c.Server.VPN.MTU = 575 },
+		"mtu above the ceiling":       func(c *config.Config) { c.Server.VPN.MTU = 1501 },
+		"negative max peers":          func(c *config.Config) { c.Server.VPN.MaxPeers = -1 },
+		"negative flows per peer":     func(c *config.Config) { c.Server.VPN.MaxFlowsPerPeer = -1 },
+		"negative flows total":        func(c *config.Config) { c.Server.VPN.MaxFlowsTotal = -1 },
+		"negative packet rate":        func(c *config.Config) { c.Server.VPN.PacketRatePerPeer = -1 },
+		"zero connect timeout":        func(c *config.Config) { c.Server.VPN.ConnectTimeout = 0 },
+		"negative connect timeout":    func(c *config.Config) { c.Server.VPN.ConnectTimeout = -time.Second },
+		"zero idle timeout":           func(c *config.Config) { c.Server.VPN.IdleTimeout = 0 },
+		"negative shutdown timeout":   func(c *config.Config) { c.Server.VPN.ShutdownTimeout = -time.Second },
+		"icmp timeout zero":           func(c *config.Config) { c.Server.VPN.ICMPTimeout = 0 },
+		"icmp concurrency zero":       func(c *config.Config) { c.Server.VPN.ICMPMaxConcurrent = 0 },
+		"icmp concurrency negative":   func(c *config.Config) { c.Server.VPN.ICMPMaxConcurrent = -1 },
+	}
+	for name, mutate := range cases {
+		cfg := base()
+		mutate(&cfg)
+		if err := config.Validate(cfg); err == nil {
+			t.Errorf("%s: Validate accepted an invalid server.vpn section", name)
+		}
+	}
+}
+
+// TestValidateVPNICMPDisabledSkipsICMPBounds keeps a peer that never asked for
+// ping working even with placeholder icmp timings, so turning the capability off
+// cannot itself break startup.
+func TestValidateVPNICMPDisabledSkipsICMPBounds(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.ICMPEnabled = false
+	cfg.Server.VPN.ICMPTimeout = 0
+	cfg.Server.VPN.ICMPMaxConcurrent = 0
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("icmp bounds must not apply while icmp is disabled: %v", err)
+	}
+}
+
+func TestValidateVPNAcceptsTheLegalBoundaries(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.MTU = 576
+	cfg.Server.VPN.ShutdownTimeout = 0
+	cfg.Server.VPN.MaxPeers = 1
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the lower boundaries must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.MTU = 1500
+	cfg.Server.VPN.IPPool = "10.64.0.0/24"
+	cfg.Server.VPN.NodeSubnetSize = 30
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the narrowest legal pool must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "100.64.0.0/16"
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("carrier-grade NAT space must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "10.0.0.0/8"
+	cfg.Server.VPN.NodeSubnetSize = 20
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("exactly the subnet count cap must be accepted: %v", err)
+	}
+}
+
+func TestVPNEnvironmentOverridesFileAndCLIOverridesEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vpn.yaml")
+	if err := os.WriteFile(path, []byte(vpnDocumentedExample), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("TUNNELMESH_SERVER_VPN_IP_POOL", "10.99.0.0/16")
+	t.Setenv("TUNNELMESH_SERVER_VPN_MTU", "1300")
+	t.Setenv("TUNNELMESH_SERVER_VPN_NODE_SUBNET_SIZE", "25")
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{
+		ConfigFile: path,
+		CLI: map[string]any{
+			"server.vpn.mtu": 1380,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Server.VPN.IPPool; got != "10.99.0.0/16" {
+		t.Errorf("environment did not override the file ip_pool: %q", got)
+	}
+	if got := cfg.Server.VPN.NodeSubnetSize; got != 25 {
+		t.Errorf("environment did not override node_subnet_size: %d", got)
+	}
+	if got := cfg.Server.VPN.MTU; got != 1380 {
+		t.Errorf("CLI did not override the environment mtu: %d", got)
+	}
+	// Untouched keys still come from the file.
+	if got := cfg.Server.VPN.EndpointHost; got != "gw-1.mesh.example.com" {
+		t.Errorf("the file value for endpoint_host was lost: %q", got)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the overridden configuration must still validate: %v", err)
+	}
+}
+
+// TestVPNLoadFailsOnAnUnusablePool is the fast-fail requirement. An operator
+// must learn that ip_pool is unusable at startup, with a message naming the key,
+// rather than at the first peer issuance.
+func TestVPNLoadFailsOnAnUnusablePool(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "10.64.0.0/33"
+	err := config.Validate(cfg)
+	if err == nil {
+		t.Fatal("an unusable ip_pool must fail validation")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "vpn") {
+		t.Errorf("the error must name the vpn section, got %q", message)
+	}
+	if !strings.Contains(message, "ip_pool") {
+		t.Errorf("the error must name the offending key, got %q", message)
+	}
+}

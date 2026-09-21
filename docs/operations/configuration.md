@@ -236,6 +236,78 @@ tunnelmesh-server --server.proxy_entry.enabled=true \
 
 改完先用 `tunnelmesh-server check-config` 校验再重启。路由本身（出口 agent、认证方式、来源 ACL、目标限制）不在这个配置文件里，全部由管理后台的托管路由维护，创建后 5 秒内生效，不需要重启 Server 或改 nginx。
 
+## 内嵌 VPN 网关（WireGuard）
+
+内嵌 VPN 网关让没有安装 `tunnelmesh-client` 的用户直接用系统自带的 WireGuard 客户端接入内网，出口仍由 Agent 承担。决策背景与边界见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)。
+
+**当前版本只提供管理面。** `server.vpn` 会被完整加载与校验，管理 API 可以签发、吊销、轮换 peer 并下发客户端配置文件，但 WireGuard 端点与内存态 TUN 设备仍在分阶段实施中，尚未随发行版提供。也就是说：现在签发的 peer 可以被管理、审计和下载配置，导入客户端后还不能建立隧道。对外通知里不要把它描述成已经可用。
+
+与 tp-* 代理入口不同，VPN 端点是一个**独立的公网 UDP 端口**：不经反向代理、不参与 HTTP 路由，必须在防火墙或安全组里单独放行，并单独限流与监控。
+
+```yaml
+server:
+  vpn:
+    enabled: false
+    listen: 0.0.0.0:51820
+    endpoint_host: gw-1.mesh.example.com
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    mtu: 1420
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `server.vpn.enabled` | `false` | 总开关。关闭时进程不创建任何 VPN 资源，行为与旧版本完全一致；管理 API 的写操作返回 409 `vpn_node_disabled`，读操作返回空列表 | 否 |
+| `server.vpn.listen` | `0.0.0.0:51820` | WireGuard 端点的公网 UDP 监听地址，需独立放行 | 否 |
+| `server.vpn.endpoint_host` | `gw-1.mesh.example.com` | 下发给用户的 `Endpoint` 域名，**只写主机名、不带端口**；端口始终取自 `listen`，二者不会互相矛盾 | `enabled=true` 时必填 |
+| `server.vpn.ip_pool` | `10.64.0.0/16` | peer 地址池。必须是 IPv4，且不得落在链路本地、未指定或组播段；可以使用 CGNAT 段（如 `100.64.0.0/16`） | 否 |
+| `server.vpn.node_subnet_size` | `24` | 每个 Server 节点从池里切出的子网前缀。必须严格窄于 `ip_pool` 的前缀且不窄于 `/30`；切出的子网总数上限 4096 | 否 |
+| `server.vpn.mtu` | `1420` | 隧道 MTU，取值 576–1500。1420 = 1500 − WireGuard 的 72 字节开销 | 否 |
+| `server.vpn.max_peers` | `0` | 单节点 peer 上限，触顶时签发返回 503 `vpn_capacity_exhausted`；0 表示不限 | 否 |
+| `server.vpn.max_flows_per_peer` | `128` | 单 peer 并发流上限，超限计入 `capacity_exhausted` | 否 |
+| `server.vpn.max_flows_total` | `0` | 节点并发流总上限；0 表示不限 | 否 |
+| `server.vpn.packet_rate_per_peer` | `0` | 单 peer 每秒包数上限，超限计入 `rate_limited`；0 表示不限 | 否 |
+| `server.vpn.connect_timeout` | `10s` | 开流（经 Agent 建立目标连接）的超时 | 否 |
+| `server.vpn.idle_timeout` | `120s` | 流空闲回收时间 | 否 |
+| `server.vpn.shutdown_timeout` | `15s` | 进程退出时等待在途流排空的上限，可为 0 | 否 |
+| `server.vpn.icmp_enabled` | `true` | 节点级 ICMP echo 总开关。这是上限而不是承诺：peer 还要单独开启，且出口 Agent 必须协商到该能力，否则签发返回 409 `vpn_agent_capability_missing` | 否 |
+| `server.vpn.icmp_timeout` | `5s` | 单次 echo 应答超时，超时计入 `icmp_timeout` | 否 |
+| `server.vpn.icmp_max_concurrent` | `64` | 节点并发 echo 上限 | 否 |
+
+三个「0 表示不限」的计数（`max_peers`、`max_flows_total`、`packet_rate_per_peer`）沿用 `max_concurrent_tunnels` 的既有约定。`icmp_timeout` 与 `icmp_max_concurrent` 只在 `icmp_enabled=true` 时校验，因此关掉 ICMP 不会因为遗留的占位取值而无法启动。
+
+`ip_pool` 与 `node_subnet_size` 由 `internal/vpn` 的 `ParsePool` 直接校验，加载器和分配器共用同一套规则：「能启动」就等价于「真的能分出地址」，启动时读到的报错与首次签发时读到的报错是同一条。每个子网的第一个可用地址保留给节点自己的 VPN 接口，不会分给 peer，所以 `/24` 子网实际可分配 253 个地址、`/30` 子网只剩 1 个。
+
+节点自身的 WireGuard 私钥**不是配置项**，只从环境变量注入：
+
+```bash
+TUNNELMESH_VPN_NODE_PRIVATE_KEY=<base64 编码的 32 字节私钥>
+```
+
+配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
+
+命令行与环境变量等价（`TUNNELMESH_SERVER_VPN_*`）：
+
+```bash
+tunnelmesh-server --server.vpn.enabled=true \
+  --server.vpn.listen=0.0.0.0:51820 \
+  --server.vpn.endpoint_host=gw-1.mesh.example.com \
+  --server.vpn.ip_pool=10.64.0.0/16 \
+  --server.vpn.node_subnet_size=24
+```
+
+改完先用 `tunnelmesh-server check-config` 校验再重启。集群里**每个节点必须配置相同的 `ip_pool` 与 `node_subnet_size`**，否则子网租约会互相拒绝；节点通过 `vpn_ip_leases` 各自抢占一个子网，租约由 epoch fencing 保护，失去租约的节点无法继续从该子网分配地址。
+
 ## Agent 连接池
 
 Agent 保持一个 `server_url`，但可以复用同一个逻辑 Agent 身份建立多条物理 WebSocket 连接。默认配置禁用扩容：

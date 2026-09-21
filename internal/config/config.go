@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
+	"github.com/tunnelmesh/tunnelmesh/internal/vpn"
 	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
@@ -137,6 +138,7 @@ type ServerConfig struct {
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
+	VPN                VPNConfig                `mapstructure:"vpn" json:"vpn" yaml:"vpn"`
 	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
 	// header may be believed when resolving a management-API client IP. It is
 	// empty by default, which means the direct peer address is always used and a
@@ -163,6 +165,57 @@ type ProxyEntryConfig struct {
 	MaxConcurrentTunnels int           `mapstructure:"max_concurrent_tunnels" json:"max_concurrent_tunnels" yaml:"max_concurrent_tunnels"`
 	MaxHeaderBytes       int           `mapstructure:"max_header_bytes" json:"max_header_bytes" yaml:"max_header_bytes"`
 	AuthBackoffThreshold int           `mapstructure:"auth_backoff_threshold" json:"auth_backoff_threshold" yaml:"auth_backoff_threshold"`
+}
+
+// VPNConfig configures the embedded WireGuard gateway.
+//
+// The shape mirrors ProxyEntryConfig: one enabled switch, the addresses it
+// binds, and the resource limits that keep a single peer from exhausting the
+// process. It is disabled by default so upgrading a deployment that has never
+// heard of the gateway changes nothing about it.
+//
+// The node's own WireGuard private key is deliberately not a key here. It is
+// injected only through TUNNELMESH_VPN_NODE_PRIVATE_KEY, because a configuration
+// file is copied, backed up, rendered into a support bundle and committed to
+// version control, while an environment variable can be sourced from a secret
+// manager and never written to disk. The key the gateway hands to each peer is
+// sealed with TUNNELMESH_TOKEN_ENCRYPTION_KEY the same way credential secrets
+// are, so neither identity is ever stored in plaintext.
+type VPNConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	// Listen is the public UDP address of the WireGuard endpoint. It is not
+	// proxied and takes no part in HTTP routing, so it must be opened, rate
+	// limited and monitored separately (see ADR 0002).
+	Listen string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	// EndpointHost is the DNS name written into the peer configurations handed
+	// to users. It is a bare host, not a host:port pair: the port always comes
+	// from Listen, so the two cannot disagree.
+	EndpointHost string `mapstructure:"endpoint_host" json:"endpoint_host" yaml:"endpoint_host"`
+	// IPPool is the address space peers are drawn from and NodeSubnetSize is the
+	// prefix each server node carves out of it. Both are validated by
+	// vpn.ParsePool so the loader and the allocator can never disagree about
+	// what is a usable pool.
+	IPPool         string `mapstructure:"ip_pool" json:"ip_pool" yaml:"ip_pool"`
+	NodeSubnetSize int    `mapstructure:"node_subnet_size" json:"node_subnet_size" yaml:"node_subnet_size"`
+	// MTU leaves 72 bytes of headroom under Ethernet for the WireGuard
+	// encapsulation at the default of 1420.
+	MTU int `mapstructure:"mtu" json:"mtu" yaml:"mtu"`
+	// The three zero-means-unlimited counters follow the convention already used
+	// by max_concurrent_tunnels, so a deployment that does not set them inherits
+	// the same "no artificial ceiling" behaviour.
+	MaxPeers          int           `mapstructure:"max_peers" json:"max_peers" yaml:"max_peers"`
+	MaxFlowsPerPeer   int           `mapstructure:"max_flows_per_peer" json:"max_flows_per_peer" yaml:"max_flows_per_peer"`
+	MaxFlowsTotal     int           `mapstructure:"max_flows_total" json:"max_flows_total" yaml:"max_flows_total"`
+	PacketRatePerPeer int           `mapstructure:"packet_rate_per_peer" json:"packet_rate_per_peer" yaml:"packet_rate_per_peer"`
+	ConnectTimeout    time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
+	IdleTimeout       time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	ShutdownTimeout   time.Duration `mapstructure:"shutdown_timeout" json:"shutdown_timeout" yaml:"shutdown_timeout"`
+	// ICMPEnabled turns on echo handling for every peer that also asks for it.
+	// A peer still needs the egress agent to have negotiated the capability, so
+	// this switch is a ceiling rather than a promise.
+	ICMPEnabled       bool          `mapstructure:"icmp_enabled" json:"icmp_enabled" yaml:"icmp_enabled"`
+	ICMPTimeout       time.Duration `mapstructure:"icmp_timeout" json:"icmp_timeout" yaml:"icmp_timeout"`
+	ICMPMaxConcurrent int           `mapstructure:"icmp_max_concurrent" json:"icmp_max_concurrent" yaml:"icmp_max_concurrent"`
 }
 
 type WebSSHConfig struct {
@@ -520,6 +573,22 @@ func setDefaults(v *viper.Viper) {
 		"server.proxy_entry.max_concurrent_tunnels":          512,
 		"server.proxy_entry.max_header_bytes":                16384,
 		"server.proxy_entry.auth_backoff_threshold":          5,
+		"server.vpn.enabled":                                 false,
+		"server.vpn.listen":                                  "0.0.0.0:51820",
+		"server.vpn.endpoint_host":                           "gw-1.mesh.example.com",
+		"server.vpn.ip_pool":                                 "10.64.0.0/16",
+		"server.vpn.node_subnet_size":                        24,
+		"server.vpn.mtu":                                     1420,
+		"server.vpn.max_peers":                               0,
+		"server.vpn.max_flows_per_peer":                      128,
+		"server.vpn.max_flows_total":                         0,
+		"server.vpn.packet_rate_per_peer":                    0,
+		"server.vpn.connect_timeout":                         10 * time.Second,
+		"server.vpn.idle_timeout":                            120 * time.Second,
+		"server.vpn.shutdown_timeout":                        15 * time.Second,
+		"server.vpn.icmp_enabled":                            true,
+		"server.vpn.icmp_timeout":                            5 * time.Second,
+		"server.vpn.icmp_max_concurrent":                     64,
 		"security.allowed_hosts":                             []string{},
 		"security.allowed_origins":                           []string{},
 		"security.allow_legacy_connection_tokens":            false,
@@ -578,6 +647,10 @@ func bindEnvironment(v *viper.Viper) {
 		"server.proxy_entry.route_header", "server.proxy_entry.client_ip_header", "server.proxy_entry.client_port_header",
 		"server.proxy_entry.connect_timeout", "server.proxy_entry.idle_timeout", "server.proxy_entry.shutdown_timeout",
 		"server.proxy_entry.max_concurrent_tunnels", "server.proxy_entry.max_header_bytes", "server.proxy_entry.auth_backoff_threshold",
+		"server.vpn.enabled", "server.vpn.listen", "server.vpn.endpoint_host", "server.vpn.ip_pool", "server.vpn.node_subnet_size",
+		"server.vpn.mtu", "server.vpn.max_peers", "server.vpn.max_flows_per_peer", "server.vpn.max_flows_total",
+		"server.vpn.packet_rate_per_peer", "server.vpn.connect_timeout", "server.vpn.idle_timeout", "server.vpn.shutdown_timeout",
+		"server.vpn.icmp_enabled", "server.vpn.icmp_timeout", "server.vpn.icmp_max_concurrent",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
@@ -593,6 +666,7 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
 	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
 	problems = append(problems, validateProxyEntry(cfg.Server.ProxyEntry)...)
+	problems = append(problems, validateVPN(cfg.Server.VPN)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
@@ -721,6 +795,61 @@ func validateProxyEntry(cfg ProxyEntryConfig) []string {
 	}
 	if cfg.MaxConcurrentTunnels < 0 || cfg.MaxHeaderBytes <= 0 || cfg.AuthBackoffThreshold <= 0 {
 		problems = append(problems, "proxy entry limits must be positive (max_concurrent_tunnels may be zero)")
+	}
+	return problems
+}
+
+// validateVPN mirrors validateProxyEntry: a disabled gateway contributes no
+// problems, so a deployment that inherited a stale or nonsensical server.vpn
+// block from an example file keeps starting.
+//
+// The address pool is checked by handing it to vpn.ParsePool rather than by
+// re-implementing the rules. That is the whole point of the pure logic package:
+// the loader and the allocator agree by construction, so a pool that loads is a
+// pool that can actually hand out addresses, and the message the operator reads
+// at startup is the same one they would have read on the first issuance.
+func validateVPN(cfg VPNConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	var problems []string
+	if _, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen)); err != nil || port == "" {
+		problems = append(problems, "server.vpn.listen must be a host:port value for the public UDP endpoint")
+	}
+	host := strings.TrimSpace(cfg.EndpointHost)
+	if host == "" {
+		problems = append(problems, "server.vpn.endpoint_host is required when the gateway is enabled")
+	} else if !validDNSHost(host) {
+		problems = append(problems, fmt.Sprintf("server.vpn.endpoint_host %q must be a bare DNS host without a port", cfg.EndpointHost))
+	}
+	if _, err := vpn.ParsePool(cfg.IPPool, cfg.NodeSubnetSize); err != nil {
+		problems = append(problems, fmt.Sprintf("server.vpn.ip_pool or server.vpn.node_subnet_size is unusable: %v", err))
+	}
+	if cfg.MTU < vpn.MinTunnelMTU || cfg.MTU > vpn.MaxTunnelMTU {
+		problems = append(problems, fmt.Sprintf("server.vpn.mtu %d must be between %d and %d", cfg.MTU, vpn.MinTunnelMTU, vpn.MaxTunnelMTU))
+	}
+	if cfg.MaxPeers < 0 {
+		problems = append(problems, "server.vpn.max_peers must not be negative (zero means unlimited)")
+	}
+	if cfg.MaxFlowsPerPeer < 0 {
+		problems = append(problems, "server.vpn.max_flows_per_peer must not be negative (zero means unlimited)")
+	}
+	if cfg.MaxFlowsTotal < 0 {
+		problems = append(problems, "server.vpn.max_flows_total must not be negative (zero means unlimited)")
+	}
+	if cfg.PacketRatePerPeer < 0 {
+		problems = append(problems, "server.vpn.packet_rate_per_peer must not be negative (zero means unlimited)")
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.IdleTimeout <= 0 || cfg.ShutdownTimeout < 0 {
+		problems = append(problems, "server.vpn timeouts must be positive (shutdown_timeout may be zero)")
+	}
+	if cfg.ICMPEnabled {
+		if cfg.ICMPTimeout <= 0 {
+			problems = append(problems, "server.vpn.icmp_timeout must be positive while icmp is enabled")
+		}
+		if cfg.ICMPMaxConcurrent <= 0 {
+			problems = append(problems, "server.vpn.icmp_max_concurrent must be positive while icmp is enabled")
+		}
 	}
 	return problems
 }

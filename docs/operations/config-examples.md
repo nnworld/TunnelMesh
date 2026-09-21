@@ -50,6 +50,35 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
+  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # configuration.md 的「内嵌 VPN 网关」一节。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 
 security:
   allowed_hosts:
@@ -107,6 +136,35 @@ server:
     endpoint: ""
     # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入。
     node_token: ""
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
+  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # configuration.md 的「内嵌 VPN 网关」一节。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 ```
 
 ## Server：集群 MySQL mTLS Relay
@@ -190,6 +248,35 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
+  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # configuration.md 的「内嵌 VPN 网关」一节。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 
 security:
   # 管理 API 和 WebSocket Host 白名单；动态 HTTP 路由由路由表匹配。
