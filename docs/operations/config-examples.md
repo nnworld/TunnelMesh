@@ -50,8 +50,9 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
-  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
+  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
+  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
   # configuration.md 的「内嵌 VPN 网关」一节。
   vpn:
     enabled: false
@@ -136,8 +137,9 @@ server:
     endpoint: ""
     # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入。
     node_token: ""
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
-  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
+  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
+  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
   # configuration.md 的「内嵌 VPN 网关」一节。
   vpn:
     enabled: false
@@ -248,8 +250,9 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、吊销、轮换
-  # peer 并下发客户端配置，WireGuard 端点仍在分阶段实施中。全部键的取值范围见
+  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
+  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
+  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
   # configuration.md 的「内嵌 VPN 网关」一节。
   vpn:
     enabled: false

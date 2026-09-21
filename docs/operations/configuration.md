@@ -240,7 +240,7 @@ tunnelmesh-server --server.proxy_entry.enabled=true \
 
 内嵌 VPN 网关让没有安装 `tunnelmesh-client` 的用户直接用系统自带的 WireGuard 客户端接入内网，出口仍由 Agent 承担。决策背景与边界见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)。
 
-**当前版本只提供管理面。** `server.vpn` 会被完整加载与校验，管理 API 可以签发、吊销、轮换 peer 并下发客户端配置文件，但 WireGuard 端点与内存态 TUN 设备仍在分阶段实施中，尚未随发行版提供。也就是说：现在签发的 peer 可以被管理、审计和下载配置，导入客户端后还不能建立隧道。对外通知里不要把它描述成已经可用。
+**当前版本只提供管理面。** `server.vpn` 会被完整加载与校验，管理 API 可以签发、列出、修改、轮换、吊销并审计 peer，但 WireGuard 端点与内存态 TUN 设备仍在分阶段实施中，尚未随发行版提供。客户端配置下载（`POST /api/v1/vpn-peers/{peerId}/config:reveal`）在本版返回 409 `vpn_node_disabled`：节点还没有自己的网关身份，渲染出来的 `[Peer] PublicKey` 会是空的，与其下发一个导入即失败的配置文件，不如明确拒绝。也就是说：现在签发的 peer 可以被管理和审计，但拿不到配置文件，即使拿到也还不能建立隧道。对外通知里不要把它描述成已经可用。
 
 与 tp-* 代理入口不同，VPN 端点是一个**独立的公网 UDP 端口**：不经反向代理、不参与 HTTP 路由，必须在防火墙或安全组里单独放行，并单独限流与监控。
 
@@ -294,7 +294,7 @@ server:
 TUNNELMESH_VPN_NODE_PRIVATE_KEY=<base64 编码的 32 字节私钥>
 ```
 
-配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
+配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。**本版还不读取该变量**：它由数据面（阶段 6）消费，届时 `enabled: true` 而变量缺失会在启动时快速失败；现在设置它不会有任何效果，也不会让 `config:reveal` 变成可用。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时签发与 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
 
 命令行与环境变量等价（`TUNNELMESH_SERVER_VPN_*`）：
 
