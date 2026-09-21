@@ -56,6 +56,11 @@ type API struct {
 	localNodeID         string
 	downloads           config.DownloadsConfig
 	identity            *IdentityServices
+	// vpnPeerService is nil until the runtime installs it with SetVPN, because
+	// assembling it needs the loaded server configuration and this node's
+	// identity, neither of which NewAPI is given. The handlers answer 503 while
+	// it is nil, which distinguishes "not wired" from "no such endpoint".
+	vpnPeerService *VPNPeerService
 	// trustedProxyList decides whether X-Forwarded-For is believed. It is empty by
 	// default, which means the direct peer address is always used.
 	trustedProxyList []string
@@ -361,6 +366,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleDashboard(w, r, p, parts[1:])
 	case "traces":
 		a.handleTraces(w, r, p, parts[1:])
+	case "vpn-peers":
+		a.handleVPNPeers(w, r, p, parts[1:])
+	case "vpn-nodes":
+		a.handleVPNNodes(w, r, p, parts[1:])
 	case "ssh-sessions":
 		if len(parts) == 1 {
 			if r.Method == http.MethodGet {

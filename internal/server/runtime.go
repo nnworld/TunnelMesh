@@ -58,6 +58,10 @@ type RuntimeConfig struct {
 	AuthorizationCache config.AuthorizationCacheConfig
 	Downloads          config.DownloadsConfig
 	WebSSH             config.WebSSHConfig
+	// VPN carries server.vpn.*. The management API assembles its peer service
+	// from it; the gateway listener itself belongs to a later phase, so an
+	// enabled section buys peer management and nothing that listens on UDP.
+	VPN config.VPNConfig
 	// ProxyEntry configures the internal listener that OpenResty relays the
 	// tp-* managed HTTP proxy traffic to. Disabled means the listener is never
 	// created, so upgrading cannot open a new port by accident.
@@ -157,6 +161,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
 	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
+	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID)
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error
 	closeStartup := func() {
