@@ -66,19 +66,14 @@ type PeerSpec struct {
 }
 
 // Validate reports the first reason this spec cannot be persisted, as the stable
-// vpn_peer_invalid code.
+// vpn_peer_invalid code. It is the whole-record check: the caller-supplied
+// fields plus the three the server assigns (public key, address, node).
 //
 // now is a parameter rather than a call to time.Now so an expiry rule stays
 // deterministic under test and so a caller that validates a batch uses one
 // instant for all of it.
 func (s PeerSpec) Validate(now time.Time) error {
-	if strings.TrimSpace(s.Name) == "" {
-		return peerInvalid("name is required")
-	}
-	if err := validateLabel("name", s.Name, MaxPeerNameLength); err != nil {
-		return err
-	}
-	if err := validateLabel("description", s.Description, MaxPeerDescriptionLength); err != nil {
+	if err := s.ValidateRequest(now); err != nil {
 		return err
 	}
 	if err := ValidatePublicKey(s.PublicKey); err != nil {
@@ -89,6 +84,40 @@ func (s PeerSpec) Validate(now time.Time) error {
 	}
 	if strings.TrimSpace(s.NodeID) == "" {
 		return peerInvalid("node is required")
+	}
+	return nil
+}
+
+// ValidateRequest checks what a caller may supply, before the server has
+// generated a key pair or allocated an address. Issuing validates through this
+// entry point so a request is rejected on its own merits rather than on fields
+// the caller never sent.
+func (s PeerSpec) ValidateRequest(now time.Time) error {
+	if err := s.ValidateFields(); err != nil {
+		return err
+	}
+	// The expiry rule lives here rather than in ValidateFields: it is the one
+	// caller field whose validity depends on the clock, and a patch that only
+	// renames a peer must stay usable after the peer has expired.
+	if s.ExpiresAt != nil && !s.ExpiresAt.After(now) {
+		return peerInvalid("expires_at must be in the future")
+	}
+	return nil
+}
+
+// ValidateFields checks the caller-supplied fields with no clock involved. A
+// partial update re-validates the merged record through it, so an expired peer
+// can still be renamed or have its policy narrowed while every other rule that
+// creation enforced continues to apply.
+func (s PeerSpec) ValidateFields() error {
+	if strings.TrimSpace(s.Name) == "" {
+		return peerInvalid("name is required")
+	}
+	if err := validateLabel("name", s.Name, MaxPeerNameLength); err != nil {
+		return err
+	}
+	if err := validateLabel("description", s.Description, MaxPeerDescriptionLength); err != nil {
+		return err
 	}
 	if strings.TrimSpace(s.AgentID) == "" {
 		return peerInvalid("agent is required")
@@ -118,9 +147,6 @@ func (s PeerSpec) Validate(now time.Time) error {
 	}
 	if s.PacketRateLimit < 0 {
 		return peerInvalid("packet_rate_limit must not be negative")
-	}
-	if s.ExpiresAt != nil && !s.ExpiresAt.After(now) {
-		return peerInvalid("expires_at must be in the future")
 	}
 	return nil
 }
@@ -231,6 +257,35 @@ func ParseAllowedIPs(encoded string) ([]*net.IPNet, error) {
 			return nil, peerInvalid(fmt.Sprintf("allowed_ips entry %q must be an ipv4 cidr", token))
 		}
 		out = append(out, &net.IPNet{IP: network.IP.To4(), Mask: net.CIDRMask(ones, ipv4Bits)})
+	}
+	return out, nil
+}
+
+// ParseAllowedIPList parses the list form a JSON request body carries, as
+// opposed to the comma-joined text ParseAllowedIPs reads back from storage.
+//
+// It exists so the two entry points cannot disagree about what a legal CIDR is.
+// Parsing each element separately also matters for safety: joining a caller's
+// array and handing it to ParseAllowedIPs would let one element containing a
+// comma silently become two rules.
+//
+// An empty or nil list is legal and means "no destination is reachable"; see
+// EncodeAllowedPorts for why the empty port list means the opposite.
+func ParseAllowedIPList(values []string) ([]*net.IPNet, error) {
+	out := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return nil, peerInvalid("allowed_ips contains an empty entry")
+		}
+		if strings.Contains(trimmed, policySeparator) {
+			return nil, peerInvalid(fmt.Sprintf("allowed_ips entry %q must be a single cidr, not a list", value))
+		}
+		parsed, err := ParseAllowedIPs(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, parsed...)
 	}
 	return out, nil
 }

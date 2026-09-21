@@ -256,3 +256,29 @@ func TestParseAllowedPortsAcceptsASinglePort(t *testing.T) {
 		t.Fatalf("parsed = %v, want [443]", parsed)
 	}
 }
+
+func TestParseAllowedIPList(t *testing.T) {
+	parsed, err := vpn.ParseAllowedIPList([]string{"10.1.0.0/16", " 10.0.0.0/16 "})
+	if err != nil {
+		t.Fatalf("ParseAllowedIPList: %v", err)
+	}
+	if got := vpn.EncodeAllowedIPs(parsed); got != "10.0.0.0/16,10.1.0.0/16" {
+		t.Fatalf("encoded = %q", got)
+	}
+	if parsed, err := vpn.ParseAllowedIPList(nil); err != nil || len(parsed) != 0 {
+		t.Fatalf("a nil list must parse to the empty set, got %v %v", parsed, err)
+	}
+	for name, values := range map[string][]string{
+		"empty element":  {"10.0.0.0/8", "  "},
+		"embedded comma": {"10.0.0.0/8,10.1.0.0/16"},
+		"not a cidr":     {"10.0.0.1"},
+		"ipv6":           {"fd00::/64"},
+		"prefix too big": {"10.0.0.0/33"},
+	} {
+		if _, err := vpn.ParseAllowedIPList(values); err == nil {
+			t.Errorf("%s: ParseAllowedIPList(%v) was accepted", name, values)
+		} else if apiErr, ok := err.(*vpn.Error); !ok || apiErr.Code != "vpn_peer_invalid" {
+			t.Errorf("%s: got %v, want a vpn_peer_invalid error", name, err)
+		}
+	}
+}
