@@ -138,3 +138,33 @@ func TestDynamicHostValidationAndRouteIDPrecedence(t *testing.T) {
 		t.Fatalf("route id got=%#v err=%v", got, err)
 	}
 }
+
+func TestIsPrivateTarget(t *testing.T) {
+	private := []string{
+		"10.0.0.1", "10.255.255.255",
+		"172.16.0.1", "172.31.255.254",
+		"192.168.0.1", "192.168.255.255",
+		"127.0.0.1", "127.255.255.254",
+		"169.254.1.1", "169.254.169.254",
+		"224.0.0.251", "0.0.0.0", "::1", "fe80::1",
+	}
+	for _, raw := range private {
+		if !IsPrivateTarget(net.ParseIP(raw)) {
+			t.Errorf("%s: expected private target", raw)
+		}
+	}
+	// 172.32.0.0/12 and 11.0.0.0/8 sit just outside the RFC1918 ranges and must
+	// stay publicly routable, otherwise the allowPrivateTargets switch silently
+	// widens to the whole internet.
+	for _, raw := range []string{"93.184.216.34", "172.32.0.1", "172.15.255.255", "11.0.0.1", "8.8.8.8", "1.1.1.1"} {
+		if IsPrivateTarget(net.ParseIP(raw)) {
+			t.Errorf("%s: expected public target", raw)
+		}
+	}
+	if IsPrivateTarget(nil) {
+		t.Error("nil address must not be reported as private")
+	}
+	if IsPrivateTarget(net.IP{}) {
+		t.Error("empty address must not be reported as private")
+	}
+}

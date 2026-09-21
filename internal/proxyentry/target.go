@@ -107,15 +107,11 @@ func (p TargetPolicy) portAllowed(port int) bool {
 }
 
 // IsPrivateTarget reports whether an address belongs to a range that is not
-// publicly routable. It is broader than net.IP.IsPrivate on purpose: loopback,
-// link-local and the unspecified address are all "inside the agent's network"
-// for the purposes of the allowPrivateTargets switch.
+// publicly routable. The implementation lives in routing.IsPrivateTarget so the
+// embedded VPN gateway and the tp-* entry share one authoritative security
+// decision; this wrapper keeps proxyentry's exported surface unchanged.
 func IsPrivateTarget(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	return routing.IsPrivateTarget(ip)
 }
 
 func validProxyHostname(host string) bool {

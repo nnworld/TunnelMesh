@@ -136,3 +136,24 @@ func IsDangerousAddress(ip net.IP) bool {
 	// remain denied.
 	return ip[0] == 0 || ip[0] >= 224 || (ip[0] == 169 && ip[1] == 254) || ip.Equal(net.IPv4(169, 254, 169, 254))
 }
+
+// IsPrivateTarget reports whether an address belongs to a range that is not
+// publicly routable. It is deliberately broader than net.IP.IsPrivate:
+// loopback, link-local and the unspecified address all count as "inside the
+// target's own network" for the purposes of an allow-private-targets switch.
+//
+// It lives here, next to IsDangerousAddress, because routing is the package
+// that already owns "is this destination reachable/legitimate". Both the tp-*
+// proxy entry and the embedded VPN gateway need the identical answer, and
+// duplicating a security decision across two packages is how the two copies
+// drift apart. Callers that used to implement it locally now delegate here.
+//
+// A nil or empty address is not private; it is invalid, and validation is the
+// caller's job (Policy.Validate rejects it with ErrDangerousAddress).
+func IsPrivateTarget(ip net.IP) bool {
+	if len(ip) == 0 {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
