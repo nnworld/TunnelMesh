@@ -279,23 +279,183 @@ func TestVPNPeerServiceRejectsWritesWhileDisabled(t *testing.T) {
 	}
 }
 
-func TestVPNPeerServiceICMPRequiresAnAgentCapability(t *testing.T) {
-	f := newVPNServiceFixture(t, nil)
-	input := issueInput()
-	input.ICMPEnabled = true
-	_, err := f.service.Issue(context.Background(), vpnOwner, input)
-	// The capability negotiation that would make this succeed is a later phase.
-	// Returning success here would create a peer the user believes can ping and
-	// that cannot, so the request is refused with the stable code instead.
-	assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+// stubAgentCapabilityProbe fixes the answer the cluster would give, so the
+// issuing rule can be tested without a session manager, a registry or a socket.
+type stubAgentCapabilityProbe struct {
+	state  server.AgentCapabilityState
+	err    error
+	probed []string
+}
 
-	// Turning the node-level switch off cannot rescue the request either: the
-	// peer asked for something no agent can currently provide.
-	f.rebuild(t, func(d *server.VPNPeerServiceDeps) {
-		d.Config.ICMPEnabled = false
+func (p *stubAgentCapabilityProbe) ProbeICMPEcho(_ context.Context, agentID string) (server.AgentCapabilityState, error) {
+	p.probed = append(p.probed, agentID)
+	return p.state, p.err
+}
+
+// vpnAuditDetails returns the details JSON of one audit action, which is where an
+// operator learns whether an issued ICMP peer was actually verified.
+func vpnAuditDetails(t *testing.T, f *vpnServiceFixture, action string) string {
+	t.Helper()
+	page, err := f.db.Audits().List(context.Background(), storage.AuditFilter{}, "", 100)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	for _, entry := range page.Items {
+		if entry.Action == action {
+			return entry.Details
+		}
+	}
+	t.Fatalf("no %q audit entry was written", action)
+	return ""
+}
+
+// ICMP is no longer refused outright: the egress agent's negotiated capability
+// decides. The node switch stays a ceiling above it, and a node that cannot
+// determine the answer says so in the audit trail instead of pretending.
+func TestVPNPeerServiceAuthorizesICMPFromTheAgentCapability(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a capable agent gets a pingable peer", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		probe := &stubAgentCapabilityProbe{state: server.CapabilitySupported}
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) { d.AgentCapabilities = probe })
+		input := issueInput()
+		input.ICMPEnabled = true
+		created, err := f.service.Issue(ctx, vpnOwner, input)
+		if err != nil {
+			t.Fatalf("Issue error = %v, want a peer", err)
+		}
+		if !created.ICMPEnabled {
+			t.Fatalf("ICMPEnabled = false, want the request honoured")
+		}
+		if details := vpnAuditDetails(t, f, "vpn_peer_issued"); !strings.Contains(details, `"icmpCapability":"verified"`) {
+			t.Fatalf("audit details = %s, want icmpCapability verified", details)
+		}
+		if len(probe.probed) != 1 || probe.probed[0] != "agent-1" {
+			t.Fatalf("probed %v, want exactly one call for agent-1", probe.probed)
+		}
 	})
-	_, err = f.service.Issue(context.Background(), vpnOwner, input)
-	assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+
+	t.Run("an unverifiable cluster still issues but records it", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) {
+			d.AgentCapabilities = &stubAgentCapabilityProbe{state: server.CapabilityUnverified}
+		})
+		input := issueInput()
+		input.ICMPEnabled = true
+		if _, err := f.service.Issue(ctx, vpnOwner, input); err != nil {
+			t.Fatalf("Issue error = %v, want a peer", err)
+		}
+		if details := vpnAuditDetails(t, f, "vpn_peer_issued"); !strings.Contains(details, `"icmpCapability":"unverified"`) {
+			t.Fatalf("audit details = %s, want icmpCapability unverified", details)
+		}
+	})
+
+	t.Run("an agent without the capability is refused", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) {
+			d.AgentCapabilities = &stubAgentCapabilityProbe{state: server.CapabilityUnsupported}
+		})
+		input := issueInput()
+		input.ICMPEnabled = true
+		_, err := f.service.Issue(ctx, vpnOwner, input)
+		assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+	})
+
+	t.Run("a probe failure is an internal error, not a capability verdict", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) {
+			d.AgentCapabilities = &stubAgentCapabilityProbe{err: errors.New("registry unavailable")}
+		})
+		input := issueInput()
+		input.ICMPEnabled = true
+		_, err := f.service.Issue(ctx, vpnOwner, input)
+		if err == nil {
+			t.Fatal("Issue error = nil, want the probe failure surfaced")
+		}
+		var apiError *vpn.Error
+		if errors.As(err, &apiError) {
+			t.Fatalf("Issue error = %v, want an internal error rather than a %s verdict", err, apiError.Code)
+		}
+		if !strings.Contains(err.Error(), "probe") {
+			t.Fatalf("Issue error = %v, want it to name the probe", err)
+		}
+	})
+
+	t.Run("the node switch stays a ceiling above the agent", func(t *testing.T) {
+		f := newVPNServiceFixture(t, func(c *server.VPNServiceConfig) { c.ICMPEnabled = false })
+		probe := &stubAgentCapabilityProbe{state: server.CapabilitySupported}
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) { d.AgentCapabilities = probe })
+		input := issueInput()
+		input.ICMPEnabled = true
+		_, err := f.service.Issue(ctx, vpnOwner, input)
+		assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+		if len(probe.probed) != 0 {
+			t.Fatalf("probed %v, want no probe call once the node switch is off", probe.probed)
+		}
+	})
+
+	t.Run("no probe wired fails closed", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		input := issueInput()
+		input.ICMPEnabled = true
+		_, err := f.service.Issue(ctx, vpnOwner, input)
+		assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+	})
+
+	t.Run("a peer that does not ask for icmp is never probed", func(t *testing.T) {
+		f := newVPNServiceFixture(t, nil)
+		probe := &stubAgentCapabilityProbe{state: server.CapabilityUnsupported}
+		f.rebuild(t, func(d *server.VPNPeerServiceDeps) { d.AgentCapabilities = probe })
+		if _, err := f.service.Issue(ctx, vpnOwner, issueInput()); err != nil {
+			t.Fatalf("Issue error = %v, want a peer", err)
+		}
+		if len(probe.probed) != 0 {
+			t.Fatalf("probed %v, want no probe call for a peer that does not use icmp", probe.probed)
+		}
+	})
+}
+
+// Turning ICMP on later is the same decision as turning it on at issue time, and
+// it is made against the agent the peer will actually egress through.
+func TestVPNPeerServiceUpdateRechecksTheAgentCapabilityForICMP(t *testing.T) {
+	ctx := context.Background()
+	f := newVPNServiceFixture(t, nil)
+	probe := &stubAgentCapabilityProbe{state: server.CapabilityUnsupported}
+	f.rebuild(t, func(d *server.VPNPeerServiceDeps) { d.AgentCapabilities = probe })
+	created, err := f.service.Issue(ctx, vpnOwner, issueInput())
+	if err != nil {
+		t.Fatalf("Issue error = %v, want a peer", err)
+	}
+
+	enabled := true
+	if _, err := f.service.Update(ctx, vpnOwner, created.ID, server.VPNPeerPatch{ICMPEnabled: &enabled}); err == nil {
+		t.Fatal("Update error = nil, want a refusal from an agent without the capability")
+	} else {
+		assertVPNError(t, err, 409, "vpn_agent_capability_missing")
+	}
+
+	probe.state = server.CapabilityUnverified
+	updated, err := f.service.Update(ctx, vpnOwner, created.ID, server.VPNPeerPatch{ICMPEnabled: &enabled})
+	if err != nil {
+		t.Fatalf("Update error = %v, want the peer updated", err)
+	}
+	if !updated.ICMPEnabled {
+		t.Fatal("ICMPEnabled = false after the patch, want true")
+	}
+	if details := vpnAuditDetails(t, f, "vpn_peer_updated"); !strings.Contains(details, `"icmpCapability":"unverified"`) {
+		t.Fatalf("audit details = %s, want icmpCapability unverified", details)
+	}
+
+	// A patch that leaves ICMP alone is not a capability question.
+	before := len(probe.probed)
+	name := "renamed"
+	if _, err := f.service.Update(ctx, vpnOwner, created.ID, server.VPNPeerPatch{Name: &name}); err != nil {
+		t.Fatalf("Update error = %v, want the rename applied", err)
+	}
+	if len(probe.probed) != before {
+		t.Fatalf("probed %v, want no new probe call for a rename", probe.probed)
+	}
 }
 
 func TestVPNPeerServiceEnforcesTheMaxPeersQuota(t *testing.T) {

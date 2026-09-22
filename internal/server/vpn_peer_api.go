@@ -213,6 +213,10 @@ func (a *API) SetVPN(cfg config.VPNConfig, nodeID string) {
 		},
 		NodeID:   nodeID,
 		LeaseTTL: vpnSubnetLeaseTTL,
+		// The probe reads this API's live session and cluster state, so an agent
+		// that negotiated stream_icmp_echo.v1 is what makes a peer pingable
+		// rather than a release note.
+		AgentCapabilities: a.vpnAgentCapabilityProbe(nodeID),
 	})
 }
 

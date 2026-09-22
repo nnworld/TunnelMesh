@@ -94,7 +94,11 @@ type VPNPeerServiceDeps struct {
 	// NodePublicKey is the gateway's WireGuard identity, written into the
 	// [Peer] section of every configuration handed to a user.
 	NodePublicKey string
-	Now           func() time.Time
+	// AgentCapabilities decides whether an egress agent can answer ICMP echo.
+	// A nil probe fails closed: "not wired" is a deployment fault, and issuing a
+	// peer that cannot ping is a promise the user will hold the product to.
+	AgentCapabilities VPNAgentCapabilityProbe
+	Now               func() time.Time
 }
 
 // VPNPeerInput is one issue request. AllowedIPs arrives as text because that is
@@ -155,6 +159,7 @@ type VPNPeerService struct {
 	nodeID        string
 	leaseTTL      time.Duration
 	nodePublicKey string
+	capabilities  VPNAgentCapabilityProbe
 	nowFn         func() time.Time
 }
 
@@ -171,6 +176,7 @@ func NewVPNPeerService(deps VPNPeerServiceDeps) *VPNPeerService {
 		nodeID:        strings.TrimSpace(deps.NodeID),
 		leaseTTL:      deps.LeaseTTL,
 		nodePublicKey: strings.TrimSpace(deps.NodePublicKey),
+		capabilities:  deps.AgentCapabilities,
 		nowFn:         deps.Now,
 	}
 }
@@ -205,7 +211,8 @@ func (s *VPNPeerService) Issue(ctx context.Context, actor auth.Principal, input 
 	if err := s.authorizeAgent(ctx, actor, spec.AgentID); err != nil {
 		return storage.VPNPeer{}, err
 	}
-	if err := refuseICMP(spec.ICMPEnabled); err != nil {
+	icmpState, err := s.authorizeICMP(ctx, spec.AgentID, spec.ICMPEnabled)
+	if err != nil {
 		return storage.VPNPeer{}, err
 	}
 	if err := s.checkCapacity(ctx); err != nil {
@@ -267,9 +274,13 @@ func (s *VPNPeerService) Issue(ctx context.Context, actor auth.Principal, input 
 		}
 		return storage.VPNPeer{}, fmt.Errorf("vpn: persist peer: %w", err)
 	}
-	s.audit(ctx, actor, vpnAuditIssued, created.ID, map[string]any{
+	issued := map[string]any{
 		"nodeId": created.NodeID, "agentId": created.AgentID, "vpnIp": created.VPNIP,
-	})
+	}
+	if spec.ICMPEnabled {
+		issued["icmpCapability"] = auditVerification(icmpState)
+	}
+	s.audit(ctx, actor, vpnAuditIssued, created.ID, issued)
 	return created, nil
 }
 
@@ -340,13 +351,18 @@ func (s *VPNPeerService) Update(ctx context.Context, actor auth.Principal, peerI
 	if err != nil {
 		return storage.VPNPeer{}, err
 	}
-	if err := refuseICMP(spec.ICMPEnabled && patch.ICMPEnabled != nil); err != nil {
-		return storage.VPNPeer{}, err
-	}
 	if patch.AgentID != nil {
 		if err := s.authorizeAgent(ctx, actor, spec.AgentID); err != nil {
 			return storage.VPNPeer{}, err
 		}
+	}
+	// After the agent authorization, not before: probing first would answer a
+	// question about an agent the caller may not be entitled to use, and the
+	// difference between 409 and the agent's own refusal is information.
+	icmpRequested := spec.ICMPEnabled && patch.ICMPEnabled != nil
+	icmpState, err := s.authorizeICMP(ctx, spec.AgentID, icmpRequested)
+	if err != nil {
+		return storage.VPNPeer{}, err
 	}
 	status := stored.Status
 	if patch.Status != nil {
@@ -378,9 +394,13 @@ func (s *VPNPeerService) Update(ctx context.Context, actor auth.Principal, peerI
 		}
 		return storage.VPNPeer{}, fmt.Errorf("vpn: persist peer update: %w", err)
 	}
-	s.audit(ctx, actor, vpnAuditUpdated, updated.ID, map[string]any{
+	changes := map[string]any{
 		"nodeId": updated.NodeID, "agentId": updated.AgentID, "status": string(updated.Status),
-	})
+	}
+	if icmpRequested {
+		changes["icmpCapability"] = auditVerification(icmpState)
+	}
+	s.audit(ctx, actor, vpnAuditUpdated, updated.ID, changes)
 	return updated, nil
 }
 
@@ -646,17 +666,55 @@ func (s *VPNPeerService) authorizeAgent(ctx context.Context, actor auth.Principa
 	return nil
 }
 
-// refuseICMP turns every per-peer ICMP request down until the capability exists.
+// authorizeICMP decides whether a peer may ask for echo, and returns the state it
+// decided so the caller can record whether the cluster was able to confirm it.
 //
-// Echo handling needs the egress agent to have negotiated stream_icmp_echo.v1,
-// and that negotiation is a later phase. Answering success here would create a
-// peer the user believes is pingable and that is not, which is worse than a
-// refusal that names the reason.
-func refuseICMP(requested bool) error {
+// Three refusals share the one stable code because they are the same thing from
+// the caller's point of view — this peer cannot have ICMP — while their messages
+// stay distinct so an operator can tell a node switch from a missing probe from
+// an agent that never negotiated the capability.
+//
+// The node switch is a ceiling above the agent: an operator who turns ICMP off on
+// this node is not overruled by an agent that happens to support it, and the
+// probe is not even asked.
+func (s *VPNPeerService) authorizeICMP(ctx context.Context, agentID string, requested bool) (AgentCapabilityState, error) {
 	if !requested {
-		return nil
+		return "", nil
 	}
-	return vpn.ErrAgentCapabilityMissing.WithMessage("egress agent lacks the required vpn capability: icmp needs stream_icmp_echo.v1, which agents do not negotiate in this release")
+	if !s.config.ICMPEnabled {
+		return CapabilityUnsupported, vpn.ErrAgentCapabilityMissing.WithMessage("egress agent lacks the required vpn capability: icmp is disabled on this server node, set server.vpn.icmp_enabled=true to allow peers to request it")
+	}
+	if s.capabilities == nil {
+		return CapabilityUnsupported, vpn.ErrAgentCapabilityMissing.WithMessage("egress agent lacks the required vpn capability: this server node has no agent capability probe configured, so it cannot verify stream_icmp_echo.v1")
+	}
+	state, err := s.capabilities.ProbeICMPEcho(ctx, agentID)
+	if err != nil {
+		// An infrastructure failure is reported as one. Folding it into a
+		// capability verdict would tell the user their agent is broken when the
+		// registry is.
+		return CapabilityUnsupported, fmt.Errorf("vpn: probe the egress agent icmp capability: %w", err)
+	}
+	switch state {
+	case CapabilitySupported, CapabilityUnverified:
+		// Unverified passes on purpose; see probeAgentICMPEcho for why a refusal
+		// here would fail at random across a cluster.
+		return state, nil
+	case CapabilityUnsupported:
+		return state, vpn.ErrAgentCapabilityMissing.WithMessage("egress agent lacks the required vpn capability: icmp needs stream_icmp_echo.v1, which the agent has not negotiated or it is not connected to any server node")
+	default:
+		return CapabilityUnsupported, fmt.Errorf("vpn: unknown agent capability state %q", state)
+	}
+}
+
+// auditVerification records whether the cluster could confirm the capability when
+// the peer was issued. The state itself is not what an operator needs afterwards;
+// whether it was verified is, because that is what separates "the agent is
+// broken" from "this peer was issued without anybody being able to check".
+func auditVerification(state AgentCapabilityState) string {
+	if state == CapabilityUnverified {
+		return "unverified"
+	}
+	return "verified"
 }
 
 // checkCapacity enforces server.vpn.max_peers against the peers this node

@@ -12,6 +12,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
@@ -97,6 +98,7 @@ type vpnPeerPayload struct {
 	AgentID          string   `json:"agentId"`
 	AllowedIPs       []string `json:"allowedIps"`
 	AllowedPorts     []int    `json:"allowedPorts"`
+	ICMPEnabled      bool     `json:"icmpEnabled"`
 	Status           string   `json:"status"`
 	ConfigRevealPath string   `json:"configRevealPath"`
 	PrivateKey       string   `json:"privateKey"`
@@ -237,6 +239,54 @@ func TestVPNPeerAPIUnavailableWithoutAssembly(t *testing.T) {
 // TestVPNPeerAPISetVPNAssemblesTheService covers the configuration-driven
 // assembly the runtime uses, so a wiring mistake cannot hide behind the
 // hand-assembled fixture every other test installs.
+// TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt drives the real gate: the
+// egress agent holds a live session that negotiated stream_icmp_echo.v1, the node
+// switch is on, and the request is answered with a peer rather than a 409.
+func TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	api := f.api
+
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: f.userAgent, NodeID: "node-a", ConnectionID: "conn-icmp",
+		ConnectionEpoch: 1, Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult, protocol.CapabilityStreamICMPEcho},
+	}, newFakeTransport()); err != nil {
+		t.Fatalf("register the egress session: %v", err)
+	}
+	api.SetAgentConnections(manager, nil)
+	api.SetClusterAgentConnections(&fixedConnectionRegistry{}, nil, "api-node-1")
+
+	store, err := auth.NewSecretStore(base64.RawStdEncoding.EncodeToString(make([]byte, 32)), "vpn-api-icmp-key")
+	if err != nil {
+		t.Fatalf("secret store: %v", err)
+	}
+	api.SetVPNPeerService(NewVPNPeerService(VPNPeerServiceDeps{
+		Peers: api.DB.VPNPeers(), Leases: api.DB.VPNIPLeases(),
+		Agents: api.DB.Agents(), Audits: api.DB.Audits(),
+		Secrets: store,
+		Config: VPNServiceConfig{
+			Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+			EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+			ICMPEnabled: true,
+		},
+		NodeID:            "api-node-1",
+		LeaseTTL:          time.Minute,
+		NodePublicKey:     vpnAPINodePublicKey,
+		AgentCapabilities: api.vpnAgentCapabilityProbe("api-node-1"),
+	}))
+
+	body := vpnPeerBody(f.userAgent, "wants-icmp")
+	body["icmpEnabled"] = true
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", body)
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", r.Code, r.Body.String())
+	}
+	if created := vpnDecodePeer(t, r); !created.ICMPEnabled {
+		t.Fatalf("created = %+v, want icmpEnabled true", created)
+	}
+}
+
 func TestVPNPeerAPISetVPNAssemblesTheService(t *testing.T) {
 	api, _, user := apiTestServer(t)
 	api.SetVPN(config.VPNConfig{
@@ -622,6 +672,9 @@ func TestVPNPeerAPIRejectsMalformedRequests(t *testing.T) {
 	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", map[string]any{"name": "x", "bogus": true}); r.Code != http.StatusBadRequest {
 		t.Errorf("an unknown create field returned %d, want 400", r.Code)
 	}
+	// This fixture leaves server.vpn.icmp_enabled false, so the node ceiling
+	// refuses the request before any agent capability is consulted. The capable
+	// path is TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt.
 	body := vpnPeerBody(f.userAgent, "wants-icmp")
 	body["icmpEnabled"] = true
 	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", body),
