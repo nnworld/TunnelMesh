@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/registry"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 )
@@ -83,6 +84,73 @@ func TestAgentConnectionSelectorPrefersHealthyLeastLoadedLocalConnection(t *test
 	}
 	if !target.Local || target.ConnectionID != "conn-a" {
 		t.Fatalf("target=%+v, want only healthy local conn-a", target)
+	}
+}
+
+func TestStreamProtocolCapabilityMapsOnlyProtocolsThatNeedOne(t *testing.T) {
+	cases := []struct {
+		proto string
+		want  string
+	}{
+		{proto: "tcp", want: ""},
+		{proto: "udp", want: ""},
+		{proto: "http", want: ""},
+		{proto: "", want: ""},
+		{proto: protocol.StreamProtocolICMPEcho, want: protocol.CapabilityStreamICMPEcho},
+		{proto: "ICMP-Echo", want: protocol.CapabilityStreamICMPEcho},
+		{proto: "unknown-protocol", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.proto, func(t *testing.T) {
+			if got := streamProtocolCapability(tc.proto); got != tc.want {
+				t.Fatalf("streamProtocolCapability(%q) = %q, want %q", tc.proto, got, tc.want)
+			}
+		})
+	}
+}
+
+// Select takes a stream protocol and a session advertises capabilities. Matching
+// one against the other rejected every session that advertised anything, which
+// is every session a real agent registers, and sent the selector down the remote
+// path where it reported a connected agent as disconnected.
+func TestAgentConnectionSelectorMatchesCapabilitiesNotProtocolNames(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-capability", NodeID: "node-a", ConnectionID: "conn-plain",
+		ConnectionEpoch: 1, Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult},
+	}, newFakeTransport()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: "agent-capability", NodeID: "node-a", ConnectionID: "conn-echo",
+		ConnectionEpoch: 1, Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult, protocol.CapabilityStreamICMPEcho},
+	}, newFakeTransport()); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewAgentConnectionSelector(manager, nil, &fixedConnectionRegistry{}, "server-local")
+
+	// tcp, udp and http are baseline: a session that advertises a capability is
+	// still expected to serve them.
+	target, err := selector.Select(context.Background(), "agent-capability", "tcp")
+	if err != nil {
+		t.Fatalf(`Select(agent, "tcp") error = %v, want a local connection`, err)
+	}
+	if !target.Local {
+		t.Fatalf(`Select(agent, "tcp") = %+v, want a local target`, target)
+	}
+
+	// icmp-echo does need the negotiated capability, so only conn-echo qualifies
+	// and the answer is deterministic even though both sessions are equally
+	// loaded.
+	target, err = selector.Select(context.Background(), "agent-capability", protocol.StreamProtocolICMPEcho)
+	if err != nil {
+		t.Fatalf(`Select(agent, "icmp-echo") error = %v, want the session that negotiated it`, err)
+	}
+	if target.ConnectionID != "conn-echo" {
+		t.Fatalf(`Select(agent, "icmp-echo") = %+v, want conn-echo`, target)
 	}
 }
 

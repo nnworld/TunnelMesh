@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/registry"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 )
@@ -93,14 +95,39 @@ func NewAgentConnectionSelector(manager *AgentSessionManager, localRelay *AgentR
 	return &AgentConnectionSelector{manager: manager, localRelay: localRelay, connections: connections, localNodeID: localNodeID}
 }
 
-func (s *AgentConnectionSelector) Select(ctx context.Context, agentID, protocol string) (relay.AgentConnectionTarget, error) {
+// streamProtocolCapability translates the stream protocol a caller asks for into
+// the capability a session must have negotiated to serve it. The empty string
+// means baseline: tcp, udp and http need nothing beyond a live connection, so
+// demanding a capability for them would reject the whole fleet.
+//
+// The comparison is case-folded because the agent folds it too. A selector that
+// required nothing for "ICMP-Echo" while the agent happily served it would route
+// an echo to a session that answers "unsupported stream protocol".
+func streamProtocolCapability(proto string) string {
+	if strings.EqualFold(proto, protocol.StreamProtocolICMPEcho) {
+		return protocol.CapabilityStreamICMPEcho
+	}
+	return ""
+}
+
+// Select picks the connection that should carry a stream. The third argument is
+// a stream protocol, not a capability name; the mapping between the two lives in
+// streamProtocolCapability.
+func (s *AgentConnectionSelector) Select(ctx context.Context, agentID, proto string) (relay.AgentConnectionTarget, error) {
 	if s == nil || s.manager == nil {
 		return relay.AgentConnectionTarget{}, relay.ErrNodeDisconnected
 	}
 	var best *AgentSession
 	bestActive := 0
 	for _, session := range s.manager.List(agentID) {
-		if !session.Healthy() || (protocol != "" && len(session.Capabilities) > 0 && !session.Supports(protocol)) {
+		if !session.Healthy() {
+			continue
+		}
+		// Only protocols that actually require a negotiation are filtered on it.
+		// Asking every session whether it supports "tcp" treated a baseline
+		// protocol as an extension and skipped every session that advertised
+		// anything at all.
+		if required := streamProtocolCapability(proto); required != "" && !session.Supports(required) {
 			continue
 		}
 		active := 0
