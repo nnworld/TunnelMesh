@@ -354,10 +354,19 @@ async function loadAgents() {
 function reload() { void load(); void loadPool() }
 function loadMore() { void load(page.value.nextCursor) }
 
+// One key per dialog session, minted when the form is (re)opened. A save that
+// fails on a lost response is retried in place, and a retry carrying a fresh
+// key is a second operation the server cannot deduplicate: a second peer and a
+// second burned address. Rotate, revoke and reveal keep minting a key per
+// click, because each of those is a new explicit confirmation rather than a
+// retry of the one before it.
+const formIdempotencyKey = ref('')
+
 function resetForm() {
   Object.assign(form, emptyForm())
   submitted.value = false
   editingPeer.value = null
+  formIdempotencyKey.value = crypto.randomUUID()
 }
 
 function openCreate() {
@@ -402,12 +411,12 @@ async function save() {
         expiresAt: original.expiresAt,
       })
       if (patch === null) return
-      await patchVpnPeer(original.id, patch, crypto.randomUUID())
+      await patchVpnPeer(original.id, patch, formIdempotencyKey.value)
       ElMessage.success(t('vpn.updated'))
     } else {
       const input = vpnPeerInputFromForm(form)
       if (input === null) return
-      await createVpnPeer(input, crypto.randomUUID())
+      await createVpnPeer(input, formIdempotencyKey.value)
       ElMessage.success(t('vpn.created'))
     }
     formVisible.value = false

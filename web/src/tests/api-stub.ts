@@ -13,12 +13,17 @@ export type ApiStub = {
   // Consecutive matching calls consume the queue in order; its last entry
   // repeats, which models "list, mutate, list again" without extra stubs.
   sequence?: unknown[]
+  // Per-call statuses, consumed with the same semantics as `sequence`. A retry
+  // path cannot be tested while one stub has one status: "fail, then succeed"
+  // is exactly the case where a caller has to reuse its idempotency key.
+  statuses?: number[]
 }
 export type ApiCall = { method: string; path: string; headers: Headers; body?: Record<string, unknown> }
 
 export function stubApi(stubs: ApiStub[]): ApiCall[] {
   const calls: ApiCall[] = []
   const queues = stubs.map(stub => [...(stub.sequence ?? [])])
+  const statusQueues = stubs.map(stub => [...(stub.statuses ?? [])])
   vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
     const method = init?.method ?? 'GET'
     const path = String(input).replace('/api/v1', '')
@@ -27,7 +32,8 @@ export function stubApi(stubs: ApiStub[]): ApiCall[] {
     if (index < 0) throw new Error(`unexpected request ${method} ${path}`)
     const stub = stubs[index] as ApiStub
     const queue = queues[index] as unknown[]
-    const status = stub.status ?? 200
+    const statuses = statusQueues[index] as number[]
+    const status = statuses.length > 1 ? statuses.shift()! : statuses.length === 1 ? statuses[0]! : stub.status ?? 200
     const data = queue.length > 1 ? queue.shift() : queue.length === 1 ? queue[0] : stub.data
     return {
       ok: status < 300, status, statusText: String(status), headers: new Headers(),

@@ -4,7 +4,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { readFileSync } from 'node:fs'
 import VpnPeers from '../views/VpnPeers.vue'
 import { i18n } from '../i18n'
-import { check, click, flush, setValue, stubApi, type ApiStub } from './api-stub'
+import { callsTo, check, click, flush, setValue, stubApi, type ApiStub } from './api-stub'
 
 // PageHeader reads the current route for its breadcrumb, and the view is
 // mounted on its own rather than through the router.
@@ -53,6 +53,16 @@ const t = (key: string) => i18n.global.t(key)
 async function settle(milliseconds = 160) {
   await new Promise(resolve => setTimeout(resolve, milliseconds))
   await flush()
+}
+
+// The row action buttons carry no class except the usage one, and adding a
+// selector hook to production markup just to reach a button is worse than
+// finding it by the label the user reads.
+async function clickButton(label: string, root: ParentNode) {
+  const found = [...root.querySelectorAll('button')].find(button => button.textContent?.trim() === label)
+  if (!found) throw new Error(`missing button ${label}`)
+  found.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+  return flush()
 }
 
 beforeEach(() => {
@@ -166,4 +176,33 @@ describe('vpn peers console', () => {
     expect(source).not.toContain('listVpnPeerFlows')
     expect(source).toContain("t('vpn.usage.flowsHint')")
   })
+  it('replays one idempotency key across save retries and mints a new one per dialog', async () => {
+    const calls = stubVpn([
+      { method: 'PATCH', path: '/vpn-peers/p-1', statuses: [500, 200], sequence: [{ error: 'internal' }, peer] },
+    ])
+    const { unmount } = await mountVpn()
+    try {
+      await clickButton(t('vpn.edit'), document.body)
+      await click('.vpn-submit', document.body)
+      await settle()
+      await click('.vpn-submit', document.body)
+      await settle()
+
+      const patches = callsTo(calls, 'PATCH', '/vpn-peers/p-1')
+      expect(patches).toHaveLength(2)
+      const firstKey = patches[0]?.headers.get('Idempotency-Key')
+      expect(firstKey).toBeTruthy()
+      // A lost response must not become a second operation: the server's
+      // idempotency store can only replay what it is asked to replay twice.
+      expect(patches[1]?.headers.get('Idempotency-Key')).toBe(firstKey)
+
+      await clickButton(t('vpn.edit'), document.body)
+      await click('.vpn-submit', document.body)
+      await settle()
+      const third = callsTo(calls, 'PATCH', '/vpn-peers/p-1')[2]
+      expect(third?.headers.get('Idempotency-Key')).toBeTruthy()
+      expect(third?.headers.get('Idempotency-Key')).not.toBe(firstKey)
+    } finally { unmount() }
+  })
+
 })
