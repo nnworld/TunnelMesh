@@ -297,6 +297,15 @@ type AgentStreamConfig struct {
 	ConnectTimeout     time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
 	OpenTimeout        time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
 	InboundBufferBytes int           `mapstructure:"inbound_buffer_bytes" json:"inbound_buffer_bytes" yaml:"inbound_buffer_bytes"`
+	// The ICMP keys mirror server.vpn.icmp_* on purpose: the server sets the
+	// per-peer ceiling and the agent sets the process-wide one, and an operator
+	// reading both blocks should see the same names and the same defaults.
+	// ICMPEnabled stays false by default so an upgrade never opens a ping socket
+	// on a host nobody prepared with net.ipv4.ping_group_range.
+	ICMPEnabled       bool          `mapstructure:"icmp_enabled" json:"icmp_enabled" yaml:"icmp_enabled"`
+	ICMPBindAddress   string        `mapstructure:"icmp_bind_address" json:"icmp_bind_address" yaml:"icmp_bind_address"`
+	ICMPTimeout       time.Duration `mapstructure:"icmp_timeout" json:"icmp_timeout" yaml:"icmp_timeout"`
+	ICMPMaxConcurrent int           `mapstructure:"icmp_max_concurrent" json:"icmp_max_concurrent" yaml:"icmp_max_concurrent"`
 }
 
 type AgentConnectionConfig struct {
@@ -605,6 +614,10 @@ func setDefaults(v *viper.Viper) {
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
 		"agent.streams.inbound_buffer_bytes":                 262144,
+		"agent.streams.icmp_enabled":                         false,
+		"agent.streams.icmp_bind_address":                    "0.0.0.0",
+		"agent.streams.icmp_timeout":                         5 * time.Second,
+		"agent.streams.icmp_max_concurrent":                  64,
 		"client.connections.min":                             1,
 		"client.connections.max":                             1,
 		"client.connections.high_watermark":                  16,
@@ -922,6 +935,23 @@ func validateAgentStreams(cfg AgentStreamConfig) []string {
 	}
 	if cfg.InboundBufferBytes <= 0 {
 		problems = append(problems, "agent stream inbound buffer bytes must be positive")
+	}
+	// Validated only while enabled, exactly like server.vpn.icmp_*: a disabled
+	// engine is never opened, so an unset address must not stop the agent from
+	// serving the tunnels it does provide.
+	if cfg.ICMPEnabled {
+		if cfg.ICMPTimeout <= 0 {
+			problems = append(problems, "agent stream icmp timeout must be positive while icmp is enabled")
+		}
+		if cfg.ICMPMaxConcurrent <= 0 {
+			problems = append(problems, "agent stream icmp max concurrent must be positive while icmp is enabled")
+		}
+		// An unprivileged ping socket binds an address, not a host:port, so a
+		// DNS name here would fail at listen time with a message that does not
+		// name this key.
+		if net.ParseIP(strings.TrimSpace(cfg.ICMPBindAddress)) == nil {
+			problems = append(problems, "agent stream icmp bind address must be an ip address while icmp is enabled")
+		}
 	}
 	return problems
 }

@@ -171,6 +171,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 	wantAgentStreams := config.AgentStreamConfig{
 		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
 	if cfg.Agent.Streams != wantAgentStreams {
 		t.Fatalf("Agent.Streams = %+v, want %+v", cfg.Agent.Streams, wantAgentStreams)
@@ -201,11 +202,80 @@ func applyStreamLatencyDefaults(cfg *config.Config) {
 	cfg.Agent.Streams = config.AgentStreamConfig{
 		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
 	cfg.Client.Stream = config.ClientStreamConfig{OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144}
 	cfg.Client.RemoteValidation = config.RemoteValidationConfig{
 		PositiveTTL: 15 * time.Second, NegativeTTL: 2 * time.Second,
 		Timeout: 3 * time.Second, MaxEntries: 10000,
+	}
+}
+
+func TestLoadAgentICMPStreamDefaultsAndValidation(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	streams := cfg.Agent.Streams
+	if streams.ICMPEnabled {
+		t.Error("ICMPEnabled default = true, want false so an upgrade never opens a ping socket by itself")
+	}
+	if streams.ICMPBindAddress != "0.0.0.0" {
+		t.Errorf("ICMPBindAddress default = %q, want 0.0.0.0", streams.ICMPBindAddress)
+	}
+	if streams.ICMPTimeout != 5*time.Second {
+		t.Errorf("ICMPTimeout default = %s, want 5s", streams.ICMPTimeout)
+	}
+	if streams.ICMPMaxConcurrent != 64 {
+		t.Errorf("ICMPMaxConcurrent default = %d, want 64", streams.ICMPMaxConcurrent)
+	}
+
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_ENABLED", "true")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_BIND_ADDRESS", "127.0.0.1")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_TIMEOUT", "2s")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_MAX_CONCURRENT", "8")
+	overridden, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment set error = %v", err)
+	}
+	got := overridden.Agent.Streams
+	if !got.ICMPEnabled || got.ICMPBindAddress != "127.0.0.1" || got.ICMPTimeout != 2*time.Second || got.ICMPMaxConcurrent != 8 {
+		t.Fatalf("Agent.Streams icmp = %+v, want the four environment overrides applied", got)
+	}
+	if err := config.Validate(overridden); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "agent icmp timeout", edit: func(c *config.Config) { c.Agent.Streams.ICMPTimeout = 0 }, want: "agent stream icmp timeout must be positive while icmp is enabled"},
+		{name: "agent icmp concurrency", edit: func(c *config.Config) { c.Agent.Streams.ICMPMaxConcurrent = -1 }, want: "agent stream icmp max concurrent must be positive while icmp is enabled"},
+		{name: "agent icmp bind address", edit: func(c *config.Config) { c.Agent.Streams.ICMPBindAddress = "agent.example.com" }, want: "agent stream icmp bind address must be an ip address while icmp is enabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broken := overridden
+			tc.edit(&broken)
+			err := config.Validate(broken)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	// A disabled engine is never validated: the agent does not open the socket,
+	// so refusing to start over an unset address would be a self-inflicted
+	// outage for every deployment that does not use ICMP.
+	disabled := overridden
+	disabled.Agent.Streams.ICMPEnabled = false
+	disabled.Agent.Streams.ICMPTimeout = 0
+	disabled.Agent.Streams.ICMPMaxConcurrent = 0
+	disabled.Agent.Streams.ICMPBindAddress = ""
+	if err := config.Validate(disabled); err != nil {
+		t.Fatalf("Validate() with icmp disabled error = %v, want nil", err)
 	}
 }
 
