@@ -821,6 +821,13 @@ func validateProxyEntry(cfg ProxyEntryConfig) []string {
 // the loader and the allocator agree by construction, so a pool that loads is a
 // pool that can actually hand out addresses, and the message the operator reads
 // at startup is the same one they would have read on the first issuance.
+// ValidateVPN exposes the server.vpn rules to callers that assemble a
+// configuration without going through Load, which is what the VPN gateway does
+// when an embedder hands it a RuntimeConfig directly. Sharing one implementation
+// is what keeps the loader and the gateway from drifting apart about which
+// sections are usable; a second copy of these rules would eventually disagree.
+func ValidateVPN(cfg VPNConfig) []string { return validateVPN(cfg) }
+
 func validateVPN(cfg VPNConfig) []string {
 	if !cfg.Enabled {
 		return nil

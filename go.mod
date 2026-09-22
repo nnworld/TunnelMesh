@@ -11,9 +11,11 @@ require (
 	go.etcd.io/etcd/client/v3 v3.7.1
 	golang.org/x/crypto v0.57.0
 	golang.org/x/net v0.59.0
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
+	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 	modernc.org/sqlite v1.58.0
 )
 
@@ -55,6 +57,7 @@ require (
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
