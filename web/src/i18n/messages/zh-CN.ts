@@ -1,7 +1,7 @@
 export default {
   common: { language: '语言', logout: '退出登录', account: '个人设置', loading: '加载中', loadFailed: '数据加载失败', retry: '重试', empty: '暂无数据', save: '保存', yes: '是', no: '否' },
   errors: { usernameInvalid: '用户名只能包含 3-64 位字母、数字、点、下划线或连字符', usernameConflict: '用户名已存在', passwordPolicy: '密码不符合安全策略', currentPassword: '当前密码不正确', adminProtected: '不能对管理员账号执行该操作', accountDeleted: '账号已删除', accountStatus: '账号状态筛选无效', idempotencyConflict: '该请求标识已被其它操作占用，请重新提交', idempotencyInProgress: '同一请求正在处理中，请稍后查看结果', secretStorageUnavailable: '服务端未配置密钥加密主键，无法保存两步验证密钥或提供商凭据', unknown: '操作失败，请重试' },
-  navigation: { dashboard: '概览', agents: '代理节点', clients: '客户端', routes: '托管路由', tunnels: '隧道', tokens: '访问令牌', servers: 'Server 节点', audits: '审计日志', users: '子账号', sso: '单点登录', security: '安全设置', downloads: '发行管理', remoteServers: '远程服务器', credentials: '密钥管理' },
+  navigation: { dashboard: '概览', agents: '代理节点', clients: '客户端', routes: '托管路由', tunnels: '隧道', tokens: '访问令牌', servers: 'Server 节点', audits: '审计日志', users: '子账号', sso: '单点登录', security: '安全设置', downloads: '发行管理', remoteServers: '远程服务器', credentials: '密钥管理', vpn: 'VPN 网关' },
   vpn: {
     title: 'VPN 网关',
     description: '为原生 WireGuard 客户端签发 peer：分配 VPN 地址、限定可访问的网段与端口，出口仍由 Agent 承担。',
