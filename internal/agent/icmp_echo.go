@@ -185,8 +185,11 @@ func (e *Echoer) Send(ctx context.Context, request EchoRequest) (EchoReply, erro
 
 	e.mu.Lock()
 	if e.closed {
+		// failureLocked reads brokenErr, which the read loop writes under the
+		// same mutex, so the cause has to be taken before unlocking.
+		failure := e.failureLocked()
 		e.mu.Unlock()
-		return EchoReply{}, e.failureLocked()
+		return EchoReply{}, failure
 	}
 	if len(e.pending) >= e.maxConcurrent {
 		e.mu.Unlock()

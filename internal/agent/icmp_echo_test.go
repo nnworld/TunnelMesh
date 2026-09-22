@@ -460,6 +460,63 @@ func TestEchoerReportsAnUnreachableHostAsAnAnswer(t *testing.T) {
 	}
 }
 
+// gatedCloseConn blocks Close until the test releases it. That is what makes
+// the window between "the engine is marked closed" and "failAll records why"
+// wide enough to assert on: without it the read loop fails and finishes before a
+// sender can observe the half-updated state.
+type gatedCloseConn struct {
+	*fakeICMPConn
+	release chan struct{}
+}
+
+func (c *gatedCloseConn) Close() error {
+	<-c.release
+	return c.fakeICMPConn.Close()
+}
+
+// TestEchoerReadsItsFailureCauseUnderTheLock is the regression guard for calling
+// failureLocked without e.mu. Senders hammer the "already closed" branch of Send
+// while the read loop is released to run failAll, so an unlocked read of
+// brokenErr overlaps the write and -race reports it. The assertion is the
+// detector itself: the test passes by not being reported.
+func TestEchoerReadsItsFailureCauseUnderTheLock(t *testing.T) {
+	conn := &gatedCloseConn{fakeICMPConn: newFakeICMPConn(), release: make(chan struct{})}
+	echoer := testEchoer(conn, time.Millisecond, 8)
+
+	stop := make(chan struct{})
+	var senders sync.WaitGroup
+	for sender := 0; sender < 4; sender++ {
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = echoer.Send(context.Background(), EchoRequest{
+					CorrelationID: "corr-lock", Target: netip.MustParseAddr("10.0.0.5"),
+					Identifier: 1, Sequence: 1,
+				})
+			}
+		}()
+	}
+
+	// Close marks the engine closed and then parks in conn.Close, which turns
+	// every sender into a tight loop over the branch under test.
+	closed := make(chan error, 1)
+	go func() { closed <- echoer.Close() }()
+	time.Sleep(20 * time.Millisecond)
+	close(conn.release)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close error = %v, want nil", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	senders.Wait()
+}
+
 func TestOpenEchoerNamesTheSysctlWhenThePingSocketIsRefused(t *testing.T) {
 	original := listenICMPPacket
 	defer func() { listenICMPPacket = original }()
