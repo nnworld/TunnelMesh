@@ -76,13 +76,17 @@ func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
 			h.supported = ack.ConnectionPoolSupported
 			if h.dispatcher != nil {
 				strictOpen := false
+				icmpEcho := false
 				for _, capability := range ack.Capabilities {
-					if capability == protocol.CapabilityStreamOpenResult {
+					switch capability {
+					case protocol.CapabilityStreamOpenResult:
 						strictOpen = true
-						break
+					case protocol.CapabilityStreamICMPEcho:
+						icmpEcho = true
 					}
 				}
 				h.dispatcher.SetOpenResultEnabled(strictOpen)
+				h.dispatcher.SetICMPEchoEnabled(icmpEcho)
 			}
 		}
 	}

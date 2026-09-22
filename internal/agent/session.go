@@ -67,6 +67,10 @@ type StreamDispatcher struct {
 	pending     map[uint32]*pendingStream
 	executor    *DialExecutor
 	openResult  bool
+	// icmpEcho is the negotiated echo gate. It starts false so an agent that
+	// never received an ack refuses echo streams instead of serving a
+	// capability the server does not know it has.
+	icmpEcho    bool
 	ttfbSamples latencySamples
 }
 
@@ -124,6 +128,32 @@ func (d *StreamDispatcher) SetOpenResultEnabled(enabled bool) {
 	d.mu.Unlock()
 }
 
+// SetICMPEchoEnabled records what the server acked. The two gates are driven
+// from the same ack but negotiated independently, so enabling strict open
+// results must not imply that echo streams are welcome.
+func (d *StreamDispatcher) SetICMPEchoEnabled(enabled bool) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.icmpEcho = enabled
+	d.mu.Unlock()
+}
+
+// validStreamTargetPort keeps the historical 1-65535 rule for every protocol
+// that addresses a port. ICMP addresses a host only, so 0 is correct there;
+// widening the rule for all protocols would turn a malformed tcp target into a
+// dial of port 0 instead of a rejection.
+func validStreamTargetPort(proto string, port int) bool {
+	if port < 0 || port > 65535 {
+		return false
+	}
+	if strings.EqualFold(proto, protocol.StreamProtocolICMPEcho) {
+		return true
+	}
+	return port >= 1
+}
+
 func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 	if d == nil {
 		return ErrStreamNotFound
@@ -134,7 +164,7 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if err != nil {
 			return err
 		}
-		if f.StreamID == 0 || p.TargetHost == "" || p.TargetPort < 1 || p.TargetPort > 65535 {
+		if f.StreamID == 0 || p.TargetHost == "" || !validStreamTargetPort(p.Protocol, p.TargetPort) {
 			return errors.New("agent: invalid stream target")
 		}
 		strictOpen := d.openResult && f.Flags&protocol.FlagStrictOpen != 0
@@ -142,6 +172,14 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if d.closed {
 			d.mu.Unlock()
 			return ErrStreamNotFound
+		}
+		// An unnegotiated capability is refused here rather than in the dial so
+		// the answer stays stable: the server learns unsupported_capability
+		// instead of a connect failure it would retry.
+		if strings.EqualFold(p.Protocol, protocol.StreamProtocolICMPEcho) && !d.icmpEcho {
+			d.mu.Unlock()
+			d.rejectStreamMode(f.StreamID, DialResult{Code: protocol.OpenResultCodeUnsupportedCapability, Stage: protocol.OpenResultStageProtocol}, strictOpen)
+			return nil
 		}
 		if _, exists := d.streams[f.StreamID]; exists {
 			d.mu.Unlock()
@@ -496,6 +534,12 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 	bufferSize := 32 << 10
 	if strings.EqualFold(entry.protocol, "udp") {
 		bufferSize = protocol.MaxPayload
+	}
+	if strings.EqualFold(entry.protocol, protocol.StreamProtocolICMPEcho) {
+		// One echo is one datagram bounded by MaxDatagram: a short buffer would
+		// truncate the reply instead of continuing it, and there is no second
+		// read to finish it.
+		bufferSize = protocol.MaxDatagram
 	}
 	buf := make([]byte, bufferSize)
 	for {
