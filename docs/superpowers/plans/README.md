@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 44 份计划，按日期倒序排列。
+共 45 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-23 | [VPN 网关 阶段 7：Agent ICMP echo 与能力协商 Implementation Plan](2026-09-23-vpn-phase7-agent-icmp.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-22 | [VPN 网关 阶段 5：管理后台 Implementation Plan](2026-09-22-vpn-phase5-admin-console.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-21 | [VPN 网关 阶段 4：纯逻辑包与管理 API Implementation Plan](2026-09-21-vpn-phase4-pure-logic-and-api.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 3：Schema v15 存储层](../../pull-requests/2026-09-20-vpn-phase3-schema-v15.md)<br>[PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-20 | [VPN 网关 阶段 3：Schema v15 与 VPN Repository Implementation Plan](2026-09-20-vpn-phase3-schema-v15.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 3：Schema v15 存储层](../../pull-requests/2026-09-20-vpn-phase3-schema-v15.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
