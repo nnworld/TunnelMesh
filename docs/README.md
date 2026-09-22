@@ -37,6 +37,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
   - [远程服务器与浏览器 SSH/SFTP](user-guide/server-admin.md#远程服务器与浏览器-sshsftp)
   - [Client 运行观测与连接管理](user-guide/server-admin.md#client-运行观测与连接管理)
   - [Server 节点与共享令牌](user-guide/server-admin.md#server-节点)
+  - [VPN 网关 peer 管理](user-guide/server-admin.md#vpn-网关-peer-管理)：签发、编辑、轮换、吊销 WireGuard peer，一次性配置 reveal 与本版能力边界
   - [发行管理](user-guide/server-admin.md#发行管理)
 - [托管 HTTP 路由](user-guide/managed-http-route.md)：显式路由、通配域名、HTTPS 上游
 - [HTTP 代理入口（tp-*）](user-guide/http-proxy-entry.md)：把 `https://tp-<name>.<domain>` 填进浏览器或系统代理，无需安装 client

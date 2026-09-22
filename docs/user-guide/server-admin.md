@@ -118,6 +118,8 @@ Agent 详情页的“逻辑 Agent 状态”按连接池健康状态推导：至�
 
 启用/禁用、逻辑删除和恢复都是管理员操作，会写入审计日志。删除只设置 `deleted_at` 并禁用节点，记录可恢复；恢复会清空 `deleted_at` 并重新启用。节点被禁用或删除后，即使持有有效 fleet token 和 mTLS 证书，relay 认证也会拒绝。
 
+页面顶部的“VPN 网关状态”区块来自 `GET /api/v1/vpn-nodes`，与节点表格是两个独立事实源：表格来自注册租约，区块来自网关运行时。刷新会同时拉取且互不等待，因此一次 501 不会把节点清单一起清空。提供网关的节点会显示子网、已分配与可分配地址、peer 数、ICMP 能力、监听地址和公网 Endpoint；本版该接口返回 501 `vpn_not_implemented`，区块显示“本版未提供网关运行时状态”而不是“已分配 0”，也不弹全局错误提示。没有节点提供网关时显示“当前没有节点提供 VPN 网关”，返回字段缺失时逐项显示 `—`。
+
 `node.id` 缺失时，Server `run` 会自动生成并回写 YAML。systemd 会在非特权服务前以 root 执行 `init-node-id`，因此 `/etc/tunnelmesh` 可以保持只读。每个节点仍必须使用独立 mTLS 证书，证书 SAN 与最终 `node.id` 精确一致。
 
 ## 远程服务器与浏览器 SSH/SFTP
@@ -198,6 +200,20 @@ ZMODEM 协议栈完全在浏览器内运行（`zmodem.js`），Server 只转发�
 创建会话失败时，认证窗口会显示 Server 返回的具体原因，而不是统一的“SSH 会话创建失败”。常见原因与处理方式如下：远程服务器不可用表示记录已被逻辑删除或禁用；Agent 不可用表示绑定的 Agent 已被禁用或不属于当前账号；Agent 离线表示该 Agent 当前没有有效租约，需要先检查 Agent 与 Server 的 WebSocket 连接；所选 SSH 公钥不可用表示公钥已删除、已禁用或不属于当前账号；活跃 SSH 会话数已达上限表示需要先断开闲置会话，或调大 `server.webssh.max_active_sessions_per_user`。
 
 Server 进程启动时会把本节点遗留的 `active` 会话统一关闭（原因记为 `node_restarted`），避免异常退出后残留会话长期占用活动会话配额；关闭数量通过 `webssh_stale_sessions_closed` 日志输出。集群模式下如果某个节点被永久下线且不再重启，其残留会话仍由 `session_ttl` 到期回收。
+
+## VPN 网关 peer 管理
+
+左侧菜单的“VPN 网关”（`/vpn`）用于给原生 WireGuard 客户端签发 peer：分配一个 VPN 地址、限定可达网段与端口，出口仍由 Agent 承担。页面不按管理员门禁，普通用户只看自己签发的 peer，管理员看全部；可见范围由服务端在分页查询内过滤，前端不再维护第二套角色判断。列表使用 cursor 分页，支持按名称或备注搜索，并按“启用中 / 已停用 / 已吊销”筛选。
+
+**当前版本只有管理面。** peer 可以签发、编辑、轮换、吊销并被审计，但网关数据面尚未随发行版提供，导入客户端后还不能建立隧道，页面顶部常驻这条说明。签发表单与服务端校验逐字对齐：名称 1–255 个字符且不含控制字符；授权网段是逗号分隔的 IPv4 CIDR，裸 IP 会被归一为 `/32`（服务端用 `net.ParseCIDR` 解析，不接受无前缀写法），留空表示没有可达目标；授权端口是逗号分隔的 1–65535 整数，留空表示不限；到期时间留空表示永不到期，填写时必须晚于当前时间；并发流与包速率上限填 0 表示不限。前端校验只省一次往返，不是信任边界，服务端会再校验一次。
+
+编辑只提交改动过的字段。集合按集合比较（服务端把 `allowed_ips` 排序后规范化存储），因此只改书写顺序不算策略变更、不会进审计；被清空的端口列表仍会提交，因为“不限端口”本身是有意义的值。“允许 ICMP echo”需要出口 Agent 协商到 `stream_icmp_echo.v1` 能力，本版服务端一律拒绝并返回 409 `vpn_agent_capability_missing`，否则会得到一个用户以为能 ping、实际不能 ping 的 peer。
+
+轮换与吊销都是终态操作，会要求二次确认：轮换后旧配置立即失效（IP 不变），必须重新下发；吊销不删除记录，公钥与地址不会被复用，也无法恢复。签发、编辑、轮换、吊销与 reveal 全部写审计日志，审计只记录 peer ID 与动作，不含任何密钥材料。
+
+“使用说明”抽屉给出客户端配置的获取方式与导入步骤。私钥是一次性的：必须输入 `REVEAL` 并勾选风险确认后才会请求 `POST /api/v1/vpn-peers/{peerId}/config:reveal`，返回的 wg-quick 配置只显示一次，只存在于当前页面内存中，关闭抽屉即清除，不写 `localStorage`/`sessionStorage`，也不进 Pinia 持久层。本版该请求恒返回 409 `vpn_node_disabled`（节点还没有自己的网关身份），抽屉会把这条事实渲染成说明而不是“操作失败”。签发还要求 Server 配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`，缺失时返回 503 `credential_secret_unavailable`，不会降级为明文存储。
+
+活跃流列表不在本页：`GET /api/v1/vpn-peers/{peerId}/flows` 属数据面能力，本版返回 501 `vpn_not_implemented`，抽屉只给出“到 Grafana 的 VPN Gateway Row 查看”的指引。IP 池概览同理，501 时显示“本版未提供网关运行时状态”，不会显示成“已分配 0”。页面按服务端稳定码分类报错，10 个码各有专属文案（如 `vpn_ip_pool_exhausted`、`vpn_capacity_exhausted`、`vpn_peer_conflict`），不会退化成一句“操作失败，请重试”。
 
 ## 审计日志
 
