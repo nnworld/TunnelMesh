@@ -519,7 +519,9 @@ func newLatencyFixture(t *testing.T) (*latencyFixture, error) {
 			InstanceID: "latency-agent-instance", Epoch: 1,
 			Collector: agent.NewMetadataCollector(nil),
 			Factory: func(session *agent.Session, _ string) agent.SessionFrameHandler {
-				session.SetCapabilities(agent.AgentStreamCapabilities(agentStreams))
+				// This fixture has no ping socket, so the echo engine is not ready and
+				// the capability must stay out of the advertisement.
+				session.SetCapabilities(agent.AgentStreamCapabilities(agentStreams, false))
 				return agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
 					MaxConcurrent: agentStreams.MaxConcurrentDials, MaxPending: agentStreams.MaxPendingDials,
 					ConnectTimeout: agentStreams.ConnectTimeout, OpenTimeout: agentStreams.OpenTimeout,

@@ -375,7 +375,9 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 
 func NewAgentDispatcherFactory(streams config.AgentStreamConfig) agent.ConnectionSessionFactory {
 	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
-		session.SetCapabilities(agent.AgentStreamCapabilities(streams))
+		// The engine is not wired yet, so nothing is ready: advertising the echo
+		// capability here would promise a stream this agent cannot serve.
+		session.SetCapabilities(agent.AgentStreamCapabilities(streams, false))
 		return agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,

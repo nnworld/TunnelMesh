@@ -209,8 +209,52 @@ func TestDialExecutorMapsConnectionRefused(t *testing.T) {
 }
 
 func TestAgentStreamCapabilitiesAdvertiseOpenResult(t *testing.T) {
-	capabilities := AgentStreamCapabilities(AgentStreamConfig{})
+	capabilities := AgentStreamCapabilities(AgentStreamConfig{}, false)
 	if len(capabilities) != 1 || capabilities[0] != protocol.CapabilityStreamOpenResult {
 		t.Fatalf("capabilities=%v, want stream open result only", capabilities)
+	}
+}
+
+// The echo capability depends on two independent facts: the operator asked for
+// it, and the process actually opened a ping socket. Either one alone must not
+// advertise it.
+func TestAgentStreamCapabilitiesAdvertiseICMPEchoOnlyWhenConfiguredAndReady(t *testing.T) {
+	cases := []struct {
+		name    string
+		streams AgentStreamConfig
+		ready   bool
+		want    []string
+	}{
+		{
+			name:    "icmp disabled",
+			streams: AgentStreamConfig{},
+			ready:   true,
+			want:    []string{protocol.CapabilityStreamOpenResult},
+		},
+		{
+			name:    "configured and the socket is open",
+			streams: AgentStreamConfig{ICMPEnabled: true},
+			ready:   true,
+			want:    []string{protocol.CapabilityStreamOpenResult, protocol.CapabilityStreamICMPEcho},
+		},
+		{
+			name:    "configured but the socket did not open",
+			streams: AgentStreamConfig{ICMPEnabled: true},
+			ready:   false,
+			want:    []string{protocol.CapabilityStreamOpenResult},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := AgentStreamCapabilities(tc.streams, tc.ready)
+			if len(got) != len(tc.want) {
+				t.Fatalf("capabilities = %v, want %v", got, tc.want)
+			}
+			for index := range got {
+				if got[index] != tc.want[index] {
+					t.Fatalf("capabilities = %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }
