@@ -464,6 +464,14 @@ agent:
     connect_timeout: 5s
     open_timeout: 8s
     inbound_buffer_bytes: 262144
+    # VPN 网关的 ICMP echo 出口。开启前主机必须先执行一次：
+    #   sysctl -w net.ipv4.ping_group_range='0 2147483647'
+    # 否则 socket 打不开、能力不通告，Server 会拒签 ICMP peer，
+    # 但 Agent 仍会继续服务 TCP/UDP/HTTP 隧道。
+    icmp_enabled: false
+    icmp_bind_address: 0.0.0.0
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
   # token 由 TUNNELMESH_AGENT_TOKEN 注入。
   metadata:
     - name: device_id

@@ -2850,7 +2850,7 @@ components:
         allowedIps: {type: array, items: {type: string}, description: 'IPv4 CIDRs. An element containing a comma is rejected rather than split, so one entry can never silently become two rules.'}
         allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: Omitted or empty permits every port.}
         allowPrivateTargets: {type: boolean, default: false}
-        icmpEnabled: {type: boolean, default: false, description: 'Refused with vpn_agent_capability_missing in this release'}
+        icmpEnabled: {type: boolean, default: false, description: 'Requires server.vpn.icmp_enabled on the node and an egress agent that is connected and has negotiated stream_icmp_echo.v1; otherwise refused with vpn_agent_capability_missing. A cluster node that cannot see the agent connection still issues the peer and records icmpCapability: unverified in the audit entry.'}
         maxConcurrentFlows: {type: integer, minimum: 0, default: 0}
         packetRateLimit: {type: integer, minimum: 0, default: 0}
         expiresAt: {type: string, format: date-time, nullable: true, description: Must be in the future}
@@ -2866,7 +2866,7 @@ components:
         allowedIps: {type: array, items: {type: string}}
         allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}}
         allowPrivateTargets: {type: boolean}
-        icmpEnabled: {type: boolean, description: 'Setting true is refused with vpn_agent_capability_missing in this release'}
+        icmpEnabled: {type: boolean, description: 'Setting true is re-checked against the egress agent capability and refused with vpn_agent_capability_missing when it is missing'}
         maxConcurrentFlows: {type: integer, minimum: 0}
         packetRateLimit: {type: integer, minimum: 0}
         expiresAt: {type: string, format: date-time, nullable: true, description: 'null clears the expiry. An instant must be in the future, which is the one clock rule that does not apply to the rest of a patch.'}

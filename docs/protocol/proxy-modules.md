@@ -45,6 +45,22 @@ legacy Agent、legacy Client 和 legacy 远端 Server 继续使用原字节流�
 
 legacy 子协议不启用 `OPEN_STREAM.Window` 语义，仍使用有界队列和 `RESET` 保护内存；已建立的 strict/flow-control 连接不会中途切换语义。
 
+## ICMP echo 与 `stream_icmp_echo.v1`
+
+VPN 网关的 `ping` 支持通过 `OPEN_STREAM.protocol = "icmp-echo"` 下发到出口 Agent，能力名为 `stream_icmp_echo.v1`。它与其它流能力一样必须协商后才可使用：Agent 未收到包含该能力的 ack 时，`icmp-echo` 开流一律以 `unsupported_capability` 安全拒绝；旧 Agent 没有这个 case，会走 default 分支返回“不支持的流协议”，不会崩溃。
+
+一条 `icmp-echo` 流只承载**一个在途 echo**，并沿用 UDP association 的数据报语义：Server 写入一个 `ICMPEchoRequest` 数据报，Agent 回写一个 `ICMPEchoReply` 数据报后返回 EOF。`target_port` 对 ICMP 没有意义，固定为 `0`；这是唯一放宽端口校验的协议，其余协议仍要求 1–65535。
+
+关联 ID 走数据报而不是 `StreamOpenPayload` 的新字段：该载荷为所有协议共用，为单一协议加字段会让其它协议的调用方面对一个永远为空的键。请求里的 `identifier`/`sequence` 是 VPN peer 自己发出的值，Agent 必须原样回传——非特权 ping socket 的 ICMP id 由内核改写，不能用于关联，因此 Agent 在 wire 上另配一个唯一 sequence，并在应答到达时逐字节比对 payload，防止 16 位序号回绕后撞上旧关联。
+
+应答状态是闭合枚举：`ok`、`timeout`、`capacity_exhausted`、`unreachable`、`unsupported`、`cancelled`。IP 没有错误通道，所以超时、超预算和目标不可达都是**应答**而不是错误；状态字符串是稳定值，数据面按它映射 `error_class` 指标标签。
+
+目标必须是字面 IP 地址：Server 在开流前完成解析，Agent 不再自行解析，否则它回答的是另一个问题。目标还要通过 `routing.IsDangerousAddress` 与引擎自身的地址族校验，链路本地段（`169.254.0.0/16`，云 metadata 所在）、组播、未指定地址和非 IPv4 一律拒绝。私网与回环目标在 Agent 侧是允许的：peer 能否到达它们由 Server 的逐包策略决定。
+
+Agent 侧的 `agent.streams.icmp_max_concurrent` 是进程级预算，独立于 Server 的 per-peer 上限：Server 看不到一个 Agent 还在替哪些 peer 服务，所以这是防止一批 VPN peer 把出口 Agent 变成反射器的最后一道防线。超限时立即回 `capacity_exhausted` 而不排队，排队会让 Server 的 per-peer 限额变成一句空话。
+
+能力只在 `agent.streams.icmp_enabled=true` **且** ping socket 真的打开时才通告。配置是意愿，引擎是事实：主机 `net.ipv4.ping_group_range` 不含进程 gid 时 socket 打不开，此时 Agent 记 Error 日志、不通告能力，但继续服务其余隧道——因为一个可选能力把整个 Agent 拉下线，违反故障隔离。
+
 ## 限制与安全
 
-代理模块不会执行任意远程命令，也不实现 P2P NAT traversal。ICMP echo 与内存态 TUN 属于独立的 VPN 网关数据面（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），不经代理模块。所有目标地址在 Agent 侧再次校验，解析结果重新进行私网/回环/链路本地限制检查。错误日志只记录协议、错误码和 trace id，不记录认证头或会话字节。
+代理模块不会执行任意远程命令，也不实现 P2P NAT traversal。内存态 TUN 与 WireGuard 端点属于独立的 VPN 网关数据面（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），不经代理模块；ICMP echo 的 Agent 侧能力按上一节实现，只放开 echo，其余 ICMP 类型仍由数据面策略链丢弃并计数。所有目标地址在 Agent 侧再次校验，解析结果重新进行私网/回环/链路本地限制检查。错误日志只记录协议、错误码和 trace id，不记录认证头或会话字节。

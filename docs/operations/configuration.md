@@ -280,7 +280,7 @@ server:
 | `server.vpn.connect_timeout` | `10s` | 开流（经 Agent 建立目标连接）的超时 | 否 |
 | `server.vpn.idle_timeout` | `120s` | 流空闲回收时间 | 否 |
 | `server.vpn.shutdown_timeout` | `15s` | 进程退出时等待在途流排空的上限，可为 0 | 否 |
-| `server.vpn.icmp_enabled` | `true` | 节点级 ICMP echo 总开关。这是上限而不是承诺：peer 还要单独开启，且出口 Agent 必须协商到该能力，否则签发返回 409 `vpn_agent_capability_missing` | 否 |
+| `server.vpn.icmp_enabled` | `true` | 节点级 ICMP echo 总开关，是上限而不是承诺：peer 还要单独开启，且出口 Agent 必须在线并已协商 `stream_icmp_echo.v1`。开关关闭时连探针都不会被询问，签发返回 409 `vpn_agent_capability_missing` | 否 |
 | `server.vpn.icmp_timeout` | `5s` | 单次 echo 应答超时，超时计入 `icmp_timeout` | 否 |
 | `server.vpn.icmp_max_concurrent` | `64` | 节点并发 echo 上限 | 否 |
 
@@ -365,7 +365,31 @@ agent:
     connect_timeout: 5s
     open_timeout: 8s
     inbound_buffer_bytes: 262144
+    # VPN 网关的 ICMP echo 出口，默认关闭。协议见 protocol/proxy-modules.md。
+    icmp_enabled: false
+    icmp_bind_address: 0.0.0.0
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
 ```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `agent.streams.icmp_enabled` | `false` | 是否打开非特权 ping socket 并通告 `stream_icmp_echo.v1`。默认关闭，因此升级二进制本身不会在任何主机上开 socket | 否 |
+| `agent.streams.icmp_bind_address` | `0.0.0.0` | ping socket 绑定的**地址**（不是 `host:port`），必须是 IP；仅在 `icmp_enabled=true` 时校验 | 否 |
+| `agent.streams.icmp_timeout` | `5s` | 单次 echo 等待应答的上限，超时回 `timeout` 状态而不是错误 | 否 |
+| `agent.streams.icmp_max_concurrent` | `64` | 该 Agent 进程的并发 echo 预算，超限立即回 `capacity_exhausted`，不排队 | 否 |
+
+`icmp_enabled=true` 还需要主机一次性放开非特权 ping socket 的 gid 范围，否则 socket 打不开、能力不通告，Server 会拒签 ICMP peer：
+
+```bash
+# 立即生效
+sysctl -w net.ipv4.ping_group_range='0 2147483647'
+# 重启后仍生效
+echo 'net.ipv4.ping_group_range = 0 2147483647' > /etc/sysctl.d/99-tunnelmesh-icmp.conf
+sysctl --system
+```
+
+收窄范围（例如只允许 Agent 的运行 gid）也可以，只要包含该进程 gid 即可。Agent 打不开 socket 时**不会退出**：它在 stderr 记一条 Error 并继续服务 TCP/UDP/HTTP 隧道，因为一个可选能力不该把整个 Agent 拉下线。命令行与环境变量等价：`TUNNELMESH_AGENT_STREAMS_ICMP_ENABLED` 等。
 
 Client 默认等待严格打开结果并限制入站缓冲：
 
