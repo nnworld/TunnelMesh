@@ -12,6 +12,11 @@ const (
 	CapabilityStreamOpenResult  = "stream_open_result.v1"
 	CapabilityStreamFlowControl = "stream_flow_control.v1"
 	CapabilityStreamFairWriter  = "stream_fair_writer.v1"
+	// CapabilityStreamICMPEcho says the agent answers "icmp-echo" streams over
+	// an unprivileged ping socket. It is negotiated like every other capability
+	// so a server never sends an echo to an agent that would answer with
+	// "unsupported stream protocol".
+	CapabilityStreamICMPEcho = "stream_icmp_echo.v1"
 )
 
 type CapabilityHello struct {
