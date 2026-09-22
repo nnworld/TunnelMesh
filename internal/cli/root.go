@@ -345,12 +345,22 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			if strings.TrimSpace(nodeID) == "" {
 				nodeID = cfg.Agent.ID
 			}
+			echoer, echoErr := startAgentEchoer(cfg.Agent.Streams)
+			if echoErr != nil {
+				// Non-fatal on purpose. The agent still serves every tunnel it
+				// already had, and the missing capability makes the server refuse
+				// to sign ICMP peers, which is where an operator looks next.
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agent icmp echo is unavailable and will not be advertised: %v\n", echoErr)
+			}
+			if echoer != nil {
+				defer func() { _ = echoer.Close() }()
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
 			return agent.RunConnectionPool(cmd.Context(), agent.WebSocketPoolOptions{
 				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
 				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
-				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams),
+				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
 				Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
 				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
 				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
@@ -373,12 +383,37 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 	}
 }
 
-func NewAgentDispatcherFactory(streams config.AgentStreamConfig) agent.ConnectionSessionFactory {
+// agentEchoOpener is a variable so a test can reproduce the permission failure a
+// real host produces when net.ipv4.ping_group_range excludes the process gid.
+var agentEchoOpener = agent.OpenEchoer
+
+// startAgentEchoer opens the unprivileged ping socket the echo capability needs.
+// It returns a nil engine and a nil error when the configuration leaves ICMP off,
+// so a host without the sysctl is never penalised for a feature it does not use.
+// When the operator did ask for it and the host refused, the error is returned
+// for the caller to report and the engine stays nil, which is what keeps the
+// capability out of the advertisement.
+func startAgentEchoer(streams config.AgentStreamConfig) (*agent.Echoer, error) {
+	if !streams.ICMPEnabled {
+		return nil, nil
+	}
+	echoer, err := agentEchoOpener(agent.EchoerConfig{
+		BindAddress:   streams.ICMPBindAddress,
+		Timeout:       streams.ICMPTimeout,
+		MaxConcurrent: streams.ICMPMaxConcurrent,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return echoer, nil
+}
+
+func NewAgentDispatcherFactory(streams config.AgentStreamConfig, echoer *agent.Echoer) agent.ConnectionSessionFactory {
 	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
-		// The engine is not wired yet, so nothing is ready: advertising the echo
-		// capability here would promise a stream this agent cannot serve.
-		session.SetCapabilities(agent.AgentStreamCapabilities(streams, false))
-		return agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
+		// Readiness is the engine, not the configuration: a host that refused the
+		// ping socket must not advertise a stream it cannot serve.
+		session.SetCapabilities(agent.AgentStreamCapabilities(streams, echoer != nil))
+		return agent.NewStreamDispatcherWithConfig(agent.Dialer{ICMPEcho: echoer}, nil, session.Send, agent.DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,
 			ConnectTimeout: streams.ConnectTimeout,

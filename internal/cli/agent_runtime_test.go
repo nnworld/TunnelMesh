@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 func TestAgentRunCommandForwardsTCPUDPAndHTTPThroughRealDispatcher(t *testing.T) {
@@ -201,7 +204,7 @@ func TestAgentRunCommandForwardsTCPUDPAndHTTPThroughRealDispatcher(t *testing.T)
 func TestAgentDispatcherFactoryAdvertisesStreamCapabilities(t *testing.T) {
 	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 1)}
 	session := agent.NewSessionWithMetadata(transport, agent.NewMetadataCollector(nil))
-	factory := NewAgentDispatcherFactory(config.AgentStreamConfig{MaxConcurrentDials: 3, MaxPendingDials: 7})
+	factory := NewAgentDispatcherFactory(config.AgentStreamConfig{MaxConcurrentDials: 3, MaxPendingDials: 7}, nil)
 	handler := factory(session, "connection-1")
 	if handler == nil {
 		t.Fatal("factory returned no handler")
@@ -216,6 +219,255 @@ func TestAgentDispatcherFactoryAdvertisesStreamCapabilities(t *testing.T) {
 	}
 	if len(payload.Capabilities) != 1 || payload.Capabilities[0] != protocol.CapabilityStreamOpenResult {
 		t.Fatalf("agent capabilities=%v", payload.Capabilities)
+	}
+}
+
+// cliICMPConn is the injected ping socket. A cli test cannot open a real one
+// because net.ipv4.ping_group_range excludes the test user, and the contract
+// under test is that the dispatcher the factory builds actually carries the
+// engine — which only a socket that receives the echo can demonstrate.
+type cliICMPConn struct {
+	mu       sync.Mutex
+	written  [][]byte
+	incoming chan []byte
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func newCLIICMPConn() *cliICMPConn {
+	return &cliICMPConn{incoming: make(chan []byte, 8), closed: make(chan struct{})}
+}
+
+func (c *cliICMPConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	select {
+	case data := <-c.incoming:
+		return copy(b, data), &net.UDPAddr{IP: net.IPv4(10, 0, 0, 5)}, nil
+	case <-c.closed:
+		return 0, nil, errors.New("icmp: closed")
+	}
+}
+
+func (c *cliICMPConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.written = append(c.written, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+func (c *cliICMPConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *cliICMPConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 168, 1, 20)}
+}
+
+func (c *cliICMPConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *cliICMPConn) writes() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.written...)
+}
+
+// answer replies to the echo the engine sent, using the wire sequence it chose:
+// that sequence is the only identifier that survives an unprivileged socket.
+func (c *cliICMPConn) answer(t *testing.T, data []byte) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		writes := c.writes()
+		if len(writes) > 0 {
+			message, err := icmp.ParseMessage(1, writes[len(writes)-1])
+			if err != nil {
+				t.Fatalf("parse the echo the engine sent: %v", err)
+			}
+			body, ok := message.Body.(*icmp.Echo)
+			if !ok {
+				t.Fatalf("echo body = %T, want *icmp.Echo", message.Body)
+			}
+			answer := icmp.Message{
+				Type: ipv4.ICMPTypeEchoReply, Code: 0,
+				Body: &icmp.Echo{ID: 31337, Seq: body.Seq, Data: data},
+			}
+			encoded, err := answer.Marshal(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.incoming <- encoded
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the engine never sent an echo, so the factory did not wire it into the dialer")
+}
+
+func hasCapability(capabilities []string, wanted string) bool {
+	for _, capability := range capabilities {
+		if capability == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func reportedCapabilities(t *testing.T, factory agent.ConnectionSessionFactory) []string {
+	t.Helper()
+	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}
+	session := agent.NewSessionWithMetadata(transport, agent.NewMetadataCollector(nil))
+	handler := factory(session, "connection-1")
+	if handler == nil {
+		t.Fatal("factory returned no handler")
+	}
+	defer handler.Close()
+	if err := session.ReportMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	frame := <-transport.sent
+	payload, err := protocol.DecodeAgentMetadataPayload(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload.Capabilities
+}
+
+// A ready engine advertises the capability and, more importantly, ends up inside
+// the dialer the factory hands to every dispatcher it builds.
+func TestAgentDispatcherFactoryWiresAReadyEchoEngine(t *testing.T) {
+	streams := config.AgentStreamConfig{
+		MaxConcurrentDials: 2, MaxPendingDials: 4, ConnectTimeout: time.Second, OpenTimeout: time.Second,
+		ICMPEnabled: true, ICMPTimeout: time.Second, ICMPMaxConcurrent: 4,
+	}
+
+	capabilities := reportedCapabilities(t, NewAgentDispatcherFactory(streams, nil))
+	if hasCapability(capabilities, protocol.CapabilityStreamICMPEcho) {
+		t.Fatalf("capabilities = %v, want no echo capability while icmp_enabled is set but no engine is ready", capabilities)
+	}
+
+	conn := newCLIICMPConn()
+	echoer := agent.NewEchoer(conn, agent.EchoerConfig{Timeout: time.Second, MaxConcurrent: 4})
+	defer echoer.Close()
+	factory := NewAgentDispatcherFactory(streams, echoer)
+	if capabilities := reportedCapabilities(t, factory); !hasCapability(capabilities, protocol.CapabilityStreamICMPEcho) {
+		t.Fatalf("capabilities = %v, want the echo capability with a ready engine", capabilities)
+	}
+
+	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 16)}
+	session := agent.NewSessionWithMetadata(transport, agent.NewMetadataCollector(nil))
+	handler := factory(session, "connection-1")
+	defer handler.Close()
+
+	// The gate is opened by the connection pool's ack handling, which lives in
+	// internal/agent and is covered there. This test is about the factory handing
+	// a ready engine to the dialer, so the gate is set directly.
+	dispatcher, ok := handler.(*agent.StreamDispatcher)
+	if !ok {
+		t.Fatalf("factory returned %T, want *agent.StreamDispatcher", handler)
+	}
+	dispatcher.SetICMPEchoEnabled(true)
+	opened, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{
+		Protocol: protocol.StreamProtocolICMPEcho, TargetHost: "10.0.0.5", TargetPort: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 7, Payload: opened}); err != nil {
+		t.Fatalf("Handle(open) error = %v, want nil", err)
+	}
+	request, err := protocol.EncodeICMPEchoRequest(protocol.ICMPEchoRequest{
+		CorrelationID: "corr-cli", Identifier: 3, Sequence: 4, Data: []byte("cli"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 7, Payload: request}); err != nil {
+		t.Fatalf("Handle(data) error = %v, want nil", err)
+	}
+
+	conn.answer(t, []byte("cli"))
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case frame := <-transport.sent:
+			if frame.Type != protocol.FrameData || frame.StreamID != 7 {
+				continue
+			}
+			reply, err := protocol.DecodeICMPEchoReply(frame.Payload)
+			if err != nil {
+				t.Fatalf("decode the reply the factory-built dispatcher sent: %v", err)
+			}
+			if reply.CorrelationID != "corr-cli" || reply.Identifier != 3 || reply.Sequence != 4 {
+				t.Fatalf("reply = %+v, want corr-cli with the peer's own identifiers 3/4", reply)
+			}
+			if reply.Status != protocol.ICMPEchoStatusOK || string(reply.Data) != "cli" {
+				t.Fatalf("reply = %+v, want status ok and the payload back", reply)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no echo reply came back through the factory-built dispatcher")
+		}
+	}
+}
+
+// A host that refuses the ping socket costs one optional capability, not every
+// tunnel the agent serves: the error is reported and the agent keeps running.
+func TestStartAgentEchoerKeepsTheAgentRunningWithoutTheCapability(t *testing.T) {
+	original := agentEchoOpener
+	defer func() { agentEchoOpener = original }()
+
+	var opened []agent.EchoerConfig
+	agentEchoOpener = func(cfg agent.EchoerConfig) (*agent.Echoer, error) {
+		opened = append(opened, cfg)
+		return nil, fmt.Errorf("listen udp4 0.0.0.0: %w", agent.ErrPingGroupRangeRequired)
+	}
+
+	echoer, err := startAgentEchoer(config.AgentStreamConfig{})
+	if echoer != nil || err != nil {
+		t.Fatalf("startAgentEchoer(disabled) = (%v, %v), want (nil, nil)", echoer, err)
+	}
+	if len(opened) != 0 {
+		t.Fatalf("the socket was opened %d times while icmp is disabled, want 0", len(opened))
+	}
+
+	streams := config.AgentStreamConfig{
+		ICMPEnabled: true, ICMPBindAddress: "127.0.0.1",
+		ICMPTimeout: 2 * time.Second, ICMPMaxConcurrent: 8,
+	}
+	echoer, err = startAgentEchoer(streams)
+	if echoer != nil {
+		t.Fatalf("startAgentEchoer() = %v, want no engine when the socket is refused", echoer)
+	}
+	if !errors.Is(err, agent.ErrPingGroupRangeRequired) {
+		t.Fatalf("error = %v, want it to name net.ipv4.ping_group_range", err)
+	}
+	if len(opened) != 1 {
+		t.Fatalf("the socket was opened %d times, want 1", len(opened))
+	}
+	if got := opened[0]; got.BindAddress != "127.0.0.1" || got.Timeout != 2*time.Second || got.MaxConcurrent != 8 {
+		t.Fatalf("EchoerConfig = %+v, want the configured bind address, timeout and budget", got)
+	}
+}
+
+func TestStartAgentEchoerReturnsTheEngineItOpened(t *testing.T) {
+	original := agentEchoOpener
+	defer func() { agentEchoOpener = original }()
+	agentEchoOpener = func(cfg agent.EchoerConfig) (*agent.Echoer, error) {
+		return agent.NewEchoer(newCLIICMPConn(), cfg), nil
+	}
+
+	echoer, err := startAgentEchoer(config.AgentStreamConfig{
+		ICMPEnabled: true, ICMPTimeout: time.Second, ICMPMaxConcurrent: 2,
+	})
+	if err != nil {
+		t.Fatalf("startAgentEchoer() error = %v, want nil", err)
+	}
+	if echoer == nil {
+		t.Fatal("startAgentEchoer() = nil, want the engine the opener produced")
+	}
+	if err := echoer.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil", err)
 	}
 }
 
