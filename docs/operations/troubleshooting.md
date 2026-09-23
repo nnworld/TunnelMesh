@@ -54,6 +54,26 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 不要在命令行、日志或工单中粘贴真实密码；此前已经暴露过的数据库凭据应立即
 轮换，并通过 systemd EnvironmentFile 或 Secret Manager 注入 DSN。
 
+### 客户端观测全为 0 且 metadata 显示已过期
+
+现象：`/clients` 页面里客户端明明在线并持续收发，列表行的「活跃 WS 连接」「活跃流」却是 `0`、「Server 节点」是 `—`、状态是「metadata 已过期」；表格上方的「在线客户端 / 活跃 WS 连接 / 活跃流」卡片同样全为 `0`。但打开详情抽屉，「WS 连接」里却列着若干条连接，且**所有连接的「连接 Epoch」都是同一个值 `2147483647`**。
+
+判定：这是 MySQL 下 `client_connection_leases.connection_epoch` 只有 32 位导致的。Server 用 8 字节随机数生成 int64 的连接 Epoch 作为 fencing token，`INTEGER` 列在写入时把它钳制成 `2147483647`；之后 `Renew`/`UpdateStats`/`Release` 都以真实 Epoch 作为 `WHERE` 条件，永远匹配 0 行。租约 90 秒后过期，于是活跃连接与活跃流归零；而心跳在租约续期失败时提前返回，连带跳过了 metadata 续期，5 分钟后被 sweeper 标记 `stale`，于是显示「metadata 已过期」。汇总卡片完全由列表行派生，所以一起归零。**「多条互不相关的连接 Epoch 完全相同且等于 2147483647」就是该缺陷的确诊特征。**
+
+快速确认（MySQL）：
+
+```sql
+SHOW COLUMNS FROM client_connection_leases LIKE 'connection_epoch';
+-- 返回 int(11) 即为受影响版本，bigint(20) 为已修复
+SELECT COUNT(DISTINCT connection_epoch) AS distinct_epochs, COUNT(*) AS rows_total
+  FROM client_connection_leases;
+-- distinct_epochs 远小于 rows_total 说明 Epoch 被钳制成同一个值
+```
+
+处置：升级到 Schema v15 的 Server 版本（见计划 `docs/superpowers/plans/2026-09-23-client-lease-epoch-observability-sync.md` 与[升级指南](schema-upgrades.md#v14-to-v15)）。该版本把两张租约表的 `connection_epoch` 加宽为 `BIGINT`，并在心跳里增加自愈：续期匹配不到行时，用内存中的权威 Epoch 重新登记租约。因此**已连接的客户端在下一个心跳周期（默认 30 秒）内自动恢复，不需要重启客户端，Agent 与 Client 二进制也不需要升级**。详情抽屉同时会区分「活跃」与「已过期」租约，过期行不再提供「关闭连接」入口。
+
+若升级后仍然全为 0：按下面的「集群连接查询或关闭失败」检查 Server 节点注册与数据库连通性，并确认 `schema_meta.version` 已经是 `15`。
+
 ### 代理节点列表显示“在线”但详情没有元数据
 
 现象：Agents 列表里某个 Agent 显示“在线”，进入详情却是“暂无元数据”或加载失败，且该 Agent 实际上从未连接过。
@@ -162,6 +182,17 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 轮询失败超过 `max_stale_on_poll_error` 后，Server 会 fail-closed，不再使用正向缓存；负向缓存仍受 `negative_ttl` 限制。若需要立即排障，可临时设置 `server.authorization_cache.enabled=false` 并滚动重启。
 - 升级前确认 `schema_meta.version=8`、v8→v9 增量脚本存在，数据库账号可创建表并更新 `schema_meta`。
 - v9 的 `authorization_revision` 是授权缓存的一致性依据。回滚应用可保留该表；不要手工删除表、修改 revision 或回退版本号。需要精确恢复时使用升级前备份。
+
+## 客户端观测与 Schema v15
+
+- 升级前确认 `schema_meta.version=14`、`migrations/incremental/v0014_to_v0015/` 下 `mysql.sql` 与 `sqlite.sql` 均存在，且数据库账号可对两张租约表执行 `ALTER TABLE`。
+- v15 只把 `client_connection_leases.connection_epoch` 与 `agent_connection_leases.connection_epoch` 从 `INTEGER` 加宽为 `BIGINT`，不新增表、不新增列、不改索引，也不重写任何数据。
+- MySQL 的 `INT → BIGINT` 需要重建表：8.0 可走 `INPLACE`，5.6/5.7 重建期间允许并发 DML。两张表每行对应一条活跃物理 WebSocket，量级通常在百行以内，预计锁表时间为秒级。
+- SQLite 侧无结构变更（其 `INTEGER` 本就是 64 位），增量脚本只执行一条幂等空操作，保持迁移链在两种驱动上一致。
+- 迁移**不会**回写升级前已被钳制成 `2147483647` 的历史行——那些租约早已过期，且无法可靠还原原始 token；活跃连接由心跳自愈负责修正。
+- 回滚应用时**保留 v15 Schema**：v14 二进制读 `BIGINT` 列仍得到 int64，功能正常。切勿把列改回 `INTEGER`，那会重新触发钳制；确需还原结构只能用升级前备份恢复，不要手工回退 `schema_meta.version`。
+- 5 分钟止损：新版 Server 启动失败时直接回退二进制即可恢复服务，数据库无需回滚。
+- 详细步骤与校验 SQL 见 [Schema 升级指南](schema-upgrades.md#v14-to-v15)。
 
 ## WebSSH 大文件传输中断
 
