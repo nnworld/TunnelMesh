@@ -267,6 +267,17 @@ func (f *vpnGatewayFixture) tcpCallCount() int {
 	return len(f.tcpCalls)
 }
 
+// tcpCallsRecorded returns a copy of the packets the TCP handler was handed.
+//
+// A copy rather than the slice itself because the handler appends to it from the
+// device's decryption goroutine, and a test that ranged over the live slice would
+// be reading a slice header another goroutine was writing.
+func (f *vpnGatewayFixture) tcpCallsRecorded() []vpnWirePacket {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]vpnWirePacket(nil), f.tcpCalls...)
+}
+
 func (f *vpnGatewayFixture) icmpCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -4,10 +4,15 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
+
+	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"github.com/tunnelmesh/tunnelmesh/internal/vpn"
@@ -35,6 +40,24 @@ const (
 // bucket per peer, which for a gateway with tens of thousands of peers is the
 // difference between a map that matters and one that does not.
 var vpnUnlimitedBucketOnce = sync.OnceValue(func() *packetBucket { return newPacketBucket(0, nil) })
+
+// errVPNGatewayClosed reports a Start attempted on a gateway that has been
+// closed.
+//
+// It is a distinct error rather than a silent no-op because both callers that can
+// hit it need to know the data plane is gone. A runtime shutdown racing a health
+// check would otherwise report a healthy gateway, and a restart that reused the
+// old object would otherwise believe it came up while holding no socket at all.
+var errVPNGatewayClosed = errors.New("vpn: the gateway is closed")
+
+// vpnPeerLoadTimeout bounds the one database read Start makes. A gateway that
+// waited forever for its peer set would hold a bound UDP port while answering no
+// handshake, which is the failure an operator can least diagnose from outside.
+const vpnPeerLoadTimeout = 30 * time.Second
+
+// vpnDeviceLogInterval bounds how often wireguard-go's own error text reaches the
+// process log. See vpnDeviceLogger for why it is bounded at all.
+const vpnDeviceLogInterval = time.Second
 
 // vpnGateway is the embedded WireGuard gateway.
 //
@@ -64,6 +87,20 @@ type vpnGateway struct {
 	tcp  *vpnTCPRelay
 	udp  *vpnUDPRelay
 	icmp *vpnICMPRelay
+
+	// mu guards the WireGuard endpoint. It is separate from every other lock here
+	// because the endpoint is written by management operations and read by the
+	// peer hooks on the packet path, and neither may wait on the other.
+	//
+	// It is never held across a call into the device. IpcSet serialises on the
+	// device's own mutex and can block behind an in-flight handshake, so a hook
+	// that waited for one would stall the peer table for every other peer on the
+	// node.
+	mu        sync.Mutex
+	wg        *device.Device
+	bind      *vpnBind
+	boundPort uint16
+	started   bool
 
 	// bucketMu guards the per-peer token buckets. It is separate from every other
 	// lock because a bucket is consulted once per packet and must never wait on a
@@ -130,8 +167,9 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 		NodeID: deps.NodeID,
 		Now:    nowFn,
 		Hooks: vpnPeerHooks{
-			onApply:  gateway.peerApplied,
-			onRemove: gateway.peerRemoved,
+			onApply:            gateway.peerApplied,
+			onRemove:           gateway.peerRemoved,
+			onReplacePublicKey: gateway.peerKeyReplaced,
 		},
 	})
 	gateway.flows = newVPNFlowTable(vpnFlowTableConfig{
@@ -165,8 +203,256 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 func (g *vpnGateway) now() time.Time { return g.nowFn() }
 
 // Start is where the gateway acquires the resources it holds for the rest of the
-// process lifetime.
-func (g *vpnGateway) Start(_ context.Context) error { return nil }
+// process lifetime: the UDP endpoint, the WireGuard device and the peer set.
+//
+// It either leaves a serving gateway or a closed one. Half-built is the state
+// that cannot be reasoned about - a bound port answering no handshake, or a
+// device with an identity and no peers - so every failure path closes the gateway
+// and returns, and a caller only ever has to distinguish "serving" from "gone".
+func (g *vpnGateway) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := g.serve(ctx); err != nil {
+		_ = g.Close()
+		return err
+	}
+	return nil
+}
+
+// serve is Start's body, split out so the failure path has one place to clean up.
+func (g *vpnGateway) serve(ctx context.Context) error {
+	g.mu.Lock()
+	if g.started {
+		g.mu.Unlock()
+		return nil
+	}
+	if g.isClosed() {
+		g.mu.Unlock()
+		return errVPNGatewayClosed
+	}
+	bind, err := newVPNBind(g.deps.Config.Listen)
+	if err != nil {
+		g.mu.Unlock()
+		return err
+	}
+	nodeConfig, err := g.renderNodeConfig(bind)
+	if err != nil {
+		g.mu.Unlock()
+		return err
+	}
+	// The device is registered before it is configured so that a failure further
+	// down still finds something to close. NewDevice spawns the read and encrypt
+	// routines immediately, and they park on a tunnel that has not been written to
+	// yet, which costs nothing until the endpoint is up.
+	tunnel := device.NewDevice(g.device, bind, vpnDeviceLogger())
+	g.bind = bind
+	g.wg = tunnel
+	g.mu.Unlock()
+
+	if err := tunnel.IpcSet(nodeConfig); err != nil {
+		return fmt.Errorf("vpn: configure the wireguard identity for server.vpn.listen %q: %w", g.deps.Config.Listen, err)
+	}
+	// Up is what actually binds the socket. wireguard-go only opens the bind for a
+	// device that is up, so setting listen_port alone leaves the port unheld - and
+	// a gateway that reports a listen address it is not listening on is worse than
+	// one that refuses to start.
+	if err := tunnel.Up(); err != nil {
+		return fmt.Errorf("vpn: bring the wireguard endpoint up on server.vpn.listen %q: %w", g.deps.Config.Listen, err)
+	}
+	bound := bind.localPort()
+	if bound == 0 {
+		return fmt.Errorf("vpn: the wireguard endpoint came up on server.vpn.listen %q without a udp port", g.deps.Config.Listen)
+	}
+	if err := g.loadPeers(ctx); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	g.boundPort = bound
+	g.started = true
+	g.mu.Unlock()
+	slog.Info("vpn_gateway_started",
+		"node_id", g.deps.NodeID,
+		"listen", g.deps.Config.Listen,
+		"port", bound,
+		"mtu", g.mtu,
+		"peers", g.peers.count())
+	return nil
+}
+
+// renderNodeConfig picks the identity block the device is started with.
+//
+// A configured port is rendered into the block. An ephemeral one is not, because
+// listen_port=0 means "stop listening" to every WireGuard implementation that
+// follows wg(8) and "choose one for me" to wireguard-go's bind, and the only
+// spelling both agree on is to leave the line out and let vpnBind supply the port
+// it was configured with.
+func (g *vpnGateway) renderNodeConfig(bind *vpnBind) (string, error) {
+	if port := bind.port(); port > 0 {
+		return vpn.RenderNodeUAPI(g.identity, port)
+	}
+	return vpn.RenderNodeIdentityUAPI(g.identity)
+}
+
+// loadPeers copies this node's peer rows out of the database and onto the device.
+//
+// A row the peer table refuses is logged and skipped rather than failing the
+// start: one malformed row must not take the gateway down for every peer that is
+// fine, and the refusal is already reported with the reason at the moment it
+// happened. The read itself failing is different. Without it the gateway would
+// refuse every packet as an unknown peer while the management API kept reporting
+// the data plane as enabled, and the database is the authority (D10), so an
+// unreadable one is a startup failure.
+func (g *vpnGateway) loadPeers(ctx context.Context) error {
+	if g.deps.Peers == nil {
+		return nil
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, vpnPeerLoadTimeout)
+	defer cancel()
+	rows, err := g.deps.Peers.ListByNode(loadCtx, g.deps.NodeID)
+	if err != nil {
+		return fmt.Errorf("vpn: load the peer set for node %q: %w", g.deps.NodeID, err)
+	}
+	refused := 0
+	for _, row := range rows {
+		if applyErr := g.peers.ApplyPeer(row); applyErr != nil {
+			refused++
+			slog.Error("vpn_peer_load_refused", "peer_id", row.ID, "error", applyErr)
+		}
+	}
+	slog.Info("vpn_peers_loaded", "node_id", g.deps.NodeID, "peers", len(rows)-refused, "refused", refused)
+	return nil
+}
+
+// localPort reports the UDP port the endpoint actually holds, or zero when the
+// gateway is not serving.
+//
+// It is not the configured port. When server.vpn.listen names port 0 the
+// operating system chose one at Start, and this is the only place that knows
+// which, so it is what the startup log and the node status report.
+func (g *vpnGateway) localPort() uint16 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.boundPort
+}
+
+// endpoint returns the WireGuard device, or nil when the gateway is not serving.
+//
+// The pointer is copied out under the lock and used after it is released. Every
+// call into the device can block, and holding mu across one would let a handshake
+// stall a management write.
+func (g *vpnGateway) endpoint() *device.Device {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.wg
+}
+
+// installDevicePeer puts one peer's key and tunnel address on the device.
+func (g *vpnGateway) installDevicePeer(entry vpnPeerEntry) error {
+	tunnel := g.endpoint()
+	if tunnel == nil {
+		// Not serving yet, or already torn down. The peer table is the memory copy
+		// either way, and a Start that follows will load it from the database.
+		return nil
+	}
+	block, err := vpn.RenderPeerUAPI(entry.PublicKey, net.IP(entry.VPNIP.AsSlice()))
+	if err != nil {
+		return err
+	}
+	if err := tunnel.IpcSet(block); err != nil {
+		return fmt.Errorf("install peer %s on the wireguard device: %w", entry.PeerID, err)
+	}
+	return nil
+}
+
+// removeDevicePeer takes one key off the device.
+//
+// Removal is by public key rather than by peer id or address, which is what makes
+// a revocation safe against reuse: an address handed to a different peer later
+// cannot resurrect the identity that was just revoked.
+func (g *vpnGateway) removeDevicePeer(peerID, publicKey string) {
+	tunnel := g.endpoint()
+	if tunnel == nil {
+		return
+	}
+	block, err := vpn.RenderPeerRemoveUAPI(publicKey)
+	if err != nil {
+		slog.Error("vpn_peer_device_remove_render_failed", "peer_id", peerID, "error", err)
+		return
+	}
+	if err := tunnel.IpcSet(block); err != nil {
+		slog.Error("vpn_peer_device_remove_failed", "peer_id", peerID, "error", err)
+	}
+}
+
+// stopEndpoint releases the WireGuard device and the socket it holds.
+//
+// Closing the device closes the tunnel device it was handed as well, so this is
+// the point after which no datagram can be decrypted into the pipeline and none
+// can be encrypted out of it. The bind is closed again afterwards because a
+// failure before the device existed leaves it holding a socket on its own, and
+// Close on both is idempotent.
+func (g *vpnGateway) stopEndpoint() {
+	g.mu.Lock()
+	tunnel := g.wg
+	bind := g.bind
+	g.wg = nil
+	g.bind = nil
+	g.boundPort = 0
+	g.started = false
+	g.mu.Unlock()
+	if tunnel != nil {
+		tunnel.Close()
+	}
+	if bind != nil {
+		_ = bind.Close()
+	}
+}
+
+// vpnDeviceLogThrottle rate limits the device's error text.
+type vpnDeviceLogThrottle struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+func (l *vpnDeviceLogThrottle) errorf(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	now := time.Now()
+	if !l.last.IsZero() && now.Sub(l.last) < vpnDeviceLogInterval {
+		l.suppressed++
+		l.mu.Unlock()
+		return
+	}
+	suppressed := l.suppressed
+	l.suppressed = 0
+	l.last = now
+	l.mu.Unlock()
+	slog.Error("vpn_device_error", "error", message, "suppressed_since_last", suppressed)
+}
+
+// vpnDeviceLogger adapts wireguard-go's two-level logger to slog.
+//
+// Verbose output is discarded. It is per packet and per handshake, so a gateway
+// carrying real traffic would produce more of it than the rest of the process
+// combined, and there is no configuration surface in this product that asks for
+// it.
+//
+// Errors are throttled rather than forwarded, because the device reports one per
+// datagram it cannot handle and the peers that produce those datagrams are on the
+// public internet. An unthrottled forward would let any host that can reach the
+// UDP port fill the log, which is a denial of service against every other
+// diagnostic the process writes. The suppressed count travels with the next
+// message that is allowed through, so the volume is still visible.
+func vpnDeviceLogger() *device.Logger {
+	throttle := &vpnDeviceLogThrottle{}
+	return &device.Logger{
+		Verbosef: device.DiscardLogf,
+		Errorf:   throttle.errorf,
+	}
+}
 
 // ApplyPeer and RemovePeer are the hot-reload side of VPNPeerSink. The database
 // write has already committed when they are called, so a failure here is reported
@@ -206,7 +492,30 @@ func (g *vpnGateway) NodeStatus(_ context.Context) (VPNNodeStatus, error) {
 // a peer's budget had no effect until the process restarted, which is the kind of
 // silent disagreement between the database and the running gateway that D10
 // exists to prevent.
-func (g *vpnGateway) peerApplied(entry vpnPeerEntry) { g.forgetBucket(entry.PeerID) }
+//
+// A device install that fails is logged and left. The row is committed and stays
+// committed, because the database is the authority and rolling it back from a
+// memory hook would be the second source of truth D10 forbids. The cost is
+// fail-closed: wireguard-go drops the datagrams of a peer it has never heard of
+// before the pipeline sees them, so a failed install produces a peer that cannot
+// connect, never one that connects without authority.
+func (g *vpnGateway) peerApplied(entry vpnPeerEntry) {
+	g.forgetBucket(entry.PeerID)
+	if err := g.installDevicePeer(entry); err != nil {
+		slog.Error("vpn_peer_device_install_failed", "peer_id", entry.PeerID, "error", err)
+	}
+}
+
+// peerKeyReplaced retires the identity a rotation displaced.
+//
+// The peer table fires this before onApply, and that order is the only safe one:
+// removing the old key first means there is no instant in which both identities
+// are answerable, so a rotation takes effect the moment the management write
+// commits rather than the moment somebody remembers to revoke the old key.
+func (g *vpnGateway) peerKeyReplaced(oldKey, _ string, entry vpnPeerEntry) {
+	slog.Info("vpn_peer_key_rotated", "peer_id", entry.PeerID)
+	g.removeDevicePeer(entry.PeerID, oldKey)
+}
 
 // peerRemoved stops a peer that is no longer servable.
 //
@@ -216,6 +525,7 @@ func (g *vpnGateway) peerApplied(entry vpnPeerEntry) { g.forgetBucket(entry.Peer
 // as the agent held the other end open.
 func (g *vpnGateway) peerRemoved(entry vpnPeerEntry) {
 	g.forgetBucket(entry.PeerID)
+	g.removeDevicePeer(entry.PeerID, entry.PublicKey)
 	if stopped := g.flows.closePeer(entry.PeerID); stopped > 0 {
 		slog.Info("vpn_peer_flows_stopped", "peer_id", entry.PeerID, "flows", stopped)
 	}
@@ -322,6 +632,7 @@ func (g *vpnGateway) release() {
 	if g.peers != nil {
 		g.peers.close()
 	}
+	g.stopEndpoint()
 	if g.device != nil {
 		_ = g.device.Close()
 	}

@@ -87,6 +87,31 @@ func RenderNodeUAPI(identity NodeIdentity, listenPort int) (string, error) {
 	), nil
 }
 
+// RenderNodeIdentityUAPI renders only this gateway's own key and leaves the
+// listen port to the bind.
+//
+// It exists for the one configuration RenderNodeUAPI cannot express, and the two
+// readings of listen_port=0 are why. wg(8) documents 0 as "stop listening", while
+// wireguard-go's BindUpdate passes it straight to the bind, which asks the
+// operating system to choose a port. A gateway whose server.vpn.listen names port
+// 0 wants the second meaning, and omitting the line is the only spelling both
+// agree on: the device keeps the port it was constructed with, the bind supplies
+// its own, and the caller reads the chosen port back off the bind.
+//
+// A deployment that serves real peers must not use it. The port a client dials is
+// the port server.vpn.listen names, and a port chosen at startup cannot be written
+// into a configuration file that was rendered before the process began.
+func RenderNodeIdentityUAPI(identity NodeIdentity) (string, error) {
+	if err := ValidatePrivateKey(identity.PrivateKey); err != nil {
+		return "", nodeKeyInvalid(err)
+	}
+	privateKey, err := EncodeKeyHex(identity.PrivateKey)
+	if err != nil {
+		return "", nodeKeyInvalid(err)
+	}
+	return uapiBlock(uapiLine(uapiPrivateKey, privateKey)), nil
+}
+
 // RenderPeerUAPI renders one peer block that creates or updates a single peer.
 //
 // It is the hot-reload unit: the gateway sends it after a peer row has been

@@ -26,6 +26,10 @@ var uapiNodeIdentity = vpn.NodeIdentity{
 }
 
 const (
+	// uapiListenPortKey is spelled out because two tests assert on its absence
+	// as much as on its presence: the identity block must not carry it.
+	uapiListenPortKey = "listen_port"
+
 	uapiAlicePrivateHex = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
 	uapiAlicePublicHex  = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
 	uapiBobPrivateHex   = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
@@ -66,6 +70,44 @@ func TestRenderNodeUAPIMatchesGolden(t *testing.T) {
 	}
 }
 
+// TestRenderNodeIdentityUAPIMatchesGolden pins the identity-only block.
+//
+// It exists because two implementations read listen_port=0 differently. Every
+// WireGuard implementation follows wg(8), where 0 means "stop listening";
+// wireguard-go's BindUpdate instead calls Open(0), which asks the operating
+// system to choose. A gateway whose server.vpn.listen names port 0 wants the
+// second reading, and the only spelling both agree on is to leave the line out:
+// the device keeps the port it was constructed with and the bind supplies it.
+func TestRenderNodeIdentityUAPIMatchesGolden(t *testing.T) {
+	got, err := vpn.RenderNodeIdentityUAPI(uapiNodeIdentity)
+	if err != nil {
+		t.Fatalf("RenderNodeIdentityUAPI: %v", err)
+	}
+	if want := golden(t, "uapi_node_identity.txt"); got != want {
+		t.Errorf("RenderNodeIdentityUAPI =\n%q\nwant\n%q", got, want)
+	}
+	if strings.Contains(got, uapiListenPortKey) {
+		t.Errorf("the identity block named a listen port, the one thing it must leave to the bind:\n%q", got)
+	}
+	if strings.Contains(got, uapiAlicePublicHex) {
+		t.Errorf("the identity block rendered a public key, which the device derives itself:\n%q", got)
+	}
+}
+
+func TestRenderNodeIdentityUAPIRefusesAnUnusableIdentity(t *testing.T) {
+	for name, identity := range map[string]vpn.NodeIdentity{
+		"empty":       {},
+		"not-a-key":   {PrivateKey: "obviously-not-a-key"},
+		"public-only": {PublicKey: rfcAlicePublic},
+	} {
+		if _, err := vpn.RenderNodeIdentityUAPI(identity); err == nil {
+			t.Errorf("%s: RenderNodeIdentityUAPI accepted an unusable identity", name)
+		} else if !errors.Is(err, vpn.ErrNodeKeyInvalid) {
+			t.Errorf("%s: RenderNodeIdentityUAPI returned %v, want the node key error", name, err)
+		}
+	}
+}
+
 func TestRenderPeerUAPIMatchesGolden(t *testing.T) {
 	got, err := vpn.RenderPeerUAPI(rfcBobPublic, net.ParseIP(uapiPeerVPNIP))
 	if err != nil {
@@ -96,6 +138,10 @@ func TestRenderUAPIBlocksAreTerminated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderNodeUAPI: %v", err)
 	}
+	identity, err := vpn.RenderNodeIdentityUAPI(uapiNodeIdentity)
+	if err != nil {
+		t.Fatalf("RenderNodeIdentityUAPI: %v", err)
+	}
 	peer, err := vpn.RenderPeerUAPI(rfcBobPublic, net.ParseIP(uapiPeerVPNIP))
 	if err != nil {
 		t.Fatalf("RenderPeerUAPI: %v", err)
@@ -104,7 +150,7 @@ func TestRenderUAPIBlocksAreTerminated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderPeerRemoveUAPI: %v", err)
 	}
-	for name, block := range map[string]string{"node": node, "peer": peer, "remove": remove} {
+	for name, block := range map[string]string{"node": node, "identity": identity, "peer": peer, "remove": remove} {
 		if !strings.HasSuffix(block, "\n\n") {
 			t.Errorf("the %s block does not end with a blank line: %q", name, block)
 		}
