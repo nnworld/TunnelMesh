@@ -71,16 +71,9 @@ func (c *vpnWireClient) devicePeer() (map[string]string, bool) {
 // client, and fails the test if it never does.
 func (c *vpnWireClient) waitHandshake(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(vpnWireHandshakeWait)
-	for time.Now().Before(deadline) {
-		if peer, ok := c.devicePeer(); ok {
-			if secs, err := strconv.ParseInt(peer["last_handshake_time_sec"], 10, 64); err == nil && secs != 0 {
-				return
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
+	if !vpnWaitDeviceHandshake(c.gateway, c.publicKeyHex, vpnWireHandshakeWait) {
+		t.Fatalf("the gateway recorded no handshake with this peer within %s", vpnWireHandshakeWait)
 	}
-	t.Fatalf("the gateway recorded no handshake with this peer within %s", vpnWireHandshakeWait)
 }
 
 // waitGone blocks until the gateway no longer knows this client at all.
@@ -196,39 +189,17 @@ func startVPNGatewayWithWireClient(t *testing.T, mutate func(*storage.VPNPeer)) 
 // have to disagree about nothing except the network in between.
 func newVPNWireClient(t *testing.T, gateway *vpnGateway, pair vpn.KeyPair, vpnIP string) *vpnWireClient {
 	t.Helper()
-	port := gateway.localPort()
-	if port == 0 {
-		t.Fatal("the gateway is not holding a UDP port, so there is nothing to dial")
-	}
 	tunnel, peerNet, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr(vpnIP)}, nil, gateway.mtu)
 	if err != nil {
 		t.Fatalf("CreateNetTUN: %v", err)
 	}
 	dev := device.NewDevice(tunnel, conn.NewDefaultBind(), vpnDeviceLogger())
 	t.Cleanup(dev.Close)
-	privateHex, err := vpn.EncodeKeyHex(pair.PrivateKey)
-	if err != nil {
-		t.Fatalf("EncodeKeyHex(private): %v", err)
-	}
 	publicHex, err := vpn.EncodeKeyHex(pair.PublicKey)
 	if err != nil {
 		t.Fatalf("EncodeKeyHex(public): %v", err)
 	}
-	serverHex, err := vpn.EncodeKeyHex(gateway.identity.PublicKey)
-	if err != nil {
-		t.Fatalf("EncodeKeyHex(node): %v", err)
-	}
-	clientConfig := strings.Join([]string{
-		"private_key=" + privateHex,
-		"listen_port=0",
-		"replace_peers=true",
-		"public_key=" + serverHex,
-		fmt.Sprintf("endpoint=127.0.0.1:%d", port),
-		"allowed_ip=0.0.0.0/0",
-		fmt.Sprintf("persistent_keepalive_interval=%d", vpnWireKeepalive),
-		"",
-	}, "\n")
-	if err := dev.IpcSet(clientConfig); err != nil {
+	if err := dev.IpcSet(vpnClientUAPI(t, gateway, pair)); err != nil {
 		t.Fatalf("client IpcSet: %v", err)
 	}
 	return &vpnWireClient{gateway: gateway, dev: dev, net: peerNet, vpnIP: vpnIP, publicKeyHex: publicHex}

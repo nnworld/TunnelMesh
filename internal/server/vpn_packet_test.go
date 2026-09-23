@@ -111,6 +111,19 @@ func (s *fakeAgentStream) Close() error {
 	return nil
 }
 
+// isClosed reports whether the gateway closed its end. The end-to-end matrix
+// reads it to prove a revocation reached the splice: a stream the gateway left
+// open would keep carrying bytes to an internal service for as long as the agent
+// held the other end, which is the failure §18.5 exists to rule out.
+func (s *fakeAgentStream) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *fakeAgentStream) recordedWrites() [][]byte {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -124,6 +137,21 @@ type fakeAgentOpener struct {
 	streams  []*fakeAgentStream
 	err      error
 	block    chan struct{}
+	// onOpen, when set, is handed every stream the gateway opens. The end-to-end
+	// matrix uses it to play the egress agent. A hook rather than a poll loop
+	// because a stream that opened and closed between two polls would be invisible,
+	// and the resulting failure would read as a gateway bug rather than as a
+	// fixture race.
+	onOpen func(relay.StreamRequest, *fakeAgentStream)
+}
+
+// setOnOpen installs the hook. It takes the lock even though every caller sets it
+// before the gateway starts, because the hook is read from the decryption
+// goroutine and -race has no other way to see the ordering.
+func (o *fakeAgentOpener) setOnOpen(hook func(relay.StreamRequest, *fakeAgentStream)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.onOpen = hook
 }
 
 func newFakeAgentOpener() *fakeAgentOpener {
@@ -135,13 +163,20 @@ func (o *fakeAgentOpener) OpenStream(_ context.Context, request relay.StreamRequ
 		<-o.block
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.requests = append(o.requests, request)
+	hook := o.onOpen
 	if o.err != nil {
+		o.mu.Unlock()
 		return nil, o.err
 	}
 	stream := newFakeAgentStream()
 	o.streams = append(o.streams, stream)
+	o.mu.Unlock()
+	// Called with the lock released: a hook that asked the opener what it had seen
+	// so far would otherwise deadlock on the mutex it is already holding.
+	if hook != nil {
+		hook(request, stream)
+	}
 	return stream, nil
 }
 
