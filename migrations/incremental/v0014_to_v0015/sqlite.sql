@@ -1,0 +1,13 @@
+-- v14 -> v15 (SQLite): no structural change.
+--
+-- A SQLite INTEGER column already holds a signed 64-bit value, so the
+-- connection_epoch fencing token was never truncated on this driver and the
+-- defect this version repairs is MySQL-only. SQLite also cannot alter a column
+-- type in place, so there is nothing to widen here.
+--
+-- The step still has to stay executable. applySchemaStatements splits a script
+-- on the statement separator and runs every non-empty fragment, so a
+-- comment-only file would reach the driver as one bare fragment. The update
+-- below is an idempotent no-op that keeps the migration chain uniform across
+-- drivers. Comments in this file must not contain a statement separator.
+UPDATE schema_meta SET version=version WHERE id=1;

@@ -2,6 +2,9 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -119,9 +122,52 @@ func TestClientConnectionRegisterDefaultsTimestampsAndHealth(t *testing.T) {
 	}
 }
 
-func TestSchemaVersionIs14(t *testing.T) {
-	if SchemaVersion != 14 {
-		t.Fatalf("SchemaVersion = %d, want 14", SchemaVersion)
+func TestSchemaVersionIs15(t *testing.T) {
+	if SchemaVersion != 15 {
+		t.Fatalf("SchemaVersion = %d, want 15", SchemaVersion)
+	}
+}
+
+// TestClientConnectionLeaseStoresFullInt64Epoch pins the fencing-token
+// contract: the Server derives connection_epoch from 8 random bytes, so the
+// column must round-trip values beyond the signed 32-bit range. When MySQL
+// stored this column as INTEGER the value was clamped to 2147483647 and every
+// epoch-predicated write silently matched zero rows, which expired the lease
+// and left the client observability page reporting a disconnected client.
+func TestClientConnectionLeaseStoresFullInt64Epoch(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const epoch = int64(math.MaxInt32) + 4242
+	createClientInstance(t, db, "client-instance-epoch", "owner-1", "client-epoch-1", now)
+	lease := ClientConnectionLease{
+		ConnectionID: "connection-epoch", ClientInstanceID: "client-instance-epoch",
+		TokenID: "token-epoch", OwnerUserID: "owner-1", ServerNodeID: "server-1",
+		ConnectionEpoch: epoch, ActiveStreams: 3, AcquiredAt: now,
+		ExpiresAt: now.Add(time.Minute), UpdatedAt: now,
+	}
+	if _, err := db.ClientConnections().Register(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.ClientConnections().Get(ctx, lease.ConnectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConnectionEpoch != epoch {
+		t.Fatalf("stored connection_epoch = %d, want %d (column truncated a 64-bit fencing token)", stored.ConnectionEpoch, epoch)
+	}
+	if err := db.ClientConnections().Renew(ctx, lease.ConnectionID, epoch, 90*time.Second); err != nil {
+		t.Fatalf("renew with the authoritative epoch: %v", err)
+	}
+	lease.ActiveStreams = 5
+	if err := db.ClientConnections().UpdateStats(ctx, lease); err != nil {
+		t.Fatalf("update stats with the authoritative epoch: %v", err)
+	}
+	if err := db.ClientConnections().Release(ctx, lease.ConnectionID, epoch); err != nil {
+		t.Fatalf("release with the authoritative epoch: %v", err)
+	}
+	if _, err := db.ClientConnections().Get(ctx, lease.ConnectionID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lease after release = %v, want sql.ErrNoRows", err)
 	}
 }
 
