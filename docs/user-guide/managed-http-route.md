@@ -86,6 +86,15 @@ client 本地端口映射没有独立的 `hostHeader`、`targetScheme` 或 `tlsS
 4. 在后台创建明确路由，或将 `server.dynamic_suffix` 配置为实际动态域名后缀。
 5. 用浏览器和 `curl -v` 验证 Host、路径和 WebSocket Upgrade。
 
+## 大响应体与流控
+
+托管路由的响应体走 `浏览器 → Server → Agent → 内网服务` 隧道，与 WebSSH 共用同一套流控：Server 在 `OPEN_STREAM` 中通告 512 KiB 接收窗口，Agent 按窗口分帧发送（单帧上限 32 KiB），Server 在真正读走字节后才回补 `WINDOW_UPDATE`。前端打包产物（例如几 MB 的 `assets/*.js`）、文件下载和长轮询都能完整传输，**无需任何配置项**。流控全貌见 [大文件传输与通道流控](server-admin.md#大文件传输与通道流控)。
+
+排障要点：
+
+- 响应体在固定大小处被截断，浏览器报资源加载中断或 `net::ERR_CONTENT_LENGTH_MISMATCH`，而响应头里的 `Content-Length` 正常：说明 Agent 侧的流在队列满时被关闭，通常是 Agent 版本旧于 Server（每流发送队列小于 Server 通告的窗口）。把 Server 与 Agent 升级到同一版本即可。
+- 经 Nginx/OpenResty 反代时，`proxy_buffering off` 与足够长的 `proxy_read_timeout` 是大响应体不被中间层掐断的前提，见 [Nginx/WSS 推荐配置](../deployment/nginx.md)。
+
 ## API 示例
 
 ```bash
