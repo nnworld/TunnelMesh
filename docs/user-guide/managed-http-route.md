@@ -78,6 +78,30 @@ client 本地端口映射没有独立的 `hostHeader`、`targetScheme` 或 `tlsS
 `tm-*.example.com`，实际请求例如 `tm-git.example.com`。通配符不能直接写成
 `*.example.com`，也不能匹配多级子域名；不符合规则的域名会被 Server 拒绝。
 
+## 上游路径与控制面保留端点
+
+托管路由按 **Host** 归属，不按路径前缀归属。一个域名要么整站属于某条路由，要么是 Server 的控制面 origin（管理后台、Agent 拨号、健康检查）。因此上游服务可以自由使用 `/api/...`、`/ws/...` 这类路径，Server 不会把它们当成自己的管理接口截走。
+
+`tm-*` 命名空间（`tm-*.<domain_suffix>` 显式泛域名与动态泛域名）的域名把**全部路径**交给上游，控制面不保留任何路径：
+
+| 请求 | 处理方 |
+| --- | --- |
+| `https://tm-6000d.example.com/api/skill/claw/cate` | 上游服务 |
+| `https://tm-6000d.example.com/ws/chat` | 上游服务 |
+| `https://tm-6000d.example.com/health`、`/metrics` | 上游服务 |
+| `https://tm-6000d.example.com/skills` | 上游服务 |
+
+显式域名路由（例如 `git.example.com`）同样把业务路径交给上游，但保留四个 TunnelMesh 自有端点，因为运营者填写的域名有可能与控制面 origin 或 Agent 拨号 origin 撞名，而这两个端点被接走的后果是整个 Agent 无法重连、LB 把健康节点摘除：
+
+| 保留路径 | 归属 | 原因 |
+| --- | --- | --- |
+| `/ws/agent`、`/ws/client` | 控制面 | Agent/Client 握手端点，被劫持会导致该 Agent 背后所有路由一起失效 |
+| `/health/` 前缀、`/metrics` | 控制面 | LB 与监控探针目标，必须先于路由解析可用 |
+
+上游服务如果确实需要在显式域名上暴露 `/health`、`/metrics`、`/ws/agent`、`/ws/client`，请改用其它路径，或改用 [HTTP 代理入口（tp-*）](http-proxy-entry.md)（该入口按注入的身份头解析路由，不做路径前缀判定）。
+
+**不要把管理后台 origin 或 Agent 拨号 origin 配成显式域名路由**，否则该 Host 的控制面（含后台静态资源）会被路由接管。`tm-*` 命名空间不存在这个风险，管理后台 origin 不会以 `tm-` 开头。
+
 ## DNS 与 TLS
 
 1. 为 `*.apps.example.com` 配置 wildcard DNS，指向 Server/LB；若使用显式泛域名，额外配置 `*.tunnel.example.com`。
