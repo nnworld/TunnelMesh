@@ -118,6 +118,13 @@ node:
 tunnelmesh-server --config /etc/tunnelmesh/server.yaml init-node-id
 ```
 
+持久化路径默认是 `/var/lib/tunnelmesh/node-id`，可用 `--node-id-path <file>` 覆盖。
+**用户级安装必须覆盖它**：systemd user 单元、macOS LaunchAgent 与一键安装脚本的 user 模式都以
+非 root 运行，写不了 `/var/lib/tunnelmesh`，`init-node-id` 会以 `permission denied` 失败。
+打包的 `deploy/systemd-user/tunnelmesh-server.service` 已内置
+`--node-id-path __STATE_DIR__/node-id`（渲染后指向 `~/.local/share/tunnelmesh/node-id`），
+一键安装脚本在校验阶段也传同一个路径；`node.id` 回写进 YAML 后，`run` 会直接复用而不再访问默认路径。
+
 systemd 打包单元会在非特权 `check-config` 和 `run` 之前，以 root 执行一次 `init-node-id`。因此 `/etc/tunnelmesh` 对服务用户可以保持只读，`/var/lib/tunnelmesh` 仍由服务用户写入。生成 `node.id` 后再签发 relay 证书；mTLS 证书 SAN 必须包含最终 `node.id` 的精确条目，并同时包含所有节点共同的 `server.relay.server_name`。
 
 切换 etcd：

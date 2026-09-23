@@ -81,3 +81,34 @@ func TestServerCheckConfigDoesNotWriteMissingNodeIDToConfig(t *testing.T) {
 		t.Fatalf("check-config unexpectedly wrote node identity file: %v", err)
 	}
 }
+
+// TestNodeIDPathFlagOverridesDefault 守护 --node-id-path：user 模式（非 root）安装时
+// /var/lib/tunnelmesh 不可写，一键安装脚本与 systemd user 单元必须能把 node identity
+// 指到用户可写的状态目录，否则 init-node-id 必然以 permission denied 失败。
+func TestNodeIDPathFlagOverridesDefault(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "server.yaml")
+	contents := "mode: cluster\nstorage:\n  driver: mysql\n  mysql:\n    dsn: db\nregistry:\n  type: database\n"
+	if err := os.WriteFile(configFile, []byte(contents), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	nodeIDPath := filepath.Join(dir, "state", "node-id")
+	root := NewServerRoot()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"init-node-id", "--config", configFile, "--node-id-path", nodeIDPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("init-node-id --node-id-path: %v", err)
+	}
+	if _, err := os.Stat(nodeIDPath); err != nil {
+		t.Fatalf("node identity was not written to %s: %v", nodeIDPath, err)
+	}
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "node:") {
+		t.Errorf("init-node-id did not persist node.id into %s:\n%s", configFile, data)
+	}
+}
