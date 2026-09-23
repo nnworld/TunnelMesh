@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1438,5 +1439,127 @@ func waitAgentResponse(frames <-chan []byte) string {
 		case <-deadline:
 			return response
 		}
+	}
+}
+
+// slowTransport stands in for an Agent WebSocket that drains more slowly than
+// the target service writes, which is the ordinary condition behind a large
+// response. It credits the stream back the way the Server does, so the pump is
+// limited by the queue rather than by a window that never refills.
+type slowTransport struct {
+	release   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+	credit    func(n int)
+	dataBytes atomic.Int64
+}
+
+func (t *slowTransport) Send(frame protocol.Frame) error {
+	select {
+	case <-t.closed:
+		return errors.New("transport closed")
+	default:
+	}
+	<-t.release
+	if frame.Type != protocol.FrameData {
+		return nil
+	}
+	t.dataBytes.Add(int64(len(frame.Payload)))
+	if t.credit != nil {
+		t.credit(len(frame.Payload))
+	}
+	return nil
+}
+
+func (t *slowTransport) Receive() (protocol.Frame, error) {
+	<-t.closed
+	return protocol.Frame{}, errors.New("closed")
+}
+
+func (t *slowTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+// TestStreamDispatcherLargeResponseSurvivesSlowWriter reproduces the truncated
+// managed-route response a browser reports as an interrupted download. The
+// target replies with a body larger than the per-stream writer queue while the
+// WebSocket drains slowly. The Server credits every Agent stream with
+// DefaultServerReceiveWindow and the pump consumes that credit before it
+// enqueues, so this peer is behaving exactly as credited: the queue must be able
+// to hold what the credit allows, and the pump must never treat a full queue as
+// a reason to abandon the response.
+func TestStreamDispatcherLargeResponseSurvivesSlowWriter(t *testing.T) {
+	const chunkSize = 32 << 10
+	const chunks = 32 // 1 MiB: twice the credit the Server advertises per stream
+	const total = chunkSize * chunks
+	const streamID = uint32(7)
+
+	chunk := make([]byte, chunkSize)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	reads := make([][]byte, chunks)
+	for i := range reads {
+		reads[i] = append([]byte(nil), chunk...)
+	}
+	conn := newFlowTestConn(reads...)
+
+	transport := &slowTransport{release: make(chan struct{}), closed: make(chan struct{})}
+	session := NewSession(transport)
+	defer session.Close()
+
+	dispatcher := NewStreamDispatcherWithSender(
+		Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return conn, nil },
+		session.Send,
+	)
+	defer dispatcher.Close()
+	// Credit returns the way the Server returns it: once the bytes are on the
+	// wire the consumer has taken them, so the pump is never window-bound here.
+	transport.credit = func(n int) {
+		_ = dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: streamID, Window: uint32(n)})
+	}
+
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "http", TargetHost: "host", TargetPort: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: streamID, Window: protocol.DefaultServerReceiveWindow, Payload: payload}
+	if err := dispatcher.Handle(open); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pump fills the queue within microseconds, long before a polling loop
+	// could observe the stream, so the teardown signal to watch is the target
+	// connection: removeAndClose closes it and forgets the stream.
+	select {
+	case <-conn.closed:
+		t.Fatalf("relay pump abandoned the response; only %d of %d bytes reached the transport", transport.dataBytes.Load(), total)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(transport.release)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && transport.dataBytes.Load() < total {
+		select {
+		case <-conn.closed:
+			t.Fatalf("relay pump abandoned the response mid-body; delivered %d of %d bytes", transport.dataBytes.Load(), total)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := transport.dataBytes.Load(); got != total {
+		t.Fatalf("delivered %d bytes, want the full %d-byte response", got, total)
+	}
+}
+
+// TestSessionWriterQueueCoversAdvertisedCredit keeps the sizing invariant from
+// drifting. The pump consumes send credit before it enqueues, so bytes waiting
+// in the per-stream queue can never exceed the credit the peer granted; a queue
+// smaller than that credit makes ErrStreamQueueFull reachable for a fully
+// compliant peer, and both relay pumps treat that error as fatal.
+func TestSessionWriterQueueCoversAdvertisedCredit(t *testing.T) {
+	if streamQueueBytes < protocol.DefaultServerReceiveWindow {
+		t.Fatalf("session writer queue = %d bytes, want at least the %d-byte credit the Server advertises", streamQueueBytes, protocol.DefaultServerReceiveWindow)
 	}
 }
