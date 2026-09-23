@@ -48,6 +48,43 @@ func TestErrorClassConstantsMatchTheSpec(t *testing.T) {
 	}
 }
 
+// TestAllErrorClassesCoversThePublishedSet pins the enumeration a caller uses to
+// bound itself by the class set. A class added to the constants but not to the
+// slice would make the denial aggregator's overflow bound too small, which is a
+// silent leak rather than a compile error.
+func TestAllErrorClassesCoversThePublishedSet(t *testing.T) {
+	classes := vpn.AllErrorClasses()
+	if len(classes) != 16 {
+		t.Fatalf("AllErrorClasses() returned %d classes, want the 16 spec classes", len(classes))
+	}
+	seen := make(map[vpn.ErrorClass]struct{}, len(classes))
+	for _, class := range classes {
+		if class == "" {
+			t.Error("AllErrorClasses() contains an empty class")
+		}
+		if _, duplicate := seen[class]; duplicate {
+			t.Errorf("AllErrorClasses() contains %q twice", class)
+		}
+		seen[class] = struct{}{}
+	}
+	for _, expected := range []vpn.ErrorClass{
+		vpn.ClassPeerUnknown, vpn.ClassPeerRevoked, vpn.ClassPeerExpired, vpn.ClassTargetDenied,
+		vpn.ClassMetadataDenied, vpn.ClassPortDenied, vpn.ClassProtocolUnsupported, vpn.ClassFragmentDropped,
+		vpn.ClassOversizeDropped, vpn.ClassCapacityExhausted, vpn.ClassRateLimited, vpn.ClassEgressUnavailable,
+		vpn.ClassEgressTimeout, vpn.ClassICMPUnsupported, vpn.ClassICMPTimeout, vpn.ClassStackError,
+	} {
+		if _, ok := seen[expected]; !ok {
+			t.Errorf("AllErrorClasses() is missing %q", expected)
+		}
+	}
+	// The returned slice must be a copy: a caller that sorted it in place would
+	// otherwise reorder the published contract for every other caller.
+	classes[0] = vpn.ClassStackError
+	if vpn.AllErrorClasses()[0] == vpn.ClassStackError {
+		t.Error("AllErrorClasses() returned the internal slice rather than a copy")
+	}
+}
+
 func policyFor(t *testing.T, mutate func(*vpn.PeerSpec), mtu int) vpn.PacketPolicy {
 	t.Helper()
 	spec := validSpec()

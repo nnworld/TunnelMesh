@@ -44,6 +44,25 @@ const (
 	ClassStackError          ErrorClass = "stack_error"
 )
 
+// allErrorClasses is the published set in declaration order. It exists so a
+// caller that must bound itself by the set - the data plane's denial aggregator
+// keeps one overflow bucket per class - derives that bound from the contract
+// rather than from a number that would silently drift when a class is added.
+var allErrorClasses = []ErrorClass{
+	ClassPeerUnknown, ClassPeerRevoked, ClassPeerExpired, ClassTargetDenied,
+	ClassMetadataDenied, ClassPortDenied, ClassProtocolUnsupported, ClassFragmentDropped,
+	ClassOversizeDropped, ClassCapacityExhausted, ClassRateLimited, ClassEgressUnavailable,
+	ClassEgressTimeout, ClassICMPUnsupported, ClassICMPTimeout, ClassStackError,
+}
+
+// AllErrorClasses returns every published error_class.
+//
+// The slice is a copy, so a caller cannot reorder or extend the contract from
+// the outside; the constants above are the only definition site.
+func AllErrorClasses() []ErrorClass {
+	return append([]ErrorClass(nil), allErrorClasses...)
+}
+
 // PacketPolicy emits only the fragment, oversize, protocol, metadata, target and
 // port classes. The remaining constants above belong to the same published label
 // set but are produced by the data plane: peer lookup, capacity and rate limiting
