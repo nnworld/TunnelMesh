@@ -8,9 +8,9 @@
 
 | 目录 | 面向 | 内容 |
 | --- | --- | --- |
-| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、SSH over WebSocket |
-| [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、OpenResty 代理入口、systemd/launchd/Windows Service、发行打包 |
-| [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、可观测性、探针、日志、SLO、容量、排障 |
+| [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、VPN 网关、SSH over WebSocket |
+| [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、OpenResty 代理入口、VPN 网关、systemd/launchd/Windows Service、发行打包 |
+| [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、VPN 网关、可观测性、探针、日志、SLO、容量、排障 |
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
 | [`api/`](api/) | 接口 | `openapi.yaml` |
@@ -37,7 +37,8 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
   - [远程服务器与浏览器 SSH/SFTP](user-guide/server-admin.md#远程服务器与浏览器-sshsftp)
   - [Client 运行观测与连接管理](user-guide/server-admin.md#client-运行观测与连接管理)
   - [Server 节点与共享令牌](user-guide/server-admin.md#server-节点)
-  - [VPN 网关 peer 管理](user-guide/server-admin.md#vpn-网关-peer-管理)：签发、编辑、轮换、吊销 WireGuard peer，一次性配置 reveal 与本版能力边界
+  - [VPN 网关 peer 管理](user-guide/server-admin.md#vpn-网关-peer-管理)：签发、编辑、轮换、吊销 WireGuard peer，一次性配置 reveal、活跃流抽屉与节点网关状态
+- [VPN 网关使用者帮助](user-guide/vpn.md)：导入后台签发的 wg-quick 配置、各平台步骤、能力边界逐条声明、失败为何是静默的、用户侧排障
   - [发行管理](user-guide/server-admin.md#发行管理)
 - [托管 HTTP 路由](user-guide/managed-http-route.md)：显式路由、通配域名、HTTPS 上游
 - [HTTP 代理入口（tp-*）](user-guide/http-proxy-entry.md)：把 `https://tp-<name>.<domain>` 填进浏览器或系统代理，无需安装 client
@@ -49,6 +50,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [管理后台前端构建与部署](deployment/frontend.md)：embed 模式与 Nginx 独立静态文件模式
 - [Nginx/WSS 推荐配置](deployment/nginx.md)：`/api/`、`/ws/*` 反代优先级与 Upgrade 透传
 - [OpenResty tp-* 代理入口](deployment/openresty-proxy-entry.md)：模板渲染、镜像构建、容量评估、reload 影响与回滚
+- [VPN 网关部署](deployment/vpn-gateway.md)：`-tags vpn` 构建变体与体积实测、公网 UDP 放行、`listen` 与 `endpoint_host`、节点私钥注入、IP 池规划、验证与 5 分钟回滚
 - [跨平台可执行文件打包](deployment/binary-release.md)：构建矩阵、`SHA256SUMS`、`manifest.json`
 - [Linux systemd 安装](deployment/linux-systemd.md)、[macOS launchd 安装](deployment/macos-launchd.md)、[Windows Service 安装](deployment/windows-service.md)
 - [部署产物清单](../deploy/README.md)：`deploy/` 下每个文件的用途、模板占位符约定和发布归档布局
@@ -60,6 +62,10 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [配置说明](operations/configuration.md)：配置模型、优先级、密钥注入、`auto-init`、`security.auth`（SSO / MFA / 受信任设备）与 `server.trusted_proxies`
 - [Server / Agent / Client 配置示例](operations/config-examples.md)：单机 SQLite、集群 MySQL、集群 etcd、启用 SSO 与 MFA 的集群示例
 - [Client 全协议与连接池配置示例](operations/client-configuration-examples.md)
+
+**VPN 网关**
+
+- [VPN 网关运维](operations/vpn.md)：运行时形态、IP 池容量与耗尽、子网租约与 stale epoch、drain 与 5 分钟止损、`error_class` 全集对照、指标复用现状与已知精度损失、结构化事件、故障表
 
 **升级与集群**
 
@@ -98,7 +104,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - 集群模式使用 MySQL 管理数据；注册发现默认使用 MySQL lease，也可以切换到 etcd。
 
 所有部署都应先执行 `check-config`，再执行 `run`。生产环境建议通过环境变量或外部配置文件注入
-敏感配置。公网入口以 HTTP/HTTPS/WSS 为主；内嵌 VPN 网关启用后会额外监听一个公网 UDP 端口（[ADR 0002](architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中，当前版本尚未提供）。
+敏感配置。公网入口以 HTTP/HTTPS/WSS 为主；内嵌 VPN 网关启用后会额外监听一个公网 UDP 端口（[ADR 0002](architecture/adr/0002-public-ingress-and-embedded-vpn.md)），其数据面在 `-tags vpn` 构建里，不带该 tag 的二进制只有管理面。
 
 ## 英文与社区
 

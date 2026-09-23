@@ -240,7 +240,9 @@ tunnelmesh-server --server.proxy_entry.enabled=true \
 
 内嵌 VPN 网关让没有安装 `tunnelmesh-client` 的用户直接用系统自带的 WireGuard 客户端接入内网，出口仍由 Agent 承担。决策背景与边界见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)。
 
-**当前版本只提供管理面。** `server.vpn` 会被完整加载与校验，管理 API 可以签发、列出、修改、轮换、吊销并审计 peer，但 WireGuard 端点与内存态 TUN 设备仍在分阶段实施中，尚未随发行版提供。客户端配置下载（`POST /api/v1/vpn-peers/{peerId}/config:reveal`）在本版返回 409 `vpn_node_disabled`：节点还没有自己的网关身份，渲染出来的 `[Peer] PublicKey` 会是空的，与其下发一个导入即失败的配置文件，不如明确拒绝。也就是说：现在签发的 peer 可以被管理和审计，但拿不到配置文件，即使拿到也还不能建立隧道。对外通知里不要把它描述成已经可用。
+**数据面在 `-tags vpn` 构建里。** 不带该 tag 的二进制只有管理面：`server.vpn` 仍会被完整加载与校验，管理 API 可以签发、列出、修改、轮换、吊销并审计 peer，但没有 WireGuard 端点，`config:reveal` 返回 409 `vpn_node_disabled`（节点没有自己的网关身份，渲染出来的 `[Peer] PublicKey` 会是空的，与其下发一个导入即失败的配置文件不如明确拒绝）。带 tag 的二进制在 `enabled: true` 时会真正监听 `listen` 指定的公网 UDP 端口并承载隧道。
+
+两种构建都**不允许**「配了 `enabled: true` 却悄悄不工作」：无 tag 构建在该配置下启动即失败并报 `this binary was built without VPN support; rebuild with -tags vpn`，而不是报告 ready 然后让每个 peer 超时。构建变体、体积实测与放行步骤见 [VPN 网关部署](../deployment/vpn-gateway.md)，容量、租约与 `error_class` 对照见 [VPN 网关运维](vpn.md)。
 
 与 tp-* 代理入口不同，VPN 端点是一个**独立的公网 UDP 端口**：不经反向代理、不参与 HTTP 路由，必须在防火墙或安全组里单独放行，并单独限流与监控。
 
@@ -294,7 +296,13 @@ server:
 TUNNELMESH_VPN_NODE_PRIVATE_KEY=<base64 编码的 32 字节私钥>
 ```
 
-配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。**本版还不读取该变量**：它由数据面（阶段 6）消费，届时 `enabled: true` 而变量缺失会在启动时快速失败；现在设置它不会有任何效果，也不会让 `config:reveal` 变成可用。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时签发与 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
+配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。base64（`wg(8)` 的写法）与 64 字符 hex（多数 keygen 一行命令的写法）都接受。
+
+该变量由数据面消费，读取时机是启动装配：`enabled: true` 而变量缺失或不可用会让进程**启动失败**，原文分别是 `vpn: TUNNELMESH_VPN_NODE_PRIVATE_KEY is not set, so the gateway has no wireguard identity` 与 `vpn: TUNNELMESH_VPN_NODE_PRIVATE_KEY is not a usable wireguard private key`（外层还会包一层 `server runtime: vpn gateway: `）。`enabled: false` 时根本不读它，所以不使用 VPN 的部署不必注入一个用不上的密钥。
+
+管理面不会因为节点私钥缺失而挂掉：`config:reveal` 此时返回 409 `vpn_node_disabled`，操作员仍然能用后台吊销旧密钥签发的 peer。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时签发与 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
+
+**节点私钥一旦更换，所有已下发配置立即失效**，必须全部重新 reveal 导入。轮换前先评估影响面并准备好重新下发的通道。
 
 命令行与环境变量等价（`TUNNELMESH_SERVER_VPN_*`）：
 

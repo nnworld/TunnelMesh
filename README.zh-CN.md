@@ -12,7 +12,7 @@
 
 在内网部署 Agent，通过托管 HTTP 路由或本地端口转发访问内网服务，并在内置管理后台中完成
 RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口以 HTTP/HTTPS/WSS 为主；
-内嵌 WireGuard VPN 网关（额外一个公网 UDP 端口）已由 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) 批准并分阶段实施，当前版本尚未提供。
+启用内嵌 WireGuard VPN 网关后会额外监听一个公网 UDP 端口（[ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)），其数据面在 `-tags vpn` 构建里。
 
 [文档站](https://nnworld.github.io/TunnelMesh/) ·
 [五分钟快速开始](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
@@ -68,7 +68,7 @@ RBAC、scoped service token、Agent 策略、审计和可观测性管理。公�
 
 | 可执行文件 | 部署位置 | 职责 | 文档 |
 | --- | --- | --- | --- |
-| `tunnelmesh-server` | 公网入口 | 管理 API（`/api/v1`）、内嵌管理后台、HTTP/HTTPS/WSS 入口、路由解析、隧道协调、节点间 relay | [Server 管理后台](docs/user-guide/server-admin.md) |
+| `tunnelmesh-server` | 公网入口 | 管理 API（`/api/v1`）、内嵌管理后台、HTTP/HTTPS/WSS 入口、路由解析、隧道协调、节点间 relay、可选的 WireGuard VPN 端点（一个公网 UDP 端口，需 `-tags vpn` 构建） | [Server 管理后台](docs/user-guide/server-admin.md)、[VPN 网关部署](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | 内网或目标主机 | 主动建立到 Server 的 TLS WebSocket，连接内网 TCP/UDP/HTTP 目标，按 allowlist 上报 metadata | [Agent 使用帮助](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | 用户主机 | 本地转发（TCP/UDP/HTTP/SOCKS5/HTTP 代理）、路由发布、面向 SSH 的 stdio TCP 代理 | [Client 使用帮助](docs/user-guide/client.md) |
 

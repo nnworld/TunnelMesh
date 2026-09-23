@@ -12,7 +12,7 @@
 
 Put an Agent inside a private network, expose managed HTTP routes or local forwards, and operate everything
 from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
-Public ingress is HTTP/HTTPS/WSS. An embedded WireGuard VPN gateway that adds one public UDP port is approved by [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) and landing in phases; it is not available yet.
+Public ingress is HTTP/HTTPS/WSS, plus one public UDP port when the embedded WireGuard VPN gateway is enabled ([ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)); its data plane ships in `-tags vpn` builds.
 
 [Docs site](https://nnworld.github.io/TunnelMesh/) ·
 [Quick start](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
@@ -69,7 +69,7 @@ self-hosted control plane and explicit access policy rather than only a point-to
 
 | Binary | Runs on | Responsibility | Guide |
 | --- | --- | --- | --- |
-| `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay | [Server admin](docs/user-guide/server-admin.md) |
+| `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay, optional WireGuard VPN endpoint on one public UDP port (`-tags vpn`) | [Server admin](docs/user-guide/server-admin.md), [VPN gateway](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | Private network or target host | Outbound TLS WebSocket to the Server, dials internal TCP/UDP/HTTP targets, reports allowlisted metadata | [Agent](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | User workstation | Local forwards (TCP/UDP/HTTP/SOCKS5/HTTP proxy), route publishing, stdio TCP proxy for SSH | [Client](docs/user-guide/client.md) |
 

@@ -50,10 +50,12 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
-  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
-  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
-  # configuration.md 的「内嵌 VPN 网关」一节。
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
   vpn:
     enabled: false
     # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
@@ -137,10 +139,12 @@ server:
     endpoint: ""
     # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入。
     node_token: ""
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
-  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
-  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
-  # configuration.md 的「内嵌 VPN 网关」一节。
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
   vpn:
     enabled: false
     # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
@@ -250,10 +254,12 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
-  # 内嵌 VPN 网关（WireGuard）。当前版本只提供管理面：可以签发、列出、修改、
-  # 轮换、吊销并审计 peer；WireGuard 端点仍在分阶段实施中，config:reveal 在
-  # 节点获得网关身份前返回 409 vpn_node_disabled。全部键的取值范围见
-  # configuration.md 的「内嵌 VPN 网关」一节。
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
   vpn:
     enabled: false
     # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。

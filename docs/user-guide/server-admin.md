@@ -215,9 +215,13 @@ Server 进程启动时会把本节点遗留的 `active` 会话统一关闭（原
 
 轮换与吊销都是终态操作，会要求二次确认：轮换后旧配置立即失效（IP 不变），必须重新下发；吊销不删除记录，公钥与地址不会被复用，也无法恢复。签发、编辑、轮换、吊销与 reveal 全部写审计日志，审计只记录 peer ID 与动作，不含任何密钥材料。
 
-“使用说明”抽屉给出客户端配置的获取方式与导入步骤。私钥是一次性的：必须输入 `REVEAL` 并勾选风险确认后才会请求 `POST /api/v1/vpn-peers/{peerId}/config:reveal`，返回的 wg-quick 配置只显示一次，只存在于当前页面内存中，关闭抽屉即清除，不写 `localStorage`/`sessionStorage`，也不进 Pinia 持久层。本版该请求恒返回 409 `vpn_node_disabled`（节点还没有自己的网关身份），抽屉会把这条事实渲染成说明而不是“操作失败”。签发还要求 Server 配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`，缺失时返回 503 `credential_secret_unavailable`，不会降级为明文存储。
+“使用说明”抽屉给出客户端配置的获取方式与导入步骤。私钥是一次性的：必须输入 `REVEAL` 并勾选风险确认后才会请求 `POST /api/v1/vpn-peers/{peerId}/config:reveal`，返回的 wg-quick 配置只显示一次，只存在于当前页面内存中，关闭抽屉即清除，不写 `localStorage`/`sessionStorage`，也不进 Pinia 持久层。reveal 能不能成功取决于**本节点有没有网关身份**：`-tags vpn` 构建、`server.vpn.enabled: true`、且 `TUNNELMESH_VPN_NODE_PRIVATE_KEY` 可用。三者缺一，请求返回 409 `vpn_node_disabled`，抽屉把这条事实渲染成说明（info 色）而不是“操作失败”——没有可纠正的动作时不该穿校验失败的红色，否则操作员会去找一个不存在的表单错误。之所以拒绝而不是渲染，是因为节点没有身份时 `[Peer] PublicKey` 会是空的，用户导入即失败且报错不指向服务端配置。签发还要求 Server 配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`，缺失时返回 503 `credential_secret_unavailable`，不会降级为明文存储。
 
-活跃流列表不在本页：`GET /api/v1/vpn-peers/{peerId}/flows` 属数据面能力，本版返回 501 `vpn_not_implemented`，抽屉只给出“到 Grafana 的 VPN Gateway Row 查看”的指引。IP 池概览同理，501 时显示“本版未提供网关运行时状态”，不会显示成“已分配 0”。页面按服务端稳定码分类报错，10 个码各有专属文案（如 `vpn_ip_pool_exhausted`、`vpn_capacity_exhausted`、`vpn_peer_conflict`），不会退化成一句“操作失败，请重试”。
+活跃流是**独立的抽屉**，不放在“使用说明”里：使用说明是离线也成立的文档，活跃流是可能失败的实时读取，两者混在一起会让一次失败的读取看起来像一条写错的说明。抽屉打开时总是重新读取而不是复用上次快照——它被用来判断“这个 peer 现在还连着吗”，一张不知道陈旧了多久的表会把这个问题答错。表格列出协议、目标、端口、开始时间与双向字节数；字节按网关计数的原值打印，不换算成 KiB，因为运维拿它和 `tunnelmesh_bytes_total` 对账时不能被后台四舍五入。
+
+流列表来自服务该 peer 的网关内存，是**此刻的快照而不是历史**：流一关闭、被回收或被吊销就离开列表，什么都不持久化，也不带 cursor（单 peer 的流集受 `server.vpn.max_flows_per_peer` 约束，分两页读会描述两个不同时刻）。集群里请求落到别的节点时返回 501 `vpn_not_implemented`，此时抽屉显示一条 info 提示而**不是空表格**——空表格会读作“该 peer 空闲”，那是一个错误的答复；501 也不是操作员能纠正的失败，所以同样不走红色。真正的读取失败（非 501）才走可重试的错误态。
+
+IP 池概览来自 `GET /api/v1/vpn-nodes`，读的是本节点：`allocated` 与 `capacity` 取自子网租约与 peer 表，不是从前缀推算的（推算出来的容量是签发方未必能兑现的承诺，子网第一个地址是保留的、租约也可能丢失）。读不到时水位保持未知、不弹 toast，不会显示成“已分配 0”。该接口在两种构建里都可用，无网关的节点报告 `enabled: false` 并省略计数器，后台渲染成 em dash。页面按服务端稳定码分类报错，每个码有专属文案（如 `vpn_ip_pool_exhausted`、`vpn_capacity_exhausted`、`vpn_peer_conflict`、`vpn_agent_capability_missing`），不会退化成一句“操作失败，请重试”。
 
 ## 审计日志
 
