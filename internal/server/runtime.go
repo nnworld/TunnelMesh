@@ -161,7 +161,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
 	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
-	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID)
+	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID, vpnNodePublicKey(runtimeConfig.VPN))
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error
 	closeStartup := func() {

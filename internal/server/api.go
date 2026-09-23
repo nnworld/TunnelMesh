@@ -61,6 +61,13 @@ type API struct {
 	// identity, neither of which NewAPI is given. The handlers answer 503 while
 	// it is nil, which distinguishes "not wired" from "no such endpoint".
 	vpnPeerService *VPNPeerService
+	// vpnDataPlane is the running gateway, and it is nil in every binary that is
+	// not built with -tags vpn or on a node with server.vpn disabled. Holding the
+	// interface rather than the concrete type is what keeps the untagged build
+	// from reaching a field only a tagged build has. The endpoints that need a
+	// live data plane answer 501 while it is nil instead of an empty list that
+	// would read as "nothing is happening".
+	vpnDataPlane VPNDataPlane
 	// trustedProxyList decides whether X-Forwarded-For is believed. It is empty by
 	// default, which means the direct peer address is always used.
 	trustedProxyList []string

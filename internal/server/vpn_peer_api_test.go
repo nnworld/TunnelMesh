@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -292,7 +294,7 @@ func TestVPNPeerAPISetVPNAssemblesTheService(t *testing.T) {
 	api.SetVPN(config.VPNConfig{
 		Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
 		EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
-	}, "node-from-config")
+	}, "node-from-config", vpnAPINodePublicKey)
 	token := apiToken(t, api, user.Username, "alice-pass")
 	r := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/vpn-peers", token, "", nil)
 	if r.Code != http.StatusOK {
@@ -698,4 +700,225 @@ func TestVPNPeerAPIRejectsMalformedRequests(t *testing.T) {
 	}))
 	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "no-pool")),
 		http.StatusBadRequest, "vpn_ip_pool_invalid")
+}
+
+// fakeVPNDataPlane stands in for the gateway. It records the peer hot-reload
+// calls the service makes so a test can assert the wiring without a UDP socket,
+// a TUN device or the "vpn" build tag.
+type fakeVPNDataPlane struct {
+	mu       sync.Mutex
+	applied  []storage.VPNPeer
+	removed  []string
+	started  bool
+	closed   bool
+	applyErr error
+}
+
+func (f *fakeVPNDataPlane) ApplyPeer(peer storage.VPNPeer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.applyErr != nil {
+		return f.applyErr
+	}
+	f.applied = append(f.applied, peer)
+	return nil
+}
+
+func (f *fakeVPNDataPlane) RemovePeer(peerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, peerID)
+	return nil
+}
+
+func (f *fakeVPNDataPlane) Start(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = true
+	return nil
+}
+
+func (f *fakeVPNDataPlane) PeerFlows(string) ([]VPNFlowSnapshot, bool) { return nil, false }
+
+func (f *fakeVPNDataPlane) NodeStatus(context.Context) (VPNNodeStatus, error) {
+	return VPNNodeStatus{}, nil
+}
+
+func (f *fakeVPNDataPlane) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+func (f *fakeVPNDataPlane) snapshot() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	applied := make([]string, 0, len(f.applied))
+	for _, peer := range f.applied {
+		applied = append(applied, peer.ID)
+	}
+	return applied, append([]string(nil), f.removed...)
+}
+
+// setVPNTestConfig is a server.vpn section that can hand out a working
+// configuration: every field RevealConfig consults is set to a usable value.
+func setVPNTestConfig() config.VPNConfig {
+	return config.VPNConfig{
+		Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+		EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+	}
+}
+
+func setVPNTestAgent(t *testing.T, api *API, user storage.User, agentID string) {
+	t.Helper()
+	agent := storage.Agent{ID: agentID, Name: agentID + " egress", OwnerUserID: user.ID, Enabled: true}
+	if err := api.DB.Agents().Create(context.Background(), agent); err != nil {
+		t.Fatalf("create agent %s: %v", agentID, err)
+	}
+}
+
+// TestVPNPeerAPISetVPNInjectsTheNodeIdentity pins the production assembly path.
+//
+// SetVPN is what the runtime calls, so the node identity has to arrive through
+// it. Every other test in this file builds the service by hand with an injected
+// NodePublicKey, which is exactly the shape of test that stays green while a real
+// deployment answers 409 vpn_node_disabled on every reveal.
+func TestVPNPeerAPISetVPNInjectsTheNodeIdentity(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	setVPNTestAgent(t, api, user, "setvpn-agent")
+	api.SetVPN(setVPNTestConfig(), "node-setvpn", vpnAPINodePublicKey)
+	token := apiToken(t, api, user.Username, "alice-pass")
+	handler := api.Handler()
+
+	r := apiJSON(t, handler, http.MethodPost, "/api/v1/vpn-peers", token, "", vpnPeerBody("setvpn-agent", "laptop"))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", r.Code, r.Body.String())
+	}
+	created := vpnDecodePeer(t, r)
+	if created.NodeID != "node-setvpn" {
+		t.Fatalf("nodeId = %q, want the identity SetVPN was given", created.NodeID)
+	}
+	revealed := apiJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/config:reveal", token,
+		map[string]string{"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "setvpn-reveal"},
+		map[string]any{"acknowledgeRisk": true})
+	if revealed.Code != http.StatusOK {
+		t.Fatalf("reveal status = %d, want 200 (%s)", revealed.Code, revealed.Body.String())
+	}
+	rendered := vpnDecodeReveal(t, revealed).Config
+	for _, want := range []string{
+		"[Interface]", "[Peer]",
+		"PrivateKey = ", "Address = " + created.VPNIP + "/32", "MTU = 1420",
+		"PublicKey = " + vpnAPINodePublicKey,
+		"Endpoint = gw-1.mesh.example.com:51820",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the rendered configuration is missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+// TestVPNPeerAPISetVPNWithoutANodeIdentityRefusesReveal pins the other half: a
+// node that could not read TUNNELMESH_VPN_NODE_PRIVATE_KEY keeps refusing with
+// the stable code instead of rendering a file whose [Peer] PublicKey is blank,
+// which would fail on the user's machine with no pointer back at the server.
+func TestVPNPeerAPISetVPNWithoutANodeIdentityRefusesReveal(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	setVPNTestAgent(t, api, user, "identityless-agent")
+	api.SetVPN(setVPNTestConfig(), "node-identityless", "")
+	token := apiToken(t, api, user.Username, "alice-pass")
+	handler := api.Handler()
+
+	created := vpnDecodePeer(t, apiJSON(t, handler, http.MethodPost, "/api/v1/vpn-peers", token, "", vpnPeerBody("identityless-agent", "laptop")))
+	vpnAssertError(t, apiJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/config:reveal", token,
+		map[string]string{"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "identityless-reveal"},
+		map[string]any{"acknowledgeRisk": true}),
+		http.StatusConflict, "vpn_node_disabled")
+}
+
+// TestSetVPNDataPlaneRegistersThePeerSink pins the hot-reload wiring: installing
+// a data plane makes it the sink the peer service notifies after a committed
+// write, and a peer that stops being active is removed rather than re-applied.
+func TestSetVPNDataPlaneRegistersThePeerSink(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	plane := &fakeVPNDataPlane{}
+	f.api.SetVPNDataPlane(plane)
+
+	created := f.createPeer(t, f.userToken, f.userAgent, "sink-peer")
+	if applied, removed := plane.snapshot(); len(applied) != 1 || applied[0] != created.ID || len(removed) != 0 {
+		t.Fatalf("after issue: applied = %v, removed = %v", applied, removed)
+	}
+	if got := plane.applied[0]; got.PublicKey != created.PublicKey || got.VPNIP != created.VPNIP {
+		t.Errorf("the sink received %+v, which is not the row that was committed", got)
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	rotated := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/rotate", f.userToken, "", nil)
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d (%s)", rotated.Code, rotated.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(applied) != 1 || len(removed) != 0 {
+		t.Fatalf("after rotate: applied = %v, removed = %v", applied, removed)
+	}
+	if got := plane.applied[0]; got.PublicKey == created.PublicKey {
+		t.Error("the sink received the pre-rotation public key, so the old identity would keep working")
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	if r := apiJSON(t, f.handler, http.MethodPatch, "/api/v1/vpn-peers/"+created.ID, f.userToken, "", map[string]any{"status": "disabled"}); r.Code != http.StatusOK {
+		t.Fatalf("disable status = %d (%s)", r.Code, r.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(removed) != 1 || removed[0] != created.ID || len(applied) != 0 {
+		t.Fatalf("after disable: applied = %v, removed = %v", applied, removed)
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	if r := apiJSON(t, f.handler, http.MethodDelete, "/api/v1/vpn-peers/"+created.ID, f.userToken, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d (%s)", r.Code, r.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(removed) != 1 || removed[0] != created.ID || len(applied) != 0 {
+		t.Fatalf("after revoke: applied = %v, removed = %v", applied, removed)
+	}
+}
+
+// TestVPNPeerServiceSurvivesAFailingSink pins the direction of authority. The
+// database write has already committed when the sink is called, so a data plane
+// that refuses the update must not turn a successful issue into a failed
+// request: the peer exists, the user has been handed an address and a key, and a
+// 500 would make them retry an operation that worked.
+func TestVPNPeerServiceSurvivesAFailingSink(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	plane := &fakeVPNDataPlane{applyErr: errors.New("uapi socket is gone")}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "sink-fails"))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (%s)", r.Code, r.Body.String())
+	}
+	created := vpnDecodePeer(t, r)
+	stored, err := f.api.DB.VPNPeers().Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("the committed row disappeared when the sink failed: %v", err)
+	}
+	if stored.ID != created.ID || stored.Status != storage.VPNPeerStatusActive {
+		t.Fatalf("the committed row is %+v", stored)
+	}
+	// The disagreement is recorded where an operator looks for it rather than
+	// being swallowed, and the record carries no key material.
+	page, err := f.api.DB.Audits().List(context.Background(), storage.AuditFilter{Action: vpnAuditSyncFailed}, "", 50)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ResourceID != created.ID {
+		t.Fatalf("found %d sync-failure audit entries for %s", len(page.Items), created.ID)
+	}
+	if details := page.Items[0].Details; strings.Contains(details, created.PublicKey) || strings.Contains(details, "PrivateKey") {
+		t.Errorf("the sync-failure audit entry carries key material: %s", details)
+	}
 }

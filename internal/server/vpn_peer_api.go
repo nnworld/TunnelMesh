@@ -188,12 +188,19 @@ func vpnExpiresAt(raw json.RawMessage) (*time.Time, bool, error) {
 // configuration. It is called once at runtime startup, next to the other
 // configuration-driven setters.
 //
-// The gateway's own WireGuard identity is left empty on purpose. It is generated
-// and persisted together with the data plane, and until it exists config:reveal
-// answers 409 vpn_node_disabled rather than rendering a file whose [Peer]
-// PublicKey is blank, which would fail on the user's machine with no pointer
-// back to the server. Everything else in the surface is fully functional.
-func (a *API) SetVPN(cfg config.VPNConfig, nodeID string) {
+// nodePublicKey is the gateway's own WireGuard identity, read by the caller from
+// vpn.NodePrivateKeyEnv. It is a parameter rather than a second environment read
+// so the management plane and the data plane cannot end up with two different
+// ideas of which key this node answers to: the value written into every peer
+// configuration must be the value the gateway handshakes with.
+//
+// An empty value is accepted and has one consequence: config:reveal answers 409
+// vpn_node_disabled rather than rendering a file whose [Peer] PublicKey is blank,
+// which would fail on the user's machine with no pointer back to the server.
+// Everything else in the surface stays functional, because issuing, listing and
+// revoking peers do not depend on the identity and a deployment that lost its key
+// still needs to retire the peers it issued with the old one.
+func (a *API) SetVPN(cfg config.VPNConfig, nodeID, nodePublicKey string) {
 	if a == nil || a.DB == nil {
 		return
 	}
@@ -211,8 +218,13 @@ func (a *API) SetVPN(cfg config.VPNConfig, nodeID string) {
 			EndpointHost: cfg.EndpointHost, Listen: cfg.Listen, MTU: cfg.MTU,
 			MaxPeers: cfg.MaxPeers, ICMPEnabled: cfg.ICMPEnabled,
 		},
-		NodeID:   nodeID,
-		LeaseTTL: vpnSubnetLeaseTTL,
+		NodeID:        nodeID,
+		LeaseTTL:      vpnSubnetLeaseTTL,
+		NodePublicKey: nodePublicKey,
+		// A data plane installed before the configuration was loaded has to be
+		// handed to the new service, otherwise reassembling the service would
+		// silently stop the hot reload.
+		Sink: a.vpnDataPlane,
 		// The probe reads this API's live session and cluster state, so an agent
 		// that negotiated stream_icmp_echo.v1 is what makes a peer pingable
 		// rather than a release note.
@@ -221,13 +233,51 @@ func (a *API) SetVPN(cfg config.VPNConfig, nodeID string) {
 }
 
 // SetVPNPeerService installs an explicitly assembled service. Tests and
-// embedders use it, and the gateway runtime will use it to supply the node
-// identity it generates.
+// embedders use it.
 func (a *API) SetVPNPeerService(service *VPNPeerService) {
 	if a == nil {
 		return
 	}
 	a.vpnPeerService = service
+}
+
+// SetVPNDataPlane installs the running gateway.
+//
+// It does two jobs that must happen together. The endpoints that report live
+// state - a peer's active flows and this node's gateway status - need the data
+// plane itself, because the answers exist only in its memory. And the peer
+// service needs it as the hot-reload sink, so a peer issued a moment ago starts
+// working without waiting for a restart or a poll.
+//
+// A nil plane is accepted and uninstalls both, which is how a node whose gateway
+// failed to start keeps serving the management API: the endpoints answer 501 and
+// the writes still commit, because the database is the authority either way.
+func (a *API) SetVPNDataPlane(plane VPNDataPlane) {
+	if a == nil {
+		return
+	}
+	a.vpnDataPlane = plane
+	var sink VPNPeerSink
+	if plane != nil {
+		// A nil interface value and a non-nil interface holding a nil pointer
+		// behave differently in a comparison, so the sink is only assigned when
+		// there is a real plane behind it.
+		sink = plane
+	}
+	if a.vpnPeerService != nil {
+		a.vpnPeerService.SetPeerSink(sink)
+	}
+}
+
+// vpnPeerFlows asks the gateway for one peer's active flows. The second return
+// value reports whether this node's gateway serves that peer at all, which is what
+// lets the handler distinguish "no traffic" from "the flows are on another node"
+// or "there is no data plane in this build".
+func (a *API) vpnPeerFlows(peerID string) ([]VPNFlowSnapshot, bool) {
+	if a == nil || a.vpnDataPlane == nil {
+		return nil, false
+	}
+	return a.vpnDataPlane.PeerFlows(peerID)
 }
 
 // handleVPNPeers routes the peer collection and its actions. Routing is by shape

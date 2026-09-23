@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
@@ -34,6 +35,11 @@ const (
 	vpnAuditRotated  = "vpn_peer_rotated"
 	vpnAuditRevoked  = "vpn_peer_revoked"
 	vpnAuditRevealed = "vpn_peer_config_revealed"
+	// vpnAuditSyncFailed records that a committed peer row could not be pushed
+	// into the data plane. It is an operational event rather than a user action:
+	// the request succeeded, the row exists, and the two halves of the system
+	// disagree until the gateway next reloads from the database.
+	vpnAuditSyncFailed = "vpn_peer_sync_failed"
 )
 
 // VPNServiceConfig is the subset of config.VPNConfig the management plane needs.
@@ -94,6 +100,11 @@ type VPNPeerServiceDeps struct {
 	// NodePublicKey is the gateway's WireGuard identity, written into the
 	// [Peer] section of every configuration handed to a user.
 	NodePublicKey string
+	// Sink receives every committed peer change so the data plane does not have
+	// to poll the database for it. A nil sink is a no-op, which is what a node
+	// running without a gateway needs: the management plane stays fully usable
+	// while the rows it writes are simply not mirrored anywhere.
+	Sink VPNPeerSink
 	// AgentCapabilities decides whether an egress agent can answer ICMP echo.
 	// A nil probe fails closed: "not wired" is a deployment fault, and issuing a
 	// peer that cannot ping is a promise the user will hold the product to.
@@ -161,6 +172,14 @@ type VPNPeerService struct {
 	nodePublicKey string
 	capabilities  VPNAgentCapabilityProbe
 	nowFn         func() time.Time
+
+	// sinkMu guards sink because the data plane is installed after construction:
+	// the runtime assembles the peer service from configuration first and starts
+	// the gateway afterwards, so requests may already be in flight when the sink
+	// appears. Reading it under the mutex costs one uncontended lock per write
+	// operation and removes any question about a torn interface value.
+	sinkMu sync.Mutex
+	sink   VPNPeerSink
 }
 
 // NewVPNPeerService assembles the service. It performs no I/O, so a disabled
@@ -178,7 +197,71 @@ func NewVPNPeerService(deps VPNPeerServiceDeps) *VPNPeerService {
 		nodePublicKey: strings.TrimSpace(deps.NodePublicKey),
 		capabilities:  deps.AgentCapabilities,
 		nowFn:         deps.Now,
+		sink:          deps.Sink,
 	}
+}
+
+// SetPeerSink installs the data plane that mirrors committed peer rows.
+//
+// It exists because of the assembly order the runtime has to use: the peer
+// service needs the loaded configuration and this node's identity, while the
+// gateway needs a started runtime to reach agents through. Installing the sink
+// afterwards is safe in both directions - a write that lands before it is picked
+// up by the gateway's own initial load from the database, which is the same
+// authority the sink is mirroring.
+func (s *VPNPeerService) SetPeerSink(sink VPNPeerSink) {
+	if s == nil {
+		return
+	}
+	s.sinkMu.Lock()
+	s.sink = sink
+	s.sinkMu.Unlock()
+}
+
+// peerSink returns the installed sink, or nil when there is none.
+func (s *VPNPeerService) peerSink() VPNPeerSink {
+	s.sinkMu.Lock()
+	defer s.sinkMu.Unlock()
+	return s.sink
+}
+
+// syncPeer pushes one committed row into the data plane.
+//
+// The direction of authority is the reason this never fails the request. The row
+// is already in the database when this runs, so the peer exists and the user has
+// been handed an address and a key; answering 500 would tell them the operation
+// failed and invite a retry that issues a second peer or rotates the key again,
+// invalidating the configuration they just downloaded. A sink that cannot keep up
+// is recorded instead, and the disagreement is self-healing: the gateway loads
+// every peer of its node from the database when it starts, so the memory view is
+// a copy that a restart repairs.
+//
+// A peer that is not active is removed rather than applied. Disabled and expired
+// peers must stop carrying traffic at the moment the row says so, and sending
+// their public key to the device would leave a handshake able to complete.
+func (s *VPNPeerService) syncPeer(ctx context.Context, actor auth.Principal, peer storage.VPNPeer) {
+	sink := s.peerSink()
+	if sink == nil {
+		return
+	}
+	var err error
+	if peer.Status == storage.VPNPeerStatusActive {
+		err = sink.ApplyPeer(peer)
+	} else {
+		err = sink.RemovePeer(peer.ID)
+	}
+	if err == nil {
+		return
+	}
+	// The reason is carried into the audit entry because that is the channel the
+	// service already owns, and an operator diagnosing "the tunnel is up but
+	// nothing flows" needs the failure next to the write that caused it. Sink
+	// errors describe a protocol or socket fault and never key material; the
+	// renderers in internal/vpn are written to keep the supplied key out of every
+	// message for exactly this reason.
+	s.audit(ctx, actor, vpnAuditSyncFailed, peer.ID, map[string]any{
+		"nodeId": peer.NodeID, "status": string(peer.Status), "reason": err.Error(),
+	})
 }
 
 // Issue creates one peer: it validates the request, authorizes the egress agent,
@@ -281,6 +364,7 @@ func (s *VPNPeerService) Issue(ctx context.Context, actor auth.Principal, input 
 		issued["icmpCapability"] = auditVerification(icmpState)
 	}
 	s.audit(ctx, actor, vpnAuditIssued, created.ID, issued)
+	s.syncPeer(ctx, actor, created)
 	return created, nil
 }
 
@@ -401,6 +485,7 @@ func (s *VPNPeerService) Update(ctx context.Context, actor auth.Principal, peerI
 		changes["icmpCapability"] = auditVerification(icmpState)
 	}
 	s.audit(ctx, actor, vpnAuditUpdated, updated.ID, changes)
+	s.syncPeer(ctx, actor, updated)
 	return updated, nil
 }
 
@@ -451,6 +536,7 @@ func (s *VPNPeerService) Rotate(ctx context.Context, actor auth.Principal, peerI
 		return storage.VPNPeer{}, fmt.Errorf("vpn: persist rotated peer: %w", err)
 	}
 	s.audit(ctx, actor, vpnAuditRotated, updated.ID, map[string]any{"nodeId": updated.NodeID})
+	s.syncPeer(ctx, actor, updated)
 	return updated, nil
 }
 
@@ -487,6 +573,13 @@ func (s *VPNPeerService) Revoke(ctx context.Context, actor auth.Principal, peerI
 	s.audit(ctx, actor, vpnAuditRevoked, stored.ID, map[string]any{
 		"nodeId": stored.NodeID, "vpnIp": stored.VPNIP,
 	})
+	// Revocation is terminal, so the row is reported to the data plane as a
+	// removal even though syncPeer would reach the same conclusion from the
+	// status: naming it here keeps the intent visible at the one call site where
+	// "the peer is gone" is the whole point of the operation.
+	revoked := stored
+	revoked.Status = storage.VPNPeerStatusRevoked
+	s.syncPeer(ctx, actor, revoked)
 	return nil
 }
 

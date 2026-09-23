@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/vpn"
 )
 
 // enabledVPNTestConfig is a fully valid server.vpn section. Every field the loader
@@ -81,4 +82,57 @@ func TestValidateVPNGatewayConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVPNNodePublicKeyReadsTheIdentityOnlyWhenItIsNeeded pins the one rule that
+// keeps the node key out of a process that has no use for it, and the one that
+// keeps the management plane from contradicting the data plane.
+func TestVPNNodePublicKeyReadsTheIdentityOnlyWhenItIsNeeded(t *testing.T) {
+	const alicePrivate = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo="
+	const alicePrivateHex = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+	const alicePublic = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
+	enabled := enabledVPNTestConfig(t)
+	disabled := enabledVPNTestConfig(t)
+	disabled.Enabled = false
+
+	t.Run("a disabled gateway never reads the secret", func(t *testing.T) {
+		t.Setenv(vpn.NodePrivateKeyEnv, alicePrivate)
+		if got := vpnNodePublicKey(disabled); got != "" {
+			t.Errorf("vpnNodePublicKey = %q on a node with server.vpn disabled, want the empty string", got)
+		}
+	})
+
+	t.Run("an enabled gateway derives the public half", func(t *testing.T) {
+		for name, supplied := range map[string]string{"base64": alicePrivate, "hex": alicePrivateHex} {
+			t.Setenv(vpn.NodePrivateKeyEnv, supplied)
+			got := vpnNodePublicKey(enabled)
+			if got != alicePublic {
+				t.Errorf("%s: vpnNodePublicKey = %q, want %q", name, got, alicePublic)
+			}
+			if err := vpn.ValidatePublicKey(got); err != nil {
+				t.Errorf("%s: the derived key is not usable as a peer public key: %v", name, err)
+			}
+			// The value is written into a configuration a user downloads, so it
+			// must be the public half and nothing else.
+			if strings.Contains(got, alicePrivate) || got == alicePrivateHex {
+				t.Errorf("%s: vpnNodePublicKey returned private key material: %q", name, got)
+			}
+		}
+	})
+
+	t.Run("an unusable identity degrades instead of failing twice", func(t *testing.T) {
+		// startVPNGateway is what refuses to start an enabled gateway without a
+		// usable identity, and it does so with a message that names the
+		// variable. Answering hard here as well would report one deployment fault
+		// twice, in two different words, and the management plane would stop
+		// serving the endpoints that do not need the identity at all.
+		for name, supplied := range map[string]string{
+			"missing": "", "blank": "   ", "garbage": "not-a-wireguard-key",
+		} {
+			t.Setenv(vpn.NodePrivateKeyEnv, supplied)
+			if got := vpnNodePublicKey(enabled); got != "" {
+				t.Errorf("%s: vpnNodePublicKey = %q, want the empty string", name, got)
+			}
+		}
+	})
 }

@@ -199,6 +199,36 @@ func startVPNGateway(ctx context.Context, deps VPNGatewayDeps) (VPNDataPlane, er
 	return gateway, nil
 }
 
+// vpnNodePublicKey reads the gateway's own WireGuard identity and returns only
+// its public half.
+//
+// The public key is what the management plane needs: it goes into the [Peer]
+// section of every configuration a user downloads, so it must be the key this
+// node actually handshakes with. Returning it from here rather than reading the
+// environment a second time inside the peer service is what makes a mismatch
+// between the two impossible.
+//
+// Two cases return the empty string, and both are deliberate. A node with
+// server.vpn disabled never reads the variable at all, so a deployment that does
+// not use the gateway is not required to inject a secret it has no use for. An
+// enabled node whose variable is missing or unusable degrades rather than failing
+// here, because startVPNGateway already refuses to start that gateway with a
+// message naming the variable: reporting the same fault twice in two different
+// words would only make the startup log harder to read, and it would take the
+// management API down with it - including the endpoints that let an operator
+// revoke the peers the old key was issued with. With no public key, config:reveal
+// answers 409 vpn_node_disabled, which is the honest answer.
+func vpnNodePublicKey(cfg config.VPNConfig) string {
+	if !cfg.Enabled {
+		return ""
+	}
+	identity, err := vpn.NodeIdentityFromEnvironment()
+	if err != nil {
+		return ""
+	}
+	return identity.PublicKey
+}
+
 // validateVPNGatewayConfig refuses a server.vpn section the gateway could not
 // serve.
 //
