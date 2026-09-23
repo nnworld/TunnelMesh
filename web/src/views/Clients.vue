@@ -131,9 +131,13 @@
             <el-table-column :label="t('clients.acquiredAt')" width="180"><template #default="{ row }">{{ formatDate(row.acquiredAt) }}</template></el-table-column>
             <el-table-column :label="t('clients.lastHeartbeatAt')" width="180"><template #default="{ row }">{{ formatDate(row.lastHeartbeatAt) }}</template></el-table-column>
             <el-table-column :label="t('clients.expiresAt')" width="180"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
+            <el-table-column :label="t('clients.leaseState')" width="110">
+              <template #default="{ row }"><StatusTag :kind="leaseLive(row) ? 'success' : 'info'" :label="leaseStateLabel(row)" /></template>
+            </el-table-column>
             <el-table-column :label="t('clients.local')" width="90"><template #default="{ row }">{{ row.local ? t('common.yes') : t('common.no') }}</template></el-table-column>
             <el-table-column :label="t('clients.actions')" width="120" fixed="right">
-              <template #default="{ row }"><el-button link type="danger" @click="openCloseConnection(row)">{{ t('clients.closeConnection') }}</el-button></template>
+              <!-- An expired lease is a historical row: closing it can only return a stale epoch. -->
+              <template #default="{ row }"><el-button v-if="leaseLive(row)" link type="danger" @click="openCloseConnection(row)">{{ t('clients.closeConnection') }}</el-button><span v-else>—</span></template>
             </el-table-column>
             <template #empty>{{ t('clients.connectionsEmpty') }}</template>
           </el-table>
@@ -185,6 +189,10 @@ const detailClient = ref<ClientInstance | null>(null)
 const connections = ref<ClientConnection[]>([])
 const connectionsLoading = ref(false)
 const connectionsError = ref(false)
+// Lease liveness is judged against one fixed baseline per drawer load rather
+// than Date.now() at render time, so a row cannot flip state mid-render and the
+// predicate stays identical for the tag and for the Close action guard.
+const connectionsNow = ref(Date.now())
 const closeVisible = ref(false)
 const closing = ref(false)
 const closeError = ref('')
@@ -197,6 +205,7 @@ const summaryCards = computed(() => [
   { label: t('clients.activeConnections'), value: items.value.reduce((total, item) => total + item.activeConnections, 0) },
   { label: t('clients.activeStreams'), value: items.value.reduce((total, item) => total + item.activeStreams, 0) },
   { label: t('clients.metadataUnavailable'), value: items.value.filter(item => item.status === 'metadata_unavailable').length },
+  { label: t('clients.metadataStale'), value: items.value.filter(item => item.status === 'stale').length },
 ])
 const metadataRows = computed(() => Object.entries(detailClient.value?.metadata || {}).map(([name, value]) => ({ name, value })))
 
@@ -254,6 +263,7 @@ function reset() {
 async function showDetail(row: ClientInstance) {
   detailVisible.value = true; detailLoading.value = true; detailError.value = false
   detailClient.value = row; connections.value = []; connectionsError.value = false; connectionsLoading.value = true
+  connectionsNow.value = Date.now()
   try {
     const [client, clientConnections] = await Promise.all([getClientDetail(row.id), listClientConnections(row.id)])
     detailClient.value = client
@@ -272,6 +282,7 @@ async function retryDetail() {
 async function loadConnections() {
   if (!detailClient.value) return
   connectionsLoading.value = true; connectionsError.value = false
+  connectionsNow.value = Date.now()
   try { connections.value = await listClientConnections(detailClient.value.id) }
   catch { connectionsError.value = true }
   finally { connectionsLoading.value = false }
@@ -304,6 +315,10 @@ function statusKind(status: ClientStatus) {
   return 'info' as const
 }
 function statusLabel(status: ClientStatus) { return t(`clients.statusLabel.${status}`) }
+// Mirrors the server-side activeConnections rule in internal/server/client_api.go,
+// which counts a lease only while its expires_at is still in the future.
+function leaseLive(connection: ClientConnection) { return new Date(connection.expiresAt).getTime() > connectionsNow.value }
+function leaseStateLabel(connection: ClientConnection) { return t(`clients.leaseStateLabel.${leaseLive(connection) ? 'live' : 'expired'}`) }
 function formatList(values: string[]) { return values.length ? values.join('、') : '—' }
 
 onMounted(load)
@@ -313,7 +328,7 @@ onMounted(load)
 .filter-form { margin-bottom: 18px; }
 .filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
 .filter-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
-.summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
+.summary-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
 .summary-card { display:flex; flex-direction:column; gap:6px; padding:16px; background:#f7fbff; border:1px solid var(--tm-border); border-radius:10px; }
 .summary-card span { color:var(--tm-muted); font-size:13px; }
 .summary-card strong { font-size:24px; line-height:1; }
