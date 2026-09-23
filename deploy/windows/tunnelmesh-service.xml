@@ -2,7 +2,7 @@
 <!--
   WinSW 服务模板，由 deploy\install\windows-install.ps1 渲染，
   server / agent / client 三个角色共用同一份文件。
-  占位符：__ROLE__、__ROLE_TITLE__、__BINARY__、__CONFIG__、__INSTALL_DIR__。
+  占位符：__ROLE__、__ROLE_TITLE__、__BINARY__、__CONFIG__、__INSTALL_DIR__、__ENV_BLOCK__。
   不要把 Token 或密码写进本文件；配置路径由 -Config 传入，日志固定在
   __INSTALL_DIR__\logs，与 docs/deployment/windows-service.md 保持一致。
 -->
@@ -10,6 +10,7 @@
   <id>tunnelmesh-__ROLE__</id>
   <name>TunnelMesh __ROLE_TITLE__</name>
   <description>TunnelMesh __ROLE__ service</description>
+__ENV_BLOCK__
   <executable>__BINARY__</executable>
   <arguments>--config &quot;__CONFIG__&quot; run</arguments>
   <workingdirectory>__INSTALL_DIR__</workingdirectory>

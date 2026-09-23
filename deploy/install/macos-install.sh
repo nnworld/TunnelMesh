@@ -17,6 +17,7 @@ sed -e "s|__ROLE__|$ROLE|g" \
   -e "s|__HOME__|$HOME|g" \
   -e "s|__BINARY__|$installed|g" \
   -e "s|__CONFIG__|$CONFIG|g" \
+  -e "s|__ENVIRONMENT__||g" \
   "$(dirname "$0")/../macos/tunnelmesh.plist" >"$plist"
 plutil -lint "$plist"
 launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true

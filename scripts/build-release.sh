@@ -106,6 +106,8 @@ for target in "${targets[@]}"; do
   case "$goos" in
     linux)
       cp -R "$ROOT_DIR/deploy/systemd" "$stage/deploy/systemd"
+      # user 模式单元模板：一键安装脚本在 Linux 默认走 systemd user unit。
+      cp -R "$ROOT_DIR/deploy/systemd-user" "$stage/deploy/systemd-user"
       ;;
     darwin)
       cp -R "$ROOT_DIR/deploy/macos" "$stage/deploy/macos"
@@ -118,6 +120,8 @@ for target in "${targets[@]}"; do
   # artifacts: they need the Go module to run, and an operator's archive has no
   # go.mod. Ship the scripts and service templates only.
   find "$stage/deploy" -name '*_test.go' -type f -delete
+  # testdata/ 是测试 fixture（curl/systemctl 等 stub 与现场生成的归档），不是部署产物。
+  find "$stage/deploy" -type d -name testdata -prune -exec rm -rf {} +
   base="tunnelmesh-${VERSION}-${goos}-${goarch}"
   platform="${goos}-${goarch}"
   platforms+=("\"${goos}/${goarch}\"")

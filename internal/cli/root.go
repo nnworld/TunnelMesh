@@ -107,6 +107,10 @@ func newRoot(use string, factory func(*rootOptions) []*cobra.Command) *cobra.Com
 	flags.StringVar(&opts.registry, "registry", "", "registry type (database or etcd)")
 	flags.StringVar(&opts.nodeID, "node.id", "", "cluster node identity")
 	flags.StringVar(&opts.nodeID, "node-id", "", "cluster node identity")
+	// node identity 的持久化路径必须可覆盖：默认值 /var/lib/tunnelmesh/node-id 只有
+	// root 可写，用户级安装（systemd user 单元、macOS LaunchAgent、一键脚本 user 模式）
+	// 需要把它指到自己的状态目录，否则 init-node-id 与 cluster 模式的 run 都会失败。
+	flags.StringVar(&opts.nodeIDPath, "node-id-path", config.DefaultNodeIDPath, "file used to persist the generated cluster node identity")
 	flags.BoolVar(&opts.bridge, "server.tcp_bridge.enabled", false, "enable TCP-over-WebSocket bridge")
 	flags.BoolVar(&opts.bridge, "tcp-bridge", false, "enable TCP-over-WebSocket bridge")
 	flags.Bool("server.tcp_bridge_enabled", false, "enable TCP-over-WebSocket bridge (flat spelling)")

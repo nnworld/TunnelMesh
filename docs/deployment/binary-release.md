@@ -80,13 +80,33 @@ DWARF 调试信息，不触碰嵌入数据。
 
 ## 安装方式
 
+- 三平台 × 三角色的一键安装（下载校验、生成配置、注册服务、升级与卸载）：
+  `deploy/install/oneclick/install-{server,agent,client}.sh`（Linux/macOS）与
+  `install-{server,agent,client}.ps1`（Windows），见[一键安装脚本](oneclick-install.md)。
 - Linux：使用 [linux-install.sh](../../deploy/install/linux-install.sh)，由 systemd 管理 Server/Agent。
 - macOS：使用 [macos-install.sh](../../deploy/install/macos-install.sh)，由 launchd 管理用户级服务；Server 建议监听 8080 并由反向代理接管 80/443。
 - Windows：使用 [windows-install.ps1](../../deploy/install/windows-install.ps1)，通过 WinSW 注册 Windows Service；不要把 Token 写入脚本参数，放在受 ACL 保护的配置文件或环境变量中。
 
 安装脚本只安装二进制和进程管理配置，不自动生成业务配置，也不会覆盖已有配置和数据。
+一键安装脚本相反：它会渲染角色配置，覆盖前自动备份为 `<path>.bak-<UTC时间戳>`（最多保留最近 3 份），
+升级时默认保留现有配置，只有显式 `--reconfigure` 才重新生成。
 
-Linux 归档包含 `deploy/systemd`，macOS 归档包含 `deploy/macos`，Windows 归档包含 `deploy/windows`。所有归档都包含三个二进制、安装脚本、`README.md`、`docs/`、`LICENSE` 和 `NOTICE`。
+归档内的 `deploy/` 内容按平台裁剪：
+
+| 平台 | 归档内的 `deploy/` 内容 |
+| --- | --- |
+| Linux | `deploy/install`（含 `oneclick/`）、`deploy/systemd`、`deploy/systemd-user` |
+| macOS | `deploy/install`（含 `oneclick/`）、`deploy/macos` |
+| Windows | `deploy/install`（含 `oneclick/`）、`deploy/windows` |
+
+`deploy/install/oneclick/` 含三个角色入口、共享库与 `winsw-checksums.txt`；
+`deploy/systemd-user/` 是 Linux 默认（user 模式）的单元模板，一键脚本从**已校验的归档**里取模板，
+因此模板版本必然与所装二进制一致。所有归档都包含三个二进制、安装脚本、`README.md`、`docs/`、
+`LICENSE` 和 `NOTICE`。
+
+`*_test.go` 与 `testdata/` 不进归档：前者是需要 Go module 的仓库一致性检查，后者是测试 fixture
+（`curl`/`systemctl`/`launchctl`/`loginctl`/`plutil` 桩与现场生成的归档），运维侧的归档里没有 `go.mod`。
+`scripts/build-release.sh` 在打包前显式删除这两类内容。
 
 `LICENSE` 与 `NOTICE` 必须随每个归档分发：项目采用 Apache License 2.0，其 4(a) 要求随作品附带
 许可文本，4(d) 要求附带 NOTICE。`scripts/build-release.sh` 会在仓库根目录缺少这两个文件时直接

@@ -8,6 +8,9 @@ Type=simple
 User=tunnelmesh
 Group=tunnelmesh
 WorkingDirectory=/var/lib/tunnelmesh-agent
+# agent.token 的 YAML 键是 `yaml:"-"`，只能通过环境变量注入；
+# 前缀 `-` 表示文件缺失时不阻塞启动，与 server 单元保持一致。
+EnvironmentFile=-/etc/tunnelmesh/agent.env
 ExecStartPre=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml check-config
 ExecStart=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml run
 Restart=on-failure

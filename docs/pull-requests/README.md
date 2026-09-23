@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 18 份记录，按日期倒序排列。
+共 19 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-09-23 | [三端一键安装脚本（server / agent / client）](2026-09-23-one-click-install-scripts.md) | [计划：三端一键安装脚本](../superpowers/plans/2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../superpowers/specs/2026-09-23-one-click-install-scripts-design.md) |
 | 2026-09-18 | [Phase A: enterprise identity foundation (SSO, MFA, device trust)](2026-09-18-sso-mfa-device-trust.md) | [计划：SSO, MFA, and device trust implementation…](../superpowers/plans/2026-09-18-sso-mfa-device-trust-implementation.md) | [规格：SSO, MFA, and device trust design (Phase …](../superpowers/specs/2026-09-18-sso-mfa-device-trust-design.md) |
 | 2026-09-18 | [P1–P3 growth and product hardening](2026-09-18-p1-p3-growth-product-hardening.md) | [计划：P1–P3 growth and product hardening implem…](../superpowers/plans/2026-09-18-p1-p3-growth-product-hardening.md) | — |
 | 2026-09-17 | [P0/P1 growth acceleration](2026-09-17-p0-p1-growth-acceleration.md) | [计划：P0/P1 Growth Acceleration](../superpowers/plans/2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../superpowers/specs/2026-09-17-p0-p1-growth-acceleration-design.md) |

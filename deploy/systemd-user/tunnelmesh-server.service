@@ -1,0 +1,27 @@
+[Unit]
+Description=TunnelMesh Server (user)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-__ENV_FILE__
+WorkingDirectory=__STATE_DIR__
+# user 单元以非 root 运行，且 ReadWritePaths 只放开状态目录：init-node-id 的默认路径
+# /var/lib/tunnelmesh/node-id 不可写，必须显式指到 __STATE_DIR__。
+ExecStartPre=__BINARY__ --config __CONFIG__ --node-id-path __STATE_DIR__/node-id init-node-id
+ExecStartPre=__BINARY__ --config __CONFIG__ check-config
+ExecStart=__BINARY__ --config __CONFIG__ --node-id-path __STATE_DIR__/node-id run
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=__STATE_DIR__
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnelmesh-server
+
+[Install]
+WantedBy=default.target

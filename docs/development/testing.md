@@ -71,8 +71,10 @@ go test ./deploy/... -count=1
 以下校验依赖平台工具，CI 与本机不一定具备，改动对应产物后需要在目标平台补跑：
 
 ```bash
-plutil -lint deploy/macos/tunnelmesh.plist                                  # macOS
+# 模板含 __ENVIRONMENT__ 占位符，未渲染时不是合法 XML；lint 的是「渲染为空」的结果。
+sed 's/^__ENVIRONMENT__$//' deploy/macos/tunnelmesh.plist | plutil -lint -    # macOS
 bash -n deploy/install/linux-install.sh deploy/install/macos-install.sh
+bash -n deploy/install/oneclick/*.sh
 promtool check config deploy/prometheus/prometheus.yml.example
 promtool check rules deploy/prometheus/recording-rules.yaml deploy/prometheus/alert-rules.yaml
 systemd-analyze verify deploy/systemd/tunnelmesh-server.service              # Linux
