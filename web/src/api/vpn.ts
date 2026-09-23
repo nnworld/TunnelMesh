@@ -81,9 +81,10 @@ export type VpnPeerCreated = VpnPeer & { configRevealPath: string }
 export type VpnPeerConfig = { id: string; name: string; vpnIp: string; format: string; config: string }
 
 // Gateway node status, the fields §10.6 of the design spec asks the node page
-// to show. The shape is owned by the data plane phase, which is why every
-// field is optional: this release answers 501 vpn_not_implemented, and a
-// partial payload from a later phase must render as "—" rather than crash.
+// to show. Every field is optional because a server built without the vpn tag
+// reports only what its configuration says: it has no leased subnet, no
+// allocation and no peer count, and those must render as "—" rather than as
+// zero, which would read as an exhausted pool.
 export type VpnNodeStatus = {
   nodeId?: string
   enabled?: boolean
@@ -96,9 +97,11 @@ export type VpnNodeStatus = {
   icmpCapable?: boolean
 }
 
-// One active flow of one peer. Also owned by the data plane phase and also
-// answered with 501 in this release; the console points at Grafana instead of
-// rendering a table that would always be empty.
+// One active flow of one peer, as the gateway's flow table holds it. Optional
+// for the same reason as the node status: the fields are added by the data
+// plane, and a partial payload must render as "—" rather than crash a table.
+// A node that does not serve the peer answers 501 vpn_not_implemented instead of
+// an empty list, so "idle" and "somewhere else" stay distinguishable.
 export type VpnFlow = {
   id?: string
   protocol?: string

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -204,6 +205,7 @@ func (a *API) SetVPN(cfg config.VPNConfig, nodeID, nodePublicKey string) {
 	if a == nil || a.DB == nil {
 		return
 	}
+	a.setVPNNodeView(cfg, nodeID)
 	a.vpnPeerService = NewVPNPeerService(VPNPeerServiceDeps{
 		Peers:  a.DB.VPNPeers(),
 		Leases: a.DB.VPNIPLeases(),
@@ -230,6 +232,21 @@ func (a *API) SetVPN(cfg config.VPNConfig, nodeID, nodePublicKey string) {
 		// rather than a release note.
 		AgentCapabilities: a.vpnAgentCapabilityProbe(nodeID),
 	})
+}
+
+// setVPNNodeView records which node this API speaks for and what its server.vpn
+// section says.
+//
+// It is a separate setter from SetVPN rather than a parameter of it because the two
+// have different lifetimes: a caller that assembles the peer service by hand still
+// has to say which node it is standing in for, or the status endpoint would report
+// an empty node id and a console would render a row nobody can match to a machine.
+func (a *API) setVPNNodeView(cfg config.VPNConfig, nodeID string) {
+	if a == nil {
+		return
+	}
+	a.vpnConfig = cfg
+	a.vpnNodeID = strings.TrimSpace(nodeID)
 }
 
 // SetVPNPeerService installs an explicitly assembled service. Tests and
@@ -303,11 +320,19 @@ func (a *API) handleVPNPeers(w http.ResponseWriter, r *http.Request, p auth.Prin
 	}
 }
 
-// handleVPNNodes answers the gateway fleet status endpoint. It is registered in
-// this release and refuses with the stable code, because the status it would
-// report (listening sockets, allocated addresses, ICMP capability) is produced by
-// the gateway runtime, which does not exist yet. A 200 with an empty list would
-// be read as "no node serves VPN" rather than "this build cannot tell".
+// handleVPNNodes answers the gateway status endpoint with the one node this process
+// is.
+//
+// The list holds a single entry rather than one per node in the cluster because a
+// fleet-wide view needs a cluster RPC that does not exist, and answering with the
+// nodes this process happens to know would show part of a fleet as if it were the
+// whole fleet. The shape stays a list so that adding the RPC later does not change
+// the contract a console already reads.
+//
+// It answers 200 in both builds. Without a gateway the entry carries what the
+// configuration says and omits the counters, which a console renders as an em dash;
+// a 501 here would read as "no node serves VPN" on every server built without the
+// vpn tag, which is a claim about the fleet that this process cannot make.
 func (a *API) handleVPNNodes(w http.ResponseWriter, r *http.Request, _ auth.Principal, parts []string) {
 	if len(parts) != 0 {
 		writeAPIError(w, http.StatusNotFound, "not found")
@@ -317,7 +342,51 @@ func (a *API) handleVPNNodes(w http.ResponseWriter, r *http.Request, _ auth.Prin
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeVPNError(w, vpn.ErrNotImplemented.WithMessage("vpn node status needs the gateway runtime, which ships with the data plane"))
+	status, err := a.localVPNNodeStatus(r.Context())
+	if err != nil {
+		writeVPNError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, vpnNodeListResponse{Items: []VPNNodeStatus{status}})
+}
+
+// localVPNNodeStatus reports this node, asking the gateway when one is installed and
+// falling back to the configuration when one is not.
+//
+// The gateway's answer is taken whole rather than merged field by field: it is the
+// component that knows whether it is serving, and a merge would let the
+// configuration's idea of icmp_enabled override the running gateway's.
+func (a *API) localVPNNodeStatus(ctx context.Context) (VPNNodeStatus, error) {
+	if a != nil && a.vpnDataPlane != nil {
+		return a.vpnDataPlane.NodeStatus(ctx)
+	}
+	var cfg config.VPNConfig
+	var nodeID string
+	if a != nil {
+		cfg, nodeID = a.vpnConfig, a.vpnNodeID
+	}
+	return VPNNodeStatus{
+		NodeID:       nodeID,
+		Enabled:      cfg.Enabled,
+		Listen:       cfg.Listen,
+		EndpointHost: cfg.EndpointHost,
+	}, nil
+}
+
+// vpnFlowListResponse is the flows envelope.
+//
+// It carries no cursor on purpose. One peer's flow set is bounded by
+// server.vpn.max_flows_per_peer, so a page control would offer a choice the gateway
+// cannot honour: a snapshot read across two requests would describe two different
+// moments and could neither be joined nor compared.
+type vpnFlowListResponse struct {
+	Items []VPNFlowSnapshot `json:"items"`
+}
+
+// vpnNodeListResponse is the node status envelope. See handleVPNNodes for why the
+// list has one entry.
+type vpnNodeListResponse struct {
+	Items []VPNNodeStatus `json:"items"`
 }
 
 func (a *API) handleVPNPeerListCreate(w http.ResponseWriter, r *http.Request, p auth.Principal) {
@@ -586,15 +655,31 @@ func (a *API) revealVPNPeerConfig(w http.ResponseWriter, r *http.Request, p auth
 	})
 }
 
-// listVPNPeerFlows refuses with the stable code, but only after the peer has
-// been resolved: answering 501 for an identifier that does not exist, or that
-// belongs to somebody else, would turn the route into an existence oracle.
+// listVPNPeerFlows reports the flows this node's gateway holds for one peer.
+//
+// Visibility is resolved first, so neither status code below can be used to probe
+// which identifiers exist or whose they are: a peer that is not yours is a 404
+// whatever the gateway would have said about it. Only then does the answer depend on
+// the data plane, and a gateway that does not serve the peer produces a 501 rather
+// than an empty list, because "no traffic" and "the traffic is on another node" are
+// different facts and only the second one tells an operator where to look.
 func (a *API) listVPNPeerFlows(w http.ResponseWriter, r *http.Request, p auth.Principal, peerID string) {
-	if _, err := a.vpnPeerService.Get(r.Context(), p, peerID); err != nil {
+	peer, err := a.vpnPeerService.Get(r.Context(), p, peerID)
+	if err != nil {
 		writeVPNError(w, err)
 		return
 	}
-	writeVPNError(w, vpn.ErrNotImplemented.WithMessage("active vpn flows need the gateway flow table, which ships with the data plane"))
+	flows, served := a.vpnPeerFlows(peer.ID)
+	if !served {
+		writeVPNError(w, vpn.ErrNotImplemented.WithMessage("this node cannot observe the flows of that peer: it is served by another node, or this server has no running gateway"))
+		return
+	}
+	if flows == nil {
+		// An idle peer is an empty list, not a null one: the console iterates it
+		// without a guard, and "no flows" is a fact this node can state.
+		flows = []VPNFlowSnapshot{}
+	}
+	writeJSON(w, http.StatusOK, vpnFlowListResponse{Items: flows})
 }
 
 // writeVPNError renders the {code,msg,data} envelope with the stable vpn code in

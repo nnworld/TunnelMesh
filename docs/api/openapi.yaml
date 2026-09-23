@@ -1496,32 +1496,49 @@ paths:
     get:
       summary: List the active flows of one peer
       description: |
-        Specified but not served yet: the flow table lives in the gateway
-        runtime. It answers 501 rather than an empty list, because an empty list
-        reads as "this peer has no traffic" and hides the fact that nothing can
-        observe traffic yet. The peer is resolved first, so the route cannot be
-        used to probe identifiers on a build that has no flow table.
-      x-tunnelmesh-phase: 6
+        Answered from the memory of the gateway that serves the peer, so it is a
+        snapshot of this instant and not a history: a flow leaves the list the
+        moment it is closed, reaped or revoked, and nothing here is persisted.
+        The projection is narrow by construction - no payload, no key material and
+        no agent-side socket detail - and carries no cursor, because one peer's
+        flow set is bounded by server.vpn.max_flows_per_peer and a list read in
+        two requests would describe two different moments.
+        Visibility is resolved before the gateway is asked, so an identifier that
+        does not exist, or that belongs to somebody else, is a 404, and the route
+        cannot be used to probe either fact.
       security: [{bearerAuth: []}]
       responses:
+        '200':
+          description: The flows this node's gateway holds for the peer. An empty list means the peer is served here and is idle.
+          content: {application/json: {schema: {$ref: '#/components/schemas/VPNFlowListEnvelope'}}}
         '401': {description: Unauthenticated}
         '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
-        '501': {description: 'Not implemented in this release (vpn_not_implemented)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '501': {description: 'This node cannot observe that peer (vpn_not_implemented): it is served by another gateway node, or this server has no running gateway because it was built without the vpn tag or runs with server.vpn disabled. Not an empty list, which would claim the peer is idle.', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: The peer service is not assembled on this server}
   /api/v1/vpn-nodes:
     get:
-      summary: Read the VPN status of every gateway node
+      summary: Read the VPN gateway status of this node
       description: |
-        Specified but not served yet: the status it would report - listening
-        sockets, endpoint, leased subnet and allocated addresses, peer counts,
-        ICMP capability - is produced by the gateway runtime. It answers 501
-        rather than a 200 with an empty list, which would read as "no node serves
-        VPN" instead of "this build cannot tell".
-      x-tunnelmesh-phase: 6
+        One entry: the node this process is. A fleet-wide view would need a
+        cluster RPC that does not exist, and answering with the nodes this process
+        happens to know would show part of a fleet as if it were the whole fleet.
+        The shape stays a list so that adding the RPC later does not change a
+        contract a console already reads.
+        Available in both builds. A server without the vpn tag, or one with
+        server.vpn disabled, reports enabled false and omits the counters, which a
+        console renders as an em dash. The counters belong to the subnet lease and
+        to the peer table, so they are read from those rather than derived from
+        configuration: a capacity computed from a prefix is a promise the issuer
+        may not be able to keep.
       security: [{bearerAuth: []}]
       responses:
+        '200':
+          description: This node's gateway status
+          content: {application/json: {schema: {$ref: '#/components/schemas/VPNNodeListEnvelope'}}}
         '401': {description: Unauthenticated}
+        '404': {description: A node sub-resource, which this route does not have}
         '405': {description: Method not allowed}
-        '501': {description: 'Not implemented in this release (vpn_not_implemented)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '500': {description: 'The gateway could not read the counters it reports. The request fails rather than answer with them omitted, because an absent counter reads as unknown and a slow database is not unknown.'}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
@@ -2802,7 +2819,7 @@ components:
         allowedIps: {type: array, items: {type: string}, description: 'Egress destinations as IPv4 CIDRs, in canonical sorted form. Empty denies every destination, the semantics WireGuard itself uses for an absent AllowedIPs.'}
         allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: 'Empty permits every port, which is the opposite of an empty allowedIps.'}
         allowPrivateTargets: {type: boolean, description: Whether the peer may reach RFC1918, loopback and link-local targets. Cloud metadata, multicast and non-routable addresses stay denied either way.}
-        icmpEnabled: {type: boolean, description: 'Always false in this release: echo handling needs an agent capability that is not negotiated yet'}
+        icmpEnabled: {type: boolean, description: 'Whether this peer asked for echo. It is a ceiling rather than a promise: the egress agent also has to have negotiated stream_icmp_echo.v1, and the node has to run server.vpn.icmp_enabled.'}
         maxConcurrentFlows: {type: integer, minimum: 0, description: Zero means unlimited}
         packetRateLimit: {type: integer, minimum: 0, description: Packets per second; zero means unlimited}
         expiresAt: {type: string, format: date-time, nullable: true}
@@ -2892,3 +2909,59 @@ components:
         - {$ref: '#/components/schemas/Envelope'}
         - type: object
           properties: {data: {$ref: '#/components/schemas/VPNConfigReveal'}}
+    VPNFlow:
+      type: object
+      additionalProperties: false
+      required: [id, protocol, target, port, startedAt, bytesSent, bytesReceived]
+      description: |
+        One active flow of one peer, as the gateway holds it in memory. The
+        identifier is unique inside one process lifetime and is not a database id:
+        flows are never persisted, so an identifier that survived a restart would
+        point at nothing.
+      properties:
+        id: {type: string}
+        protocol: {type: string, enum: [tcp, udp, icmp-echo]}
+        target: {type: string, description: The internal address the flow goes to}
+        port: {type: integer, minimum: 0, maximum: 65535, description: 'Zero for icmp-echo, which has no port'}
+        startedAt: {type: string, format: date-time}
+        bytesSent: {type: integer, minimum: 0, description: Tunnel payload the peer sent towards the internal service}
+        bytesReceived: {type: integer, minimum: 0, description: Tunnel payload the internal service sent back}
+    VPNFlowList:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/VPNFlow'}}
+    VPNFlowListEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNFlowList'}}
+    VPNNodeStatus:
+      type: object
+      additionalProperties: false
+      required: [nodeId, enabled, icmpCapable]
+      description: |
+        One gateway node. The counters are absent rather than zero when the node
+        cannot know them - no gateway in this build, or no subnet leased yet -
+        because zero allocated reads as "the pool is empty" while an omitted
+        counter reads as "unknown", which is the fact.
+      properties:
+        nodeId: {type: string}
+        enabled: {type: boolean, description: Whether server.vpn is enabled on that node}
+        listen: {type: string, description: 'The configured UDP endpoint. Absent while the section is disabled, because nothing is bound.'}
+        endpointHost: {type: string, description: The host written into the peer configurations this node issues}
+        subnet: {type: string, description: 'The subnet this node leased. Absent until the first peer is issued, which is when a subnet is claimed.'}
+        allocated: {type: integer, minimum: 0, description: Addresses handed out of that subnet}
+        capacity: {type: integer, minimum: 0, description: 'Addresses the subnet can hold: every address in the prefix except the network address, the broadcast address and the one the node reserves for its own tunnel interface'}
+        peers: {type: integer, minimum: 0, description: 'Peers this node issued that are not revoked. A revoked row keeps its address forever, so it is not part of a count an operator reads as live.'}
+        icmpCapable: {type: boolean, description: 'server.vpn.icmp_enabled on a gateway that is actually serving. A switch alone cannot promise an echo reply.'}
+    VPNNodeList:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/VPNNodeStatus'}}
+    VPNNodeListEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNNodeList'}}

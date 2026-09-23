@@ -68,6 +68,12 @@ type API struct {
 	// live data plane answer 501 while it is nil instead of an empty list that
 	// would read as "nothing is happening".
 	vpnDataPlane VPNDataPlane
+	// vpnConfig and vpnNodeID are the node view the gateway status endpoint reports
+	// when no data plane is installed, which is every untagged binary and every node
+	// with server.vpn disabled. SetVPN records them, because that is the only place
+	// the loaded server configuration reaches the API.
+	vpnConfig config.VPNConfig
+	vpnNodeID string
 	// trustedProxyList decides whether X-Forwarded-For is believed. It is empty by
 	// default, which means the direct peer address is always used.
 	trustedProxyList []string

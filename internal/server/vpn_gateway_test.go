@@ -243,10 +243,12 @@ func newVPNWireClient(t *testing.T, gateway *vpnGateway, pair vpn.KeyPair, vpnIP
 type stubVPNPeerRepository struct {
 	storage.VPNPeerRepository
 
-	mu     sync.Mutex
-	rows   []storage.VPNPeer
-	err    error
-	called []string
+	mu       sync.Mutex
+	rows     []storage.VPNPeer
+	err      error
+	called   []string
+	count    int
+	countErr error
 }
 
 func (r *stubVPNPeerRepository) ListByNode(_ context.Context, nodeID string) ([]storage.VPNPeer, error) {
@@ -257,6 +259,20 @@ func (r *stubVPNPeerRepository) ListByNode(_ context.Context, nodeID string) ([]
 		return nil, r.err
 	}
 	return append([]storage.VPNPeer(nil), r.rows...), nil
+}
+
+// CountByNode answers the peer counter the node status reports. It is a stored
+// value rather than len(rows) because the two are different claims in a cluster:
+// the row set is what this process loaded, the count is what the database holds for
+// the node, and a status that reported the first would look right on a node that
+// had refused to load a malformed row.
+func (r *stubVPNPeerRepository) CountByNode(_ context.Context, _ string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.countErr != nil {
+		return 0, r.countErr
+	}
+	return r.count, nil
 }
 
 func (r *stubVPNPeerRepository) loads() []string {
@@ -585,5 +601,223 @@ func TestVPNGatewayStartRefusesWhenTheNodeKeyIsMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), vpn.NodePrivateKeyEnv) {
 		t.Errorf("newVPNGateway reported %v, want an error naming %s", err, vpn.NodePrivateKeyEnv)
+	}
+}
+
+// D13's node status is the gateway's own report, so the arithmetic behind it is
+// asserted here rather than through a fake: capacity has to be the range
+// Pool.AllocateAddress actually hands out, and icmpCapable has to say "running"
+// rather than "configured".
+func TestVPNGatewayNodeStatusReportsTheLeasedSubnetAndThePeerCount(t *testing.T) {
+	leases := &recordingLeaseRepository{held: []storage.VPNIPLease{{
+		ID: "lease-1", NodeID: vpnLifecycleNodeID, Subnet: vpnLifecycleSubnet,
+		LeaseHolder: vpnLifecycleNodeID, Epoch: 1, AllocatedCount: 12,
+	}}}
+	peers := &stubVPNPeerRepository{count: 3}
+	fixture := newVPNGatewayFixture(t, enabledVPNTestConfig(t), func(deps *VPNGatewayDeps) {
+		deps.Leases = leases
+		deps.Peers = peers
+	})
+	gateway := fixture.gateway
+	if err := gateway.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	status, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus: %v", err)
+	}
+	if status.NodeID != vpnLifecycleNodeID {
+		t.Errorf("nodeId = %q, want %q", status.NodeID, vpnLifecycleNodeID)
+	}
+	if !status.Enabled {
+		t.Error("an enabled gateway reported itself disabled")
+	}
+	if status.Listen != "127.0.0.1:0" || status.EndpointHost != "gw-1.mesh.example.com" {
+		t.Errorf("listen/endpointHost = %q/%q, want the configured pair", status.Listen, status.EndpointHost)
+	}
+	if status.Subnet != vpnLifecycleSubnet {
+		t.Errorf("subnet = %q, want %q", status.Subnet, vpnLifecycleSubnet)
+	}
+	if status.Allocated == nil || *status.Allocated != 12 {
+		t.Errorf("allocated = %v, want 12", status.Allocated)
+	}
+	// A /24 holds 256 addresses; the network address, the broadcast address and
+	// the one the node reserves for its own tunnel interface are not issuable, so
+	// 253 is the number a console may promise an operator.
+	if status.Capacity == nil || *status.Capacity != 253 {
+		t.Errorf("capacity = %v, want 253", status.Capacity)
+	}
+	if status.Peers == nil || *status.Peers != 3 {
+		t.Errorf("peers = %v, want 3", status.Peers)
+	}
+	if !status.ICMPCapable {
+		t.Error("icmpCapable = false on a running gateway whose configuration allows echo")
+	}
+}
+
+// Echo capability is a property of a gateway that is serving, not of a
+// configuration that says it may: a console that read the switch alone would
+// promise a ping that nothing answers.
+func TestVPNGatewayNodeStatusReportsICMPOnlyWhileServing(t *testing.T) {
+	fixture := newVPNGatewayFixture(t, enabledVPNTestConfig(t), nil)
+	gateway := fixture.gateway
+
+	before, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus before Start: %v", err)
+	}
+	if before.ICMPCapable {
+		t.Error("icmpCapable is true on a gateway that has not started")
+	}
+
+	if err := gateway.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	serving, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus while serving: %v", err)
+	}
+	if !serving.ICMPCapable {
+		t.Error("icmpCapable is false on a serving gateway whose configuration allows echo")
+	}
+
+	if err := gateway.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	after, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus after Close: %v", err)
+	}
+	if after.ICMPCapable {
+		t.Error("icmpCapable is true on a gateway that has been closed")
+	}
+}
+
+// A configuration that forbids echo caps the answer whatever the gateway is doing,
+// because the pipeline refuses the packet before any agent is asked.
+func TestVPNGatewayNodeStatusReportsICMPDisabledByConfiguration(t *testing.T) {
+	cfg := enabledVPNTestConfig(t)
+	cfg.ICMPEnabled = false
+	fixture := newVPNGatewayFixture(t, cfg, nil)
+	gateway := fixture.gateway
+	if err := gateway.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	status, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus: %v", err)
+	}
+	if status.ICMPCapable {
+		t.Error("icmpCapable is true while server.vpn.icmp_enabled is false")
+	}
+}
+
+// The counters are the part a console cannot work around, so a repository that
+// does not answer has to fail the request instead of leaving them out: an omitted
+// counter renders as an em dash, and "no subnet leased" is a different claim from
+// "the database did not answer".
+func TestVPNGatewayNodeStatusReportsARepositoryItCannotRead(t *testing.T) {
+	cases := []struct {
+		name   string
+		leases *recordingLeaseRepository
+		peers  *stubVPNPeerRepository
+	}{
+		{"the lease repository", &recordingLeaseRepository{listErr: context.DeadlineExceeded}, &stubVPNPeerRepository{count: 1}},
+		{"the peer repository", &recordingLeaseRepository{}, &stubVPNPeerRepository{countErr: context.DeadlineExceeded}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newVPNGatewayFixture(t, enabledVPNTestConfig(t), func(deps *VPNGatewayDeps) {
+				deps.Leases = testCase.leases
+				deps.Peers = testCase.peers
+			})
+			if _, err := fixture.gateway.NodeStatus(context.Background()); err == nil {
+				t.Fatal("NodeStatus reported a status it could not read")
+			}
+		})
+	}
+}
+
+// A node that holds no lease yet has no subnet to report, and that is a state
+// rather than an error: the subnet is leased when the first peer is issued, so a
+// freshly started gateway legitimately reports the configuration fields alone.
+func TestVPNGatewayNodeStatusWithoutALeaseOmitsTheCounters(t *testing.T) {
+	fixture := newVPNGatewayFixture(t, enabledVPNTestConfig(t), func(deps *VPNGatewayDeps) {
+		deps.Leases = &recordingLeaseRepository{}
+		deps.Peers = &stubVPNPeerRepository{count: 0}
+	})
+	gateway := fixture.gateway
+	if err := gateway.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	status, err := gateway.NodeStatus(context.Background())
+	if err != nil {
+		t.Fatalf("NodeStatus: %v", err)
+	}
+	if status.Subnet != "" {
+		t.Errorf("subnet = %q, want it omitted for a node with no lease", status.Subnet)
+	}
+	if status.Allocated != nil || status.Capacity != nil {
+		t.Errorf("allocated/capacity = %v/%v, want both omitted", status.Allocated, status.Capacity)
+	}
+	if status.Peers == nil || *status.Peers != 0 {
+		t.Errorf("peers = %v, want an explicit zero: the count is known and it is none", status.Peers)
+	}
+}
+
+// D13's serving test is the second return value. A peer this gateway does not hold
+// has its traffic somewhere else, and answering with an empty list would tell the
+// console "no traffic" for a peer that is busy on another node.
+func TestVPNGatewayPeerFlowsAnswersOnlyForPeersItServes(t *testing.T) {
+	fixture := newVPNGatewayFixture(t, enabledVPNTestConfig(t), nil)
+	gateway := fixture.gateway
+	if err := gateway.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	fixture.applyPeer(t, nil)
+	registered := vpnLifecycleFlow(t, gateway, "peer-a", nil)
+	registered.AddSent(1200)
+	registered.AddReceived(3400)
+
+	flows, served := gateway.PeerFlows("peer-a")
+	if !served {
+		t.Fatal("the gateway does not serve a peer it holds")
+	}
+	if len(flows) != 1 {
+		t.Fatalf("PeerFlows returned %d flows, want 1", len(flows))
+	}
+	if flows[0].ID != registered.ID() || flows[0].Protocol != "tcp" {
+		t.Errorf("the snapshot describes %+v, want the registered tcp flow", flows[0])
+	}
+	if flows[0].BytesSent != 1200 || flows[0].BytesReceived != 3400 {
+		t.Errorf("byte counters = %d/%d, want 1200/3400", flows[0].BytesSent, flows[0].BytesReceived)
+	}
+
+	if _, served := gateway.PeerFlows("peer-nobody"); served {
+		t.Error("the gateway claims to serve a peer it has never held")
+	}
+
+	// A peer with no traffic is an empty list rather than "not served": the
+	// difference is what tells the console to render "idle" instead of 501.
+	other := vpnPeerRow("peer-b", vpnPeerKeyB, vpnWireSecondIP)
+	if err := gateway.ApplyPeer(other); err != nil {
+		t.Fatalf("ApplyPeer: %v", err)
+	}
+	idle, served := gateway.PeerFlows("peer-b")
+	if !served {
+		t.Fatal("the gateway does not serve a peer it holds")
+	}
+	if len(idle) != 0 {
+		t.Errorf("an idle peer reported %d flows, want none", len(idle))
+	}
+
+	if err := gateway.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, served := gateway.PeerFlows("peer-a"); served {
+		t.Error("a closed gateway still claims to serve a peer")
 	}
 }

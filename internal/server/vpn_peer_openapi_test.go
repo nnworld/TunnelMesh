@@ -111,8 +111,8 @@ func TestVPNPeerOpenAPIMatchesTheServedSurface(t *testing.T) {
 	// the marker: the peer flow table and the gateway fleet status. A marker on a
 	// working endpoint would tell a client to stop calling it; a missing marker on
 	// a 501 would leave the phase of the gap unrecorded.
-	if phases != 2 {
-		t.Errorf("found %d operations marked x-tunnelmesh-phase, want 2", phases)
+	if phases != 0 {
+		t.Errorf("found %d operations marked x-tunnelmesh-phase, want 0: every documented vpn operation is served", phases)
 	}
 }
 

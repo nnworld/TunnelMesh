@@ -59,6 +59,11 @@ const vpnPeerLoadTimeout = 30 * time.Second
 // process log. See vpnDeviceLogger for why it is bounded at all.
 const vpnDeviceLogInterval = time.Second
 
+// vpnNodeStatusTimeout bounds the two reads a status request makes. The console
+// polls it, so a status that waited for a slow database would hold a request open
+// for as long as the driver's own timeout allows and read as a hung page.
+const vpnNodeStatusTimeout = 5 * time.Second
+
 // vpnGateway is the embedded WireGuard gateway.
 //
 // It is composed the way ProxyEntry is: one struct holding an already-validated
@@ -424,22 +429,116 @@ func (g *vpnGateway) ApplyPeer(peer storage.VPNPeer) error {
 
 func (g *vpnGateway) RemovePeer(peerID string) error { return g.peers.RemovePeer(peerID) }
 
-// PeerFlows reports that this gateway serves no peer yet, which is the honest
-// answer until the flow table exists. The false return is what makes the API
-// answer 501 rather than an empty list.
-func (g *vpnGateway) PeerFlows(_ string) ([]VPNFlowSnapshot, bool) { return nil, false }
+// PeerFlows reports one peer's active flows, and whether this gateway serves that
+// peer at all.
+//
+// The second value is the reason the method exists in this shape. D13 makes "not
+// served here" a 501 rather than an empty list, because an empty list is exactly
+// what an idle peer looks like, and the traffic of a peer attached to another node
+// is not idle. Membership is read from the peer table rather than from the
+// configuration or the database: the table is the set this gateway will actually
+// decrypt for, so it is the only answer that cannot promise a flow list for a peer
+// whose datagrams are being dropped.
+func (g *vpnGateway) PeerFlows(peerID string) ([]VPNFlowSnapshot, bool) {
+	if !g.serving() {
+		return nil, false
+	}
+	if _, held := g.peers.lookupByID(peerID); !held {
+		return nil, false
+	}
+	return g.flows.snapshot(peerID), true
+}
 
-// NodeStatus answers from configuration. The counters that need the database and
-// the running data plane are left unset so the console renders an em dash instead
-// of a zero that would claim the pool is empty.
-func (g *vpnGateway) NodeStatus(_ context.Context) (VPNNodeStatus, error) {
-	return VPNNodeStatus{
+// NodeStatus reports this node's gateway.
+//
+// The configuration fields come from the validated section the gateway was
+// assembled with. The counters are read from the two repositories that own them,
+// because neither is a fact about this process: the allocated count belongs to the
+// lease row and the peer count to the database, and a gateway that reported the row
+// set it loaded instead would disagree with the management API the moment a write
+// landed for a row it refused to load.
+//
+// A repository that does not answer fails the request instead of leaving the
+// counter out. An omitted counter renders as an em dash, and "this node holds no
+// subnet" is a different claim from "the database did not answer".
+func (g *vpnGateway) NodeStatus(ctx context.Context) (VPNNodeStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	status := VPNNodeStatus{
 		NodeID:       g.deps.NodeID,
 		Enabled:      g.deps.Config.Enabled,
 		Listen:       g.deps.Config.Listen,
 		EndpointHost: g.deps.Config.EndpointHost,
-	}, nil
+		// Echo is a property of a gateway that is serving, not of a switch that says
+		// it may: the pipeline refuses the datagram before any agent is asked.
+		ICMPCapable: g.deps.Config.ICMPEnabled && g.serving(),
+	}
+	readCtx, cancel := context.WithTimeout(ctx, vpnNodeStatusTimeout)
+	defer cancel()
+	if g.deps.Leases != nil {
+		held, err := g.deps.Leases.ListByHolder(readCtx, g.deps.NodeID)
+		if err != nil {
+			return VPNNodeStatus{}, fmt.Errorf("vpn: list the subnets leased by node %q: %w", g.deps.NodeID, err)
+		}
+		// A node holds one subnet, and the first row is the one its peers live in:
+		// a second one can only be a lease an older ip_pool left behind, whose
+		// addresses are still valid but whose capacity is not what this node issues
+		// from.
+		if len(held) > 0 {
+			lease := held[0]
+			status.Subnet = lease.Subnet
+			allocated := lease.AllocatedCount
+			status.Allocated = &allocated
+			if capacity, ok := vpnSubnetCapacity(g.deps.Config.IPPool, g.deps.Config.NodeSubnetSize, lease.Subnet); ok {
+				status.Capacity = &capacity
+			}
+		}
+	}
+	if g.deps.Peers != nil {
+		peers, err := g.deps.Peers.CountByNode(readCtx, g.deps.NodeID)
+		if err != nil {
+			return VPNNodeStatus{}, fmt.Errorf("vpn: count the peers of node %q: %w", g.deps.NodeID, err)
+		}
+		status.Peers = &peers
+	}
+	return status, nil
 }
+
+// vpnSubnetCapacity is how many peer addresses one subnet can hold: every address
+// in the prefix except the network address, the broadcast address and the one the
+// node reserves for its own tunnel interface.
+//
+// It is derived through the pool rather than from the prefix length alone so it
+// cannot drift from the range Pool.AllocateAddress actually hands out, which is the
+// number a console is promising an operator. A prefix too small to hold all four
+// roles reports no capacity at all rather than one that could never be filled.
+func vpnSubnetCapacity(ipPool string, nodeSubnetSize int, subnet string) (int, bool) {
+	pool, err := vpn.ParsePool(ipPool, nodeSubnetSize)
+	if err != nil {
+		return 0, false
+	}
+	nodeSubnet, err := pool.NodeSubnet(subnet)
+	if err != nil {
+		return 0, false
+	}
+	ones, bits := nodeSubnet.Mask.Size()
+	if bits == 0 || ones < 2 {
+		return 0, false
+	}
+	size := 1 << (bits - ones)
+	if size < 4 {
+		return 0, false
+	}
+	return size - 3, true
+}
+
+// serving reports whether the endpoint is up.
+//
+// The bound port is the fact rather than the started flag: stopEndpoint zeroes it in
+// the same step that closes the device, so a gateway that has been torn down cannot
+// report itself as running no matter which order the two were read in.
+func (g *vpnGateway) serving() bool { return g.localPort() != 0 }
 
 // peerApplied reacts to a peer becoming servable, or to its row changing.
 //

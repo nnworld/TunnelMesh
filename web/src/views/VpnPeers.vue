@@ -5,10 +5,6 @@
       <el-button :loading="loading" @click="reload">{{ t('vpn.refresh') }}</el-button>
     </PageHeader>
 
-    <!-- A peer issued today is managed and audited but cannot carry traffic, so
-         the notice is on the page itself rather than buried in the docs. -->
-    <el-alert class="phase-notice" type="info" show-icon :closable="false" :title="t('vpn.dataPlanePending')" />
-
     <div v-if="pool" class="tm-card pool-overview">
       <h3>{{ t('vpn.poolTitle') }}</h3>
       <dl>
@@ -21,8 +17,9 @@
         <dt>{{ t('vpn.poolIcmp') }}</dt><dd>{{ pool.icmpCapable ? t('common.yes') : t('common.no') }}</dd>
       </dl>
     </div>
-    <!-- 501 is a state, not a failure: the pool level is unknown, and rendering
-         it as zero allocated would be a number nobody can act on. -->
+    <!-- An unreadable status is a state, not a number: the pool level is
+         unknown, and rendering it as zero allocated would be a figure nobody can
+         act on and everybody would believe. -->
     <p v-else class="pool-note">{{ t('vpn.poolUnavailable') }}</p>
 
     <div class="tm-card table-card">
@@ -52,9 +49,10 @@
           <el-table-column :label="t('vpn.expiresAt')" width="180">
             <template #default="{ row }">{{ row.expiresAt ? formatDate(row.expiresAt) : t('vpn.never') }}</template>
           </el-table-column>
-          <el-table-column :label="t('vpn.actions')" width="300" fixed="right">
+          <el-table-column :label="t('vpn.actions')" width="360" fixed="right">
             <template #default="{ row }">
               <el-button class="vpn-usage" link type="primary" @click="openUsage(row)">{{ t('vpn.usageOpen') }}</el-button>
+              <el-button class="vpn-flows" link type="primary" @click="openFlows(row)">{{ t('vpn.flowsOpen') }}</el-button>
               <el-button link type="primary" @click="showDetail(row)">{{ t('vpn.detail') }}</el-button>
               <el-button v-if="row.status !== 'revoked'" link type="primary" @click="openEdit(row)">{{ t('vpn.edit') }}</el-button>
               <el-button v-if="row.status !== 'revoked'" link type="warning" @click="rotate(row)">{{ t('vpn.rotate') }}</el-button>
@@ -194,6 +192,45 @@
         <el-button class="vpn-usage-close" @click="closeUsage">{{ t('vpn.usageClose') }}</el-button>
       </template>
     </el-drawer>
+
+    <!-- A drawer of its own rather than a block inside the usage drawer: the
+         usage drawer is documentation that stays true offline, while this one is
+         a live read that can fail, and mixing the two would make a failed read
+         look like a failed instruction. -->
+    <el-drawer v-model="flowsVisible" :title="t('vpn.flowsTitle')" size="min(720px,100vw)">
+      <div v-if="flowsPeer" class="flows-body">
+        <div class="flows-toolbar">
+          <span class="flows-peer">{{ flowsPeer.name }} · {{ flowsPeer.vpnIp }}</span>
+          <el-button size="small" :loading="flowsLoading" @click="loadFlows">{{ t('vpn.flowsRefresh') }}</el-button>
+        </div>
+        <!-- A node that does not serve the peer answers 501, which is neither a
+             failure the operator can correct nor an empty flow list: an empty
+             table here would read as "the peer is idle". -->
+        <el-alert v-if="flowsNotice" class="flows-notice" :type="flowsNoticeKind" show-icon :closable="false" :title="flowsNotice" />
+        <DataState v-else :loading="flowsLoading" :error="flowsError" :empty="!flows.length" :error-label="t('vpn.flowsLoadFailed')" :retry-label="t('common.retry')" :empty-label="t('vpn.flowsEmpty')" @retry="loadFlows">
+          <el-table :data="flows" size="small">
+            <el-table-column prop="protocol" :label="t('vpn.flows.protocol')" width="90" />
+            <el-table-column prop="target" :label="t('vpn.flows.target')" min-width="140" />
+            <el-table-column prop="port" :label="t('vpn.flows.port')" width="80" />
+            <el-table-column :label="t('vpn.flows.startedAt')" width="170">
+              <template #default="{ row }">{{ formatDate(row.startedAt) }}</template>
+            </el-table-column>
+            <!-- Printed as the gateway counts them rather than as KiB: the number
+                 an operator compares against tunnelmesh_bytes_total must not be
+                 rounded by the console that shows it. -->
+            <el-table-column :label="t('vpn.flows.bytesSent')" width="120">
+              <template #default="{ row }">{{ row.bytesSent ?? '—' }}</template>
+            </el-table-column>
+            <el-table-column :label="t('vpn.flows.bytesReceived')" width="130">
+              <template #default="{ row }">{{ row.bytesReceived ?? '—' }}</template>
+            </el-table-column>
+          </el-table>
+        </DataState>
+      </div>
+      <template #footer>
+        <el-button class="vpn-flows-close" @click="flowsVisible = false">{{ t('vpn.flowsClose') }}</el-button>
+      </template>
+    </el-drawer>
   </section>
 </template>
 
@@ -207,8 +244,9 @@ import StatusTag from '../components/StatusTag.vue'
 import { useFormatDateTime } from '../i18n/format'
 import { getAgents, type Agent } from '../api/client'
 import {
-  createVpnPeer, listVpnNodes, listVpnPeers, patchVpnPeer, revealVpnPeerConfig, revokeVpnPeer,
-  rotateVpnPeer, type VpnNodeStatus, type VpnPeer, type VpnPeerStatus,
+  createVpnPeer, listVpnNodes, listVpnPeerFlows, listVpnPeers, patchVpnPeer,
+  revealVpnPeerConfig, revokeVpnPeer, rotateVpnPeer,
+  type VpnFlow, type VpnNodeStatus, type VpnPeer, type VpnPeerStatus,
 } from '../api/vpn'
 import { filterAgents, loadAgentsForSelection } from './token-form'
 import {
@@ -290,6 +328,51 @@ const formInvalid = computed(() => (
 
 const detailVisible = ref(false)
 const detailPeer = ref<VpnPeer | null>(null)
+
+const flowsVisible = ref(false)
+const flowsPeer = ref<VpnPeer | null>(null)
+const flows = ref<VpnFlow[]>([])
+const flowsLoading = ref(false)
+const flowsError = ref(false)
+const flowsNotice = ref('')
+const flowsNoticeKind = ref<'info' | 'error'>('info')
+
+// Opening always re-reads rather than showing the last snapshot: the drawer is
+// used to decide whether a peer is still connected, and a table that is stale by
+// an unknown amount answers that question wrongly.
+async function openFlows(peer: VpnPeer) {
+  flowsPeer.value = peer
+  flows.value = []
+  flowsNotice.value = ''
+  flowsError.value = false
+  flowsVisible.value = true
+  await loadFlows()
+}
+
+async function loadFlows() {
+  const peer = flowsPeer.value
+  if (!peer) return
+  flowsLoading.value = true
+  flowsError.value = false
+  try {
+    const result = await listVpnPeerFlows(peer.id)
+    flows.value = result.items ?? []
+    flowsNotice.value = ''
+  } catch (error) {
+    flows.value = []
+    if (isVpnUnavailableState(error)) {
+      flowsNotice.value = vpnErrorMessage(error, t, 'vpn.flowsLoadFailed')
+      flowsNoticeKind.value = 'info'
+    } else {
+      // A failed read is retryable, so it goes through DataState, which is the
+      // one place on this page that renders a retry button.
+      flowsNotice.value = ''
+      flowsError.value = true
+    }
+  } finally {
+    flowsLoading.value = false
+  }
+}
 
 const usageVisible = ref(false)
 const usagePeer = ref<VpnPeer | null>(null)
@@ -527,5 +610,5 @@ reload()
 </script>
 
 <style scoped>
-.phase-notice{margin-bottom:14px}.pool-overview{margin-bottom:14px}.pool-overview h3{margin:0 0 10px;font-size:15px}.pool-overview dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 16px;margin:0}.pool-overview dt{color:var(--tm-muted);font-size:12px}.pool-overview dd{margin:0;font-weight:600}.pool-note{margin:0 0 14px;color:var(--tm-muted);font-size:13px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}.keyword-input{width:220px}.load-more{margin-top:12px;text-align:center}.field-help{margin:4px 0 0;color:var(--tm-muted);font-size:12px;line-height:1.6}.key-text{word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.limit-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.usage-summary{margin-bottom:16px}.reveal-block,.usage-block{margin-bottom:20px}.reveal-block h3,.usage-block h3{margin:0 0 10px;font-size:15px}.reveal-row{display:flex;gap:10px;align-items:center;margin-top:10px}.reveal-row .el-input{max-width:220px}.reveal-notice{margin-top:10px}.vpn-config{margin:12px 0 0;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-all}.reveal-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.usage-block ul{margin:0;padding-left:18px;color:var(--tm-text);font-size:13px;line-height:1.8}
+.pool-overview{margin-bottom:14px}.pool-overview h3{margin:0 0 10px;font-size:15px}.pool-overview dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 16px;margin:0}.pool-overview dt{color:var(--tm-muted);font-size:12px}.pool-overview dd{margin:0;font-weight:600}.pool-note{margin:0 0 14px;color:var(--tm-muted);font-size:13px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}.keyword-input{width:220px}.load-more{margin-top:12px;text-align:center}.field-help{margin:4px 0 0;color:var(--tm-muted);font-size:12px;line-height:1.6}.key-text{word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.limit-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.usage-summary{margin-bottom:16px}.reveal-block,.usage-block{margin-bottom:20px}.reveal-block h3,.usage-block h3{margin:0 0 10px;font-size:15px}.reveal-row{display:flex;gap:10px;align-items:center;margin-top:10px}.reveal-row .el-input{max-width:220px}.reveal-notice{margin-top:10px}.vpn-config{margin:12px 0 0;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-all}.reveal-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.usage-block ul{margin:0;padding-left:18px;color:var(--tm-text);font-size:13px;line-height:1.8}.flows-toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:12px}.flows-peer{font-weight:600;font-size:13px}.flows-notice{margin-bottom:12px}
 </style>

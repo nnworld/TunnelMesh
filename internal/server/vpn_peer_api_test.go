@@ -22,6 +22,10 @@ import (
 // tests. It is a published test vector, not a secret.
 const vpnAPINodePublicKey = "3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08="
 
+// vpnAPINodeID is the node the fixture's peer service issues for, and therefore
+// the node the status endpoint reports.
+const vpnAPINodeID = "api-node-1"
+
 // vpnAPIFixture is an authenticated management API with the peer service
 // assembled over the same SQLite database the other API tests use, plus a second
 // non-admin account so ownership can be exercised from the HTTP layer.
@@ -69,9 +73,16 @@ func newVPNAPIFixture(t *testing.T, mutate func(*VPNServiceConfig)) *vpnAPIFixtu
 	api.SetVPNPeerService(NewVPNPeerService(VPNPeerServiceDeps{
 		Peers: api.DB.VPNPeers(), Leases: api.DB.VPNIPLeases(),
 		Agents: api.DB.Agents(), Audits: api.DB.Audits(),
-		Secrets: store, Config: cfg, NodeID: "api-node-1", LeaseTTL: time.Minute,
+		Secrets: store, Config: cfg, NodeID: vpnAPINodeID, LeaseTTL: time.Minute,
 		NodePublicKey: vpnAPINodePublicKey,
 	}))
+	// The node view is recorded separately because it is what the status endpoint
+	// falls back to when no gateway is installed, which is the state every untagged
+	// test runs in.
+	api.setVPNNodeView(config.VPNConfig{
+		Enabled: cfg.Enabled, Listen: cfg.Listen, EndpointHost: cfg.EndpointHost,
+		IPPool: cfg.IPPool, NodeSubnetSize: cfg.NodeSubnetSize, ICMPEnabled: cfg.ICMPEnabled,
+	}, vpnAPINodeID)
 	return &vpnAPIFixture{
 		api: api, handler: api.Handler(),
 		userToken:  apiToken(t, api, "alice", "alice-pass"),
@@ -113,6 +124,40 @@ type vpnPagePayload struct {
 	Items      []vpnPeerPayload `json:"items"`
 	NextCursor string           `json:"nextCursor"`
 	HasMore    bool             `json:"hasMore"`
+}
+
+// vpnFlowPayload and vpnNodePayload decode the two live-state responses. The
+// counters are pointers because the server omits them when it cannot know them,
+// and a test that decoded them as ints would read a missing counter as zero - the
+// exact confusion the projection was shaped to prevent.
+type vpnFlowPayload struct {
+	ID            string    `json:"id"`
+	Protocol      string    `json:"protocol"`
+	Target        string    `json:"target"`
+	Port          int       `json:"port"`
+	StartedAt     time.Time `json:"startedAt"`
+	BytesSent     int64     `json:"bytesSent"`
+	BytesReceived int64     `json:"bytesReceived"`
+}
+
+type vpnFlowListPayload struct {
+	Items []vpnFlowPayload `json:"items"`
+}
+
+type vpnNodePayload struct {
+	NodeID       string `json:"nodeId"`
+	Enabled      bool   `json:"enabled"`
+	Listen       string `json:"listen"`
+	EndpointHost string `json:"endpointHost"`
+	Subnet       string `json:"subnet"`
+	Allocated    *int   `json:"allocated"`
+	Capacity     *int   `json:"capacity"`
+	Peers        *int   `json:"peers"`
+	ICMPCapable  bool   `json:"icmpCapable"`
+}
+
+type vpnNodeListPayload struct {
+	Items []vpnNodePayload `json:"items"`
 }
 
 type vpnRevealPayload struct {
@@ -183,6 +228,26 @@ func vpnDecodeReveal(t *testing.T, r *httptest.ResponseRecorder) vpnRevealPayloa
 		t.Fatalf("decode the revealed configuration: %v (%s)", err, envelope.Data)
 	}
 	return revealed
+}
+
+func vpnDecodeFlows(t *testing.T, r *httptest.ResponseRecorder) vpnFlowListPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var payload vpnFlowListPayload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decode the flow list: %v (%s)", err, r.Body.String())
+	}
+	return payload
+}
+
+func vpnDecodeNodes(t *testing.T, r *httptest.ResponseRecorder) vpnNodeListPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var payload vpnNodeListPayload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decode the node list: %v (%s)", err, r.Body.String())
+	}
+	return payload
 }
 
 func vpnPeerBody(agentID, name string) map[string]any {
@@ -616,20 +681,211 @@ func TestVPNPeerAPIRevealGuardsThePrivateKey(t *testing.T) {
 	}
 }
 
-// TestVPNPeerAPIRefusesTheDataPlaneEndpoints pins D12: an endpoint whose data
-// plane dependency has not shipped answers 501 with the stable code, never a 200
-// with an empty list that a console would render as "nothing is happening".
-func TestVPNPeerAPIRefusesTheDataPlaneEndpoints(t *testing.T) {
+// TestVPNPeerAPIWithoutADataPlaneReportsWhatItCannotObserve pins D13's negative
+// half: a node with no running gateway answers 501 for one peer's flows, because a
+// 200 with an empty list would be read as "this peer has no traffic" and hide the
+// fact that nothing here can observe traffic at all.
+//
+// The node status endpoint is deliberately not in that set. It answers 200 in both
+// builds, because the configuration it reports exists whether or not a gateway was
+// built into the binary, and a console that had to special-case 501 for the node
+// page would render "no node serves VPN" for a fleet that simply runs an untagged
+// server.
+func TestVPNPeerAPIWithoutADataPlaneReportsWhatItCannotObserve(t *testing.T) {
 	f := newVPNAPIFixture(t, nil)
 	created := f.createPeer(t, f.userToken, f.userAgent, "flows")
 	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
-		http.StatusNotImplemented, "vpn_not_implemented")
-	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.adminToken, "", nil),
 		http.StatusNotImplemented, "vpn_not_implemented")
 	// A missing peer is still a 404: the flows route resolves the peer before
 	// reporting what it cannot do, so it cannot be used to probe the build.
 	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/vpn-peer-missing/flows", f.userToken, "", nil),
 		http.StatusNotFound, "vpn_peer_not_found")
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200 without a data plane", r.Code, r.Body.String())
+	}
+	nodes := vpnDecodeNodes(t, r)
+	if len(nodes.Items) != 1 {
+		t.Fatalf("node status listed %d nodes, want this node only", len(nodes.Items))
+	}
+	node := nodes.Items[0]
+	if node.NodeID != vpnAPINodeID {
+		t.Errorf("nodeId = %q, want %q", node.NodeID, vpnAPINodeID)
+	}
+	if !node.Enabled {
+		t.Error("an enabled server.vpn section was reported as disabled")
+	}
+	if node.Listen != "0.0.0.0:51820" || node.EndpointHost != "gw-1.mesh.example.com" {
+		t.Errorf("listen/endpointHost = %q/%q, want the configured pair", node.Listen, node.EndpointHost)
+	}
+	// No gateway in this build, so nothing can say whether echo would be served.
+	if node.ICMPCapable {
+		t.Error("icmpCapable is true on a node with no data plane")
+	}
+	for name, counter := range map[string]*int{"allocated": node.Allocated, "capacity": node.Capacity, "peers": node.Peers} {
+		if counter != nil {
+			t.Errorf("%s = %d without a data plane, want it omitted so the console renders an em dash", name, *counter)
+		}
+	}
+}
+
+// A disabled node still answers 200, and says so: this is the shape the console
+// renders after the operator takes the stop-loss path of ADR 0002.
+func TestVPNPeerAPIReportsADisabledNode(t *testing.T) {
+	f := newVPNAPIFixture(t, func(c *VPNServiceConfig) { c.Enabled = false })
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	node := vpnDecodeNodes(t, r).Items[0]
+	if node.Enabled {
+		t.Error("a disabled server.vpn section was reported as enabled")
+	}
+	if node.ICMPCapable {
+		t.Error("icmpCapable is true on a disabled node")
+	}
+}
+
+// D13's positive half: a gateway that serves the peer answers 200 with exactly the
+// snapshot it holds, field for field. The projection is narrow on purpose - no
+// payload, no key material, no agent-side socket - and the test asserts the fields
+// that are there rather than only the count, because a byte counter rendered as the
+// flow identifier is the kind of mistake a shape-only assertion passes.
+func TestVPNPeerAPIListsTheActiveFlowsOfAServedPeer(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "flows")
+	started := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	plane := &fakeVPNDataPlane{
+		serves: true,
+		flows: []VPNFlowSnapshot{
+			{ID: "vpnflow-1", Protocol: "tcp", Target: "192.168.1.20", Port: 443, StartedAt: started, BytesSent: 2048, BytesReceived: 4096},
+			{ID: "vpnflow-2", Protocol: "icmp-echo", Target: "192.168.1.21", StartedAt: started.Add(time.Minute), BytesSent: 64, BytesReceived: 64},
+		},
+	}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("flows = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	items := vpnDecodeFlows(t, r).Items
+	if len(items) != 2 {
+		t.Fatalf("flows listed %d items, want 2 (%s)", len(items), r.Body.String())
+	}
+	first := items[0]
+	if first.ID != "vpnflow-1" || first.Protocol != "tcp" || first.Target != "192.168.1.20" || first.Port != 443 {
+		t.Errorf("the first flow decoded as %+v, want the tcp snapshot", first)
+	}
+	if !first.StartedAt.Equal(started) {
+		t.Errorf("startedAt = %s, want %s", first.StartedAt, started)
+	}
+	if first.BytesSent != 2048 || first.BytesReceived != 4096 {
+		t.Errorf("byte counters = %d/%d, want 2048/4096", first.BytesSent, first.BytesReceived)
+	}
+	if second := items[1]; second.Protocol != "icmp-echo" || second.Port != 0 {
+		t.Errorf("the second flow decoded as %+v, want the echo snapshot", second)
+	}
+	if calls, _ := plane.liveState(); len(calls) != 1 || calls[0] != created.ID {
+		t.Errorf("the gateway was asked about %v, want one call for %s", calls, created.ID)
+	}
+}
+
+// A gateway that serves other peers but not this one still answers 501. The peer
+// row exists and is readable, which is exactly why the answer cannot be an empty
+// list: the traffic is on another node.
+func TestVPNPeerAPIReportsFlowsOfAPeerOnAnotherNodeAsNotImplemented(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "remote")
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{serves: false})
+
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
+		http.StatusNotImplemented, "vpn_not_implemented")
+}
+
+// Visibility is resolved before the gateway is asked, so a peer belonging to
+// somebody else is a 404 and not a 501. Answering 501 there would make the status
+// code itself an ownership oracle: two identifiers, two different answers, one of
+// them not yours.
+func TestVPNPeerAPIFlowsOfAnotherUsersPeerAreNotFound(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.otherToken, f.otherAgent, "bobs")
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{serves: true})
+
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
+		http.StatusNotFound, "vpn_peer_not_found")
+}
+
+// The node status is the gateway's own report when one is installed: the counters
+// exist only in its memory and in the repositories it reads, so the API must not
+// invent them from configuration.
+func TestVPNPeerAPIReportsTheGatewayNodeStatus(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	allocated, capacity, peers := 18, 253, 4
+	plane := &fakeVPNDataPlane{status: VPNNodeStatus{
+		NodeID: vpnAPINodeID, Enabled: true, Listen: "0.0.0.0:51820",
+		EndpointHost: "gw-1.mesh.example.com", Subnet: "10.64.5.0/24",
+		Allocated: &allocated, Capacity: &capacity, Peers: &peers, ICMPCapable: true,
+	}}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.adminToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	nodes := vpnDecodeNodes(t, r)
+	if len(nodes.Items) != 1 {
+		t.Fatalf("node status listed %d nodes, want this node only", len(nodes.Items))
+	}
+	node := nodes.Items[0]
+	if node.NodeID != vpnAPINodeID || !node.Enabled || node.Subnet != "10.64.5.0/24" {
+		t.Errorf("node decoded as %+v, want the gateway's report", node)
+	}
+	for name, got := range map[string]struct {
+		value *int
+		want  int
+	}{"allocated": {node.Allocated, 18}, "capacity": {node.Capacity, 253}, "peers": {node.Peers, 4}} {
+		if got.value == nil {
+			t.Errorf("%s was omitted, want %d", name, got.want)
+			continue
+		}
+		if *got.value != got.want {
+			t.Errorf("%s = %d, want %d", name, *got.value, got.want)
+		}
+	}
+	if !node.ICMPCapable {
+		t.Error("icmpCapable = false, want the gateway's answer")
+	}
+	if _, calls := plane.liveState(); calls != 1 {
+		t.Errorf("the gateway was asked for its status %d times, want 1", calls)
+	}
+}
+
+// A gateway that cannot read its own counters must fail the request. Reporting the
+// configuration fields with the counters omitted would render as "no subnet
+// leased", which is a different claim from "the database did not answer".
+func TestVPNPeerAPIReportsAFailingGatewayStatus(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{statusErr: errors.New("vpn: list leased subnets: context deadline exceeded")})
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.adminToken, "", nil)
+	if r.Code != http.StatusInternalServerError {
+		t.Fatalf("node status = %d (%s), want 500", r.Code, r.Body.String())
+	}
+}
+
+// The node view is a collection route with no sub-resources, so the two shapes a
+// caller can get wrong are answered apart: an unknown deeper path is a 404 and a
+// known one reached with the wrong verb is a 405.
+func TestVPNPeerAPIRejectsMalformedNodeRequests(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-nodes", f.adminToken, "", nil); r.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST on the node collection returned %d, want 405", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes/api-node-1", f.adminToken, "", nil); r.Code != http.StatusNotFound {
+		t.Errorf("a node sub-resource returned %d, want 404", r.Code)
+	}
 }
 
 func TestVPNPeerAPIDisabledNode(t *testing.T) {
@@ -712,6 +968,16 @@ type fakeVPNDataPlane struct {
 	started  bool
 	closed   bool
 	applyErr error
+	// The live-state answers. Both are configurable because D13 makes them the
+	// whole difference between a 200 and a 501: a gateway that does not serve the
+	// peer has to say so, and a gateway that cannot read its own counters has to
+	// fail rather than report zeros.
+	serves      bool
+	flows       []VPNFlowSnapshot
+	status      VPNNodeStatus
+	statusErr   error
+	flowCalls   []string
+	statusCalls int
 }
 
 func (f *fakeVPNDataPlane) ApplyPeer(peer storage.VPNPeer) error {
@@ -738,10 +1004,32 @@ func (f *fakeVPNDataPlane) Start(context.Context) error {
 	return nil
 }
 
-func (f *fakeVPNDataPlane) PeerFlows(string) ([]VPNFlowSnapshot, bool) { return nil, false }
+func (f *fakeVPNDataPlane) PeerFlows(peerID string) ([]VPNFlowSnapshot, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flowCalls = append(f.flowCalls, peerID)
+	if !f.serves {
+		return nil, false
+	}
+	return append([]VPNFlowSnapshot(nil), f.flows...), true
+}
 
 func (f *fakeVPNDataPlane) NodeStatus(context.Context) (VPNNodeStatus, error) {
-	return VPNNodeStatus{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statusCalls++
+	if f.statusErr != nil {
+		return VPNNodeStatus{}, f.statusErr
+	}
+	return f.status, nil
+}
+
+// liveState returns what the gateway answered, so a test can assert the route
+// consulted it at all rather than only that the response looked right.
+func (f *fakeVPNDataPlane) liveState() ([]string, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.flowCalls...), f.statusCalls
 }
 
 func (f *fakeVPNDataPlane) Close() error {

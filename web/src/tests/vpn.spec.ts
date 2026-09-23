@@ -4,6 +4,8 @@ import { createPinia, setActivePinia } from 'pinia'
 import { readFileSync } from 'node:fs'
 import VpnPeers from '../views/VpnPeers.vue'
 import { i18n } from '../i18n'
+import zhCN from '../i18n/messages/zh-CN'
+import enUS from '../i18n/messages/en-US'
 import { callsTo, check, click, flush, setValue, stubApi, type ApiStub } from './api-stub'
 
 // PageHeader reads the current route for its breadcrumb, and the view is
@@ -22,12 +24,23 @@ const peer = {
 }
 const agent = { id: 'a-1', name: 'edge-1', enabled: true, status: 'active', ownerUserId: 'u-1' }
 const rendered = '[Interface]\nPrivateKey = SECRET-PLAINTEXT\nAddress = 10.64.0.2/32\n'
+// What the gateway runtime reports about the node this API speaks for. Every
+// field is present because a partial payload has its own test below.
+const node = {
+  nodeId: 'n-1', enabled: true, listen: '0.0.0.0:51820', endpointHost: 'vpn.example.com',
+  subnet: '10.64.0.0/24', allocated: 3, capacity: 253, peers: 3, icmpCapable: true,
+}
+const flow = {
+  id: 'f-1', protocol: 'tcp', target: '10.0.0.7', port: 443,
+  startedAt: '2026-09-23T08:00:00Z', bytesSent: 2048, bytesReceived: 4096,
+}
 
 function stubVpn(overrides: ApiStub[] = []) {
   return stubApi([
     ...overrides,
     { path: '/vpn-peers', data: { items: [peer], nextCursor: '', hasMore: false } },
-    { path: '/vpn-nodes', status: 501, data: { error: 'vpn_not_implemented' } },
+    { path: '/vpn-peers/p-1/flows', data: { items: [flow] } },
+    { path: '/vpn-nodes', data: { items: [node] } },
     { path: '/agents', data: { items: [agent] } },
   ])
 }
@@ -72,18 +85,24 @@ beforeEach(() => {
 })
 
 describe('vpn peers console', () => {
-  it('lists peers and says plainly that this release has no data plane', async () => {
+  it('lists peers without a standing disclaimer about a missing data plane', async () => {
     stubVpn()
     const { container, unmount } = await mountVpn()
     try {
       expect(container.textContent).toContain('laptop')
       expect(container.textContent).toContain('10.64.0.2')
-      expect(container.textContent).toContain(t('vpn.dataPlanePending'))
+      expect(container.querySelector('.phase-notice')).toBeNull()
+      // The key is gone from both locales rather than merely unrendered: a key
+      // that survives a release which can carry traffic gets reused by the next
+      // banner somebody adds, and then the console lies about the build again.
+      for (const locale of [zhCN, enUS]) {
+        expect(Object.keys(locale.vpn)).not.toContain('dataPlanePending')
+      }
     } finally { unmount() }
   })
 
-  it('reports the pool overview as unavailable rather than as zero allocated', async () => {
-    stubVpn()
+  it('reports the pool overview as unavailable when the node status cannot be read', async () => {
+    stubVpn([{ path: '/vpn-nodes', status: 500, data: { error: 'internal' } }])
     const { container, unmount } = await mountVpn()
     try {
       expect(container.querySelector('.pool-overview')).toBeNull()
@@ -163,6 +182,37 @@ describe('vpn peers console', () => {
     } finally { unmount() }
   })
 
+  it('renders the active flows of one peer in a drawer of their own', async () => {
+    const calls = stubVpn()
+    const { unmount } = await mountVpn()
+    try {
+      await clickButton(t('vpn.flowsOpen'), document.body)
+      expect(callsTo(calls, 'GET', '/vpn-peers/p-1/flows')).toHaveLength(1)
+      const drawer = document.body.querySelector('.flows-body')
+      expect(drawer?.textContent).toContain('10.0.0.7')
+      expect(drawer?.textContent).toContain('443')
+      // Byte counters are printed exactly as the gateway reports them: the number
+      // an operator compares against tunnelmesh_bytes_total must not be rounded.
+      expect(drawer?.textContent).toContain('2048')
+      expect(drawer?.textContent).toContain('4096')
+      expect(drawer?.textContent).not.toContain(t('vpn.errors.notImplemented'))
+    } finally { unmount() }
+  })
+
+  it('renders a peer this node cannot observe as information rather than as no traffic', async () => {
+    stubVpn([{ path: '/vpn-peers/p-1/flows', status: 501, data: { error: 'vpn_not_implemented' } }])
+    const { unmount } = await mountVpn()
+    try {
+      await clickButton(t('vpn.flowsOpen'), document.body)
+      const notice = document.body.querySelector('.flows-notice')
+      expect(notice?.classList.contains('el-alert--info')).toBe(true)
+      expect(notice?.textContent).toContain(t('vpn.errors.notImplemented'))
+      // An empty table here would read as "the peer is idle", which is the one
+      // conclusion the 501 rules out.
+      expect(document.body.querySelector('.flows-body')?.textContent).not.toContain('10.0.0.7')
+    } finally { unmount() }
+  })
+
   it('keeps the one-time key material out of persistent storage and out of the list', async () => {
     const source = readFileSync('src/views/VpnPeers.vue', 'utf8')
     expect(source).not.toContain('localStorage')
@@ -171,9 +221,9 @@ describe('vpn peers console', () => {
     expect(source).toContain('ElMessageBox.confirm')
     expect(source).toContain('rotateVpnPeer')
     expect(source).toContain('revokeVpnPeer')
-    // Active flows are a data-plane fact; the list must not grow a column that
-    // this release can only answer with 501.
-    expect(source).not.toContain('listVpnPeerFlows')
+    // Active flows are a data-plane fact this node can now answer, so they are
+    // read from the gateway instead of being delegated to a dashboard.
+    expect(source).toContain('listVpnPeerFlows')
     expect(source).toContain("t('vpn.usage.flowsHint')")
   })
   it('replays one idempotency key across save retries and mints a new one per dialog', async () => {

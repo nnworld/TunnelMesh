@@ -96,16 +96,38 @@ describe('vpn api client', () => {
     expect(call?.body).toEqual({ acknowledgeRisk: true })
   })
 
-  it('reaches the two gateway-runtime routes so their 501 can be rendered as a state', async () => {
+  it('reads the node status the gateway runtime reports', async () => {
     const calls = stubApi([
-      { path: '/vpn-peers/p-1/flows', status: 501, data: { error: 'vpn_not_implemented' } },
-      { path: '/vpn-nodes', status: 501, data: { error: 'vpn_not_implemented' } },
+      { path: '/vpn-nodes', data: { items: [{ nodeId: 'n-1', enabled: true, listen: '0.0.0.0:51820', subnet: '10.64.0.0/24', allocated: 3, capacity: 253, peers: 3, icmpCapable: true }] } },
     ])
 
-    await expect(listVpnPeerFlows('p-1')).rejects.toMatchObject({ status: 501, domain: 'vpn_not_implemented' })
-    await expect(listVpnNodes()).rejects.toMatchObject({ status: 501, domain: 'vpn_not_implemented' })
-    expect(callsTo(calls, 'GET', '/vpn-peers/p-1/flows')).toHaveLength(1)
+    const nodes = await listVpnNodes()
+
+    expect(nodes.items[0]?.subnet).toBe('10.64.0.0/24')
+    expect(nodes.items[0]?.icmpCapable).toBe(true)
     expect(callsTo(calls, 'GET', '/vpn-nodes')).toHaveLength(1)
+  })
+
+  it('reads the active flows of one peer field by field', async () => {
+    const calls = stubApi([
+      { path: '/vpn-peers/p-1/flows', data: { items: [{ id: 'f-1', protocol: 'tcp', target: '10.0.0.7', port: 443, startedAt: '2026-09-23T08:00:00Z', bytesSent: 2048, bytesReceived: 4096 }] } },
+    ])
+
+    const flows = await listVpnPeerFlows('p-1')
+
+    expect(flows.items[0]).toMatchObject({ protocol: 'tcp', target: '10.0.0.7', port: 443, bytesSent: 2048, bytesReceived: 4096 })
+    expect(callsTo(calls, 'GET', '/vpn-peers/p-1/flows')[0]?.path).toBe('/vpn-peers/p-1/flows')
+  })
+
+  it('maps a peer this node cannot observe onto its stable domain code', async () => {
+    const calls = stubApi([
+      { path: '/vpn-peers/p-1/flows', status: 501, data: { error: 'vpn_not_implemented' } },
+    ])
+
+    // Not an empty list: "the peer is idle" and "the peer is served elsewhere"
+    // are different facts, and only the second tells an operator where to look.
+    await expect(listVpnPeerFlows('p-1')).rejects.toMatchObject({ status: 501, domain: 'vpn_not_implemented' })
+    expect(callsTo(calls, 'GET', '/vpn-peers/p-1/flows')).toHaveLength(1)
   })
 
   it('never declares a sealed private-key column on the peer projection', () => {
