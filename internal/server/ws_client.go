@@ -506,6 +506,12 @@ func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.F
 				}
 				mu.Unlock()
 				_ = stream.conn.Close()
+				// The peer must learn the byte stream ended early. Dropping the
+				// stream silently leaves the Client holding a short body, which
+				// surfaces as a truncated download with nothing in the log to
+				// explain it. Unreachable for a peer that honours its window,
+				// because the queue is sized from the credit it granted.
+				_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
 				return
 			}
 		}
