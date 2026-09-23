@@ -171,10 +171,15 @@ type vpnFlowTable struct {
 	nowFn        func() time.Time
 	newID        func() string
 
-	mu     sync.Mutex
-	flows  map[vpnFlowKey]*vpnFlow
-	byPeer map[string]map[vpnFlowKey]struct{}
-	closed bool
+	mu sync.Mutex
+	// draining is set by the teardown before the listeners go. It is a separate
+	// flag from closed because the two states answer differently: a draining table
+	// still serves the flows it holds and reports capacity for the ones it refuses,
+	// while a closed one refuses everything including the flows it had.
+	draining bool
+	flows    map[vpnFlowKey]*vpnFlow
+	byPeer   map[string]map[vpnFlowKey]struct{}
+	closed   bool
 }
 
 func newVPNFlowTable(cfg vpnFlowTableConfig) *vpnFlowTable {
@@ -236,6 +241,13 @@ func (t *vpnFlowTable) register(reg vpnFlowRegistration) (*vpnFlow, bool, error)
 	}
 	if existing, ok := t.flows[reg.Key]; ok {
 		return existing, false, nil
+	}
+	if t.draining {
+		// Reported as capacity rather than as closed: the gateway is still serving
+		// every flow it holds, and D14 counts a refused new flow during a drain
+		// under the same class as one refused for hitting a ceiling. An existing
+		// flow is returned above, so a drain never interrupts traffic in flight.
+		return nil, false, fmt.Errorf("%w: the gateway is draining", errVPNFlowCapacity)
 	}
 	// The tighter of the two ceilings wins. server.vpn.max_flows_per_peer is the
 	// operator's cap on what any one peer may hold, and vpn_peers.max_concurrent_flows
@@ -413,6 +425,25 @@ func (t *vpnFlowTable) snapshot(peerID string) []VPNFlowSnapshot {
 	return items
 }
 
+// drain refuses new registrations and leaves the registered flows running.
+//
+// It is the first step of the teardown and the reason the wait that follows is
+// bounded: without it a flow could be registered after the listeners were closed
+// and before the timeout expired, and the gateway would then force-close a
+// connection it had just accepted.
+func (t *vpnFlowTable) drain() {
+	t.mu.Lock()
+	t.draining = true
+	t.mu.Unlock()
+}
+
+// isDraining reports whether the table has stopped accepting new flows.
+func (t *vpnFlowTable) isDraining() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.draining
+}
+
 // close tears down every flow and refuses later registrations. It is idempotent
 // and reports how many flows it closed, so the shutdown path can say what it did.
 func (t *vpnFlowTable) close() int {
@@ -422,6 +453,7 @@ func (t *vpnFlowTable) close() int {
 		return 0
 	}
 	t.closed = true
+	t.draining = true
 	flows := make([]*vpnFlow, 0, len(t.flows))
 	for key := range t.flows {
 		if flow := t.detachLocked(key); flow != nil {

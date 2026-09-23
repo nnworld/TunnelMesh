@@ -5,9 +5,12 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"github.com/tunnelmesh/tunnelmesh/internal/vpn"
 )
 
@@ -82,5 +85,107 @@ func TestStartVPNGatewayWithTheBuildTagRejectsAnUnusableConfig(t *testing.T) {
 	}
 	if gateway != nil {
 		t.Errorf("a refused gateway must be nil, got %T", gateway)
+	}
+}
+
+// The runtime is where the gateway becomes part of a serving process, so the
+// assembly is asserted end to end rather than one call at a time: an enabled
+// server.vpn must produce a gateway that holds a UDP port, hand that same gateway
+// to the management API as both the live-state source and the hot-reload sink, and
+// give the port back when the runtime closes.
+func TestNewServerRuntimeWithTheBuildTagStartsTheVPNGateway(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-vpn-gateway?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pair, err := vpn.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	t.Setenv(vpn.NodePrivateKeyEnv, pair.PrivateKey)
+
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{NodeID: "node-a", VPN: enabledVPNTestConfig(t)})
+	if err != nil {
+		t.Fatalf("NewServerRuntime: %v", err)
+	}
+	if runtime.vpnGateway == nil {
+		t.Fatal("an enabled server.vpn installed no gateway")
+	}
+	gateway, ok := runtime.vpnGateway.(*vpnGateway)
+	if !ok {
+		t.Fatalf("the runtime installed %T, want *vpnGateway", runtime.vpnGateway)
+	}
+	port := gateway.localPort()
+	if port == 0 {
+		t.Error("the runtime's gateway holds no UDP port")
+	}
+	// The identity check matters more than the non-nil one: a second gateway, or a
+	// wrapper that dropped the sink, would leave the management API writing peer
+	// rows nothing reloads.
+	if runtime.API.vpnDataPlane != gateway {
+		t.Errorf("the management API holds %v, want the runtime's gateway", runtime.API.vpnDataPlane)
+	}
+
+	if err := runtime.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	// A port the runtime kept would fail the restart that follows a shutdown with
+	// address-in-use, which turns a routine deploy into an outage.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)})
+		if err == nil {
+			_ = probe.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("port %d was still held 10s after the runtime closed: %v", port, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The serve shutdown chain and the runtime's own Close both reach the gateway,
+	// so the second call has to be a no-op rather than a second teardown.
+	if err := runtime.Close(); err != nil {
+		t.Errorf("a second Close returned %v, want nil", err)
+	}
+}
+
+// A listen address the gateway cannot bind must fail the process at startup. The
+// alternative is a server that reports itself ready while every peer configured
+// against it times out, which is the failure an operator can least diagnose from
+// outside the box.
+func TestNewServerRuntimeWithTheBuildTagReportsAnUnusableVPNListenAddress(t *testing.T) {
+	db, err := storage.OpenSQLite(context.Background(), "file:runtime-vpn-gateway-taken?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pair, err := vpn.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	t.Setenv(vpn.NodePrivateKeyEnv, pair.PrivateKey)
+
+	taken, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	cfg := enabledVPNTestConfig(t)
+	cfg.Listen = taken.LocalAddr().String()
+
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{}, RuntimeConfig{NodeID: "node-a", VPN: cfg})
+	if err == nil {
+		if runtime != nil {
+			_ = runtime.Close()
+		}
+		t.Fatalf("the runtime came up with server.vpn.listen %q already taken", cfg.Listen)
+	}
+	if runtime != nil {
+		t.Errorf("a refused runtime must be nil, got %T", runtime)
+	}
+	if !strings.Contains(err.Error(), "vpn") {
+		t.Errorf("error %q does not say which subsystem refused to start", err)
 	}
 }

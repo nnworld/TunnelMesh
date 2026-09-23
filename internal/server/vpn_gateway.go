@@ -113,6 +113,32 @@ type vpnGateway struct {
 	selfMu      sync.RWMutex
 	selfAddress netip.Addr
 
+	// The lifecycle state below is owned by vpn_lifecycle.go, which is where the
+	// loops it describes are started and stopped.
+	//
+	// bgCtx is separate from baseCtx because the two end at different moments.
+	// baseCtx bounds the streams the gateway opens and is cancelled by the forced
+	// step of the teardown; bgCtx survives until the loops are stopped, so a long
+	// drain cannot let the subnet lease expire while peers are still being served.
+	bgOnce           sync.Once
+	bgMu             sync.Mutex
+	bgStarted        bool
+	bgStopped        bool
+	bgCtx            context.Context
+	cancelBackground context.CancelFunc
+	reaperDone       chan struct{}
+	renewalDone      chan struct{}
+	// leaseRenewInterval and idleReapInterval default to a fraction of the lease
+	// TTL and of server.vpn.idle_timeout. They are fields so a test can observe
+	// several passes instead of waiting out a production interval.
+	leaseRenewInterval time.Duration
+	idleReapInterval   time.Duration
+	// shutdownMu guards shutdownTrace, the record of which teardown steps ran and
+	// in which order. It is logged at the end of a shutdown and asserted against
+	// D14 by the lifecycle tests.
+	shutdownMu    sync.Mutex
+	shutdownTrace []string
+
 	// The protocol handlers are fields rather than direct calls for two reasons. A
 	// build whose stack is not wired can say so honestly instead of panicking, and
 	// the pipeline's dispatch can be tested before either relay exists.
@@ -151,16 +177,25 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 		ctx = context.Background()
 	}
 	baseCtx, cancelBase := context.WithCancel(ctx)
+	bgCtx, cancelBackground := context.WithCancel(ctx)
 	gateway := &vpnGateway{
-		deps:       deps,
-		identity:   identity,
-		metrics:    newVPNMetrics(deps.Metrics),
-		nowFn:      nowFn,
-		mtu:        mtu,
-		buckets:    make(map[string]*packetBucket),
-		baseCtx:    baseCtx,
-		cancelBase: cancelBase,
-		closed:     make(chan struct{}),
+		deps:             deps,
+		identity:         identity,
+		metrics:          newVPNMetrics(deps.Metrics),
+		nowFn:            nowFn,
+		mtu:              mtu,
+		buckets:          make(map[string]*packetBucket),
+		baseCtx:          baseCtx,
+		cancelBase:       cancelBase,
+		bgCtx:            bgCtx,
+		cancelBackground: cancelBackground,
+		// Both channels exist from construction and are closed by their loop. A
+		// teardown that only waited on channels a started loop created would have to
+		// know whether Start ran, which is exactly the state a failed construction
+		// does not have.
+		reaperDone:  make(chan struct{}),
+		renewalDone: make(chan struct{}),
+		closed:      make(chan struct{}),
 	}
 	gateway.peers = newVPNPeerTable(vpnPeerTableConfig{
 		MTU:    mtu,
@@ -201,85 +236,6 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 }
 
 func (g *vpnGateway) now() time.Time { return g.nowFn() }
-
-// Start is where the gateway acquires the resources it holds for the rest of the
-// process lifetime: the UDP endpoint, the WireGuard device and the peer set.
-//
-// It either leaves a serving gateway or a closed one. Half-built is the state
-// that cannot be reasoned about - a bound port answering no handshake, or a
-// device with an identity and no peers - so every failure path closes the gateway
-// and returns, and a caller only ever has to distinguish "serving" from "gone".
-func (g *vpnGateway) Start(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := g.serve(ctx); err != nil {
-		_ = g.Close()
-		return err
-	}
-	return nil
-}
-
-// serve is Start's body, split out so the failure path has one place to clean up.
-func (g *vpnGateway) serve(ctx context.Context) error {
-	g.mu.Lock()
-	if g.started {
-		g.mu.Unlock()
-		return nil
-	}
-	if g.isClosed() {
-		g.mu.Unlock()
-		return errVPNGatewayClosed
-	}
-	bind, err := newVPNBind(g.deps.Config.Listen)
-	if err != nil {
-		g.mu.Unlock()
-		return err
-	}
-	nodeConfig, err := g.renderNodeConfig(bind)
-	if err != nil {
-		g.mu.Unlock()
-		return err
-	}
-	// The device is registered before it is configured so that a failure further
-	// down still finds something to close. NewDevice spawns the read and encrypt
-	// routines immediately, and they park on a tunnel that has not been written to
-	// yet, which costs nothing until the endpoint is up.
-	tunnel := device.NewDevice(g.device, bind, vpnDeviceLogger())
-	g.bind = bind
-	g.wg = tunnel
-	g.mu.Unlock()
-
-	if err := tunnel.IpcSet(nodeConfig); err != nil {
-		return fmt.Errorf("vpn: configure the wireguard identity for server.vpn.listen %q: %w", g.deps.Config.Listen, err)
-	}
-	// Up is what actually binds the socket. wireguard-go only opens the bind for a
-	// device that is up, so setting listen_port alone leaves the port unheld - and
-	// a gateway that reports a listen address it is not listening on is worse than
-	// one that refuses to start.
-	if err := tunnel.Up(); err != nil {
-		return fmt.Errorf("vpn: bring the wireguard endpoint up on server.vpn.listen %q: %w", g.deps.Config.Listen, err)
-	}
-	bound := bind.localPort()
-	if bound == 0 {
-		return fmt.Errorf("vpn: the wireguard endpoint came up on server.vpn.listen %q without a udp port", g.deps.Config.Listen)
-	}
-	if err := g.loadPeers(ctx); err != nil {
-		return err
-	}
-
-	g.mu.Lock()
-	g.boundPort = bound
-	g.started = true
-	g.mu.Unlock()
-	slog.Info("vpn_gateway_started",
-		"node_id", g.deps.NodeID,
-		"listen", g.deps.Config.Listen,
-		"port", bound,
-		"mtu", g.mtu,
-		"peers", g.peers.count())
-	return nil
-}
 
 // renderNodeConfig picks the identity block the device is started with.
 //
@@ -577,66 +533,4 @@ func (g *vpnGateway) isSelfAddress(address netip.Addr) bool {
 	g.selfMu.RLock()
 	defer g.selfMu.RUnlock()
 	return g.selfAddress.IsValid() && g.selfAddress == address
-}
-
-// isClosed reports whether Close has run.
-func (g *vpnGateway) isClosed() bool {
-	select {
-	case <-g.closed:
-		return true
-	default:
-		return false
-	}
-}
-
-// Close releases the gateway exactly once.
-func (g *vpnGateway) Close() error {
-	g.closeOnce.Do(g.release)
-	return nil
-}
-
-// release is the teardown body. It is also what a failed construction calls, so
-// an error halfway through assembly cannot leave a device, a stack or a denial
-// aggregator behind.
-//
-// The order matters and follows D14: stop accepting new work first, then the
-// flows, then the device, then the stack. Closing the flow table before the
-// device means a handler that tries to emit a reply during teardown meets a
-// closed device and returns, rather than queueing a packet nobody will encrypt.
-func (g *vpnGateway) release() {
-	select {
-	case <-g.closed:
-	default:
-		close(g.closed)
-	}
-	if g.cancelBase != nil {
-		g.cancelBase()
-	}
-	if g.flows != nil {
-		g.flows.close()
-	}
-	if g.tcp != nil {
-		g.tcp.close()
-	}
-	if g.udp != nil {
-		g.udp.close()
-	}
-	if g.denials != nil {
-		// A fresh context rather than baseCtx: baseCtx was just cancelled, and the
-		// last window of denials is exactly the one an operator investigating a
-		// shutdown wants to see.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = g.denials.Close(ctx)
-		cancel()
-	}
-	if g.peers != nil {
-		g.peers.close()
-	}
-	g.stopEndpoint()
-	if g.device != nil {
-		_ = g.device.Close()
-	}
-	if g.stack != nil {
-		_ = g.stack.close()
-	}
 }

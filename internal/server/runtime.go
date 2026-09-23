@@ -91,13 +91,17 @@ type ServerRuntime struct {
 	WebSSHBroker           *WebSSHBroker
 	// Identity carries the SSO, MFA, and device-trust services the management
 	// API depends on. It is exported so an embedder can inspect the wiring.
-	Identity                     *IdentityServices
-	managedRoutes                *ManagedRouteHandler
-	serverNodeLifecycle          *ServerNodeLifecycle
-	relayServer                  *grpc.Server
-	relayListener                net.Listener
-	proxyEntry                   *ProxyEntryListener
-	proxyEntryService            *ProxyEntry
+	Identity            *IdentityServices
+	managedRoutes       *ManagedRouteHandler
+	serverNodeLifecycle *ServerNodeLifecycle
+	relayServer         *grpc.Server
+	relayListener       net.Listener
+	proxyEntry          *ProxyEntryListener
+	proxyEntryService   *ProxyEntry
+	// vpnGateway is the embedded WireGuard data plane, nil when server.vpn is
+	// disabled. It is typed as the untagged seam rather than as the gateway so this
+	// file compiles, and keeps compiling, in a build that contains no data plane.
+	vpnGateway                   VPNDataPlane
 	clientMetadataSweeper        *ClientMetadataSweeper
 	clientMetadataSweeperCancel  context.CancelFunc
 	clientMetadataSweeperDone    chan error
@@ -165,6 +169,9 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error
 	closeStartup := func() {
+		if runtime.vpnGateway != nil {
+			_ = runtime.vpnGateway.Close()
+		}
 		if authorizationCacheCleanup != nil {
 			_ = authorizationCacheCleanup()
 		}
@@ -334,6 +341,51 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		runtime.ProxyEntryEnabled = true
 		slog.Info("proxy_entry_enabled", "listen", runtimeConfig.ProxyEntry.Listen, "domain_suffix", runtimeConfig.ProxyEntry.DomainSuffix)
 	}
+	if runtimeConfig.VPN.Enabled {
+		// Constructed and started here rather than in ServeListener for the same
+		// reason the proxy entry is: an unusable server.vpn section, a missing node
+		// key or a taken UDP port has to fail startup instead of leaving a process
+		// that reports itself ready while every peer configured against it times
+		// out. In a build without the vpn tag this is where the operator is told to
+		// rebuild, which is also what stops an untagged binary from looking like it
+		// is serving a tunnel it cannot decrypt.
+		//
+		// clientTransport is the agent-facing transport (local sessions plus the
+		// cluster connection selector), so an egress agent attached to another
+		// Server node is reached through the existing relay without extra wiring.
+		vpnPlane, err := startVPNGateway(context.Background(), VPNGatewayDeps{
+			Config:       runtimeConfig.VPN,
+			NodeID:       serverNodeID,
+			Opener:       clientTransport,
+			Peers:        db.VPNPeers(),
+			Leases:       db.VPNIPLeases(),
+			Audits:       db.Audits(),
+			Metrics:      runtime.metrics,
+			Capabilities: runtime.API.vpnAgentCapabilityProbe(serverNodeID),
+		})
+		if err != nil {
+			closeStartup()
+			return nil, fmt.Errorf("server runtime: vpn gateway: %w", err)
+		}
+		if vpnPlane != nil {
+			if err := vpnPlane.Start(context.Background()); err != nil {
+				_ = vpnPlane.Close()
+				closeStartup()
+				return nil, fmt.Errorf("server runtime: start the vpn gateway: %w", err)
+			}
+			runtime.vpnGateway = vpnPlane
+			// Installed after Start so the management API never hands out a gateway
+			// that is not serving: the same object is the source for the live-flow
+			// and node-status endpoints and the hot-reload sink the peer service
+			// writes through, and the two must not disagree about which gateway is
+			// running.
+			runtime.API.SetVPNDataPlane(vpnPlane)
+			slog.Info("vpn_gateway_enabled",
+				"node_id", serverNodeID,
+				"listen", runtimeConfig.VPN.Listen,
+				"endpoint_host", runtimeConfig.VPN.EndpointHost)
+		}
+	}
 	runtime.clientMetadataSweeper = NewClientMetadataSweeper(db.ClientInstances(), DefaultClientMetadataSweepInterval)
 	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
 	runtime.clientMetadataSweeperCancel = stopSweeper
@@ -369,7 +421,13 @@ func (r *ServerRuntime) Close() error {
 	if r.WebSSHBroker != nil {
 		r.WebSSHBroker.CloseAll()
 	}
-	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr error
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr error
+	// The data plane goes first among the owned resources: it is a public traffic
+	// path with its own drain budget, and stopping it before the sweepers means no
+	// flow can be created while the rest of the runtime is being unwound.
+	if vpnErr = r.closeVPNGateway(); vpnErr != nil {
+		slog.Error("vpn_gateway_close_failed", "error", vpnErr)
+	}
 	if r.authMaintenanceSweeperCancel != nil {
 		r.authMaintenanceSweeperCancel()
 		if err := <-r.authMaintenanceSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
@@ -414,7 +472,20 @@ func (r *ServerRuntime) Close() error {
 	if r.ClientStreamService != nil {
 		_ = r.ClientStreamService.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr)
+}
+
+// closeVPNGateway drains and releases the embedded data plane.
+//
+// Both the serve shutdown chain and Close reach it, because a supervisor that
+// cancels the serve context and one that only calls Close must both end up with the
+// UDP port released. The gateway's own Close is idempotent, so the second call is a
+// no-op rather than a second teardown.
+func (r *ServerRuntime) closeVPNGateway() error {
+	if r == nil || r.vpnGateway == nil {
+		return nil
+	}
+	return r.vpnGateway.Close()
 }
 
 // closeAgentConnection is the authenticated inter-Server control handler. The
@@ -882,6 +953,13 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		// The data plane is drained after the HTTP server so the management API can
+		// still answer while flows finish, and before ServeListener returns so a
+		// supervisor restarting the process cannot meet its own UDP port. Its budget
+		// is server.vpn.shutdown_timeout, which is the operator's to set.
+		if err := r.closeVPNGateway(); err != nil {
+			slog.Error("vpn_gateway_close_failed", "error", err)
+		}
 	}
 	select {
 	case err := <-errCh:

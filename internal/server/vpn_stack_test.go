@@ -73,6 +73,15 @@ func (m *countingVPNMetrics) droppedRecords() []string {
 	return append([]string(nil), m.dropped...)
 }
 
+// leaseRecords exposes the subnet-lease renewals the gateway reported. The lease
+// vector is the one D15 makes behavioural: a stopped renewal has to be visible as
+// a metric rather than inferred from a loop that stopped ticking.
+func (m *countingVPNMetrics) leaseRecords() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.leases...)
+}
+
 func (m *countingVPNMetrics) countDropped(class vpn.ErrorClass) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
