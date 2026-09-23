@@ -8,13 +8,14 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 40 份计划，按日期倒序排列。
+共 41 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
 | 2026-09-23 | [三端一键安装脚本 Implementation Plan](2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../specs/2026-09-23-one-click-install-scripts-design.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
+| 2026-09-23 | [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md)<br>[PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md) |
 | 2026-09-18 | [SSO, MFA, and device trust implementation plan (Phase A)](2026-09-18-sso-mfa-device-trust-implementation.md) | [规格：Enterprise capability roadmap design](../specs/2026-09-18-enterprise-capability-roadmap-design.md)<br>[规格：SSO, MFA, and device trust design (Phase …](../specs/2026-09-18-sso-mfa-device-trust-design.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [P1–P3 growth and product hardening implementation plan](2026-09-18-p1-p3-growth-product-hardening.md) | — | [PR：P1–P3 growth and product hardening](../../pull-requests/2026-09-18-p1-p3-growth-product-hardening.md) |
 | 2026-09-17 | [P0/P1 Growth Acceleration Implementation Plan](2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../specs/2026-09-17-p0-p1-growth-acceleration-design.md) | [PR：P0/P1 growth acceleration](../../pull-requests/2026-09-17-p0-p1-growth-acceleration.md) |
@@ -59,6 +60,7 @@
 
 以下计划按 AGENTS.md 的紧急修复条款先止损、后补记，正文已标注“补记计划”：
 
+- [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md)（2026-09-23）
 - [ZMODEM 出站写入串行化修复实施计划](2026-09-13-zmodem-write-serialization.md)（2026-09-13）
 - [ZMODEM 停滞处置策略与进度节流实施计划](2026-09-13-zmodem-stall-channel-policy.md)（2026-09-13）
 - [ZMODEM Sentry 生命周期与停滞豁免实施计划](2026-09-13-zmodem-sentry-lifecycle-stall-policy.md)（2026-09-13）
