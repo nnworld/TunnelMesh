@@ -673,6 +673,14 @@ func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth
 		return
 	}
 	view, err := a.service.GetAgentMetadataView(r.Context(), agentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Authorization already passed, so the agent exists; it simply never
+		// reported. That is an empty collection, not a missing resource, and the
+		// console has a designed empty state for it. Answering 404 here turned
+		// "never connected" into an error banner with a retry button.
+		writeJSON(w, http.StatusOK, agentMetadataResponse{AgentID: agentID, Items: []MetadataItem{}, Instances: []agentMetadataInstanceResponse{}})
+		return
+	}
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -684,6 +692,15 @@ func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth
 	data := agentMetadataResponse{
 		AgentID: view.AgentID, InstanceID: view.InstanceID, NodeID: view.NodeID, Epoch: view.Epoch, Revision: view.Revision,
 		Stale: view.Stale, ReportedAt: view.ReportedAt, UpdatedAt: view.UpdatedAt, Items: view.Items,
+	}
+	// The console reads items.length without a null guard, and an agent whose
+	// snapshot carries no items is a legitimate state, so the envelope always
+	// carries arrays rather than JSON null.
+	if data.Items == nil {
+		data.Items = []MetadataItem{}
+	}
+	if data.Instances == nil {
+		data.Instances = []agentMetadataInstanceResponse{}
 	}
 	for _, instance := range view.Instances {
 		connectionCount := 0
@@ -736,9 +753,14 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request, p auth.Principa
 		writeStorageError(w, err)
 		return
 	}
+	online, err := a.onlineAgentIDs(r.Context(), page.Items)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
 	items := make([]any, 0, len(page.Items))
 	for _, agent := range page.Items {
-		items = append(items, publicAgent(agent))
+		items = append(items, publicAgentWithStatus(agent, online[agent.ID]))
 	}
 	writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
 }
@@ -1749,6 +1771,44 @@ func publicUser(v storage.User) map[string]any {
 }
 func publicAgent(v storage.Agent) map[string]any {
 	return map[string]any{"id": v.ID, "name": v.Name, "ownerUserId": v.OwnerUserID, "capabilities": decodeStrings(v.Capabilities), "enabled": v.Enabled, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}
+}
+
+// publicAgentWithStatus renders one list row with its connectivity beside the
+// administrative enabled flag. The two are independent facts: enabled is what
+// an administrator switched, status is whether an unexpired connection lease
+// exists. Rendering enabled as connectivity is what made a never-connected
+// agent read as online.
+func publicAgentWithStatus(v storage.Agent, online bool) map[string]any {
+	out := publicAgent(v)
+	if online {
+		out["status"] = "online"
+	} else {
+		out["status"] = "offline"
+	}
+	return out
+}
+
+// onlineAgentIDs resolves connectivity for exactly the agents in one page. The
+// owner filter already ran in listAgentsForOwner, so the batch lookup never
+// widens what the caller can see, and it stays one query instead of one per
+// row. Leases are the same fact the dashboard counts for agentsOnline.
+func (a *API) onlineAgentIDs(ctx context.Context, agents []storage.Agent) (map[string]bool, error) {
+	out := make(map[string]bool, len(agents))
+	if a == nil || a.DB == nil || a.DB.Leases() == nil || len(agents) == 0 {
+		return out, nil
+	}
+	ids := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		ids = append(ids, agent.ID)
+	}
+	active, err := a.DB.Leases().ListActiveAgentIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range active {
+		out[id] = true
+	}
+	return out, nil
 }
 func publicPolicy(v storage.AgentPolicy) map[string]any {
 	return map[string]any{"id": v.ID, "agentId": v.AgentID, "targetHost": v.TargetHost, "targetPort": v.TargetPort, "protocol": v.Protocol, "allowedCIDRs": nonemptySplit(v.AllowedCIDRs), "allowedPorts": decodeInts(v.AllowedPorts), "deletedAt": v.DeletedAt, "createdAt": v.CreatedAt, "updatedAt": v.UpdatedAt}

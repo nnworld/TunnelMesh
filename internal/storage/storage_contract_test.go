@@ -379,8 +379,31 @@ func TestAgentConnectionLeaseRepositoryContract(t *testing.T) {
 	if len(active) != 2 {
 		t.Fatalf("active after expiry = %+v, want conn-a and conn-b only", active)
 	}
+	// The batch form must agree with ListActiveByAgent on expiry filtering and
+	// must not report an agent that holds no lease at all.
+	activeIDs, err := db.Leases().ListActiveAgentIDs(ctx, []string{base.AgentID, "agent-without-lease"})
+	if err != nil {
+		t.Fatalf("list active agent ids: %v", err)
+	}
+	if len(activeIDs) != 1 || activeIDs[0] != base.AgentID {
+		t.Fatalf("active agent ids = %+v, want only %s", activeIDs, base.AgentID)
+	}
+	none, err := db.Leases().ListActiveAgentIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("list active agent ids for empty input: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("active agent ids for empty input = %+v, want none", none)
+	}
 	if err := db.Leases().ReleaseConnection(ctx, base.AgentID, second.ConnectionID, second.ConnectionEpoch); err != nil {
 		t.Fatalf("release second connection: %v", err)
+	}
+	remaining, err := db.Leases().ListActiveAgentIDs(ctx, []string{base.AgentID})
+	if err != nil {
+		t.Fatalf("list active agent ids after release: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("active agent ids after release = %+v, want conn-a still active", remaining)
 	}
 }
 

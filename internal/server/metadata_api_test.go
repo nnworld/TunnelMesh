@@ -34,10 +34,30 @@ func TestMetadataAPI(t *testing.T) {
 		}
 	})
 
-	t.Run("missing metadata is not found", func(t *testing.T) {
-		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata", ownerToken, "", nil)
-		if response.Code != http.StatusNotFound {
+	// An agent that exists but never reported has an empty metadata collection,
+	// not a missing resource: the console renders its designed empty state
+	// instead of an error banner with a retry button.
+	t.Run("missing metadata returns an empty view", func(t *testing.T) {
+		response := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/agents/agent-metadata/metadata?includeStale=true", ownerToken, "", nil)
+		if response.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		var envelope struct {
+			Data struct {
+				AgentID   string           `json:"agentId"`
+				Items     []map[string]any `json:"items"`
+				Instances []map[string]any `json:"instances"`
+				Stale     bool             `json:"stale"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Data.AgentID != agent.ID {
+			t.Fatalf("agentId = %q, want %q", envelope.Data.AgentID, agent.ID)
+		}
+		if len(envelope.Data.Items) != 0 || len(envelope.Data.Instances) != 0 || envelope.Data.Stale {
+			t.Fatalf("unexpected empty view: %s", response.Body.String())
 		}
 	})
 
