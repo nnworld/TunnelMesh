@@ -1,0 +1,24 @@
+[Unit]
+Description=TunnelMesh Client (user)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-__ENV_FILE__
+WorkingDirectory=__STATE_DIR__
+ExecStartPre=__BINARY__ --config __CONFIG__ check-config
+ExecStart=__BINARY__ --config __CONFIG__ run
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=__STATE_DIR__
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnelmesh-client
+
+[Install]
+WantedBy=default.target

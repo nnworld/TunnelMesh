@@ -3,13 +3,14 @@
 <!--
   launchd 用户级服务模板，由 deploy/install/macos-install.sh 渲染，
   server / agent / client 三个角色共用同一份文件。
-  占位符：__ROLE__、__HOME__、__BINARY__、__CONFIG__。
+  占位符：__ROLE__、__HOME__、__BINARY__、__CONFIG__、__ENVIRONMENT__。
   不要把 Token、密码或私钥写进本文件；敏感值只通过配置文件或环境变量注入。
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.tunnelmesh.__ROLE__</string>
+__ENVIRONMENT__
   <key>ProgramArguments</key>
   <array>
     <string>__BINARY__</string>
