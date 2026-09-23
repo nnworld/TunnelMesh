@@ -61,6 +61,7 @@ type vpnGateway struct {
 	flows   *vpnFlowTable
 	denials *denialAggregator
 
+	tcp  *vpnTCPRelay
 	udp  *vpnUDPRelay
 	icmp *vpnICMPRelay
 
@@ -78,9 +79,12 @@ type vpnGateway struct {
 	// The protocol handlers are fields rather than direct calls for two reasons. A
 	// build whose stack is not wired can say so honestly instead of panicking, and
 	// the pipeline's dispatch can be tested before either relay exists.
-	serveTCP  func(context.Context, vpnPeerEntry, vpnWirePacket)
-	serveUDP  func(context.Context, vpnPeerEntry, vpnWirePacket)
-	serveICMP func(context.Context, vpnPeerEntry, vpnWirePacket)
+	// Each handler takes the parsed header and the datagram it came from. Only
+	// TCP needs the bytes: it is the one protocol the gateway terminates in the
+	// stack, so it is the one that has to hand the segment over.
+	serveTCP  func(context.Context, vpnPeerEntry, vpnWirePacket, []byte)
+	serveUDP  func(context.Context, vpnPeerEntry, vpnWirePacket, []byte)
+	serveICMP func(context.Context, vpnPeerEntry, vpnWirePacket, []byte)
 
 	// baseCtx is cancelled by Close and bounds every stream the gateway opens.
 	baseCtx    context.Context
@@ -149,6 +153,8 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 		return nil, err
 	}
 	gateway.stack = assembled
+	gateway.tcp = newVPNTCPRelay(gateway)
+	gateway.serveTCP = gateway.tcp.serve
 	gateway.udp = newVPNUDPRelay(gateway)
 	gateway.serveUDP = gateway.udp.serve
 	gateway.icmp = newVPNICMPRelay(gateway)
@@ -298,6 +304,9 @@ func (g *vpnGateway) release() {
 	}
 	if g.flows != nil {
 		g.flows.close()
+	}
+	if g.tcp != nil {
+		g.tcp.close()
 	}
 	if g.udp != nil {
 		g.udp.close()

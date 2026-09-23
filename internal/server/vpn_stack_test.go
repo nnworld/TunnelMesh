@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -100,8 +101,11 @@ func vpnTCPSegment(src, dst net.IP, srcPort, dstPort uint16, seq, ack uint32, fl
 		WindowSize: 64240,
 	})
 	copy(segment[header.TCPMinimumSize:], payload)
-	tcpHeader.SetChecksum(^tcpHeader.CalculateChecksum(header.PseudoHeaderChecksum(
-		tcp.ProtocolNumber, srcAddr, dstAddr, uint16(len(segment)))))
+	// CalculateChecksum sums the pseudo-header and the TCP header up to the data
+	// offset; the payload has to be folded in by the caller, or a segment that
+	// carries bytes arrives with a checksum the stack rejects silently.
+	partial := header.PseudoHeaderChecksum(tcp.ProtocolNumber, srcAddr, dstAddr, uint16(len(segment)))
+	tcpHeader.SetChecksum(^tcpHeader.CalculateChecksum(checksum.Checksum(payload, partial)))
 	return segment
 }
 

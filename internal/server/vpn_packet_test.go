@@ -249,13 +249,13 @@ func newVPNGatewayFixture(t *testing.T, cfg config.VPNConfig, mutate func(*VPNGa
 	return fixture
 }
 
-func (f *vpnGatewayFixture) spyTCP(_ context.Context, _ vpnPeerEntry, parsed vpnWirePacket) {
+func (f *vpnGatewayFixture) spyTCP(_ context.Context, _ vpnPeerEntry, parsed vpnWirePacket, _ []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tcpCalls = append(f.tcpCalls, parsed)
 }
 
-func (f *vpnGatewayFixture) spyICMP(_ context.Context, _ vpnPeerEntry, parsed vpnWirePacket) {
+func (f *vpnGatewayFixture) spyICMP(_ context.Context, _ vpnPeerEntry, parsed vpnWirePacket, _ []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.icmpCalls = append(f.icmpCalls, parsed)
@@ -287,12 +287,20 @@ func (f *vpnGatewayFixture) applyPeer(t *testing.T, mutate func(*storage.VPNPeer
 	if mutate != nil {
 		mutate(&row)
 	}
+	return f.applyPeerRow(t, row)
+}
+
+// applyPeerRow installs one prepared row and returns the entry the peer table
+// holds for it.
+//
+// The entry is returned even when the peer is not serving: a revoked or an
+// expired row is still held, and a test that asserts the refusal needs the peer
+// ID the audit entry names.
+func (f *vpnGatewayFixture) applyPeerRow(t *testing.T, row storage.VPNPeer) vpnPeerEntry {
+	t.Helper()
 	if err := f.gateway.peers.ApplyPeer(row); err != nil {
 		t.Fatalf("ApplyPeer: %v", err)
 	}
-	// The entry is returned even when the peer is not serving: a revoked or
-	// expired row is still held, and a test that asserts the refusal needs the
-	// peer ID the audit entry names.
 	entry, _, _ := f.gateway.peers.lookupByIP(netip.MustParseAddr(row.VPNIP))
 	return entry
 }

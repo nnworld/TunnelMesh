@@ -83,7 +83,7 @@ type vpnUDPFlow struct {
 // four-tuple arriving on different decryption goroutines converge on one stream:
 // without it both would see an empty table and both would dial, and the peer
 // would get two answers to one query.
-func (r *vpnUDPRelay) serve(_ context.Context, entry vpnPeerEntry, parsed vpnWirePacket) {
+func (r *vpnUDPRelay) serve(_ context.Context, entry vpnPeerEntry, parsed vpnWirePacket, _ []byte) {
 	g := r.gateway
 	label := "udp"
 	key := vpnTuple(entry, parsed, label)

@@ -83,9 +83,9 @@ func (g *vpnGateway) handlePacket(packet []byte) {
 
 	switch parsed.Protocol {
 	case vpn.ProtocolTCP:
-		g.dispatch("tcp", g.serveTCP, label, ctx, parsed, entry)
+		g.dispatch("tcp", g.serveTCP, label, ctx, parsed, entry, packet)
 	case vpn.ProtocolUDP:
-		g.dispatch("udp", g.serveUDP, label, ctx, parsed, entry)
+		g.dispatch("udp", g.serveUDP, label, ctx, parsed, entry, packet)
 	case vpn.ProtocolICMP:
 		// Only echo is relayed. The gateway promises it never emits an ICMP
 		// datagram it did not build itself, and answering a TTL-exceeded or a
@@ -95,7 +95,7 @@ func (g *vpnGateway) handlePacket(packet []byte) {
 				fmt.Sprintf("icmp type %d code %d is not relayed", parsed.ICMPType, parsed.ICMPCode))
 			return
 		}
-		g.dispatch("icmp", g.serveICMP, label, ctx, parsed, entry)
+		g.dispatch("icmp", g.serveICMP, label, ctx, parsed, entry, packet)
 	default:
 		// Unreachable: the protocol whitelist above already refused everything
 		// else. It stays because a policy change that widens the whitelist must
@@ -107,7 +107,7 @@ func (g *vpnGateway) handlePacket(packet []byte) {
 
 // dispatch hands an allowed packet to its protocol handler, or counts the absence
 // of one.
-func (g *vpnGateway) dispatch(name string, handler func(context.Context, vpnPeerEntry, vpnWirePacket), label string, ctx context.Context, parsed vpnWirePacket, entry vpnPeerEntry) {
+func (g *vpnGateway) dispatch(name string, handler func(context.Context, vpnPeerEntry, vpnWirePacket, []byte), label string, ctx context.Context, parsed vpnWirePacket, entry vpnPeerEntry, packet []byte) {
 	if handler == nil {
 		if _, loaded := vpnHandlerMissingLogged.LoadOrStore(name, struct{}{}); !loaded {
 			slog.Error("vpn_handler_missing", "protocol", name,
@@ -116,7 +116,7 @@ func (g *vpnGateway) dispatch(name string, handler func(context.Context, vpnPeer
 		g.denyPacket(label, parsed, entry, vpn.ClassStackError, "the "+name+" relay is not installed in this build")
 		return
 	}
-	handler(ctx, entry, parsed)
+	handler(ctx, entry, parsed, packet)
 }
 
 // denyUnparsed counts a datagram that could not be read at all.
@@ -136,6 +136,25 @@ func (g *vpnGateway) denyUnparsed(cause error) {
 // denyPacket counts one refusal and folds it into the audit window.
 func (g *vpnGateway) denyPacket(label string, parsed vpnWirePacket, entry vpnPeerEntry, class vpn.ErrorClass, reason string) {
 	g.metrics.Dropped(label, class)
+	g.denials.Record(g.baseCtx, vpnDenial{
+		PeerID:   entry.PeerID,
+		Class:    class,
+		Reason:   reason,
+		Protocol: label,
+		Dest:     parsed.Dst,
+		Port:     parsed.DstPort,
+	})
+}
+
+// denyAudited folds one refusal into the audit window without counting it a
+// second time.
+//
+// It exists for the failures a component below the pipeline has already reported
+// through the same series. The stack counts a claim or a listen fault as
+// tcp/stack_error itself, because it cannot know which packet - if any - provoked
+// it; a second increment for that packet would make one event look like two and
+// would put every threshold built on the series out by a factor nobody could name.
+func (g *vpnGateway) denyAudited(label string, parsed vpnWirePacket, entry vpnPeerEntry, class vpn.ErrorClass, reason string) {
 	g.denials.Record(g.baseCtx, vpnDenial{
 		PeerID:   entry.PeerID,
 		Class:    class,

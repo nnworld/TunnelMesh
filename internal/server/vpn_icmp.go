@@ -165,7 +165,7 @@ type vpnICMPEcho struct {
 // before any resource is allocated: the node switch, the semaphore and the flow
 // registration. Only the dial and the wait for an answer move to a goroutine,
 // because those are bounded by timeouts a peer controls.
-func (r *vpnICMPRelay) serve(_ context.Context, entry vpnPeerEntry, parsed vpnWirePacket) {
+func (r *vpnICMPRelay) serve(_ context.Context, entry vpnPeerEntry, parsed vpnWirePacket, _ []byte) {
 	g := r.gateway
 	label := protocol.StreamProtocolICMPEcho
 
