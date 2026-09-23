@@ -44,6 +44,13 @@ type fakeAgentStream struct {
 	closeOnce sync.Once
 	writeMu   sync.Mutex
 	writes    [][]byte
+
+	// readMu guards pending, the tail of an injected datagram a short Read did not
+	// take. Serving the remainder instead of dropping it is what makes the fake
+	// honest about a relay that hands one datagram over in pieces, which is the
+	// case the icmp relay's accumulating reader exists for.
+	readMu  sync.Mutex
+	pending []byte
 }
 
 func newFakeAgentStream() *fakeAgentStream {
@@ -55,14 +62,26 @@ func newFakeAgentStream() *fakeAgentStream {
 }
 
 func (s *fakeAgentStream) Read(buffer []byte) (int, error) {
-	select {
-	case payload, ok := <-s.inject:
-		if !ok {
+	for {
+		s.readMu.Lock()
+		if len(s.pending) > 0 {
+			n := copy(buffer, s.pending)
+			s.pending = s.pending[n:]
+			s.readMu.Unlock()
+			return n, nil
+		}
+		s.readMu.Unlock()
+		select {
+		case payload, ok := <-s.inject:
+			if !ok {
+				return 0, io.EOF
+			}
+			s.readMu.Lock()
+			s.pending = payload
+			s.readMu.Unlock()
+		case <-s.closed:
 			return 0, io.EOF
 		}
-		return copy(buffer, payload), nil
-	case <-s.closed:
-		return 0, io.EOF
 	}
 }
 

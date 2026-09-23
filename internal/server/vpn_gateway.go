@@ -61,7 +61,8 @@ type vpnGateway struct {
 	flows   *vpnFlowTable
 	denials *denialAggregator
 
-	udp *vpnUDPRelay
+	udp  *vpnUDPRelay
+	icmp *vpnICMPRelay
 
 	// bucketMu guards the per-peer token buckets. It is separate from every other
 	// lock because a bucket is consulted once per packet and must never wait on a
@@ -150,6 +151,8 @@ func newVPNGateway(ctx context.Context, deps VPNGatewayDeps, identity vpn.NodeId
 	gateway.stack = assembled
 	gateway.udp = newVPNUDPRelay(gateway)
 	gateway.serveUDP = gateway.udp.serve
+	gateway.icmp = newVPNICMPRelay(gateway)
+	gateway.serveICMP = gateway.icmp.serve
 	return gateway, nil
 }
 
