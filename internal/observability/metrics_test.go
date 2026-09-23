@@ -99,8 +99,26 @@ func TestMetricsActiveGaugesDoNotGoNegative(t *testing.T) {
 	}
 }
 
+// The VPN gateway labels its ICMP relay with the stream protocol name rather than
+// "icmp", because that is the value the agent-side stream carries and one protocol
+// must not appear as two series in a dashboard. A label the normaliser folded into
+// "unknown" would make every ICMP denial invisible.
+func TestNormalizeProtocolKeepsTheICMPEchoLabel(t *testing.T) {
+	if got := NormalizeProtocol("icmp-echo"); got != "icmp-echo" {
+		t.Fatalf("NormalizeProtocol(icmp-echo) = %q, want %q", got, "icmp-echo")
+	}
+	if got := NormalizeProtocol("ICMP-Echo"); got != "icmp-echo" {
+		t.Fatalf("NormalizeProtocol(ICMP-Echo) = %q, want the lower-cased label", got)
+	}
+	// Only the echo label joins the set: a bare "icmp" would let a caller claim a
+	// protocol the gateway never relays.
+	if got := NormalizeProtocol("icmp"); got != "unknown" {
+		t.Fatalf("NormalizeProtocol(icmp) = %q, want unknown", got)
+	}
+}
+
 func TestNormalizeProtocolBoundsPeerControlledLabels(t *testing.T) {
-	for _, value := range []string{"tcp", "UDP", "http", "websocket"} {
+	for _, value := range []string{"tcp", "UDP", "http", "websocket", "icmp-echo"} {
 		if got := NormalizeProtocol(value); got == "unknown" {
 			t.Fatalf("NormalizeProtocol(%q) unexpectedly unknown", value)
 		}

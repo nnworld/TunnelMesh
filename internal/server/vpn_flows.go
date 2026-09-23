@@ -237,12 +237,13 @@ func (t *vpnFlowTable) register(reg vpnFlowRegistration) (*vpnFlow, bool, error)
 	if existing, ok := t.flows[reg.Key]; ok {
 		return existing, false, nil
 	}
-	limit := reg.PeerLimit
-	if limit < 0 {
-		limit = 0
-	}
-	if limit == 0 {
-		limit = t.perPeerLimit
+	// The tighter of the two ceilings wins. server.vpn.max_flows_per_peer is the
+	// operator's cap on what any one peer may hold, and vpn_peers.max_concurrent_flows
+	// is what this peer was issued with; letting the row raise the operator's cap
+	// would mean a management write could exceed a limit set to contain it.
+	limit := t.perPeerLimit
+	if reg.PeerLimit > 0 && (limit <= 0 || reg.PeerLimit < limit) {
+		limit = reg.PeerLimit
 	}
 	if limit > 0 && len(t.byPeer[reg.Key.PeerID]) >= limit {
 		return nil, false, fmt.Errorf("%w: peer %s holds %d flows", errVPNFlowCapacity, reg.Key.PeerID, limit)
