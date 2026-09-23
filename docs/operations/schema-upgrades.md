@@ -1,5 +1,118 @@
 # Schema Upgrade Guide
 
+## v14 to v15
+
+Schema v15 widens the connection fencing token from a 32-bit `INTEGER` to a
+`BIGINT` on both lease tables. It changes no table, no column name, no index,
+and no data semantics — only the storage width of one column per table.
+
+| Table | Column | Before | After |
+| --- | --- | --- | --- |
+| `client_connection_leases` | `connection_epoch` | `INTEGER NOT NULL` | `BIGINT NOT NULL` |
+| `agent_connection_leases` | `connection_epoch` | `INTEGER NOT NULL` in `migrations/ddl.sql`, `BIGINT NOT NULL` in `v0006_to_v0007` | `BIGINT NOT NULL` |
+
+Why this is not a cosmetic change: `connection_epoch` is the fencing token that
+rejects stale connection generations. `internal/server/ws_client.go` derives the
+Client token from eight random bytes, so it routinely exceeds the signed 32-bit
+range. On MySQL a 32-bit `INTEGER` column **clamps** such a value to
+`2147483647` at insert time. Every later write filters on
+`WHERE connection_id=? AND connection_epoch=?` using the true in-memory token,
+so it matched zero rows and returned `sql.ErrNoRows`:
+
+- `Renew` never extended `expires_at`, so the lease lapsed after
+  `DefaultClientConnectionLeaseTTL` (90s) while the WebSocket stayed open.
+- `ClientObservabilityService.Heartbeat` returned early on that error, so
+  `TouchInstance` never ran; `client_instance_metadata.expires_at` lapsed after
+  `DefaultClientMetadataTTL` (5m) and `ClientMetadataSweeper` set `stale=1`.
+- `newClientView` therefore reported `status=stale`, `activeConnections=0`,
+  `activeStreams=0`, and no server node, and the console summary cards — which
+  derive from those rows — showed zeros for a client that was actively serving
+  traffic.
+
+The detail drawer still listed the lease rows, so the page contradicted itself:
+"0 active connections" beside four connections, all showing epoch `2147483647`.
+That identical epoch across unrelated connections is the diagnostic signature of
+this defect.
+
+SQLite was never affected: its `INTEGER` is already a signed 64-bit value. The
+defect survived because the MySQL-backed contract tests are gated behind
+`TUNNELMESH_TEST_MYSQL_DSN` and do not run in CI. `agent_connection_leases` is
+widened in the same step to remove the drift between `migrations/ddl.sql` and
+`v0006_to_v0007/mysql.sql`; agent epochs are small counters today, but a fresh
+MySQL install and an upgraded one must agree on the authoritative schema.
+
+Before upgrading:
+
+1. **Back up the database and verify the backup can be restored.**
+2. Confirm `schema_meta.version=14`.
+3. Confirm `migrations/incremental/v0014_to_v0015/mysql.sql` and `sqlite.sql` are
+   present, along with every intermediate version from the current one.
+4. Confirm the database account can `ALTER TABLE` both lease tables and update
+   `schema_meta`.
+5. No secret or environment change is required for this version.
+
+Start the new Server with `storage.auto_init: true`. The migration applies the
+driver-specific statements and advances `schema_meta.version` to `15` only after
+they succeed. On SQLite the step is structurally inert and executes a single
+idempotent `UPDATE schema_meta SET version=version WHERE id=1` no-op, because
+SQLite cannot alter a column type in place and does not need to.
+
+Expected lock impact: `client_connection_leases` and `agent_connection_leases`
+hold one row per live physical WebSocket, so both are small (typically tens to
+hundreds of rows). Widening `INT` to `BIGINT` requires a table rebuild — MySQL
+8.0 can use `ALGORITHM=INPLACE`, MySQL 5.6/5.7 rebuild with concurrent DML
+allowed. Budget seconds, not minutes, and run it in a normal maintenance window.
+
+Verify:
+
+```sql
+SELECT version FROM schema_meta WHERE id=1;
+-- expected: 15
+
+-- MySQL
+SHOW COLUMNS FROM client_connection_leases LIKE 'connection_epoch';
+SHOW COLUMNS FROM agent_connection_leases LIKE 'connection_epoch';
+-- expected Type: bigint(20)
+
+-- SQLite (declared type is unchanged; INTEGER already stores 64 bits)
+PRAGMA table_info(client_connection_leases);
+```
+
+Both MySQL columns must report `bigint`. A fresh deployment seeded from
+`migrations/ddl.sql` produces the same types at version `15`.
+
+### Self-healing after the upgrade
+
+Rows written before the upgrade still hold the clamped `2147483647` value; the
+migration widens the column but deliberately does not rewrite those rows, since
+they are already-expired leases and there is no reliable way to reconstruct the
+original token. Live connections repair themselves: `ClientConnectionLeaseController.Heartbeat`
+treats a missed `Renew` as "the stored token is not authoritative" and
+re-registers the lease with the true in-memory epoch. Connected clients
+therefore recover on their next heartbeat (default 30s) **without reconnecting**,
+and the console numbers return with them.
+
+Because of that self-heal, upgrading the Server is sufficient. **Agent and
+Client binaries do not need to be upgraded or restarted** — no protocol frame,
+capability, or API contract changed in this release.
+
+### Compatibility and rollback
+
+Widening a column is backward compatible for readers: a v14 binary reading a v15
+`BIGINT` column still receives an `int64`. The version gate is still strict, so
+a v14 Server refuses to open a v15 database with `schema version mismatch:
+database has version 15, application requires version 14`.
+
+Roll back by **reverting the binary and keeping the v15 schema**. Do not narrow
+the column back to `INTEGER`: that reintroduces the clamping and would silently
+truncate any token already stored above the 32-bit range. If the exact v14
+structure is genuinely required, restore the pre-upgrade backup instead of
+writing reverse DDL, and never decrement `schema_meta.version` by hand.
+
+Five-minute containment: if a new Server fails to start after this migration,
+redeploy the previous binary. The v15 schema is readable by v14, so no database
+rollback is needed to restore service.
+
 ## v13 to v14
 
 Schema v14 is the enterprise identity foundation: OIDC single sign-on, TOTP MFA

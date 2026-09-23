@@ -63,8 +63,8 @@ func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T
 }
 
 func TestMySQLV11ToV12WebSSHMigrationsAreAdjacent(t *testing.T) {
-	if SchemaVersion != 14 {
-		t.Fatalf("SchemaVersion = %d, want 14", SchemaVersion)
+	if SchemaVersion != 15 {
+		t.Fatalf("SchemaVersion = %d, want 15", SchemaVersion)
 	}
 	if !strings.Contains(migrations.V11ToV12SQLite, "CREATE TABLE IF NOT EXISTS credentials") {
 		t.Fatal("SQLite migration lacks credentials")
@@ -389,4 +389,62 @@ func TestMySQLIdentityRepositoryContract(t *testing.T) {
 	}
 	defer db.Close()
 	runIdentityRepositoryContract(t, db)
+}
+
+// TestMySQLV14ToV15WidensConnectionEpoch guards the drift that made every
+// Client lease unwritable on MySQL: newClientConnectionEpoch produces a random
+// int64 fencing token, but a 32-bit INTEGER column clamps it to 2147483647, so
+// Renew/UpdateStats/Release never match their epoch predicate. The assertions
+// are textual on purpose — the MySQL-backed contract tests are skipped unless
+// TUNNELMESH_TEST_MYSQL_DSN is set, which is exactly why the original
+// INTEGER/BIGINT mismatch between migrations/ddl.sql and v0006_to_v0007
+// survived unnoticed.
+func TestMySQLV14ToV15WidensConnectionEpoch(t *testing.T) {
+	if SchemaVersion != 15 {
+		t.Fatalf("SchemaVersion = %d, want 15", SchemaVersion)
+	}
+	script := migrations.V14ToV15MySQL
+	upper := strings.ToUpper(script)
+	for _, forbidden := range []string{"JSON", "WITH RECURSIVE", "ON DUPLICATE KEY", "CREATE INDEX IF NOT EXISTS", "DROP TABLE"} {
+		if strings.Contains(upper, forbidden) {
+			t.Fatalf("migration must not use MySQL 5.6-incompatible fragment %q: %s", forbidden, script)
+		}
+	}
+	// Both lease tables carry a connection_epoch fencing token, and both must be
+	// widened in the same step so a fresh install and an upgraded install agree.
+	for _, table := range []string{"client_connection_leases", "agent_connection_leases"} {
+		fragment := "ALTER TABLE " + table + " MODIFY connection_epoch BIGINT NOT NULL"
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("migration missing required fragment %q: %s", fragment, script)
+		}
+	}
+	// SQLite INTEGER is already 64 bits and SQLite cannot ALTER a column type,
+	// so the SQLite step must stay structurally inert but still be executable:
+	// applySchemaStatements splits on ';' and runs every non-empty statement.
+	sqlite := migrations.V14ToV15SQLite
+	if strings.Contains(strings.ToUpper(sqlite), "ALTER TABLE") {
+		t.Fatalf("SQLite v14 to v15 migration must not alter columns: %s", sqlite)
+	}
+	if strings.TrimSpace(sqlite) == "" {
+		t.Fatal("SQLite v14 to v15 migration must not be empty")
+	}
+	// The full DDL is the authoritative current schema for an empty database and
+	// must not reintroduce the narrow type on either lease table.
+	for _, table := range []string{"client_connection_leases", "agent_connection_leases"} {
+		start := strings.Index(migrations.DDL, "CREATE TABLE IF NOT EXISTS "+table)
+		if start < 0 {
+			t.Fatalf("full DDL lacks table %s", table)
+		}
+		end := strings.Index(migrations.DDL[start:], ");")
+		if end < 0 {
+			t.Fatalf("full DDL table %s is not terminated", table)
+		}
+		section := migrations.DDL[start : start+end]
+		if !strings.Contains(section, "connection_epoch BIGINT NOT NULL") {
+			t.Fatalf("full DDL %s must declare connection_epoch BIGINT: %s", table, section)
+		}
+		if strings.Contains(section, "connection_epoch INTEGER") {
+			t.Fatalf("full DDL %s still declares a 32-bit connection_epoch: %s", table, section)
+		}
+	}
 }

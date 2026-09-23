@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -63,7 +65,25 @@ func (c *ClientConnectionLeaseController) Heartbeat(ctx context.Context, record 
 	if current, ok := c.manager.Get(record.ConnectionID); ok {
 		record = current
 	}
+	// Renew is fenced on connection_epoch, so it matches zero rows whenever the
+	// stored token differs from the authoritative in-memory one. That is the
+	// state a lease row is left in when MySQL clamped the 32-bit column and the
+	// row was written with a truncated token. The live WebSocket is the authority
+	// on whether the connection exists and on its true token, so re-register
+	// instead of letting the lease expire underneath a connected client; that is
+	// what lets an already-connected client recover without a reconnect.
+	// Register already writes the fresh expiry and counters, which makes the
+	// separate stats update redundant on that path.
+	//
+	// The instance-ID guard keeps the invariant that every lease row identifies a
+	// known client instance. Before CLIENT_HELLO (or the legacy downgrade) there
+	// is no row to heal yet, and creating one would leave an orphan that no
+	// instance-scoped query can attribute.
 	if err := c.connections.Renew(ctx, record.ConnectionID, record.ConnectionEpoch, c.ttl); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) || record.ClientInstanceID == "" {
+			return err
+		}
+		_, err = c.Register(ctx, record)
 		return err
 	}
 	return c.connections.UpdateStats(ctx, storage.ClientConnectionLease{

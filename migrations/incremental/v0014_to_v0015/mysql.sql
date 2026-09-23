@@ -1,0 +1,27 @@
+-- v14 -> v15: widen the connection fencing token to 64 bits.
+--
+-- Both lease tables store connection_epoch, the fencing token the Server uses
+-- to reject stale generations. internal/server/ws_client.go derives the Client
+-- token from 8 random bytes, so it routinely exceeds the signed 32-bit range.
+-- MySQL declared the column INTEGER, which clamps such a value to 2147483647 on
+-- insert; every later write filters on `connection_epoch = <true token>` and
+-- then matches zero rows, so Renew/UpdateStats/Release silently did nothing.
+-- The lease TTL lapsed, the metadata refresh chained behind it never ran, and
+-- the console reported a busy client as disconnected with expired metadata.
+--
+-- agent_connection_leases is widened in the same step even though agent epochs
+-- are small counters today: migrations/incremental/v0006_to_v0007/mysql.sql
+-- already declares BIGINT while migrations/ddl.sql declared INTEGER, so a fresh
+-- install and an upgraded install disagreed about the authoritative schema.
+--
+-- Widening an INT to a BIGINT preserves every stored value and is therefore
+-- backward compatible: a v14 binary reading the v15 column still gets an int64.
+-- The reverse is not safe, so roll back by keeping this schema and reverting
+-- the binary rather than by narrowing the column again.
+--
+-- Retry safety: MODIFY to a type the column already has is a no-op in MySQL, so
+-- a partially applied migration can be re-run after an interruption. MySQL DDL
+-- commits implicitly, so this script deliberately does not rely on an enclosing
+-- transaction rolling back.
+ALTER TABLE client_connection_leases MODIFY connection_epoch BIGINT NOT NULL;
+ALTER TABLE agent_connection_leases MODIFY connection_epoch BIGINT NOT NULL;

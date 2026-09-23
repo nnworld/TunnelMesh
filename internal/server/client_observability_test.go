@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -10,6 +11,10 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
+
+// errClientLeaseWrite stands in for any durable lease failure, including the
+// sql.ErrNoRows a truncated connection_epoch used to produce.
+var errClientLeaseWrite = errors.New("client lease write failed")
 
 func newClientObservabilityFixture() (*ClientObservabilityService, *fakeClientInstanceRepo, *fakeClientConnectionRepo, *ClientSessionManager) {
 	instances := &fakeClientInstanceRepo{nextID: "client-instance-1"}
@@ -224,4 +229,44 @@ func TestClientObservabilityHeartbeatTouchesInstanceAndLease(t *testing.T) {
 	if len(connections.renewed) != 1 || len(connections.stats) != 1 || connections.stats[0].ActiveStreams != 1 {
 		t.Fatalf("leases renewed=%v stats=%#v", connections.renewed, connections.stats)
 	}
+}
+
+// TestClientObservabilityHeartbeatTouchesMetadataWhenLeaseFails pins the
+// decoupling between the two durable writes a heartbeat performs. A live
+// physical WebSocket is itself proof that the client instance is alive, so a
+// lease-table failure must not stop the metadata refresh. Before this, the
+// lease error returned early and TouchInstance never ran: the metadata TTL
+// lapsed, the sweeper marked the instance stale, and the console showed
+// "metadata expired" for a client that was actively exchanging frames.
+func TestClientObservabilityHeartbeatTouchesMetadataWhenLeaseFails(t *testing.T) {
+	service, instances, connections, manager := newClientObservabilityFixture()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-1",
+		Identity: auth.TokenIdentity{
+			TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient,
+		},
+	}
+	if _, err := service.RegisterLegacy(context.Background(), principal); err != nil {
+		t.Fatal(err)
+	}
+	// Fail both lease writes so the heartbeat cannot recover by re-registering.
+	connections.renewErr = errClientLeaseWrite
+	connections.err = errClientLeaseWrite
+	instances.touched = nil
+	instances.touchedIDs = nil
+
+	err := service.Heartbeat(context.Background(), principal)
+	if !errors.Is(err, errClientLeaseWrite) {
+		t.Fatalf("heartbeat error = %v, want the lease failure to stay observable", err)
+	}
+	if len(instances.touched) != 1 {
+		t.Fatalf("metadata must still be refreshed while the lease write fails; touched = %#v", instances.touched)
+	}
+	if instances.touchedIDs[0] != [2]string{"owner-1", "legacy-connection-1"} {
+		t.Fatalf("touched ids = %#v", instances.touchedIDs)
+	}
+	if len(connections.renewed) != 1 {
+		t.Fatalf("renewed = %#v", connections.renewed)
+	}
+	_ = manager
 }

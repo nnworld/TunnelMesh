@@ -136,11 +136,16 @@ func (s *ClientObservabilityService) Heartbeat(ctx context.Context, principal Cl
 	if !ok {
 		return ErrSessionClosed
 	}
-	if err := s.leases.Heartbeat(ctx, record); err != nil {
-		return err
-	}
+	// The lease write and the metadata write are independent facts and must be
+	// attempted separately. Returning early on a lease failure stopped the
+	// metadata refresh, so the metadata TTL lapsed and the sweeper marked a
+	// client that was still exchanging frames as stale. A live physical
+	// WebSocket is itself proof of instance liveness, so the touch never depends
+	// on the lease table; errors.Join keeps both failures observable.
+	leaseErr := s.leases.Heartbeat(ctx, record)
 	now := time.Now().UTC()
-	return s.instances.TouchInstance(ctx, record.OwnerUserID, s.currentInstanceID(record.ConnectionID), now, now.Add(s.metadataTTL))
+	touchErr := s.instances.TouchInstance(ctx, record.OwnerUserID, s.currentInstanceID(record.ConnectionID), now, now.Add(s.metadataTTL))
+	return errors.Join(leaseErr, touchErr)
 }
 
 func (s *ClientObservabilityService) StreamOpened(principal ClientSessionPrincipal) error {
