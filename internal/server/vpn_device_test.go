@@ -301,7 +301,7 @@ func TestVPNDeviceInjectReachesTheNetworkDispatcher(t *testing.T) {
 	device.endpoint().Attach(dispatcher)
 
 	packet := vpnIPv4Packet(vpnTestProtocolTCP, net.ParseIP("10.64.5.7"), net.ParseIP("10.0.0.9"), []byte("syn"))
-	if err := device.inject(packet); err != nil {
+	if err := device.injectTCP(packet); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
 	delivered := dispatcher.delivered()
@@ -320,22 +320,39 @@ func TestVPNDeviceInjectReachesTheNetworkDispatcher(t *testing.T) {
 	// injecting one would be counted by gvisor as an unknown protocol and could
 	// make the stack answer with an error datagram of its own.
 	v6 := vpnIPv6VersionOf(packet)
-	if err := device.inject(v6); err == nil {
+	if err := device.injectTCP(v6); err == nil {
 		t.Error("inject accepted an ipv6 datagram")
 	} else if len(dispatcher.delivered()) != 1 {
 		t.Error("inject delivered a datagram it should have refused")
 	}
-	if err := device.inject(nil); err == nil {
+	if err := device.injectTCP(nil); err == nil {
 		t.Error("inject accepted an empty packet")
 	}
-	if err := device.inject(packet[:8]); err == nil {
-		t.Error("inject accepted a truncated ipv4 header")
+	if err := device.injectTCP(packet[:8]); err == nil {
+		t.Error("injectTCP accepted a truncated ipv4 header")
+	}
+
+	// The stack terminates TCP and nothing else, and that has to be enforced at
+	// the door rather than trusted to the pipeline: gvisor answers an
+	// unregistered transport protocol with an ICMP protocol-unreachable of its
+	// own, which is a packet the gateway never constructed and never chose a
+	// destination for.
+	for name, other := range map[string][]byte{
+		"udp":  vpnIPv4Packet(vpnTestProtocolUDP, net.ParseIP("10.64.5.7"), net.ParseIP("10.0.0.53"), []byte("query")),
+		"icmp": vpnIPv4Packet(vpnTestProtocolICMP, net.ParseIP("10.64.5.7"), net.ParseIP("10.0.0.1"), []byte("echo")),
+	} {
+		if err := device.injectTCP(other); !errors.Is(err, errVPNDeviceNotTCP) {
+			t.Errorf("%s: injectTCP = %v, want errVPNDeviceNotTCP", name, err)
+		}
+		if got := len(dispatcher.delivered()); got != 1 {
+			t.Errorf("%s: injectTCP delivered %d packets to the stack, want the one tcp segment", name, got)
+		}
 	}
 
 	if err := device.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := device.inject(packet); !errors.Is(err, os.ErrClosed) {
+	if err := device.injectTCP(packet); !errors.Is(err, os.ErrClosed) {
 		t.Errorf("inject after Close = %v, want os.ErrClosed", err)
 	}
 }
@@ -403,6 +420,42 @@ func TestVPNDeviceNeverBlocksTheStackOnAFullQueue(t *testing.T) {
 	case <-blocked:
 	case <-time.After(2 * time.Second):
 		t.Error("ReadContext on an empty queue blocked past its deadline")
+	}
+}
+
+// TestVPNDeviceEmitBypassesTheStack pins the return path for packets the gateway
+// builds itself. They must reach the WireGuard reader byte for byte: the stack has
+// no idea the destination exists, so anything it did to them would be wrong.
+func TestVPNDeviceEmitBypassesTheStack(t *testing.T) {
+	device, _ := newVPNDeviceFixture(t, 1420, 8)
+	dispatcher := &recordingNetworkDispatcher{}
+	device.endpoint().Attach(dispatcher)
+
+	packet := vpnIPv4Packet(vpnTestProtocolICMP, net.ParseIP("10.0.0.9"), net.ParseIP("10.64.5.7"), []byte("echo-reply"))
+	if err := device.emit(packet); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	if got := readOutbound(t, device); !bytes.Equal(got, packet) {
+		t.Errorf("emit produced %s, want %s", vpnHex(got), vpnHex(packet))
+	}
+	if got := len(dispatcher.delivered()); got != 0 {
+		t.Errorf("emit delivered %d packets to the network dispatcher, want none", got)
+	}
+
+	for name, bad := range map[string][]byte{
+		"nil":      nil,
+		"short":    packet[:8],
+		"not ipv4": vpnIPv6VersionOf(packet),
+	} {
+		if err := device.emit(bad); err == nil {
+			t.Errorf("%s: emit accepted an unusable packet", name)
+		}
+	}
+	if err := device.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := device.emit(packet); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("emit after Close = %v, want os.ErrClosed", err)
 	}
 }
 

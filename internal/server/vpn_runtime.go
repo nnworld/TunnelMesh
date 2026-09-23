@@ -105,6 +105,16 @@ type vpnMetrics interface {
 	Bytes(direction, protocol string, n int64)
 	// Stream records one flow outcome and keeps the active-flow gauge honest.
 	Stream(protocol, result, errorClass string)
+	// Dropped counts one packet the gateway refused to forward. The class is one
+	// of the sixteen published vpn.ErrorClass values, which is what makes it safe
+	// as a Prometheus label: a reason string built from a peer's request would be
+	// unbounded cardinality and would eventually exhaust the registry.
+	//
+	// It is a separate method from Stream because the two count different things.
+	// Stream tracks a flow that was opened and later ended; Dropped tracks a
+	// packet that never became a flow at all, which is the majority of what a
+	// policy denial looks like.
+	Dropped(protocol string, class vpn.ErrorClass)
 	// Lease records a subnet lease renewal outcome.
 	Lease(operation, result, errorClass string)
 }
@@ -129,15 +139,31 @@ func (m observabilityVPNMetrics) Stream(protocol, result, errorClass string) {
 	m.metrics.ObserveStream(protocol, result, errorClass)
 }
 
+// Dropped reuses the stream vector with the "rejected" result, which is the
+// closest existing series to "a packet was refused".
+//
+// That reuse is a known imprecision and is recorded as such: ObserveStream also
+// maintains an active-stream gauge, which it decrements on "rejected" without a
+// matching increment, so a burst of denials can pull the tcp gauge below the true
+// number of live flows until the next accept corrects it. The counter itself,
+// which is what the alerts read, is exact. Phase 8 replaces this body with a
+// dedicated tunnelmesh_vpn_packets_dropped_total and the packet path does not
+// change, which is the whole reason the gateway depends on this interface rather
+// than on *observability.Metrics.
+func (m observabilityVPNMetrics) Dropped(protocol string, class vpn.ErrorClass) {
+	m.metrics.ObserveStream(protocol, "rejected", string(class))
+}
+
 func (m observabilityVPNMetrics) Lease(operation, result, errorClass string) {
 	m.metrics.ObserveRegistryLease(operation, result, errorClass)
 }
 
 type nopVPNMetrics struct{}
 
-func (nopVPNMetrics) Bytes(string, string, int64)   {}
-func (nopVPNMetrics) Stream(string, string, string) {}
-func (nopVPNMetrics) Lease(string, string, string)  {}
+func (nopVPNMetrics) Bytes(string, string, int64)    {}
+func (nopVPNMetrics) Stream(string, string, string)  {}
+func (nopVPNMetrics) Dropped(string, vpn.ErrorClass) {}
+func (nopVPNMetrics) Lease(string, string, string)   {}
 
 // VPNGatewayDeps carries everything the gateway is allowed to touch.
 //

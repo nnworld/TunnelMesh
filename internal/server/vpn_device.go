@@ -56,8 +56,22 @@ var (
 	// protocol registered, so injecting one would be counted by gvisor as an
 	// unknown protocol rather than refused by anything that could explain it.
 	errVPNDeviceNotIPv4 = errors.New("vpn: the tunnel carries ipv4 only")
+	// errVPNDeviceNotTCP refuses a datagram the embedded stack does not terminate.
+	//
+	// It exists because of what gvisor does with a protocol it has not been given:
+	// DeliverTransportPacket answers TransportPacketProtocolUnreachable for an
+	// unregistered transport, and the IPv4 layer turns that into an ICMP
+	// protocol-unreachable sent back to the peer (network/ipv4/ipv4.go:1360). A
+	// gateway that only ever means to answer ICMP echo would then be emitting ICMP
+	// it never constructed, to a destination it never chose. Refusing at the door
+	// makes "netstack terminates TCP and nothing else" a structural property rather
+	// than a promise the packet pipeline has to keep on every path.
+	errVPNDeviceNotTCP = errors.New("vpn: the embedded stack terminates tcp only")
 	// errVPNDeviceShortPacket refuses a datagram too short to hold an IPv4 header.
 	errVPNDeviceShortPacket = errors.New("vpn: packet is shorter than an ipv4 header")
+	// errVPNDeviceQueueFull reports that the stack could not accept an outbound
+	// packet. It is the emit-side counterpart of the DroppedOutbound counter.
+	errVPNDeviceQueueFull = errors.New("vpn: the outbound queue is full")
 	// errVPNDeviceBadBuffer reports a Read call whose arguments cannot be
 	// satisfied. wireguard-go always passes a batch of buffers and a matching
 	// slice of sizes, so this is a programming error in a caller rather than a
@@ -158,16 +172,21 @@ func newMemoryDevice(mtu, queueSize int, inbound vpnInboundHandler) (*memoryDevi
 // a NIC and so a test can inject outbound packets the way the stack does.
 func (d *memoryDevice) endpoint() *channel.Endpoint { return d.ep }
 
-// inject hands one IPv4 packet to the stack.
+// injectTCP hands one IPv4/TCP segment to the stack.
 //
 // It is the pipeline's only door into netstack, and calling it is a decision the
 // pipeline makes after the peer, rate and destination checks have passed. The
 // device itself never calls it: a decrypted packet goes to the handler first, and
 // only what the handler allows comes back.
 //
+// The protocol field is checked rather than trusted for the reason
+// errVPNDeviceNotTCP gives: everything the gateway sends back to a peer that is
+// not a TCP segment it constructed itself goes out through emit, so the stack
+// never sees a datagram it would feel obliged to answer with an ICMP error.
+//
 // The packet is copied by buffer.MakeWithData, so the caller keeps ownership of
 // the slice it passed.
-func (d *memoryDevice) inject(packet []byte) error {
+func (d *memoryDevice) injectTCP(packet []byte) error {
 	if d.isClosed() {
 		return os.ErrClosed
 	}
@@ -177,9 +196,48 @@ func (d *memoryDevice) inject(packet []byte) error {
 	if packet[0]>>4 != 4 {
 		return errVPNDeviceNotIPv4
 	}
+	if header.IPv4(packet).TransportProtocol() != header.TCPProtocolNumber {
+		return errVPNDeviceNotTCP
+	}
 	d.ep.InjectInbound(header.IPv4ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(packet),
 	}))
+	return nil
+}
+
+// emit hands one fully formed IPv4 packet to the peer without involving the stack.
+//
+// It is the return path for everything the gateway builds itself - a relayed UDP
+// datagram, an ICMP echo reply - and it is deliberately separate from injectTCP:
+// these packets are complete on the wire and must not be routed, checksummed or
+// answered by netstack, which has no idea the destination exists.
+//
+// A full outbound queue is reported rather than waited on, for the same reason
+// WriteNotify drops instead of blocking: this runs on a relay path, and stalling
+// it would hold a stream open on behalf of one slow peer.
+func (d *memoryDevice) emit(packet []byte) error {
+	if d.isClosed() {
+		return os.ErrClosed
+	}
+	if len(packet) < header.IPv4MinimumSize {
+		return errVPNDeviceShortPacket
+	}
+	if packet[0]>>4 != 4 {
+		return errVPNDeviceNotIPv4
+	}
+	var list stack.PacketBufferList
+	list.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(packet),
+	}))
+	written, terr := d.ep.WritePackets(list)
+	if terr != nil {
+		d.dropped.Add(1)
+		return fmt.Errorf("vpn: emit packet to peer: %v", terr)
+	}
+	if written != 1 {
+		d.dropped.Add(1)
+		return errVPNDeviceQueueFull
+	}
 	return nil
 }
 
