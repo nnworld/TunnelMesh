@@ -7,6 +7,9 @@
           <el-table-column prop="name" :label="t('agents.name')" />
           <el-table-column prop="id" label="ID" />
           <el-table-column :label="t('agents.status')">
+            <template #default="scope"><StatusTag :kind="scope.row.status === 'online' ? 'success' : 'info'" :label="scope.row.status === 'online' ? t('agents.online') : t('agents.offline')" /></template>
+          </el-table-column>
+          <el-table-column :label="t('agents.enabledColumn')">
             <template #default="scope"><StatusTag :kind="scope.row.enabled ? 'success' : 'warning'" :label="scope.row.enabled ? t('agents.active') : t('agents.disabled')" /></template>
           </el-table-column>
           <el-table-column :label="t('agents.actions')">
