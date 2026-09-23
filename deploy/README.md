@@ -9,9 +9,14 @@
 | 路径 | 内容 | 对应文档 |
 | --- | --- | --- |
 | `systemd/tunnelmesh-server.service`、`tunnelmesh-agent.service`、`tunnelmesh-client.service` | Linux systemd unit，每角色一份，脚本直接安装不做替换 | [Linux systemd 安装](../docs/deployment/linux-systemd.md) |
+| `systemd-user/tunnelmesh-server.service`、`tunnelmesh-agent.service`、`tunnelmesh-client.service` | Linux systemd **user** 单元模板，每角色一份，路径全部由占位符渲染 | [一键安装脚本](../docs/deployment/oneclick-install.md) |
 | `macos/tunnelmesh.plist` | launchd 用户级服务模板，三角色共用，占位符渲染 | [macOS launchd 安装](../docs/deployment/macos-launchd.md) |
 | `windows/tunnelmesh-service.xml` | WinSW 服务模板，三角色共用，占位符渲染 | [Windows Service 安装](../docs/deployment/windows-service.md) |
 | `install/linux-install.sh`、`macos-install.sh`、`windows-install.ps1`、`windows-uninstall.ps1` | 安装与卸载脚本 | 同上三篇 |
+| `install/oneclick/install-{server,agent,client}.sh`、`install-{server,agent,client}.ps1` | 三平台 × 三角色的一键安装入口，只声明参数与角色问答 | [一键安装脚本](../docs/deployment/oneclick-install.md) |
+| `install/oneclick/tunnelmesh-install-common.sh`、`tunnelmesh-install-common.ps1` | 一键安装的共享实现：下载校验、交互、渲染、服务生命周期、升级与卸载 | 同上 |
+| `install/oneclick/winsw-checksums.txt` | WinSW 校验和登记表；未登记的版本拒绝自动下载 | [Windows Service 安装](../docs/deployment/windows-service.md) |
+| `install/oneclick/testdata/` | 函数级 bash 测试套件、渲染驱动与 `curl`/`systemctl`/`launchctl`/`loginctl`/`plutil` 桩；不进发布归档 | [测试与验证](../docs/development/testing.md) |
 | `openresty/tunnelmesh_proxy_entry.lua`、`openresty/tunnelmesh-proxy.conf.example`、`openresty/Dockerfile.proxy-connect` | tp-* HTTP 代理入口的 OpenResty 搬运层、server 块模板与补丁内核镜像 | [OpenResty 代理入口部署](../docs/deployment/openresty-proxy-entry.md) |
 | `prometheus/prometheus.yml.example` | Prometheus 抓取起点配置（单节点与集群两种形态） | [可观测性](../docs/operations/observability.md) |
 | `prometheus/recording-rules.yaml`、`alert-rules.yaml` | 录制规则与告警规则 | 同上 |
@@ -21,8 +26,17 @@
 
 ## 模板约定
 
-- `macos/tunnelmesh.plist` 占位符：`__ROLE__`、`__HOME__`、`__BINARY__`、`__CONFIG__`。
-- `windows/tunnelmesh-service.xml` 占位符：`__ROLE__`、`__ROLE_TITLE__`、`__BINARY__`、`__CONFIG__`、`__INSTALL_DIR__`。
+- `macos/tunnelmesh.plist` 占位符：`__ROLE__`、`__HOME__`、`__BINARY__`、`__CONFIG__`、`__ENVIRONMENT__`。
+  `__ENVIRONMENT__` 渲染为 `EnvironmentVariables` dict（无敏感值时渲染为空串），token 因此不必写进 YAML。
+- `windows/tunnelmesh-service.xml` 占位符：`__ROLE__`、`__ROLE_TITLE__`、`__BINARY__`、`__CONFIG__`、
+  `__INSTALL_DIR__`、`__ENV_BLOCK__`。`__ENV_BLOCK__` 渲染为若干 `<env name= value= />`（WinSW 没有
+  EnvironmentFile 机制），渲染后必须收紧 ACL。
+- `systemd-user/tunnelmesh-<role>.service` 占位符：`__BINARY__`、`__CONFIG__`、`__ENV_FILE__`、`__STATE_DIR__`。
+  user 单元以非 root 运行且 `ReadWritePaths` 只放开状态目录，因此 server 的 `init-node-id` 与 `run`
+  都必须带 `--node-id-path __STATE_DIR__/node-id`，不能依赖默认的 `/var/lib/tunnelmesh`。
+- system 模式下只有在用户选择了非默认运行账户或路径时才生成 drop-in
+  `/etc/systemd/system/tunnelmesh-<role>.service.d/oneclick.conf`，用它覆盖 `User=`/`Group=` 与路径，
+  **不修改仓库模板**；卸载时一并删除。
 - 每个角色只允许有一份模板来源：安装脚本只做占位符替换，不得内联生成第二份模板。历史上
   client 用 checked-in 模板、server/agent 用脚本内联生成，结果 client 分支原样拷贝模板并
   静默忽略调用方传入的配置路径，Windows 的日志目录也与文档不一致。
@@ -99,7 +113,7 @@ CA 私钥刻意放在 `relay/` 之外：Compose 只挂载 CA 证书和该节点�
 
 | 平台 | 归档内的 `deploy/` 内容 |
 | --- | --- |
-| Linux | `deploy/install`、`deploy/systemd` |
+| Linux | `deploy/install`、`deploy/systemd`、`deploy/systemd-user` |
 | macOS | `deploy/install`、`deploy/macos` |
 | Windows | `deploy/install`、`deploy/windows` |
 
@@ -114,7 +128,11 @@ CA 私钥刻意放在 `relay/` 之外：Compose 只挂载 CA 证书和该节点�
 ```bash
 go test ./deploy/... -count=1                  # Dashboard schema、模板与脚本一致性
 go test ./deploy/openresty -count=1            # OpenResty 产物与 server.proxy_entry 默认值一致
-plutil -lint deploy/macos/tunnelmesh.plist     # macOS
+go test ./deploy/install/oneclick -count=1     # 一键安装脚本契约、函数级套件与配置漂移
+TM_ONECLICK_E2E=1 go test ./deploy/install/oneclick -count=1  # 端到端：安装 → 升级 → 卸载
+bash -n deploy/install/oneclick/*.sh
+# 模板含 __ENVIRONMENT__ 占位符，未渲染时不是合法 XML；lint 的是「渲染为空」的结果。
+sed 's/^__ENVIRONMENT__$//' deploy/macos/tunnelmesh.plist | plutil -lint -   # macOS
 bash -n deploy/install/linux-install.sh deploy/install/macos-install.sh
 bash -n scripts/gen-relay-certs.sh
 bash -n deploy/openresty/spike-connect-check.sh

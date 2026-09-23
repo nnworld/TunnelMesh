@@ -23,3 +23,19 @@ const (
 	// before a WINDOW_UPDATE is emitted, on either end.
 	DefaultWindowUpdateThreshold = 128 << 10
 )
+
+// Every relay pump in this codebase consumes send credit before it hands a frame
+// to its outbound queue, and a peer only returns credit after it has taken the
+// bytes. Queued bytes therefore can never exceed the credit the peer advertised
+// when the stream opened:
+//
+//	queued = consumed - sent  <=  initialWindow + updates - sent  <=  initialWindow
+//
+// because updates are bounded by what the peer has already received. That makes
+// "per-stream outbound queue >= the window the peer advertises" the invariant
+// which keeps a full queue unreachable for a compliant peer. It matters because
+// the outbound queues refuse frames instead of blocking, and every pump treats a
+// refusal as a fatal stream error: sizing a queue below the credit does not add
+// safety, it turns ordinary backpressure into a truncated transfer. The Server
+// mirrors the same rule on its inbound side, where the relay stream's
+// receiveBudget equals the window it advertised in OPEN_STREAM.

@@ -769,6 +769,8 @@ paths:
       responses: {'200': {description: Dashboard summary}, '401': {description: Unauthenticated}}
   /api/v1/agents:
     get:
+      summary: List agents the caller may administer
+      description: Each item carries `enabled`, the administrative switch, and `status`, which is `online` while the agent holds an unexpired connection lease and `offline` otherwise. The two are independent facts, so `enabled` alone never implies connectivity; an agent created in the console lists as `offline` until it first dials in.
       security: [{ bearerAuth: [] }]
       parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
       responses: {'200': {description: Cursor page}}
@@ -789,7 +791,7 @@ paths:
       - {$ref: '#/components/parameters/IncludeStale'}
     get:
       summary: Read the latest runtime metadata reported by an agent
-      description: Stale snapshots are omitted by default. Set includeStale=true to read the last stale snapshot marked with stale=true. Runtime metadata is read-only through this API.
+      description: Stale snapshots are omitted by default. Set includeStale=true to read the last stale snapshot marked with stale=true. An agent that exists but never reported returns 200 with empty `items` and `instances` arrays, which is a legitimate empty collection rather than a missing resource. Runtime metadata is read-only through this API.
       security: [{bearerAuth: []}]
       responses:
         '200':
@@ -800,7 +802,7 @@ paths:
                 $ref: '#/components/schemas/AgentMetadataEnvelope'
         '401': {description: Unauthenticated}
         '403': {description: Agent is not owned by the caller}
-        '404': {description: Agent or metadata snapshot not found, or snapshot is stale without includeStale=true}
+        '404': {description: Agent not found, or snapshot is stale without includeStale=true}
   /api/v1/agents/{agentId}/connections:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     get:

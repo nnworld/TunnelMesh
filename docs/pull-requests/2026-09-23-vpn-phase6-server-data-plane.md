@@ -460,3 +460,80 @@ go build -tags vpn -o /tmp/tm-server-vpn ./cmd/tunnelmesh-server && stat -f%z /t
 - 后续阶段：阶段 8（可观测性与部署）承接 `tunnelmesh_vpn_*` 专用指标向量、Grafana 的 VPN Row 与告警规则、
   `test/e2e/vpn/`、`Dockerfile` 的 `GO_VERSION`、`.dockerignore`、发行矩阵的 VPN 变体、
   以及本阶段未能在 Linux 取证的“非 root + 无 `CAP_NET_ADMIN`”两项
+## 补记：合并 `main` 后的 Schema 版本重编号（v15 → v16）
+
+本节是 `AGENTS.md` 允许的补记，只记录已验证事实。上文「集成状态」里的提交数、变更规模与
+「零改动守卫：`migrations/`、`SchemaVersion`、增量链零改动」描述的是**合并 `main` 之前**的状态，
+以本节为准。
+
+### 触发原因
+
+本分支的阶段 3 把 VPN 存储落在 `migrations/incremental/v0014_to_v0015/`，`SchemaVersion = 15`。
+在本分支开发期间，`main` 发布了 v1.2.4（`2fafd7f`），用**同一个** `v0014_to_v0015` 目录和
+**同一个** `SchemaVersion = 15` 修复了 `connection_epoch` 的 32 位钳制缺陷。合并时两者在
+`migrations/incremental/v0014_to_v0015/{mysql,sqlite}.sql` 上产生 add/add 冲突。
+
+`AGENTS.md` 规定「已发布的增量脚本禁止修改、重排或删除；修复已发布迁移必须新增下一个 Schema
+版本」。`main` 的 v15 已随 v1.2.4 发布，本分支的 v15 未发布，因此由 VPN 迁移让位。
+
+### 处理
+
+| 项 | 合并前（本分支） | 合并后 |
+| --- | --- | --- |
+| `connection_epoch` 加宽 | — | `migrations/incremental/v0014_to_v0015/`（保留 `main` 原文，逐字未改） |
+| VPN 两张表与五个索引 | `migrations/incremental/v0014_to_v0015/` | `migrations/incremental/v0015_to_v0016/` |
+| `internal/storage/db.go` `SchemaVersion` | 15 | 16，并新增 `case 15` 迁移分支 |
+| `migrations/embed.go` | `V14ToV15{MySQL,SQLite}` | 追加 `V15ToV16{MySQL,SQLite}` |
+| `migrations/ddl.sql` | VPN 表 + `connection_epoch INTEGER` | 两侧自动合并：VPN 表 + `connection_epoch BIGINT` |
+
+两步互相独立：v15 只 `ALTER` 两张租约表的列宽，v16 只 `CREATE` 新对象，链按相邻版本顺序执行，
+多版本升级不得跳步。
+
+### 同步改动
+
+- 迁移测试全部重编号：`TestSQLiteV14ToV15VPNMigration` → `TestSQLiteV15ToV16VPNMigration`、
+  `TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe` → `TestMySQLV15ToV16VPNMigrationsAreAdjacentAndDialectSafe`、
+  `TestMySQLV14ToV15VPNMigration` → `TestMySQLV15ToV16VPNMigration`、`prepareV14Base` → `prepareV15Base`。
+  `main` 的 `TestMySQLV14ToV15WidensConnectionEpoch` 与 `TestSQLiteV14ToV15LeaseEpochMigration`
+  保持原名（它们测的仍是 v14→v15 这一步），只把 `SchemaVersion` 断言从 15 调到 16。
+- `TestSchemaVersionIs15` → `TestSchemaVersionIs16`。
+- `TestSQLiteV14ToV15LeaseEpochMigration` 的收尾断言由硬编码 `!= 15` 改为 `!= SchemaVersion`：
+  `auto_init` 总是迁移到链尾，v14 起点现在会一路走到 v16。测试注释同步说明「相邻链缺一步会以
+  `missing adjacent migration` 失败」，原有意图（v14→v15 步可执行、int64 fencing token 往返）未削弱。
+- `docs/operations/schema-upgrades.md`：新增 `## v15 to v16` 段（由原 `## v14 to v15` 段重编号而来，
+  并补写「为什么是 v16 而不是 v15」），`main` 的 `## v14 to v15` 段逐字保留在其后；
+  `## v13 to v14` 及更早的段落与合并基线逐字一致（`difflib` 校验 0 差异）。
+- 同文档「Five-minute stop-loss」一节按阶段 6 的既成事实改写：`server.vpn.*` 已经存在，
+  止损首选 `server.vpn.enabled: false` 配置开关而不是回滚发布。
+- `docs/user-guide/server-admin.md`：当前 Schema 版本 v15 → v16。
+- 阶段 3 的计划与 PR 记录（`2026-09-20-vpn-phase3-schema-v15.md`）按时点记录不可改写原则
+  **未修改**，其中的 v15 编号是当时的真实决策；重编号这一事实只记录在本节与 `schema-upgrades.md`。
+
+### 其它冲突处理
+
+- `web/src/i18n/messages/{en-US,zh-CN}.ts`：两侧改动正交（本分支加 `servers.vpn.*`，`main` 加
+  `clients.metadataStale`、`clients.leaseState*`），逐行取本分支的 `servers` 行与 `main` 的 `clients` 行；
+  合并前用 base 三方比对确认过正交性。
+- `docs/README.md`：文档地图三行合并，同时保留 `一键安装` 与 `VPN 网关`。
+- `docs/pull-requests/README.md`、`docs/superpowers/{plans,specs}/README.md`、
+  `docs/architecture/adr/README.md`：由 `scripts/gen_doc_index.py` 重新生成，连续两跑输出幂等。
+- `internal/storage/{client_repository_test.go,mysql_test.go}`：两侧新增的测试全部保留。
+
+### 验证（合并后实测）
+
+| 命令 | 结果 |
+| --- | --- |
+| `go build ./...` / `go build -tags vpn ./...` | 通过 |
+| `go test ./... -count=1` | 24 包全绿 |
+| `go test -tags vpn ./... -count=1` | 24 包全绿 |
+| `go test -tags vpn ./internal/server/ -run 'VPNGateway\|VPNE2E' -count=1 -v` | 32 个用例全绿 |
+| `go test -race -tags vpn ./internal/{storage,server,client,agent,protocol,e2e}/... ./scripts/ -count=1 -timeout 30m` | 全绿，`DATA RACE` 0 次（`internal/server` 510s） |
+| `go vet ./...` / `go vet -tags vpn ./...` | 通过 |
+| `gofmt -l internal scripts cmd deploy` | 无输出 |
+| `git diff --check` / `git diff --cached --check` | 无输出 |
+| `cd web && npm test -- --run` | 40 files / 335 tests 全绿 |
+| `cd web && npm run build` + `scripts/verify-web-embed.sh` | 通过，`web/dist` 与 `internal/server/web_dist` 一致 |
+
+`main` 带进来的 `deploy/install/oneclick` 的 `TestShellFunctionSuite` 在**有控制终端**的环境下会
+阻塞在 `/dev/tty` 交互提示（`==> 认证方式（socks5 只支持 none|password）`）直到 10 分钟超时，
+与本次合并无关（无控制终端时该套件 1.2s 通过）。本节所有 `go test` 均通过 `setsid` 脱离控制终端执行。

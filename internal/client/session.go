@@ -56,6 +56,11 @@ func (mode SessionOpenMode) supportsClientMetadata() bool {
 const (
 	defaultStreamWindow          = 262144
 	defaultWindowUpdateThreshold = 131072
+	// windowWaitInterval bounds how long a blocked write waits before it
+	// re-checks the terminal state. The credit signal is the fast path; the
+	// interval only guarantees a session shutdown is noticed even when the
+	// stream was already half-closed remotely and no further signal arrives.
+	windowWaitInterval = 100 * time.Millisecond
 )
 
 type Session struct {
@@ -577,6 +582,11 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 					stream.finish(err)
 					s.removeStream(f.StreamID)
 					_ = s.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: f.StreamID})
+					continue
+				}
+				select {
+				case stream.windowSignal <- struct{}{}:
+				default:
 				}
 			}
 		case protocol.FrameReset:
@@ -638,6 +648,10 @@ type frameStream struct {
 	halfOnce       sync.Once
 	flow           *protocol.StreamState
 	receiveUnacked uint32
+	// windowSignal wakes a write that is waiting for send credit. It is a wake
+	// token rather than a byte channel because the authoritative credit lives in
+	// flow; coalescing several updates into one wake is therefore harmless.
+	windowSignal chan struct{}
 }
 
 func (s *frameStream) deliverOpenResult(payload protocol.OpenResultPayload) bool {
@@ -661,6 +675,7 @@ func newFrameStream(s *Session, id uint32) *frameStream {
 		if state, err := protocol.NewStreamState(id, s.initialWindow); err == nil {
 			_ = state.OpenLocal()
 			stream.flow = state
+			stream.windowSignal = make(chan struct{}, 1)
 		}
 	}
 	return stream
@@ -735,15 +750,70 @@ func (s *frameStream) Write(p []byte) (int, error) {
 	if closed || tr == nil {
 		return 0, ErrSessionClosed
 	}
-	if s.flow != nil {
-		if err := s.flow.ConsumeSend(uint32(len(p))); err != nil {
-			return 0, err
+	// A write is split into frames no larger than MaxStreamFrame. The encoder
+	// would accept up to MaxPayload, but the peer's inbound budget is a fraction
+	// of that and refuses an oversized frame, so chunking is what lets a large
+	// write cross a smaller receive window at all.
+	written := 0
+	for written < len(p) {
+		size := len(p) - written
+		if size > protocol.MaxStreamFrame {
+			size = protocol.MaxStreamFrame
+		}
+		if err := s.waitForSendWindow(size); err != nil {
+			return written, err
+		}
+		frame := protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.id, Payload: append([]byte(nil), p[written:written+size]...)}
+		if err := s.session.sendFrame(frame); err != nil {
+			return written, err
+		}
+		written += size
+	}
+	return written, nil
+}
+
+// waitForSendWindow reserves size bytes of peer credit, blocking until the
+// credit arrives. Returning ErrWindowExhausted instead of waiting truncated
+// every bulk transfer whose next chunk did not fit the remaining credit: the
+// caller copies through this stream with io.Copy and treats the first error as
+// the end of the body, so the peer received a short response under an intact
+// Content-Length. Blocking happens on the per-stream write path, never on the
+// shared receive loop, so one stalled stream cannot head-of-line block another.
+func (s *frameStream) waitForSendWindow(size int) error {
+	if s.flow == nil {
+		return nil
+	}
+	for {
+		err := s.flow.ConsumeSend(uint32(size))
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, protocol.ErrWindowExhausted) {
+			return err
+		}
+		timer := time.NewTimer(windowWaitInterval)
+		select {
+		case <-s.windowSignal:
+			timer.Stop()
+		case <-timer.C:
+		case <-s.done:
+			timer.Stop()
+		}
+		s.mu.Lock()
+		streamErr := s.err
+		s.mu.Unlock()
+		// A remote HALF_CLOSE ends only the read direction, so it must not abort
+		// a write that is still owed credit. Every other terminal state must.
+		if streamErr != nil && !errors.Is(streamErr, io.EOF) {
+			return streamErr
+		}
+		s.session.mu.RLock()
+		closed := s.session.closed
+		s.session.mu.RUnlock()
+		if closed {
+			return ErrSessionClosed
 		}
 	}
-	if err := s.session.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.id, Payload: append([]byte(nil), p...)}); err != nil {
-		return 0, err
-	}
-	return len(p), nil
 }
 func (s *frameStream) Close() error {
 	s.closeOnce.Do(func() {

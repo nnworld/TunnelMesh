@@ -31,6 +31,7 @@ $rendered = $rendered.Replace('__ROLE__', $Role)
 $rendered = $rendered.Replace('__BINARY__', $binaryName)
 $rendered = $rendered.Replace('__CONFIG__', $configXml)
 $rendered = $rendered.Replace('__INSTALL_DIR__', $InstallDir)
+$rendered = $rendered.Replace('__ENV_BLOCK__', '')
 Set-Content -Encoding UTF8 -Path $xml -Value $rendered
 & $wrapper stop 2>$null; & $wrapper uninstall 2>$null
 & $wrapper install

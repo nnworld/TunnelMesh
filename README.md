@@ -151,20 +151,28 @@ source for management data. See [architecture overview](docs/architecture/overvi
 
 ### Install
 
-For Linux or macOS, download the installer, review it, and install a checksum-verified release:
+One command per role (`server`, `agent`, `client`). Download the installer, review it, then run it:
 
 ```sh
 curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/nnworld/TunnelMesh/main/scripts/install.sh \
-  --output /tmp/tunnelmesh-install.sh
-less /tmp/tunnelmesh-install.sh
-bash /tmp/tunnelmesh-install.sh --version v1.1.1
+  https://raw.githubusercontent.com/nnworld/TunnelMesh/main/deploy/install/oneclick/install-agent.sh \
+  --output /tmp/tunnelmesh-install-agent.sh
+less /tmp/tunnelmesh-install-agent.sh
+/bin/bash /tmp/tunnelmesh-install-agent.sh
 ```
 
-The default install directory is `~/.local/bin`; use `--install-dir /usr/local/bin` for a system-wide
-install. Without `--version`, the installer resolves and installs the latest stable release. To register
-systemd or launchd services, use the platform installer included in the
-[release archive](https://github.com/nnworld/TunnelMesh/releases) or the deployment guides.
+Prefer a one-liner? Both forms work:
+
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/nnworld/TunnelMesh/main/deploy/install/oneclick/install-agent.sh)"
+curl -fsSL https://raw.githubusercontent.com/nnworld/TunnelMesh/main/deploy/install/oneclick/install-agent.sh | bash -s -- --version v1.1.1
+```
+
+The installer asks for the server URL and token, writes the configuration, registers a systemd user
+unit (Linux), a LaunchAgent (macOS), or a WinSW service (Windows, use `install-agent.ps1`), then starts
+and verifies it. Add `--yes` for unattended installs and re-run the same command to upgrade.
+To install only the three binaries without service registration, use `scripts/install.sh`
+(default `~/.local/bin`). Full guide: [one-click install](docs/deployment/oneclick-install.md).
 
 Download a prebuilt archive for Linux, macOS, or Windows from
 [GitHub Releases](https://github.com/nnworld/TunnelMesh/releases), or build from source

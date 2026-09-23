@@ -1,16 +1,21 @@
 # Schema Upgrade Guide
 
-## v14 to v15
+## v15 to v16
 
-Schema v15 is the storage foundation for the embedded VPN gateway approved in
+Schema v16 is the storage foundation for the embedded VPN gateway approved in
 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) and
 described in
 [the embedded VPN gateway spec](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md).
 It adds two tables and five indexes and touches no existing table: every
 statement is a `CREATE TABLE` or a `CREATE INDEX`, so the change is expand-only
-and carries no `ALTER TABLE` cost. No API route, configuration key or frontend
-asset changes in this release — the gateway itself lands in later phases, and
-until then both tables stay empty.
+and carries no `ALTER TABLE` cost.
+
+This step is numbered v16 rather than v15 because `v0014_to_v0015` was published
+in v1.2.4 for the `connection_epoch` widening documented in the next section, and
+a published incremental script must never be renumbered or rewritten. The two
+steps are independent: v15 widens one column on two existing tables, v16 only
+creates new objects, so either may be applied first in a multi-version upgrade as
+long as the chain runs one adjacent step at a time.
 
 New tables:
 
@@ -73,11 +78,11 @@ the failure would be a `CREATE TABLE` that silently truncates or refuses.
 
 1. **Back up the database and verify the backup can be restored.** This upgrade
    is not reversible by application rollback; see "Roll back" below.
-2. Confirm `schema_meta.version=14`. **v14 is the minimum source version**: the
-   repository only maintains adjacent incremental scripts, so a database at v13
-   or earlier must be upgraded to v14 first.
-3. Confirm both `migrations/incremental/v0014_to_v0015/mysql.sql` and
-   `migrations/incremental/v0014_to_v0015/sqlite.sql` are present, and that every
+2. Confirm `schema_meta.version=15`. **v15 is the minimum source version**: the
+   repository only maintains adjacent incremental scripts, so a database at v14
+   or earlier must be upgraded to v15 first.
+3. Confirm both `migrations/incremental/v0015_to_v0016/mysql.sql` and
+   `migrations/incremental/v0015_to_v0016/sqlite.sql` are present, and that every
    intermediate version from the current one is present too. Cross-version
    upgrades must run one adjacent step at a time.
 4. Confirm the database account can `CREATE TABLE`, `CREATE INDEX` and update
@@ -85,14 +90,15 @@ the failure would be a `CREATE TABLE` that silently truncates or refuses.
    needs it for any earlier step in the chain.
 5. **No new environment variable is required.** `TUNNELMESH_VPN_NODE_PRIVATE_KEY`
    belongs to a later phase and does not exist yet; `TUNNELMESH_TOKEN_ENCRYPTION_KEY`
-   keeps its v14 meaning and is still only used by the identity and credential
-   features. Nothing in v15 reads a secret that is not already configured.
+   keeps its v15 meaning and is still used by the identity, credential and VPN
+   private-key features. Nothing in v16 reads a secret that is not already
+   configured.
 6. Plan for a full-fleet restart rather than a rolling upgrade. See the
    compatibility note below.
 
 Start the new Server with schema initialization enabled
 (`storage.auto_init: true`). The migration applies the driver-specific
-statements and advances `schema_meta.version` to `15` only after they succeed.
+statements and advances `schema_meta.version` to `16` only after they succeed.
 
 ### Lock impact and capacity
 
@@ -105,7 +111,7 @@ releases.
 
 Contrast with v13 to v14, which ran `ALTER TABLE users ADD COLUMN`: MySQL 5.6
 and 5.7 apply that with the `INPLACE` algorithm, which still rebuilds `users` and
-blocks concurrent DML for the duration (recorded in that section below). **v15
+blocks concurrent DML for the duration (recorded in that section below). **v16
 contains no `ALTER` at all, so that cost does not exist here.** Keeping the VPN
 storage in two new tables instead of extending existing ones is what buys that.
 
@@ -122,14 +128,14 @@ endpoint and the critical paths — login, Agent registration, managed routes an
 Because `internal/storage/db.go` refuses to open a database whose
 `schema_meta.version` is higher than the binary's `SchemaVersion`, **this is not
 a window in which old and new nodes can run side by side**: once any node has
-migrated the database to v15, an un-upgraded node that restarts fails to start.
+migrated the database to v16, an un-upgraded node that restarts fails to start.
 Complete the fleet inside one maintenance window, exactly as for v13 to v14.
 
 ### Verify
 
 ```sql
 SELECT version FROM schema_meta WHERE id=1;
--- expected: 15
+-- expected: 16
 
 -- MySQL
 SHOW TABLES LIKE 'vpn\_%';
@@ -146,46 +152,47 @@ SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN
 Both tables and all five `idx_vpn_*` indexes must be present, plus the two
 inline unique constraints. `requireSchemaTables` checks the two table names at
 startup, so a Server that boots at all has passed part of this verification.
-Both tables must be empty (`SELECT COUNT(*)`) unless a later phase has already
-been deployed. Finish with a smoke test of the health endpoint and the critical
+Both tables are empty (`SELECT COUNT(*)`) on a database that has not yet issued
+a VPN peer; a gateway that is already serving peers has rows in `vpn_peers` and
+one row per node subnet in `vpn_ip_leases`. Finish with a smoke test of the health endpoint and the critical
 paths listed above, and confirm the upgrade log contains no DSN, password or
 token.
 
 A fresh deployment seeded from `migrations/ddl.sql` produces the same objects at
-version `15`; `TestSQLiteFreshSchemaMatchesIncrementalVPNChain` asserts that the
+version `16`; `TestSQLiteFreshSchemaMatchesIncrementalVPNChain` asserts that the
 full DDL and the incremental chain agree on every column and index.
 
-### Compatibility: a v14 binary cannot open a v15 database
+### Compatibility: a v15 binary cannot open a v16 database
 
-The migration statements are additive, but the version gate is strict. A v14
-Server refuses a v15 database before serving any traffic: with
+The migration statements are additive, but the version gate is strict. A v15
+Server refuses a v16 database before serving any traffic: with
 `storage.auto_init: false` the schema check requires an exact version match and
-fails with `schema version mismatch: database has version 15, application
-requires version 14`; with `auto_init: true` the loader rejects any version above
-its own `SchemaVersion` with the same error. The gate is symmetric: a v15 Server
-against a v14 database fails with `database has version 14, application requires
-version 15` when `auto_init` is off, and with `auto_init` on it runs
-`v0014_to_v0015` — or, if that adjacent script is missing from the embedded
-migrations, reports `missing adjacent migration v0014_to_v0015` and refuses to
+fails with `schema version mismatch: database has version 16, application
+requires version 15`; with `auto_init: true` the loader rejects any version above
+its own `SchemaVersion` with the same error. The gate is symmetric: a v16 Server
+against a v15 database fails with `database has version 15, application requires
+version 16` when `auto_init` is off, and with `auto_init` on it runs
+`v0015_to_v0016` — or, if that adjacent script is missing from the embedded
+migrations, reports `missing adjacent migration v0015_to_v0016` and refuses to
 start. Independent of the version number, startup also verifies that both new
 tables exist and fails with `schema is missing required table <name>` if either
 is absent.
 
 ### Roll back
 
-The two new tables are invisible to a v14 binary: v14 code neither reads nor
+The two new tables are invisible to a v15 binary: v15 code neither reads nor
 writes them, so **no reverse DDL is needed**. That does not make downgrade free,
-because a v14 binary still refuses to open a database stamped `15`. The supported
+because a v15 binary still refuses to open a database stamped `16`. The supported
 paths are therefore:
 
 1. **Restore the pre-upgrade backup** — the only path that returns the fleet to
-   v14 with its data intact.
-2. **Fix forward** on v15. Preferred whenever the problem is in application code
+   v15 with its data intact.
+2. **Fix forward** on v16. Preferred whenever the problem is in application code
    rather than in the migration, since the migration itself cannot corrupt
    existing data.
 
-Never hand-run `UPDATE schema_meta SET version=14`. That leaves v15 tables
-present under a v14 version number, which the next upgrade attempt misreads, and
+Never hand-run `UPDATE schema_meta SET version=15`. That leaves v16 tables
+present under a v15 version number, which the next upgrade attempt misreads, and
 it defeats the very gate that makes the failure mode above detectable.
 
 If a downgrade must keep production data, an operator may drop the two tables
@@ -196,8 +203,12 @@ non-empty `vpn_peers` destroys peer records that no other table can rebuild.
 
 ### Five-minute stop-loss
 
-This release ships no runtime switch — `server.vpn.*` does not exist yet — so
-there is nothing to turn off. The stop-loss is: halt the rollout, leave the
+The gateway itself is switched off by default, so the fastest containment is a
+configuration change rather than a deploy: set `server.vpn.enabled: false` (or
+unset `TUNNELMESH_VPN_NODE_PRIVATE_KEY`) and restart, which stops the WireGuard
+listener and refuses new peer configuration without touching the schema. See
+[VPN gateway operations](vpn.md) for the full switch and its metrics. If the
+problem is the migration rather than the gateway, halt the rollout, leave the
 migrated database as it is, roll the binary back to the pre-upgrade version, and
 continue from "Roll back" above. Because the migration is additive-only, nodes
 that have not been touched yet keep serving normally for the whole window, and a
@@ -208,12 +219,125 @@ restarts.
 
 MySQL DDL commits implicitly, so an interrupted run can leave one table created
 and the other missing. `applySchemaStatements` tolerates duplicate objects from v6
-onward, which makes re-running the same `v0014_to_v0015` script safe once the
+onward, which makes re-running the same `v0015_to_v0016` script safe once the
 blocking condition is cleared; `schema_meta.version` only advances after the whole
-script succeeds and stays at `14` otherwise. Inspect the error, fix the cause —
+script succeeds and stays at `15` otherwise. Inspect the error, fix the cause —
 almost always a missing `CREATE` privilege or an existing object with the same
 name — and re-run the same script. Do not edit a published incremental script to
 work around a failure: the fix belongs in the next schema version.
+
+## v14 to v15
+
+Schema v15 widens the connection fencing token from a 32-bit `INTEGER` to a
+`BIGINT` on both lease tables. It changes no table, no column name, no index,
+and no data semantics — only the storage width of one column per table.
+
+| Table | Column | Before | After |
+| --- | --- | --- | --- |
+| `client_connection_leases` | `connection_epoch` | `INTEGER NOT NULL` | `BIGINT NOT NULL` |
+| `agent_connection_leases` | `connection_epoch` | `INTEGER NOT NULL` in `migrations/ddl.sql`, `BIGINT NOT NULL` in `v0006_to_v0007` | `BIGINT NOT NULL` |
+
+Why this is not a cosmetic change: `connection_epoch` is the fencing token that
+rejects stale connection generations. `internal/server/ws_client.go` derives the
+Client token from eight random bytes, so it routinely exceeds the signed 32-bit
+range. On MySQL a 32-bit `INTEGER` column **clamps** such a value to
+`2147483647` at insert time. Every later write filters on
+`WHERE connection_id=? AND connection_epoch=?` using the true in-memory token,
+so it matched zero rows and returned `sql.ErrNoRows`:
+
+- `Renew` never extended `expires_at`, so the lease lapsed after
+  `DefaultClientConnectionLeaseTTL` (90s) while the WebSocket stayed open.
+- `ClientObservabilityService.Heartbeat` returned early on that error, so
+  `TouchInstance` never ran; `client_instance_metadata.expires_at` lapsed after
+  `DefaultClientMetadataTTL` (5m) and `ClientMetadataSweeper` set `stale=1`.
+- `newClientView` therefore reported `status=stale`, `activeConnections=0`,
+  `activeStreams=0`, and no server node, and the console summary cards — which
+  derive from those rows — showed zeros for a client that was actively serving
+  traffic.
+
+The detail drawer still listed the lease rows, so the page contradicted itself:
+"0 active connections" beside four connections, all showing epoch `2147483647`.
+That identical epoch across unrelated connections is the diagnostic signature of
+this defect.
+
+SQLite was never affected: its `INTEGER` is already a signed 64-bit value. The
+defect survived because the MySQL-backed contract tests are gated behind
+`TUNNELMESH_TEST_MYSQL_DSN` and do not run in CI. `agent_connection_leases` is
+widened in the same step to remove the drift between `migrations/ddl.sql` and
+`v0006_to_v0007/mysql.sql`; agent epochs are small counters today, but a fresh
+MySQL install and an upgraded one must agree on the authoritative schema.
+
+Before upgrading:
+
+1. **Back up the database and verify the backup can be restored.**
+2. Confirm `schema_meta.version=14`.
+3. Confirm `migrations/incremental/v0014_to_v0015/mysql.sql` and `sqlite.sql` are
+   present, along with every intermediate version from the current one.
+4. Confirm the database account can `ALTER TABLE` both lease tables and update
+   `schema_meta`.
+5. No secret or environment change is required for this version.
+
+Start the new Server with `storage.auto_init: true`. The migration applies the
+driver-specific statements and advances `schema_meta.version` to `15` only after
+they succeed. On SQLite the step is structurally inert and executes a single
+idempotent `UPDATE schema_meta SET version=version WHERE id=1` no-op, because
+SQLite cannot alter a column type in place and does not need to.
+
+Expected lock impact: `client_connection_leases` and `agent_connection_leases`
+hold one row per live physical WebSocket, so both are small (typically tens to
+hundreds of rows). Widening `INT` to `BIGINT` requires a table rebuild — MySQL
+8.0 can use `ALGORITHM=INPLACE`, MySQL 5.6/5.7 rebuild with concurrent DML
+allowed. Budget seconds, not minutes, and run it in a normal maintenance window.
+
+Verify:
+
+```sql
+SELECT version FROM schema_meta WHERE id=1;
+-- expected: 15
+
+-- MySQL
+SHOW COLUMNS FROM client_connection_leases LIKE 'connection_epoch';
+SHOW COLUMNS FROM agent_connection_leases LIKE 'connection_epoch';
+-- expected Type: bigint(20)
+
+-- SQLite (declared type is unchanged; INTEGER already stores 64 bits)
+PRAGMA table_info(client_connection_leases);
+```
+
+Both MySQL columns must report `bigint`. A fresh deployment seeded from
+`migrations/ddl.sql` produces the same types at version `15`.
+
+### Self-healing after the upgrade
+
+Rows written before the upgrade still hold the clamped `2147483647` value; the
+migration widens the column but deliberately does not rewrite those rows, since
+they are already-expired leases and there is no reliable way to reconstruct the
+original token. Live connections repair themselves: `ClientConnectionLeaseController.Heartbeat`
+treats a missed `Renew` as "the stored token is not authoritative" and
+re-registers the lease with the true in-memory epoch. Connected clients
+therefore recover on their next heartbeat (default 30s) **without reconnecting**,
+and the console numbers return with them.
+
+Because of that self-heal, upgrading the Server is sufficient. **Agent and
+Client binaries do not need to be upgraded or restarted** — no protocol frame,
+capability, or API contract changed in this release.
+
+### Compatibility and rollback
+
+Widening a column is backward compatible for readers: a v14 binary reading a v15
+`BIGINT` column still receives an `int64`. The version gate is still strict, so
+a v14 Server refuses to open a v15 database with `schema version mismatch:
+database has version 15, application requires version 14`.
+
+Roll back by **reverting the binary and keeping the v15 schema**. Do not narrow
+the column back to `INTEGER`: that reintroduces the clamping and would silently
+truncate any token already stored above the 32-bit range. If the exact v14
+structure is genuinely required, restore the pre-upgrade backup instead of
+writing reverse DDL, and never decrement `schema_meta.version` by hand.
+
+Five-minute containment: if a new Server fails to start after this migration,
+redeploy the previous binary. The v15 schema is readable by v14, so no database
+rollback is needed to restore service.
 
 ## v13 to v14
 

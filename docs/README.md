@@ -9,7 +9,7 @@
 | 目录 | 面向 | 内容 |
 | --- | --- | --- |
 | [`user-guide/`](user-guide/) | 使用者 | Client、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、VPN 网关、SSH over WebSocket |
-| [`deployment/`](deployment/) | 部署者 | Docker、前端构建、Nginx、OpenResty 代理入口、VPN 网关、systemd/launchd/Windows Service、发行打包 |
+| [`deployment/`](deployment/) | 部署者 | 一键安装、Docker、前端构建、Nginx、OpenResty 代理入口、VPN 网关、systemd/launchd/Windows Service、发行打包 |
 | [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、VPN 网关、可观测性、探针、日志、SLO、容量、排障 |
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
@@ -52,6 +52,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [OpenResty tp-* 代理入口](deployment/openresty-proxy-entry.md)：模板渲染、镜像构建、容量评估、reload 影响与回滚
 - [VPN 网关部署](deployment/vpn-gateway.md)：`-tags vpn` 构建变体与体积实测、公网 UDP 放行、`listen` 与 `endpoint_host`、节点私钥注入、IP 池规划、验证与 5 分钟回滚
 - [跨平台可执行文件打包](deployment/binary-release.md)：构建矩阵、`SHA256SUMS`、`manifest.json`
+- [一键安装脚本](deployment/oneclick-install.md)：三角色一条命令，交互/非交互、升级与卸载、镜像源与离线安装
 - [Linux systemd 安装](deployment/linux-systemd.md)、[macOS launchd 安装](deployment/macos-launchd.md)、[Windows Service 安装](deployment/windows-service.md)
 - [部署产物清单](../deploy/README.md)：`deploy/` 下每个文件的用途、模板占位符约定和发布归档布局
 

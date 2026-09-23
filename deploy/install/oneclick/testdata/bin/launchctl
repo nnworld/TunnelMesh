@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# 服务管理 stub：把「程序名 + 全部参数」追加写入 $SVC_STUB_LOG，永远成功。
+# plutil 需要 -lint 时同样只记录不校验（渲染结果由 run_tests.sh 单独断言）。
+set -uo pipefail
+printf '%s %s\n' "$(basename "$0")" "$*" >>"${SVC_STUB_LOG:-/dev/null}"
+exit 0

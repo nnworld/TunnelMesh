@@ -120,6 +120,20 @@ describe('agent detail cluster connections', () => {
     }
   })
 
+  // An agent that exists but never reported has an empty metadata collection.
+  // The view must render its designed empty state, not the error banner with a
+  // retry button, which is what a 404 from the API used to produce.
+  it('renders the empty metadata state without an error banner when nothing was reported', async () => {
+    vi.mocked(getAgentMetadata).mockReset().mockResolvedValue({ ...metadata, items: [], instances: [] })
+    const { container, unmount } = await mountAgentDetail()
+    try {
+      expect(container.textContent).toContain(i18n.global.t('agentDetail.empty'))
+      expect(container.querySelector('.el-alert')).toBeNull()
+    } finally {
+      unmount()
+    }
+  })
+
   it('derives logical agent status from healthy pooled connections', async () => {
     vi.mocked(listAgentConnections).mockReset().mockResolvedValue([
       { ...connections[0], instanceId: 'instance-live', healthy: true },

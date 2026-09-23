@@ -1,8 +1,8 @@
 package client
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -133,7 +133,7 @@ func TestSessionSlowDatagramDoesNotBlockPing(t *testing.T) {
 	}
 }
 
-func TestSessionFlowControlRejectsOverSendAndAdvertisesWindow(t *testing.T) {
+func TestSessionFlowControlAdvertisesWindowAndWaitsForCredit(t *testing.T) {
 	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
 	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
 	if session.OpenMode() != SessionOpenFlowControl {
@@ -153,8 +153,55 @@ func TestSessionFlowControlRejectsOverSendAndAdvertisesWindow(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for OPEN")
 	}
-	if _, err := stream.Write(make([]byte, 262145)); !errors.Is(err, protocol.ErrWindowExhausted) {
-		t.Fatalf("over-send error=%v, want ErrWindowExhausted", err)
+	// A write larger than the outstanding credit must wait for the peer to
+	// grant more, not fail. Failing is what truncated bulk transfers: callers
+	// copy through this stream with io.Copy and treat the first error as the
+	// end of the body, while the peer keeps the Content-Length it was promised.
+	written := make(chan int, 1)
+	writeErr := make(chan error, 1)
+	go func() {
+		n, err := stream.Write(make([]byte, 262145))
+		written <- n
+		writeErr <- err
+	}()
+
+	var drained int
+	for drained < 262144 {
+		select {
+		case frame := <-tr.sent:
+			if frame.Type != protocol.FrameData {
+				continue
+			}
+			// One frame must never exceed the documented per-frame cap: the
+			// peer's inbound budget is smaller than the encoder limit, so an
+			// oversized frame would be refused and kill a healthy stream.
+			if len(frame.Payload) > protocol.MaxStreamFrame {
+				t.Fatalf("DATA payload = %d bytes, want at most %d", len(frame.Payload), protocol.MaxStreamFrame)
+			}
+			drained += len(frame.Payload)
+		case err := <-writeErr:
+			t.Fatalf("write stopped after %d bytes with err=%v, want it to wait for credit", drained, err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out after %d bytes", drained)
+		}
+	}
+	select {
+	case err := <-writeErr:
+		t.Fatalf("write finished before the last byte was credited: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 7, Window: 1}
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("write after WINDOW_UPDATE failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write never resumed after the peer granted credit")
+	}
+	if n := <-written; n != 262145 {
+		t.Fatalf("Write returned %d, want 262145", n)
 	}
 }
 
@@ -256,8 +303,12 @@ func TestSessionFlowControlAppliesPeerWindowUpdate(t *testing.T) {
 	if _, err := stream.Write(make([]byte, 262144)); err != nil {
 		t.Fatal(err)
 	}
-	if frame := <-tr.sent; frame.Type != protocol.FrameData || frame.StreamID != 9 {
-		t.Fatalf("initial DATA=%+v", frame)
+	for remaining := 262144; remaining > 0; {
+		frame := <-tr.sent
+		if frame.Type != protocol.FrameData || frame.StreamID != 9 {
+			t.Fatalf("initial DATA=%+v", frame)
+		}
+		remaining -= len(frame.Payload)
 	}
 
 	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 9, Window: 100}
@@ -323,4 +374,85 @@ func (t *blockingDataTransport) Close() error {
 		close(t.closed)
 	}
 	return nil
+}
+
+// TestSessionFlowControlBulkWriteIsDeliveredIntact covers the user-visible
+// symptom: a body several times larger than one window must arrive complete and
+// in order. The peer releases credit the way the Server does, so the write is
+// limited by the protocol rather than by a queue that refuses frames.
+func TestSessionFlowControlBulkWriteIsDeliveredIntact(t *testing.T) {
+	const total = 1 << 20 // four times the credit a single window grants
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 64), recv: make(chan protocol.Frame, 64), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	defer session.Close()
+	stream, err := session.OpenStreamConn(context.Background(), StreamRequest{StreamID: 11, AgentID: "agent", Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	<-tr.sent // OPEN_STREAM
+
+	payload := make([]byte, total)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+
+	received := make(chan []byte, 128)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		var got, unacked int
+		for frame := range tr.sent {
+			if frame.Type != protocol.FrameData || frame.StreamID != 11 {
+				continue
+			}
+			received <- append([]byte(nil), frame.Payload...)
+			got += len(frame.Payload)
+			unacked += len(frame.Payload)
+			if unacked >= 131072 {
+				tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 11, Window: uint32(unacked)}
+				unacked = 0
+			}
+			if got >= total {
+				return
+			}
+		}
+	}()
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Write(payload)
+		writeErr <- err
+	}()
+
+	var got []byte
+	writeDone := false
+	deadline := time.After(30 * time.Second)
+	for len(got) < total {
+		select {
+		case chunk := <-received:
+			got = append(got, chunk...)
+		case err := <-writeErr:
+			writeDone = true
+			if err != nil {
+				t.Fatalf("bulk write failed after %d of %d bytes: %v", len(got), total, err)
+			}
+		case <-deadline:
+			t.Fatalf("timed out with %d of %d bytes delivered", len(got), total)
+		}
+	}
+	if !writeDone {
+		select {
+		case err := <-writeErr:
+			if err != nil {
+				t.Fatalf("bulk write error=%v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("bulk write never returned")
+		}
+	}
+	<-drained
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("delivered %d bytes that differ from the payload", len(got))
+	}
 }

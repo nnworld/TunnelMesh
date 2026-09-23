@@ -16,15 +16,17 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/migrations"
 )
 
-// vpnSchemaTables are the two tables schema v15 adds for the embedded VPN
+// vpnSchemaTables are the two tables schema v16 adds for the embedded VPN
 // gateway. They are asserted together everywhere because a migration that
 // creates one without the other leaves the node unable to serve peers.
 var vpnSchemaTables = []string{"vpn_peers", "vpn_ip_leases"}
 
-// prepareV14Base builds a database that really is at v14: the full DDL minus
-// the two VPN tables, with schema_meta pinned to 14. DROP TABLE removes the
-// table's indexes with it, so no DROP INDEX statement is needed (or valid).
-func prepareV14Base(t *testing.T, dsn string) {
+// prepareV15Base builds a database that really is at v15: the full DDL minus
+// the two VPN tables, with schema_meta pinned to 15. v15 is the published
+// connection_epoch widening, which migrations/ddl.sql already carries, so
+// removing the two VPN tables is exactly the pre-v16 shape. DROP TABLE removes
+// the table's indexes with it, so no DROP INDEX statement is needed (or valid).
+func prepareV15Base(t *testing.T, dsn string) {
 	t.Helper()
 	raw, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -36,12 +38,12 @@ func prepareV14Base(t *testing.T, dsn string) {
 	}
 	statements = append(statements,
 		`DELETE FROM schema_meta WHERE id=1`,
-		`INSERT INTO schema_meta(id,version) VALUES(1,14)`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,15)`,
 	)
 	for _, statement := range statements {
 		if _, err := raw.Exec(statement); err != nil {
 			raw.Close()
-			t.Fatalf("prepare v14 base: %v (%s)", err, firstLine(statement))
+			t.Fatalf("prepare v15 base: %v (%s)", err, firstLine(statement))
 		}
 	}
 	if err := raw.Close(); err != nil {
@@ -65,11 +67,11 @@ func assertSQLiteTableExists(t *testing.T, db *sql.DB, table string) {
 	}
 }
 
-// TestSQLiteV14ToV15VPNMigration upgrades a real v14 database and asserts the
+// TestSQLiteV15ToV16VPNMigration upgrades a real v15 database and asserts the
 // migration is additive, preserves existing rows, and is safe to re-run.
-func TestSQLiteV14ToV15VPNMigration(t *testing.T) {
-	dsn := "file:" + filepath.Join(t.TempDir(), "v14-to-v15.sqlite")
-	prepareV14Base(t, dsn)
+func TestSQLiteV15ToV16VPNMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v15-to-v16.sqlite")
+	prepareV15Base(t, dsn)
 
 	raw, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -86,7 +88,7 @@ func TestSQLiteV14ToV15VPNMigration(t *testing.T) {
 
 	db, err := OpenSQLite(context.Background(), dsn, true)
 	if err != nil {
-		t.Fatalf("migrate v14 to v15: %v", err)
+		t.Fatalf("migrate v15 to v16: %v", err)
 	}
 	defer db.Close()
 	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
@@ -116,7 +118,7 @@ func TestSQLiteV14ToV15VPNMigration(t *testing.T) {
 
 // TestSQLiteFreshSchemaMatchesIncrementalVPNChain is the drift guard between
 // migrations/ddl.sql and migrations/incremental: one database built from the
-// full DDL and one upgraded from a real v14 base must expose the same columns
+// full DDL and one upgraded from a real v15 base must expose the same columns
 // and the same indexes. Unlike the identity-chain equivalent, this test
 // actually runs the migration, so a missing incremental statement fails here.
 func TestSQLiteFreshSchemaMatchesIncrementalVPNChain(t *testing.T) {
@@ -214,10 +216,10 @@ func TestSQLiteFreshSchemaMatchesIncrementalVPNChain(t *testing.T) {
 	}
 
 	upgraded := "file:" + filepath.Join(dir, "upgraded.sqlite")
-	prepareV14Base(t, upgraded)
+	prepareV15Base(t, upgraded)
 	upgradedDB, err := OpenSQLite(context.Background(), upgraded, true)
 	if err != nil {
-		t.Fatalf("run the incremental chain over the v14 base: %v", err)
+		t.Fatalf("run the incremental chain over the v15 base: %v", err)
 	}
 	if version, err := upgradedDB.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
 		upgradedDB.Close()
@@ -260,11 +262,11 @@ func TestSQLiteFreshSchemaMatchesIncrementalVPNChain(t *testing.T) {
 
 // TestSQLiteAutoInitDisabledRejectsMissingVPNTables proves the two new tables
 // are part of the startup gate: with auto-init off, a database that skipped the
-// v15 migration fails fast and names the missing table.
+// v16 migration fails fast and names the missing table.
 func TestSQLiteAutoInitDisabledRejectsMissingVPNTables(t *testing.T) {
 	for _, table := range vpnSchemaTables {
 		t.Run(table, func(t *testing.T) {
-			dsn := "file:schema-v15-missing-" + strings.ReplaceAll(table, "_", "-") + "?mode=memory&cache=shared"
+			dsn := "file:schema-v16-missing-" + strings.ReplaceAll(table, "_", "-") + "?mode=memory&cache=shared"
 			raw, err := sql.Open("sqlite", dsn)
 			if err != nil {
 				t.Fatal(err)
@@ -410,7 +412,7 @@ func TestVPNIPLeaseModelValidation(t *testing.T) {
 	}
 }
 
-// TestVPNSentinelErrorsAreDistinct keeps the four v15 sentinels separable: a
+// TestVPNSentinelErrorsAreDistinct keeps the four v16 sentinels separable: a
 // caller that maps one of them to an HTTP status must not accidentally match
 // another through error wrapping.
 func TestVPNSentinelErrorsAreDistinct(t *testing.T) {

@@ -90,3 +90,24 @@ func TestInstallScriptSupportsSafetyModes(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildReleaseShipsOneClickInstallers 守护发布归档布局：一键安装脚本与 user 模式
+// 单元模板必须进归档（安装时模板取自已校验的归档，才能保证与二进制同版本），
+// 而 *_test.go 与 testdata/ 是仓库自检与 fixture，运维侧的归档里没有 go.mod，不能发布。
+func TestBuildReleaseShipsOneClickInstallers(t *testing.T) {
+	data, err := os.ReadFile("build-release.sh")
+	if err != nil {
+		t.Fatalf("read build-release.sh: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"deploy/install",      // oneclick/ 随 deploy/install 一起进归档
+		"deploy/systemd-user", // user 模式单元模板必须进 Linux 归档
+		`-name '*_test.go'`,   // 既有：测试文件不发布
+		"-name testdata",      // 新增：测试 fixture 不发布
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("build-release.sh is missing %q", want)
+		}
+	}
+}

@@ -1,0 +1,16 @@
+# WinSW 校验和 pin 列表。
+# 格式：<version> <arch> <sha256> <asset-name>（4 列，空格分隔；# 开头为注释）
+#
+# 补录流程（必须在可访问 github.com Release 的机器上执行，然后把结果提交到本文件）：
+#   curl -fsSL -o /tmp/WinSW-x64.exe \
+#     https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe
+#   shasum -a 256 /tmp/WinSW-x64.exe
+#   # 追加一行： v2.12.0 amd64 <上一步输出的 64 位十六进制> WinSW-x64.exe
+#   并在 docs/deployment/windows-service.md 记录版本、日期与补录人。
+#
+# 安全策略：install-*.ps1 只自动下载本文件中已登记的版本；查不到条目时中止，
+# 打印手动下载步骤，并提示用 -WinSW <本地路径> 指定。绝不静默信任未 pin 的二进制。
+# 上游未发布 arm64 资产，Windows on ARM 统一使用 WinSW-x64.exe（x64 仿真）。
+#
+# 当前没有已登记条目：实现环境无法访问 github.com Release 下载，
+# 补录步骤见 docs/deployment/windows-service.md 的「一键安装」小节。

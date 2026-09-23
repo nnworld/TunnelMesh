@@ -65,8 +65,8 @@ func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T
 }
 
 func TestMySQLV11ToV12WebSSHMigrationsAreAdjacent(t *testing.T) {
-	if SchemaVersion != 15 {
-		t.Fatalf("SchemaVersion = %d, want 15", SchemaVersion)
+	if SchemaVersion != 16 {
+		t.Fatalf("SchemaVersion = %d, want 16", SchemaVersion)
 	}
 	if !strings.Contains(migrations.V11ToV12SQLite, "CREATE TABLE IF NOT EXISTS credentials") {
 		t.Fatal("SQLite migration lacks credentials")
@@ -393,7 +393,7 @@ func TestMySQLIdentityRepositoryContract(t *testing.T) {
 	runIdentityRepositoryContract(t, db)
 }
 
-// TestMySQLVPNRepositoryContract runs the v15 VPN repositories against a real
+// TestMySQLVPNRepositoryContract runs the v16 VPN repositories against a real
 // MySQL server so a driver-specific SQL error cannot slip through the SQLite
 // run. It is skipped when no server is configured.
 func TestMySQLVPNRepositoryContract(t *testing.T) {
@@ -410,7 +410,7 @@ func TestMySQLVPNRepositoryContract(t *testing.T) {
 	runVPNIPLeaseRepositoryContract(t, db)
 }
 
-// vpnSchemaIndexes are the five secondary indexes schema v15 adds. The names are
+// vpnSchemaIndexes are the five secondary indexes schema v16 adds. The names are
 // asserted literally because the upgrade runbook and ops tooling refer to them.
 var vpnSchemaIndexes = []string{
 	"idx_vpn_peers_owner",
@@ -430,14 +430,14 @@ const (
 	mysql56MinHeadroom     = 0.15
 )
 
-// TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe is an ungated static
+// TestMySQLV15ToV16VPNMigrationsAreAdjacentAndDialectSafe is an ungated static
 // gate: it needs no MySQL instance, so it runs on every developer machine and in
-// CI. The two v15 scripts must be additive, must agree with each other and with
+// CI. The two v16 scripts must be additive, must agree with each other and with
 // migrations/ddl.sql, and must respect the per-dialect index syntax.
-func TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
+func TestMySQLV15ToV16VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
 	scripts := map[string]string{
-		"mysql":  migrations.V14ToV15MySQL,
-		"sqlite": migrations.V14ToV15SQLite,
+		"mysql":  migrations.V15ToV16MySQL,
+		"sqlite": migrations.V15ToV16SQLite,
 	}
 	for _, forbidden := range []string{
 		"DROP COLUMN", "MODIFY COLUMN", "DROP TABLE", "JSON",
@@ -445,7 +445,7 @@ func TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
 	} {
 		for name, script := range scripts {
 			if strings.Contains(strings.ToUpper(script), forbidden) {
-				t.Fatalf("%s v15 migration must be additive only; found %q", name, forbidden)
+				t.Fatalf("%s v16 migration must be additive only; found %q", name, forbidden)
 			}
 		}
 	}
@@ -465,37 +465,37 @@ func TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
 	for name, script := range scripts {
 		for _, table := range vpnSchemaTables {
 			if !strings.Contains(script, "CREATE TABLE IF NOT EXISTS "+table) {
-				t.Fatalf("%s v15 migration lacks table %s", name, table)
+				t.Fatalf("%s v16 migration lacks table %s", name, table)
 			}
 		}
 		for _, fragment := range requiredFragments {
 			if !strings.Contains(script, fragment) {
-				t.Fatalf("%s v15 migration missing required fragment %q", name, fragment)
+				t.Fatalf("%s v16 migration missing required fragment %q", name, fragment)
 			}
 		}
 		// MySQL 5.6 rejects an index on a TEXT column without a prefix length
 		// (Error 1170), so no indexed timestamp may ever become TEXT.
 		for _, forbidden := range []string{"expires_at TEXT", "created_at TEXT", "updated_at TEXT", "acquired_at TEXT"} {
 			if strings.Contains(script, forbidden) {
-				t.Fatalf("%s v15 migration uses TEXT for an indexed timestamp; forbidden %q", name, forbidden)
+				t.Fatalf("%s v16 migration uses TEXT for an indexed timestamp; forbidden %q", name, forbidden)
 			}
 		}
 		if !strings.HasSuffix(strings.TrimSpace(script), ";") {
-			t.Fatalf("%s v15 migration must end with a semicolon", name)
+			t.Fatalf("%s v16 migration must end with a semicolon", name)
 		}
-		assertNoCommentOnlyChunks(t, name+" v15 migration", script)
+		assertNoCommentOnlyChunks(t, name+" v16 migration", script)
 	}
 	// MySQL cannot spell CREATE INDEX with IF NOT EXISTS, while SQLite must so a
 	// partially applied migration stays retry-safe.
 	if strings.Contains(scripts["mysql"], "CREATE INDEX IF NOT EXISTS") {
-		t.Fatal("MySQL v15 migration must not use CREATE INDEX IF NOT EXISTS")
+		t.Fatal("MySQL v16 migration must not use CREATE INDEX IF NOT EXISTS")
 	}
 	for _, index := range vpnSchemaIndexes {
 		if !strings.Contains(scripts["sqlite"], "CREATE INDEX IF NOT EXISTS "+index+" ON ") {
-			t.Fatalf("SQLite v15 migration lacks the retry-safe index %s", index)
+			t.Fatalf("SQLite v16 migration lacks the retry-safe index %s", index)
 		}
 		if !strings.Contains(scripts["mysql"], "CREATE INDEX "+index+" ON ") {
-			t.Fatalf("MySQL v15 migration lacks the index %s", index)
+			t.Fatalf("MySQL v16 migration lacks the index %s", index)
 		}
 		if !strings.Contains(migrations.DDL, "CREATE INDEX "+index+" ON ") {
 			t.Fatalf("full DDL lacks the index %s", index)
@@ -516,13 +516,13 @@ func TestMySQLV14ToV15VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
 		}
 		return strings.TrimSpace(strings.Join(kept, "\n"))
 	}
-	mysqlTables := tableStatements("MySQL v15 migration", scripts["mysql"])
-	sqliteTables := tableStatements("SQLite v15 migration", scripts["sqlite"])
+	mysqlTables := tableStatements("MySQL v16 migration", scripts["mysql"])
+	sqliteTables := tableStatements("SQLite v16 migration", scripts["sqlite"])
 	if mysqlTables != sqliteTables {
-		t.Fatalf("v15 table statements differ between dialects:\nmysql:\n%s\nsqlite:\n%s", mysqlTables, sqliteTables)
+		t.Fatalf("v16 table statements differ between dialects:\nmysql:\n%s\nsqlite:\n%s", mysqlTables, sqliteTables)
 	}
 	if !strings.Contains(tableStatements("migrations/ddl.sql", migrations.DDL), mysqlTables) {
-		t.Fatal("migrations/ddl.sql does not contain the v15 table statements verbatim")
+		t.Fatal("migrations/ddl.sql does not contain the v16 table statements verbatim")
 	}
 }
 
@@ -550,7 +550,7 @@ func assertNoCommentOnlyChunks(t *testing.T, label, script string) {
 	}
 }
 
-// vpnColumn is one parsed column of a v15 table plus its worst-case MySQL 5.6
+// vpnColumn is one parsed column of a v16 table plus its worst-case MySQL 5.6
 // footprint.
 type vpnColumn struct {
 	name      string
@@ -566,14 +566,14 @@ type vpnIndexKey struct {
 	columns []string
 }
 
-// TestVPNMigrationsFitMySQL56Budgets proves the v15 tables fit the MySQL 5.6
+// TestVPNMigrationsFitMySQL56Budgets proves the v16 tables fit the MySQL 5.6
 // inline row and index key budgets. It parses the DDL text instead of querying a
 // server, so it is a real gate on machines without MySQL. Only the two new
 // tables are covered: pre-existing tables are out of scope, and the known
 // oidc_providers overrun is tracked separately.
 func TestVPNMigrationsFitMySQL56Budgets(t *testing.T) {
 	sources := []struct{ label, script string }{
-		{"migrations.V14ToV15MySQL", migrations.V14ToV15MySQL},
+		{"migrations.V15ToV16MySQL", migrations.V15ToV16MySQL},
 		{"migrations/ddl.sql", migrations.DDL},
 	}
 	budget := float64(mysql56InlineRowBudget)
@@ -754,10 +754,10 @@ func mysql56TypeWidth(decl string) (int, error) {
 	return width, nil
 }
 
-// TestMySQLV14ToV15VPNMigration runs the real migration against a MySQL server
+// TestMySQLV15ToV16VPNMigration runs the real migration against a MySQL server
 // when one is provided. It is skipped otherwise; the ungated static gates above
 // are what keep the scripts honest on machines without MySQL.
-func TestMySQLV14ToV15VPNMigration(t *testing.T) {
+func TestMySQLV15ToV16VPNMigration(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {
 		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
@@ -774,11 +774,11 @@ func TestMySQLV14ToV15VPNMigration(t *testing.T) {
 		raw.Close()
 		t.Fatalf("prepare MySQL schema: %v", err)
 	}
-	statements := []string{`DROP TABLE IF EXISTS vpn_ip_leases`, `DROP TABLE IF EXISTS vpn_peers`, `UPDATE schema_meta SET version=14 WHERE id=1`}
+	statements := []string{`DROP TABLE IF EXISTS vpn_ip_leases`, `DROP TABLE IF EXISTS vpn_peers`, `UPDATE schema_meta SET version=15 WHERE id=1`}
 	for _, statement := range statements {
 		if _, err := raw.ExecContext(context.Background(), statement); err != nil {
 			raw.Close()
-			t.Fatalf("prepare v14 schema: %v", err)
+			t.Fatalf("prepare v15 schema: %v", err)
 		}
 	}
 	t.Cleanup(func() {
@@ -798,7 +798,7 @@ func TestMySQLV14ToV15VPNMigration(t *testing.T) {
 
 	db, err := OpenMySQL(context.Background(), dsn, true)
 	if err != nil {
-		t.Fatalf("migrate v14 to v15: %v", err)
+		t.Fatalf("migrate v15 to v16: %v", err)
 	}
 	defer db.Close()
 	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
@@ -809,6 +809,64 @@ func TestMySQLV14ToV15VPNMigration(t *testing.T) {
 		if err := db.SQL().QueryRowContext(context.Background(),
 			`SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?`, table).Scan(&name); err != nil {
 			t.Fatalf("table %s missing after the migration: %v", table, err)
+		}
+	}
+}
+
+// TestMySQLV14ToV15WidensConnectionEpoch guards the drift that made every
+// Client lease unwritable on MySQL: newClientConnectionEpoch produces a random
+// int64 fencing token, but a 32-bit INTEGER column clamps it to 2147483647, so
+// Renew/UpdateStats/Release never match their epoch predicate. The assertions
+// are textual on purpose — the MySQL-backed contract tests are skipped unless
+// TUNNELMESH_TEST_MYSQL_DSN is set, which is exactly why the original
+// INTEGER/BIGINT mismatch between migrations/ddl.sql and v0006_to_v0007
+// survived unnoticed.
+func TestMySQLV14ToV15WidensConnectionEpoch(t *testing.T) {
+	if SchemaVersion != 16 {
+		t.Fatalf("SchemaVersion = %d, want 16", SchemaVersion)
+	}
+	script := migrations.V14ToV15MySQL
+	upper := strings.ToUpper(script)
+	for _, forbidden := range []string{"JSON", "WITH RECURSIVE", "ON DUPLICATE KEY", "CREATE INDEX IF NOT EXISTS", "DROP TABLE"} {
+		if strings.Contains(upper, forbidden) {
+			t.Fatalf("migration must not use MySQL 5.6-incompatible fragment %q: %s", forbidden, script)
+		}
+	}
+	// Both lease tables carry a connection_epoch fencing token, and both must be
+	// widened in the same step so a fresh install and an upgraded install agree.
+	for _, table := range []string{"client_connection_leases", "agent_connection_leases"} {
+		fragment := "ALTER TABLE " + table + " MODIFY connection_epoch BIGINT NOT NULL"
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("migration missing required fragment %q: %s", fragment, script)
+		}
+	}
+	// SQLite INTEGER is already 64 bits and SQLite cannot ALTER a column type,
+	// so the SQLite step must stay structurally inert but still be executable:
+	// applySchemaStatements splits on ';' and runs every non-empty statement.
+	sqlite := migrations.V14ToV15SQLite
+	if strings.Contains(strings.ToUpper(sqlite), "ALTER TABLE") {
+		t.Fatalf("SQLite v14 to v15 migration must not alter columns: %s", sqlite)
+	}
+	if strings.TrimSpace(sqlite) == "" {
+		t.Fatal("SQLite v14 to v15 migration must not be empty")
+	}
+	// The full DDL is the authoritative current schema for an empty database and
+	// must not reintroduce the narrow type on either lease table.
+	for _, table := range []string{"client_connection_leases", "agent_connection_leases"} {
+		start := strings.Index(migrations.DDL, "CREATE TABLE IF NOT EXISTS "+table)
+		if start < 0 {
+			t.Fatalf("full DDL lacks table %s", table)
+		}
+		end := strings.Index(migrations.DDL[start:], ");")
+		if end < 0 {
+			t.Fatalf("full DDL table %s is not terminated", table)
+		}
+		section := migrations.DDL[start : start+end]
+		if !strings.Contains(section, "connection_epoch BIGINT NOT NULL") {
+			t.Fatalf("full DDL %s must declare connection_epoch BIGINT: %s", table, section)
+		}
+		if strings.Contains(section, "connection_epoch INTEGER") {
+			t.Fatalf("full DDL %s still declares a 32-bit connection_epoch: %s", table, section)
 		}
 	}
 }

@@ -26,6 +26,18 @@ const (
 	// the Agent dispatcher can never drift apart.
 	defaultAgentReceiveWindow         = protocol.DefaultAgentReceiveWindow
 	defaultAgentWindowUpdateThreshold = protocol.DefaultWindowUpdateThreshold
+
+	// streamQueueBytes is the per-stream send queue of one Agent session, sized
+	// from the credit the Server advertises rather than chosen independently.
+	// readBack consumes send credit before it enqueues, so bytes waiting in the
+	// queue can never exceed the outstanding credit; matching the queue to the
+	// credit is what makes ErrStreamQueueFull unreachable for a compliant peer.
+	// A smaller queue is not extra safety: the FairFrameWriter refuses a frame
+	// instead of blocking, and readBack treats that refusal as fatal, so an
+	// ordinary burst truncates the response. The Server mirrors the same
+	// invariant on its inbound side, where receiveBudget equals the window it
+	// advertised in OPEN_STREAM.
+	streamQueueBytes = protocol.DefaultServerReceiveWindow
 )
 
 type StreamOpenPayload = protocol.StreamOpenPayload
@@ -558,6 +570,7 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 			}
 			if sendErr := d.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buf[:n]...)}); sendErr != nil {
 				d.removeAndClose(id, entry)
+				_ = d.sendReset(id)
 				return
 			}
 		}
@@ -582,6 +595,7 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 			if !stale && sender != nil {
 				if sendErr := sender(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: id}); sendErr != nil {
 					d.removeAndClose(id, entry)
+					_ = d.sendReset(id)
 					return
 				}
 			}
@@ -723,7 +737,7 @@ type Session struct {
 }
 
 func NewSession(tr FrameTransport) *Session {
-	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{})
+	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{StreamQueueBytes: streamQueueBytes})
 	go func() { _ = writer.Run(context.Background()) }()
 	return &Session{
 		transport: tr, writer: writer, BaseBackoff: time.Second, MaxBackoff: 30 * time.Second,

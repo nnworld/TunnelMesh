@@ -6,7 +6,7 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 25 份记录，按日期倒序排列。
+共 30 份记录，按日期倒序排列。
 
 ## 记录清单
 
@@ -14,6 +14,11 @@
 | --- | --- | --- | --- |
 | 2026-09-23 | [VPN 网关 阶段 7：Agent ICMP echo 与能力协商](2026-09-23-vpn-phase7-agent-icmp.md) | [计划：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../superpowers/plans/2026-09-23-vpn-phase7-agent-icmp.md) | [规格：内嵌 VPN 网关（WireGuard）](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md)<br>[ADR：Open a public UDP ingress for an embedded…](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [VPN 网关 阶段 6：Server 数据面](2026-09-23-vpn-phase6-server-data-plane.md) | [计划：VPN 网关 阶段 6：Server 数据面（WireGuard + netsta…](../superpowers/plans/2026-09-23-vpn-phase6-server-data-plane.md) | [规格：内嵌 VPN 网关（WireGuard）](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md)<br>[ADR：Open a public UDP ingress for an embedded…](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-23 | [三端一键安装脚本（server / agent / client）](2026-09-23-one-click-install-scripts.md) | [计划：三端一键安装脚本](../superpowers/plans/2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../superpowers/specs/2026-09-23-one-click-install-scripts-design.md) |
+| 2026-09-23 | [Managed-route large response truncation](2026-09-23-managed-route-response-truncation.md) | [计划：托管路由大响应体截断修复](../superpowers/plans/2026-09-23-managed-route-response-truncation.md) | — |
+| 2026-09-23 | [Managed-route hosts shadowed by control-plane path prefixes](2026-09-23-managed-route-reserved-path-shadowing.md) | [计划：托管路由被控制面保留路径遮蔽修复](../superpowers/plans/2026-09-23-managed-route-reserved-path-shadowing.md) | — |
+| 2026-09-23 | [Client lease epoch width and observability sync](2026-09-23-client-lease-epoch-observability-sync.md) | [计划：客户端运行观测状态不同步修复](../superpowers/plans/2026-09-23-client-lease-epoch-observability-sync.md) | — |
+| 2026-09-23 | [Agent list connectivity status and empty metadata view](2026-09-23-agent-online-status-and-empty-metadata.md) | [计划：代理节点在线状态与空元数据修复](../superpowers/plans/2026-09-23-agent-online-status-and-empty-metadata.md) | — |
 | 2026-09-22 | [VPN 网关 阶段 5：管理后台](2026-09-22-vpn-phase5-admin-console.md) | [计划：VPN 网关 阶段 5：管理后台](../superpowers/plans/2026-09-22-vpn-phase5-admin-console.md) | [规格：内嵌 VPN 网关（WireGuard）](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md)<br>[ADR：Open a public UDP ingress for an embedded…](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-21 | [VPN 网关 阶段 4：纯逻辑包与管理 API](2026-09-21-vpn-phase4-pure-logic-and-api.md) | [计划：VPN 网关 阶段 4：纯逻辑包与管理 API](../superpowers/plans/2026-09-21-vpn-phase4-pure-logic-and-api.md) | [规格：内嵌 VPN 网关（WireGuard）](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md)<br>[ADR：Open a public UDP ingress for an embedded…](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-20 | [VPN 网关 阶段 3：Schema v15 存储层](2026-09-20-vpn-phase3-schema-v15.md) | [计划：VPN 网关 阶段 3：Schema v15 与 VPN Repository](../superpowers/plans/2026-09-20-vpn-phase3-schema-v15.md) | [规格：内嵌 VPN 网关（WireGuard）](../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md)<br>[ADR：Open a public UDP ingress for an embedded…](../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |

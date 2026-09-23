@@ -30,7 +30,7 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 管理员可在“子账号”中创建、启用、禁用、重置密码、逻辑删除和恢复普通账号。创建/重置返回的临时密码只显示一次，响应使用 `Cache-Control: no-store`，不要写入工单、日志或浏览器存储。删除只设置 `deleted_at` 和禁用状态，Agent、路由、隧道、Token 与审计记录都会保留；恢复会清空 `deleted_at`。已删除用户名不能复用，管理员账号不能被这些接口操作。
 
-当前 Schema 版本为 v15。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
+当前 Schema 版本为 v16。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
 
 ## 单点登录、两步验证与受信任设备
 
@@ -53,7 +53,7 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 ## Agent 列表与详情
 
-Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details 可查看 Agent 详情及运行时 metadata：
+Agents 页面展示 Agent ID、名称、连通性状态、启用状态和能力。连通性状态以**未过期的连接租约**为准：持有租约即“在线”，否则“离线”；它与启用状态是两个独立事实，因此新建但从未连接的 Agent 会显示“离线 + 启用”，而不是过去的“在线”。点击 Details 可查看 Agent 详情及运行时 metadata：
 
 - 逻辑 Agent 在线/离线状态；
 - 活跃实例数按健康连接的实例 ID 去重统计；实例列表仍会显示历史过期实例；
@@ -62,6 +62,8 @@ Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details �
 - 集群内所有物理连接的 instance、connection、connection epoch、所属 Server 节点、Server 地址、活跃流、最后心跳和租约到期时间；
 - 字段名称、来源类型（`file` 或 `env`）和值；
 - 敏感字段显示为 Redacted，后台没有编辑上报值的入口。
+
+从未连接过的 Agent 没有 metadata 记录，详情页显示“暂无元数据”空态而不是加载失败横幅；这是正常状态，Agent 首次上报后数据自动出现。
 
 Agent metadata 只能由 Agent 按 allowlist 上报。修改字段必须修改 Agent 配置并等待下一次上报；管理员不能通过 API 伪造上报数据。
 
@@ -161,9 +163,12 @@ Agent 详情页的“逻辑 Agent 状态”按连接池健康状态推导：至�
 | --- | --- | --- |
 | Agent → Server（下载方向） | Server 在 `OPEN_STREAM` 中通告接收窗口，Agent 按窗口发送；Server 在消费者真正读走字节后才回补 `WINDOW_UPDATE` | 窗口 512 KiB，单帧上限 32 KiB，每消费 128 KiB 回补一次 |
 | Server → Agent（上传方向） | Agent 通告 256 KiB 接收窗口并对超额直接 `RESET`；Server 发送前扣减窗口，窗口耗尽时阻塞等待 `WINDOW_UPDATE` | 窗口 256 KiB，每消费 128 KiB 回补一次 |
+| Client ↔ Server（本地发布与端口转发） | Client 的写入按单帧上限切块并逐块扣减对端窗口，窗口耗尽时阻塞等待 `WINDOW_UPDATE` 而不是报错 | 窗口 256 KiB，单帧上限 32 KiB，每消费 128 KiB 回补一次 |
 | 浏览器 ↔ Server | WebSocket `bufferedAmount` 超过 1 MiB 时写入方等待排空（写入按 FIFO 串行化，保证字节顺序），SSH 接收队列上限 64 MiB | 高水位 1 MiB，硬上限 64 MiB |
 
 Server 的中继接收缓冲按**字节**而不是按帧计数：窗口以字节为单位，如果对端用大量小帧填满同一个窗口，按帧计数的缓冲会先溢出并把一条健康的传输判死。这也是传输几 MB 文件时最常见的“中途断开、退出码 0”根因。
+
+每一跳的**每流发送队列**必须不小于对端通告的窗口额度：队列满时写入方拿到的是拒绝而不是阻塞，中继泵会把拒绝当作致命错误关闭流，于是响应体在 `Content-Length` 完整的情况下变短。把队列调小于窗口不是额外的安全边界，而是把正常背压变成截断传输。Agent 的每流队列直接取 Server 在 `OPEN_STREAM` 中通告的 512 KiB，Client 的每流队列等于自己通告的 256 KiB；两端版本不一致时窗口与队列可能对不上，升级必须 Server 与 Agent/Client 同步进行。
 
 浏览器侧的出站方向同样有顺序保证：终端按键、ZMODEM 协议帧和 SFTP 请求共用同一条 SSH 通道，而 libssh2 的非阻塞写在窗口紧张时只消费部分字节、剩余部分需要续写。多个写者并发时续写会互相插队，在真实网络上表现为 `rz` 报 `ZRPOS`、`sz` 收不到 `OO` 等坏帧症状。前端因此对每条通道施加单写者闸门：任意时刻只有一个任务调用 libssh2 的写路径，排队顺序即调用顺序；SFTP 的目录列举等由多次请求组成的操作整体持闸，避免上传续写插进列举请求中间。闸门只排队微任务，不引入可感知延迟，也没有任何配置项。
 

@@ -78,6 +78,30 @@ client 本地端口映射没有独立的 `hostHeader`、`targetScheme` 或 `tlsS
 `tm-*.example.com`，实际请求例如 `tm-git.example.com`。通配符不能直接写成
 `*.example.com`，也不能匹配多级子域名；不符合规则的域名会被 Server 拒绝。
 
+## 上游路径与控制面保留端点
+
+托管路由按 **Host** 归属，不按路径前缀归属。一个域名要么整站属于某条路由，要么是 Server 的控制面 origin（管理后台、Agent 拨号、健康检查）。因此上游服务可以自由使用 `/api/...`、`/ws/...` 这类路径，Server 不会把它们当成自己的管理接口截走。
+
+`tm-*` 命名空间（`tm-*.<domain_suffix>` 显式泛域名与动态泛域名）的域名把**全部路径**交给上游，控制面不保留任何路径：
+
+| 请求 | 处理方 |
+| --- | --- |
+| `https://tm-6000d.example.com/api/skill/claw/cate` | 上游服务 |
+| `https://tm-6000d.example.com/ws/chat` | 上游服务 |
+| `https://tm-6000d.example.com/health`、`/metrics` | 上游服务 |
+| `https://tm-6000d.example.com/skills` | 上游服务 |
+
+显式域名路由（例如 `git.example.com`）同样把业务路径交给上游，但保留四个 TunnelMesh 自有端点，因为运营者填写的域名有可能与控制面 origin 或 Agent 拨号 origin 撞名，而这两个端点被接走的后果是整个 Agent 无法重连、LB 把健康节点摘除：
+
+| 保留路径 | 归属 | 原因 |
+| --- | --- | --- |
+| `/ws/agent`、`/ws/client` | 控制面 | Agent/Client 握手端点，被劫持会导致该 Agent 背后所有路由一起失效 |
+| `/health/` 前缀、`/metrics` | 控制面 | LB 与监控探针目标，必须先于路由解析可用 |
+
+上游服务如果确实需要在显式域名上暴露 `/health`、`/metrics`、`/ws/agent`、`/ws/client`，请改用其它路径，或改用 [HTTP 代理入口（tp-*）](http-proxy-entry.md)（该入口按注入的身份头解析路由，不做路径前缀判定）。
+
+**不要把管理后台 origin 或 Agent 拨号 origin 配成显式域名路由**，否则该 Host 的控制面（含后台静态资源）会被路由接管。`tm-*` 命名空间不存在这个风险，管理后台 origin 不会以 `tm-` 开头。
+
 ## DNS 与 TLS
 
 1. 为 `*.apps.example.com` 配置 wildcard DNS，指向 Server/LB；若使用显式泛域名，额外配置 `*.tunnel.example.com`。
@@ -85,6 +109,15 @@ client 本地端口映射没有独立的 `hostHeader`、`targetScheme` 或 `tlsS
 3. 将 HTTP/HTTPS 流量转发到 Server 的 80/443。
 4. 在后台创建明确路由，或将 `server.dynamic_suffix` 配置为实际动态域名后缀。
 5. 用浏览器和 `curl -v` 验证 Host、路径和 WebSocket Upgrade。
+
+## 大响应体与流控
+
+托管路由的响应体走 `浏览器 → Server → Agent → 内网服务` 隧道，与 WebSSH 共用同一套流控：Server 在 `OPEN_STREAM` 中通告 512 KiB 接收窗口，Agent 按窗口分帧发送（单帧上限 32 KiB），Server 在真正读走字节后才回补 `WINDOW_UPDATE`。前端打包产物（例如几 MB 的 `assets/*.js`）、文件下载和长轮询都能完整传输，**无需任何配置项**。流控全貌见 [大文件传输与通道流控](server-admin.md#大文件传输与通道流控)。
+
+排障要点：
+
+- 响应体在固定大小处被截断，浏览器报资源加载中断或 `net::ERR_CONTENT_LENGTH_MISMATCH`，而响应头里的 `Content-Length` 正常：说明 Agent 侧的流在队列满时被关闭，通常是 Agent 版本旧于 Server（每流发送队列小于 Server 通告的窗口）。把 Server 与 Agent 升级到同一版本即可。
+- 经 Nginx/OpenResty 反代时，`proxy_buffering off` 与足够长的 `proxy_read_timeout` 是大响应体不被中间层掐断的前提，见 [Nginx/WSS 推荐配置](../deployment/nginx.md)。
 
 ## API 示例
 

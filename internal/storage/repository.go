@@ -241,6 +241,7 @@ type LeaseRepository interface {
 	RenewConnection(context.Context, string, string, int64, time.Duration) error
 	ReleaseConnection(context.Context, string, string, int64) error
 	ListActiveByAgent(context.Context, string) ([]AgentLease, error)
+	ListActiveAgentIDs(context.Context, []string) ([]string, error)
 	UpdateConnectionStats(context.Context, AgentLease) error
 }
 
@@ -2074,6 +2075,38 @@ func (r *leaseRepo) ListActiveByAgent(ctx context.Context, agentID string) ([]Ag
 	}
 	return leases, rows.Err()
 }
+
+// ListActiveAgentIDs returns the subset of agentIDs holding an unexpired
+// connection lease. It is the batch form of ListActiveByAgent for list pages,
+// where one query per row would scale with the page size. The caller is
+// expected to pass only IDs the caller may already see, so this method adds no
+// authorization of its own.
+func (r *leaseRepo) ListActiveAgentIDs(ctx context.Context, agentIDs []string) ([]string, error) {
+	if len(agentIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(agentIDs)), ",")
+	args := make([]any, 0, len(agentIDs)+1)
+	args = append(args, tm(time.Now().UTC()))
+	for _, id := range agentIDs {
+		args = append(args, id)
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT agent_id FROM agent_connection_leases WHERE expires_at>? AND agent_id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (r *leaseRepo) UpdateConnectionStats(ctx context.Context, v AgentLease) error {
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `UPDATE agent_connection_leases SET active_streams=?,health_score=?,updated_at=? WHERE agent_id=? AND connection_id=? AND connection_epoch=? AND expires_at>?`, v.ActiveStreams, v.HealthScore, tm(now), v.AgentID, v.ConnectionID, v.ConnectionEpoch, tm(now))

@@ -7,12 +7,13 @@
 [实施计划](../plans/README.md)分开维护。规则权威来源是
 [AGENTS.md](../../../AGENTS.md)。
 
-共 21 份规格，按日期倒序排列。
+共 22 份规格，按日期倒序排列。
 
 ## 规格清单
 
 | 日期 | 设计规格 | 关联计划 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-23 | [三端一键安装脚本设计](2026-09-23-one-click-install-scripts-design.md) | [计划：三端一键安装脚本](../plans/2026-09-23-one-click-install-scripts.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
 | 2026-09-19 | [内嵌 VPN 网关（WireGuard）设计](2026-09-19-embedded-vpn-gateway-design.md) | — | [ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-18 | [SSO, MFA, and device trust design (Phase A)](2026-09-18-sso-mfa-device-trust-design.md) | [计划：SSO, MFA, and device trust implementation…](../plans/2026-09-18-sso-mfa-device-trust-implementation.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [Enterprise capability roadmap design](2026-09-18-enterprise-capability-roadmap-design.md) | [计划：SSO, MFA, and device trust implementation…](../plans/2026-09-18-sso-mfa-device-trust-implementation.md) | — |

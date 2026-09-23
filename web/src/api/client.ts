@@ -1,6 +1,6 @@
 export type APIResponse<T> = { code: number; msg: string; data: T }
 
-export type Agent = { id: string; name: string; enabled: boolean; ownerUserId?: string; capabilities?: string[] }
+export type Agent = { id: string; name: string; enabled: boolean; status: 'online' | 'offline'; ownerUserId?: string; capabilities?: string[] }
 export type AgentCreateInput = { name: string; enabled: boolean; capabilities?: string[] }
 export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted: boolean }
 export type AgentMetadataInstance = {
