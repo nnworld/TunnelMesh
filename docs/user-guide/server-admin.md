@@ -53,7 +53,7 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 ## Agent 列表与详情
 
-Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details 可查看 Agent 详情及运行时 metadata：
+Agents 页面展示 Agent ID、名称、连通性状态、启用状态和能力。连通性状态以**未过期的连接租约**为准：持有租约即“在线”，否则“离线”；它与启用状态是两个独立事实，因此新建但从未连接的 Agent 会显示“离线 + 启用”，而不是过去的“在线”。点击 Details 可查看 Agent 详情及运行时 metadata：
 
 - 逻辑 Agent 在线/离线状态；
 - 活跃实例数按健康连接的实例 ID 去重统计；实例列表仍会显示历史过期实例；
@@ -62,6 +62,8 @@ Agents 页面展示 Agent ID、名称、启用状态和能力。点击 Details �
 - 集群内所有物理连接的 instance、connection、connection epoch、所属 Server 节点、Server 地址、活跃流、最后心跳和租约到期时间；
 - 字段名称、来源类型（`file` 或 `env`）和值；
 - 敏感字段显示为 Redacted，后台没有编辑上报值的入口。
+
+从未连接过的 Agent 没有 metadata 记录，详情页显示“暂无元数据”空态而不是加载失败横幅；这是正常状态，Agent 首次上报后数据自动出现。
 
 Agent metadata 只能由 Agent 按 allowlist 上报。修改字段必须修改 Agent 配置并等待下一次上报；管理员不能通过 API 伪造上报数据。
 

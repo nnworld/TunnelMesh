@@ -54,6 +54,14 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 不要在命令行、日志或工单中粘贴真实密码；此前已经暴露过的数据库凭据应立即
 轮换，并通过 systemd EnvironmentFile 或 Secret Manager 注入 DSN。
 
+### 代理节点列表显示“在线”但详情没有元数据
+
+现象：Agents 列表里某个 Agent 显示“在线”，进入详情却是“暂无元数据”或加载失败，且该 Agent 实际上从未连接过。
+
+判定：列表的“在线/离线”以未过期的 `agent_connection_leases` 租约为准，与启用状态分列展示。旧版本把**启用状态**渲染成了“在线”，所以新建未连接的 Agent 也显示在线；同时元数据接口对“存在但从未上报”的 Agent 返回 404，前端把它显示成加载失败横幅。
+
+处置：升级到列表状态按租约计算、元数据缺失返回空集合的 Server 版本（见计划 `docs/superpowers/plans/2026-09-23-agent-online-status-and-empty-metadata.md`）。升级后未连接 Agent 显示“离线 + 启用”，详情页显示“暂无元数据”空态。若升级后仍显示“在线”却无元数据，按下面的“Agent 不在线”排查租约与心跳。
+
 ## Agent 不在线
 
 1. 确认 Agent 能访问 Server 的 `wss://` 地址。
