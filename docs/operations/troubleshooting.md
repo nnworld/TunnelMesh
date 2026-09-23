@@ -81,6 +81,18 @@ mysql -h 10.228.128.81 -P 4963 -u '<user>' -p tunnelmesh \\
 - 409：域名和路径已存在，重用原配置或删除旧路由。
 - 502/504：检查 Agent session、目标地址、目标端口和 policy。
 
+### 托管路由的 `/api/` 或 `/ws/` 路径返回管理 API 的 404
+
+现象：托管路由域名下以 `/api/` 开头的接口返回 TunnelMesh 自己的响应体，而不是上游服务的响应：
+
+```json
+{"code":404,"msg":"Not Found","data":{"error":"not found"}}
+```
+
+判定：`{code, msg, data}` 是管理 API 的统一信封，说明请求**没有进入 Agent 转发链路**，而是被 Server 的控制面处理器接走了。同一个 Host 上不带保留前缀的路径（例如 `/skills`）正常返回上游内容，即可确认是路径前缀被控制面劫持，与路由配置、Agent 在线状态、目标服务都无关。旧版本的 Server 按“先路径、后 Host”分派，会劫持托管路由主机上的 `/api/*`、`/ws/*`、`/health/*` 与 `/metrics`。
+
+处置：升级到按 **Host 作用域**分派的 Server 版本（见计划 `docs/superpowers/plans/2026-09-23-managed-route-reserved-path-shadowing.md`）。升级后 `tm-*` 命名空间的域名把全部路径交给上游；显式域名路由上仍保留 `/ws/agent`、`/ws/client`、`/health/*`、`/metrics` 四个控制面端点，上游同名路径需要改名或改用 `tp-*` 代理入口。**Server 单独升级即可生效，Agent 与 Client 不需要升级。**
+
 ## SSH / websocat 失败
 
 - 必须使用 `websocat --binary`。
