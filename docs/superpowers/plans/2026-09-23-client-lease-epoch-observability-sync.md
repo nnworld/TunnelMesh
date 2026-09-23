@@ -130,6 +130,7 @@ return s.instances.TouchInstance(ctx, ...)
 - `migrations/migrations.go`：新增 `V14ToV15MySQL` / `V14ToV15SQLite` embed
 - `internal/storage/db.go`：`SchemaVersion` 15；`initializeSchema` 补 `case 14`
 - `internal/storage/client_repository_test.go`：`TestSchemaVersionIs14` → `TestSchemaVersionIs15`；新增 int64 epoch 往返测试与 DDL 漂移断言
+- `internal/storage/sqlite_test.go`：新增 v14 → v15 升级链测试
 - `internal/storage/mysql_test.go`：Schema 版本断言 14 → 15
 - `internal/server/client_connection_lease.go`：`Heartbeat` 自愈回退
 - `internal/server/client_connection_lease_test.go`：自愈测试

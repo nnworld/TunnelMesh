@@ -824,3 +824,77 @@ func TestSQLiteFreshSchemaMatchesIncrementalIdentityChain(t *testing.T) {
 		}
 	}
 }
+
+// TestSQLiteV14ToV15LeaseEpochMigration covers the upgrade step that widens
+// connection_epoch on both lease tables. On SQLite the step is structurally
+// inert, because a SQLite INTEGER already stores a signed 64-bit value and the
+// driver cannot alter a column type in place, so what has to hold here is that
+// the chain advances from 14 to 15, that reopening the database is a no-op, and
+// that a lease written with a token above the 32-bit range still round-trips
+// through the epoch-fenced write path afterwards.
+func TestSQLiteV14ToV15LeaseEpochMigration(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "v14-to-v15.sqlite")
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrations.DDL); err != nil {
+		raw.Close()
+		t.Fatalf("create base schema: %v", err)
+	}
+	// The full DDL creates schema_meta but leaves it empty, so seed the source
+	// version to exercise exactly one adjacent step.
+	for _, statement := range []string{
+		`DELETE FROM schema_meta WHERE id=1`,
+		`INSERT INTO schema_meta(id,version) VALUES(1,14)`,
+	} {
+		if _, err := raw.Exec(statement); err != nil {
+			raw.Close()
+			t.Fatalf("prepare v14 schema: %v (%s)", err, statement)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("migrate v14 to v15: %v", err)
+	}
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != 15 {
+		t.Fatalf("schema version = %d, err = %v, want 15", version, err)
+	}
+
+	// The fencing token the Server actually generates spans the full int64 range.
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const epoch = int64(1) << 40
+	lease := ClientConnectionLease{
+		ConnectionID: "connection-v15", ClientInstanceID: "client-instance-v15",
+		TokenID: "token-v15", OwnerUserID: "owner-v15", ServerNodeID: "server-1",
+		ConnectionEpoch: epoch, ActiveStreams: 2, AcquiredAt: now,
+		ExpiresAt: now.Add(time.Minute), UpdatedAt: now,
+	}
+	if _, err := db.ClientConnections().Register(ctx, lease); err != nil {
+		t.Fatalf("register lease after migration: %v", err)
+	}
+	if err := db.ClientConnections().Renew(ctx, lease.ConnectionID, epoch, 90*time.Second); err != nil {
+		t.Fatalf("renew with the authoritative epoch after migration: %v", err)
+	}
+	if err := db.ClientConnections().Release(ctx, lease.ConnectionID, epoch); err != nil {
+		t.Fatalf("release with the authoritative epoch after migration: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second open must be a no-op: the migration is retry-safe.
+	db2, err := OpenSQLite(context.Background(), dsn, true)
+	if err != nil {
+		t.Fatalf("reopen migrated database: %v", err)
+	}
+	defer db2.Close()
+	if version, err := db2.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version after reopen = %d, err = %v, want %d", version, err, SchemaVersion)
+	}
+}

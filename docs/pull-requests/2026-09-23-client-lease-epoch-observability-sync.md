@@ -123,6 +123,10 @@ unchanged. No new data is exposed, and no secret, token, or DSN is logged.
 - `internal/storage/client_repository_test.go`: `TestSchemaVersionIs15` and
   `TestClientConnectionLeaseStoresFullInt64Epoch`, which round-trips an epoch
   above `MaxInt32` through Register → Renew → UpdateStats → Release.
+- `internal/storage/sqlite_test.go`: `TestSQLiteV14ToV15LeaseEpochMigration`,
+  which seeds a v14 database, asserts the chain advances to 15, round-trips a
+  `1<<40` epoch through the fenced write path afterwards, and confirms a second
+  open is a retry-safe no-op.
 - `internal/server/client_connection_lease_test.go`: self-heal on an epoch
   mismatch, a case proving non-epoch storage errors still propagate, and a case
   proving no orphan lease is registered before the instance ID is known.
