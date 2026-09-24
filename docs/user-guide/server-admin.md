@@ -73,18 +73,22 @@ Agent 详情中的连接列表来自数据库连接租约，并用当前 Server 
 
 ## Client 运行观测与连接管理
 
-Clients 页面用于查看当前用户权限范围内的客户端实例、metadata 和物理 WebSocket 连接。管理员可以按 Owner、Token、Server 节点、状态、Agent 和关键词筛选；普通用户的 Owner 过滤固定为自己的用户 ID，并在数据库查询内完成，不能通过分页绕过。
+Clients 页面用于查看当前用户权限范围内的客户端实例、metadata 和物理 WebSocket 连接。管理员可以按 Owner、Token、Server 节点、状态、元数据时效、Agent 和关键词筛选；普通用户的 Owner 过滤固定为自己的用户 ID，并在数据库查询内完成，不能通过分页绕过。`status` 查询参数只接受 `online` 和 `offline`；历史值 `stale` 与 `metadata_unavailable` 仍作为 `metadataState=expired|unavailable` 的别名保留一个次版本后移除。
 
 客户端会通过 metadata 子协议上报稳定实例 ID、版本、commit、平台、主机名、进程启动时间、本地监听入口、允许的 Agent 和非敏感自定义字段。自定义字段必须写入 Client 配置的 `client.metadata` allowlist，来源只能是绝对路径文件或指定环境变量。最多 32 项，单项 4 KiB，总 payload 32 KiB；包含 password、passphrase、token、secret、private key、api key、credential、authorization、cookie 或 DSN 语义的名称会被拒绝。metadata 只用于观测，不参与任何授权判断。
 
-新版客户端鉴权后必须先发送 `CLIENT_HELLO`，之后才能发送 `CLIENT_METADATA_UPDATE`。未按顺序发送的更新会被拒绝，不会更新实例或连接租约。旧客户端不会协商 metadata 子协议，Server 会显示为 `metadata_unavailable`。
+新版客户端鉴权后必须先发送 `CLIENT_HELLO`，之后才能发送 `CLIENT_METADATA_UPDATE`。未按顺序发送的更新会被拒绝，不会更新实例或连接租约。
 
-状态含义如下：
+列表用两列表达两个互相独立的事实，不再把 metadata 时效混进在线状态：
 
-- `online`：至少一条连接租约未过期；
-- `offline`：当前没有未过期连接租约；
-- `stale`：metadata 已超过 TTL；
-- `metadata_unavailable`：旧客户端未协商 metadata 子协议，仅能看到基础连接信息。
+- `status`（是否存在）：`online` 表示至少一条连接租约未过期，`offline` 表示当前没有未过期租约。判定只看连接租约，与 metadata 是否新鲜无关。
+- `metadataState`（时效）：`fresh` 表示已上报且未超过 TTL；`expired` 表示已上报但超过 TTL；`unavailable` 表示该 Client 从未成功上报 `CLIENT_HELLO`（旧客户端即属此类），此时只能看到基础连接信息。
+
+因此一个在线但 metadata 已过期的客户端会同时显示 `online` 与 `metadata 已过期`；一个早已断开的记录会显示 `offline`，不会再被标成“已过期”。
+
+表格上方的统计卡片来自服务端对整个筛选结果集的聚合（`GET /api/v1/clients` 响应的 `summary`），不是当前游标页的逐行累加，所以翻页或筛选后仍与全量一致。
+
+未上报 metadata 的实例记录是按物理连接生成的，连接关闭时随即删除；后台清扫任务还会回收没有活跃租约且已过期的同类残留记录。已上报过 `CLIENT_HELLO` 的记录代表真实安装身份，永远不会被自动删除。
 
 连接列表展示每条物理 WebSocket 的 connection ID、connection epoch、所属 Server 节点、Token、活跃流、健康分、获取时间、最后心跳和租约到期时间。关闭连接必须携带列表中的 connection epoch；本地连接直接关闭，远端连接通过已认证的 Server-node relay 控制通道转发。请求只影响这一条物理连接，客户端连接池可能自动重连。
 

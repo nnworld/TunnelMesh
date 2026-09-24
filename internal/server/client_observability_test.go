@@ -270,3 +270,80 @@ func TestClientObservabilityHeartbeatTouchesMetadataWhenLeaseFails(t *testing.T)
 	}
 	_ = manager
 }
+
+// A Client that reconnects without CLIENT_HELLO leaves a per-connection row
+// behind. Without this cleanup those rows accumulate forever as
+// "metadata 已过期" ghosts for a machine that is already listed as online.
+func TestClientObservabilityReleaseDropsUnreportedRow(t *testing.T) {
+	service, instances, _, _ := newClientObservabilityFixture()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-1",
+		Identity: auth.TokenIdentity{
+			TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient,
+		},
+	}
+	if _, err := service.RegisterLegacy(context.Background(), principal); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Release(context.Background(), principal); err != nil {
+		t.Fatal(err)
+	}
+	if len(instances.deletedUnreported) != 1 || instances.deletedUnreported[0] != "client-instance-1" {
+		t.Fatalf("deleted unreported rows = %#v", instances.deletedUnreported)
+	}
+}
+
+// A row that gained a CLIENT_HELLO after the connection started must survive the
+// release of one physical connection out of a pooled Client.
+func TestClientObservabilityKeepsReportedRowOnRelease(t *testing.T) {
+	service, instances, _, _ := newClientObservabilityFixture()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-1",
+		Identity: auth.TokenIdentity{
+			TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient,
+		}, MetadataEnabled: true,
+	}
+	if _, err := service.Hello(context.Background(), principal, protocol.ClientMetadataPayload{
+		InstanceID: "client-0123456789abcdef", Revision: 1, ReportedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The repository, not the service, owns the decision: it reports no affected
+	// row for a CLIENT_HELLO instance, and that must not fail the release.
+	instances.reportedRowKept = true
+	if err := service.Release(context.Background(), principal); err != nil {
+		t.Fatalf("Release() error = %v, want the no-match delete tolerated", err)
+	}
+	if len(instances.deletedUnreported) != 1 || instances.deletedUnreported[0] != "client-instance-1" {
+		t.Fatalf("deleted unreported rows = %#v", instances.deletedUnreported)
+	}
+}
+
+// The hello payload is the durable "reported" marker, so it can never collapse to
+// the empty object that RegisterLegacy writes for never-reported rows.
+func TestPersistedClientHelloMetadataIsNeverEmptyObject(t *testing.T) {
+	service, instances, _, _ := newClientObservabilityFixture()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-1",
+		Identity: auth.TokenIdentity{
+			TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient,
+		}, MetadataEnabled: true,
+	}
+	if _, err := service.Hello(context.Background(), principal, protocol.ClientMetadataPayload{
+		InstanceID: "client-0123456789abcdef", Revision: 1, ReportedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(instances.upserts) == 0 {
+		t.Fatal("no metadata persisted")
+	}
+	if got := instances.upserts[0].Metadata; got == "{}" || got == "" {
+		t.Fatalf("CLIENT_HELLO metadata = %q, must never equal the legacy marker", got)
+	}
+	if _, err := service.RegisterLegacy(context.Background(), principal); err != nil {
+		t.Fatal(err)
+	}
+	if got := instances.upserts[len(instances.upserts)-1].Metadata; got != "{}" {
+		t.Fatalf("legacy metadata = %q, want {}", got)
+	}
+}

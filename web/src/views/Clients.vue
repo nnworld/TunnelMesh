@@ -21,6 +21,11 @@
               <el-option v-for="option in statusOptions" :key="option" :value="option" :label="statusLabel(option)" />
             </el-select>
           </el-form-item>
+          <el-form-item :label="t('clients.metadataState')">
+            <el-select v-model="filters.metadataState" clearable>
+              <el-option v-for="option in metadataStateOptions" :key="option" :value="option" :label="metadataStateLabel(option)" />
+            </el-select>
+          </el-form-item>
           <el-form-item :label="t('clients.agent')">
             <el-input v-model="filters.agentId" :placeholder="t('clients.agent')" clearable />
           </el-form-item>
@@ -59,8 +64,11 @@
           <el-table-column :label="t('clients.serverNodes')" min-width="150"><template #default="{ row }">{{ formatList(row.serverNodeIds) }}</template></el-table-column>
           <el-table-column prop="activeConnections" :label="t('clients.activeConnections')" width="110" />
           <el-table-column prop="activeStreams" :label="t('clients.activeStreams')" width="100" />
-          <el-table-column :label="t('clients.status')" width="150">
+          <el-table-column :label="t('clients.status')" width="110">
             <template #default="{ row }"><StatusTag :kind="statusKind(row.status)" :label="statusLabel(row.status)" /></template>
+          </el-table-column>
+          <el-table-column :label="t('clients.metadataState')" width="150">
+            <template #default="{ row }"><StatusTag :kind="metadataStateKind(row.metadataState)" :label="metadataStateLabel(row.metadataState)" /></template>
           </el-table-column>
           <el-table-column :label="t('clients.lastSeen')" width="180"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
           <el-table-column :label="t('clients.actions')" width="100" fixed="right">
@@ -87,6 +95,7 @@
             <el-descriptions-item :label="t('clients.instanceId')">{{ detailClient.instanceId }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.owner')">{{ detailClient.ownerUserId }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.status')"><StatusTag :kind="statusKind(detailClient.status)" :label="statusLabel(detailClient.status)" /></el-descriptions-item>
+            <el-descriptions-item :label="t('clients.metadataState')"><StatusTag :kind="metadataStateKind(detailClient.metadataState)" :label="metadataStateLabel(detailClient.metadataState)" /></el-descriptions-item>
             <el-descriptions-item :label="t('clients.version')">{{ detailClient.version || '—' }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.commit')">{{ detailClient.commit || '—' }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.platform')">{{ detailClient.platform || '—' }}</el-descriptions-item>
@@ -172,7 +181,7 @@ import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useFormatDateTime } from '../i18n/format'
 import { useAuthStore } from '../stores/auth'
-import { APIError, closeClientConnection, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance, type ClientStatus } from '../api/client'
+import { APIError, closeClientConnection, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance, type ClientMetadataState, type ClientListSummary, type ClientStatus } from '../api/client'
 
 const { t } = useI18n()
 const auth = useAuthStore()
@@ -181,7 +190,11 @@ const items = ref<ClientInstance[]>([])
 const loading = ref(false)
 const error = ref(false)
 const nextCursor = ref('')
-const filters = reactive({ ownerUserId: '', tokenId: '', serverNodeId: '', status: '' as '' | ClientStatus, agentId: '', keyword: '' })
+const filters = reactive({ ownerUserId: '', tokenId: '', serverNodeId: '', status: '' as '' | ClientStatus, metadataState: '' as '' | ClientMetadataState, agentId: '', keyword: '' })
+// Counters are the server's whole-population aggregate for the active filter.
+// Deriving them from the loaded rows is what made the cards disagree with the
+// table once the list paginated.
+const summary = ref<ClientListSummary | null>(null)
 const detailVisible = ref(false)
 const detailLoading = ref(false)
 const detailError = ref(false)
@@ -197,15 +210,16 @@ const closeVisible = ref(false)
 const closing = ref(false)
 const closeError = ref('')
 const closeTarget = ref<ClientConnection | null>(null)
-const statusOptions = ['online', 'offline', 'stale', 'metadata_unavailable'] as const
+const statusOptions = ['online', 'offline'] as const
+const metadataStateOptions = ['fresh', 'expired', 'unavailable'] as const
 
 const clientDetailTitle = computed(() => t('clients.detailTitle'))
 const summaryCards = computed(() => [
-  { label: t('clients.onlineClients'), value: items.value.filter(item => item.activeConnections > 0).length },
-  { label: t('clients.activeConnections'), value: items.value.reduce((total, item) => total + item.activeConnections, 0) },
-  { label: t('clients.activeStreams'), value: items.value.reduce((total, item) => total + item.activeStreams, 0) },
-  { label: t('clients.metadataUnavailable'), value: items.value.filter(item => item.status === 'metadata_unavailable').length },
-  { label: t('clients.metadataStale'), value: items.value.filter(item => item.status === 'stale').length },
+  { label: t('clients.onlineClients'), value: summary.value?.online ?? 0 },
+  { label: t('clients.activeConnections'), value: summary.value?.activeConnections ?? 0 },
+  { label: t('clients.activeStreams'), value: summary.value?.activeStreams ?? 0 },
+  { label: t('clients.metadataUnavailable'), value: summary.value?.metadataUnavailable ?? 0 },
+  { label: t('clients.metadataStale'), value: summary.value?.metadataStale ?? 0 },
 ])
 const metadataRows = computed(() => Object.entries(detailClient.value?.metadata || {}).map(([name, value]) => ({ name, value })))
 
@@ -217,11 +231,13 @@ async function load() {
       tokenId: filters.tokenId || undefined,
       serverNodeId: filters.serverNodeId || undefined,
       status: filters.status || undefined,
+      metadataState: filters.metadataState || undefined,
       agentId: filters.agentId || undefined,
       keyword: filters.keyword || undefined,
       limit: 100,
     })
     items.value = page.items
+    summary.value = page.summary ?? null
     nextCursor.value = page.nextCursor || ''
   } catch {
     error.value = true
@@ -241,10 +257,12 @@ async function loadMore() {
       status: filters.status || undefined,
       agentId: filters.agentId || undefined,
       keyword: filters.keyword || undefined,
+      metadataState: filters.metadataState || undefined,
       cursor: nextCursor.value,
       limit: 100,
     })
     items.value.push(...page.items)
+    summary.value = page.summary ?? summary.value
     nextCursor.value = page.nextCursor || ''
   } catch {
     error.value = true
@@ -256,7 +274,7 @@ async function loadMore() {
 function query() { void load() }
 function reset() {
   filters.ownerUserId = ''; filters.tokenId = ''; filters.serverNodeId = ''
-  filters.status = ''; filters.agentId = ''; filters.keyword = ''
+  filters.status = ''; filters.metadataState = ''; filters.agentId = ''; filters.keyword = ''
   void load()
 }
 
@@ -309,12 +327,12 @@ async function closeConnection() {
   }
 }
 
-function statusKind(status: ClientStatus) {
-  if (status === 'online') return 'success' as const
-  if (status === 'stale' || status === 'metadata_unavailable') return 'warning' as const
-  return 'info' as const
-}
+function statusKind(status: ClientStatus) { return status === 'online' ? 'success' as const : 'info' as const }
 function statusLabel(status: ClientStatus) { return t(`clients.statusLabel.${status}`) }
+// A missing snapshot is worth flagging, but it is not a health problem: the
+// connection itself is reported by the presence tag next to it.
+function metadataStateKind(state: ClientMetadataState) { return state === 'fresh' ? 'success' as const : 'warning' as const }
+function metadataStateLabel(state: ClientMetadataState) { return t(`clients.metadataStateLabel.${state}`) }
 // Mirrors the server-side activeConnections rule in internal/server/client_api.go,
 // which counts a lease only while its expires_at is still in the future.
 function leaseLive(connection: ClientConnection) { return new Date(connection.expiresAt).getTime() > connectionsNow.value }

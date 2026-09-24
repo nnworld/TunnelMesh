@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -11,14 +12,18 @@ import (
 )
 
 type fakeClientInstanceRepo struct {
-	mu         sync.Mutex
-	upserts    []storage.ClientInstance
-	touched    [][2]time.Time
-	touchedIDs [][2]string
-	markStale  []string
-	expired    []time.Time
-	nextID     string
-	err        error
+	mu                sync.Mutex
+	upserts           []storage.ClientInstance
+	touched           [][2]time.Time
+	touchedIDs        [][2]string
+	markStale         []string
+	expired           []time.Time
+	purged            []time.Time
+	summarized        []time.Time
+	deletedUnreported []string
+	nextID            string
+	reportedRowKept   bool
+	err               error
 }
 
 func (r *fakeClientInstanceRepo) Upsert(_ context.Context, instance storage.ClientInstance) (storage.ClientInstance, error) {
@@ -88,5 +93,40 @@ func TestClientMetadataSweeperMarksExpiredAndStops(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("sweeper did not stop")
+	}
+}
+
+func (r *fakeClientInstanceRepo) Summarize(_ context.Context, _ storage.ClientInstanceFilter, at time.Time) (storage.ClientInstanceSummary, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.summarized = append(r.summarized, at)
+	return storage.ClientInstanceSummary{}, r.err
+}
+func (r *fakeClientInstanceRepo) DeleteUnreported(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deletedUnreported = append(r.deletedUnreported, id)
+	if r.reportedRowKept && id == "client-instance-1" {
+		return sql.ErrNoRows
+	}
+	return r.err
+}
+func (r *fakeClientInstanceRepo) PurgeUnreported(_ context.Context, at time.Time) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.purged = append(r.purged, at)
+	return int64(len(r.purged)), r.err
+}
+
+func TestClientMetadataSweeperPurgesUnreportedOrphans(t *testing.T) {
+	repo := &fakeClientInstanceRepo{}
+	sweeper := NewClientMetadataSweeper(repo, time.Hour)
+	if _, err := sweeper.Sweep(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.expired) != 1 || len(repo.purged) != 1 {
+		t.Fatalf("expired=%d purged=%d, want one of each", len(repo.expired), len(repo.purged))
 	}
 }

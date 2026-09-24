@@ -852,12 +852,20 @@ paths:
         - {name: ownerUserId, in: query, schema: {type: string}, description: Administrator-only owner filter}
         - {name: tokenId, in: query, schema: {type: string}}
         - {name: serverNodeId, in: query, schema: {type: string}}
-        - {name: status, in: query, schema: {type: string, enum: [online, offline, stale, metadata_unavailable]}}
+        - name: status
+          in: query
+          description: Client presence only, decided by live WebSocket leases. The legacy values stale and metadata_unavailable are accepted as deprecated aliases of metadataState=expired|unavailable.
+          schema: {type: string, enum: [online, offline, stale, metadata_unavailable]}
+          deprecated: true
+        - name: metadataState
+          in: query
+          description: Metadata freshness, independent from presence. reported matches every Client that ever accepted CLIENT_HELLO (fresh or expired).
+          schema: {type: string, enum: [fresh, expired, unavailable, reported]}
         - {name: agentId, in: query, schema: {type: string}}
         - {name: keyword, in: query, schema: {type: string, maxLength: 255}}
       responses:
-        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/ClientPageEnvelope'}}}}
-        '400': {description: Invalid status filter}
+        '200': {description: Cursor page plus whole-population summary, content: {application/json: {schema: {$ref: '#/components/schemas/ClientPageEnvelope'}}}}
+        '400': {description: Invalid status or metadataState filter}
         '401': {description: Unauthenticated}
         '403': {description: Non-administrator requested another owner}
   /api/v1/clients/{clientInstanceId}:
@@ -2183,15 +2191,28 @@ components:
             data: {$ref: '#/components/schemas/Client'}
     ClientPage:
       type: object
-      required: [items, hasMore]
+      required: [items, hasMore, summary]
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Client'}}
         nextCursor: {type: string}
         hasMore: {type: boolean}
+        summary: {$ref: '#/components/schemas/ClientListSummary'}
+    ClientListSummary:
+      type: object
+      description: Aggregates over the whole filtered Client population, never the current cursor page, so console counters cannot disagree with the table.
+      additionalProperties: false
+      required: [total, online, activeConnections, activeStreams, metadataUnavailable, metadataStale]
+      properties:
+        total: {type: integer, minimum: 0}
+        online: {type: integer, minimum: 0, description: Clients with at least one unexpired lease}
+        activeConnections: {type: integer, minimum: 0, description: Unexpired physical WebSocket leases across the population}
+        activeStreams: {type: integer, minimum: 0}
+        metadataUnavailable: {type: integer, minimum: 0, description: Clients that never accepted CLIENT_HELLO}
+        metadataStale: {type: integer, minimum: 0, description: Reported metadata past its TTL, regardless of presence}
     Client:
       type: object
       additionalProperties: false
-      required: [id, instanceId, ownerUserId, tokenIds, agentIds, status, activeConnections, activeStreams, serverNodeIds, lastSeenAt, metadata, capabilities, listeners]
+      required: [id, instanceId, ownerUserId, tokenIds, agentIds, status, metadataState, activeConnections, activeStreams, serverNodeIds, lastSeenAt, metadata, capabilities, listeners]
       properties:
         id: {type: string, description: Server-managed Client instance resource ID}
         instanceId: {type: string, description: Stable client-generated logical instance ID}
@@ -2203,7 +2224,8 @@ components:
         platform: {type: string}
         hostname: {type: string}
         processStartAt: {type: string, format: date-time}
-        status: {type: string, enum: [online, offline, stale, metadata_unavailable]}
+        status: {type: string, enum: [online, offline], description: Presence only. Derived from unexpired leases, never from metadata state.}
+        metadataState: {type: string, enum: [fresh, expired, unavailable], description: fresh and expired require an accepted CLIENT_HELLO; unavailable means the Client never reported metadata and is independent of presence.}
         activeConnections: {type: integer, minimum: 0}
         activeStreams: {type: integer, minimum: 0}
         serverNodeIds: {type: array, items: {type: string}}

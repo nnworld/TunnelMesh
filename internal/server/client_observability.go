@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -170,9 +171,17 @@ func (s *ClientObservabilityService) Release(ctx context.Context, principal Clie
 		return ErrSessionClosed
 	}
 	err := s.leases.Release(ctx, record.ConnectionID, record.ConnectionEpoch)
+	// A never-reported row is a per-connection record with no durable meaning, so
+	// it must die with its connection. DeleteUnreported only matches metadata='{}',
+	// which makes it safe to attempt for every release, including a pooled Client
+	// that reported metadata on another connection.
+	deleteErr := s.instances.DeleteUnreported(ctx, record.ClientInstanceID)
+	if errors.Is(deleteErr, sql.ErrNoRows) {
+		deleteErr = nil
+	}
 	s.manager.Remove(record.ConnectionID)
 	s.forgetConnection(record.ConnectionID)
-	return err
+	return errors.Join(err, deleteErr)
 }
 
 func (s *ClientObservabilityService) persistMetadata(ctx context.Context, principal ClientSessionPrincipal, payload protocol.ClientMetadataPayload) (storage.ClientInstance, protocol.ClientMetadataAckPayload, error) {

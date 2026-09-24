@@ -23,7 +23,7 @@ function instance(overrides: Partial<ClientInstance> = {}): ClientInstance {
   return {
     id: 'client-instance-1', instanceId: 'client-local-1', ownerUserId: 'owner-1',
     tokenIds: ['token-1'], agentIds: [], version: 'v1.0.0', commit: 'abc', platform: 'linux',
-    hostname: 'host-a', processStartAt: '2026-09-23T10:00:00Z', status: 'online',
+    hostname: 'host-a', processStartAt: '2026-09-23T10:00:00Z', status: 'online', metadataState: 'fresh',
     activeConnections: 2, activeStreams: 3, serverNodeIds: ['server-1'],
     lastSeenAt: '2026-09-23T10:05:00Z', metadata: {}, capabilities: ['client_metadata.v1'], listeners: [],
     ...overrides,
@@ -51,10 +51,13 @@ function summaryCards(container: HTMLElement) {
   }))
 }
 
-// The summary cards and the table rows used to disagree because both were
-// derived from leases whose epoch-predicated heartbeat write silently matched
-// zero rows on MySQL. The card set now accounts for every status the table can
-// show, so a "metadata expired" row is visible in the summary too.
+// The cards used to be recomputed from the rows on the current cursor page, so
+// they contradicted the table and each other: an online client carrying lapsed
+// metadata was counted as "metadata expired" while still being counted as
+// online, and a client whose metadata was never reported was counted as neither
+// online nor offline. The numbers now come from the server's aggregate over the
+// whole filtered population, and presence and metadata freshness are separate
+// columns.
 describe('client observability summary', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
@@ -63,20 +66,17 @@ describe('client observability summary', () => {
     vi.mocked(listClientConnections).mockReset()
   })
 
-  it('counts online clients, connections, streams, and both metadata states', async () => {
+  it('renders the server summary for the whole population, not the loaded page', async () => {
     vi.mocked(listClients).mockResolvedValue({
-      items: [
-        instance({ id: 'a', instanceId: 'client-a', status: 'online', activeConnections: 2, activeStreams: 5 }),
-        instance({ id: 'b', instanceId: 'client-b', status: 'stale', activeConnections: 0, activeStreams: 0, serverNodeIds: [] }),
-        instance({ id: 'c', instanceId: 'client-c', status: 'metadata_unavailable', activeConnections: 1, activeStreams: 0 }),
-        instance({ id: 'd', instanceId: 'client-d', status: 'offline', activeConnections: 0, activeStreams: 0, serverNodeIds: [] }),
-      ],
-      nextCursor: '',
+      items: [instance({ id: 'a', instanceId: 'client-a' })],
+      summary: { total: 27, online: 6, activeConnections: 16, activeStreams: 233, metadataUnavailable: 1, metadataStale: 0 },
+      nextCursor: 'cursor-1',
+      hasMore: true,
     })
     const { container, unmount } = await mountClients()
     try {
       const cards = summaryCards(container)
-      expect(cards.map(card => card.value)).toEqual(['2', '3', '5', '1', '1'])
+      expect(cards.map(card => card.value)).toEqual(['6', '16', '233', '1', '0'])
       expect(cards.map(card => card.label)).toEqual([
         i18n.global.t('clients.onlineClients'),
         i18n.global.t('clients.activeConnections'),
@@ -89,14 +89,40 @@ describe('client observability summary', () => {
     }
   })
 
-  it('keeps every summary card at zero when no client holds a live lease', async () => {
+  it('keeps every summary card at zero when the server reports no activity', async () => {
     vi.mocked(listClients).mockResolvedValue({
-      items: [instance({ status: 'stale', activeConnections: 0, activeStreams: 0, serverNodeIds: [] })],
+      items: [instance({ status: 'offline', metadataState: 'expired', activeConnections: 0, activeStreams: 0 })],
+      summary: { total: 0, online: 0, activeConnections: 0, activeStreams: 0, metadataUnavailable: 0, metadataStale: 0 },
       nextCursor: '',
     })
     const { container, unmount } = await mountClients()
     try {
-      expect(summaryCards(container).map(card => card.value)).toEqual(['0', '0', '0', '0', '1'])
+      expect(summaryCards(container).map(card => card.value)).toEqual(['0', '0', '0', '0', '0'])
+    } finally {
+      unmount()
+    }
+  })
+
+  it('shows an online client with lapsed metadata as online plus an expired tag', async () => {
+    vi.mocked(listClients).mockResolvedValue({
+      items: [
+        instance({ id: 'a', instanceId: 'client-a', status: 'online', metadataState: 'expired' }),
+        instance({ id: 'b', instanceId: 'client-b', status: 'online', metadataState: 'unavailable' }),
+        instance({ id: 'c', instanceId: 'client-c', status: 'offline', metadataState: 'unavailable', serverNodeIds: [] }),
+      ],
+      summary: { total: 3, online: 2, activeConnections: 2, activeStreams: 2, metadataUnavailable: 2, metadataStale: 1 },
+      nextCursor: '',
+    })
+    const { container, unmount } = await mountClients()
+    try {
+      const rows = Array.from(container.querySelectorAll('.el-table__body tr'))
+      const byInstanceId = new Map(rows.map(row => [row.querySelector('td')?.textContent?.trim() ?? '', row.textContent ?? '']))
+      expect(byInstanceId.get('client-a')).toContain(i18n.global.t('clients.statusLabel.online'))
+      expect(byInstanceId.get('client-a')).toContain(i18n.global.t('clients.metadataStateLabel.expired'))
+      expect(byInstanceId.get('client-b')).toContain(i18n.global.t('clients.metadataStateLabel.unavailable'))
+      expect(byInstanceId.get('client-c')).toContain(i18n.global.t('clients.statusLabel.offline'))
+      // A dead row must never be presented as merely "metadata expired".
+      expect(byInstanceId.get('client-c')).not.toContain(i18n.global.t('clients.metadataStateLabel.expired'))
     } finally {
       unmount()
     }
