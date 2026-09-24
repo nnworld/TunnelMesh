@@ -117,5 +117,7 @@
   `fix(client): isolate uploads and bound inbound state`、`fix(config): enforce stream window invariants`、
   `fix(server): report truncated managed responses`、`fix(server): pump client uploads off the frame loop`、
   `docs(dataplane): record window credit invariants`。
-- PR body 是本文件的副本，链接见下。
+- PR body 是本文件的副本。
+- 远端 PR：https://github.com/nnworld/TunnelMesh/pull/29。
+- 检查：`build-test` 46 s、`packaging` 7 s、`mysql56` 1m34s 全部通过；合并按管理员绕过必需评审执行。
 - 关联记录：[实施计划](../superpowers/plans/2026-09-24-dataplane-flow-control-hardening.md)、[ADR 0002](../architecture/adr/0002-dataplane-window-credit-invariants.md)。
