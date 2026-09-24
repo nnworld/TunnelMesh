@@ -45,6 +45,58 @@ tls:
 
 `server.tcp_bridge_enabled` 是 `server.tcp_bridge.enabled` 的扁平兼容写法，只在配置文件中生效；命令行、环境变量或 `Set` 覆盖中任一处出现规范键或扁平键时，扁平别名不再二次应用。环境变量两种写法都映射到 `TUNNELMESH_SERVER_TCP_BRIDGE_ENABLED`。
 
+## 管理入口的超时、上限与保留策略
+
+管理监听器用一个端口承载后台页面、`/api/v1`、Agent/Client WebSocket 和 WebSSH。这决定了它的边界不能照搬普通 HTTP 服务：一条已升级的连接要活几个小时，而一个恶意或缓慢的客户端又必须在几秒内被切断。`server.http.*` 就是这个折中——限制"请求头 + 请求体 + keep-alive 空闲"，不限制已建立连接的存活时间。
+
+```yaml
+server:
+  http:
+    read_header_timeout: 10s
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    body_timeout: 30s
+    max_connections: 0
+  agents:
+    max_connections_per_agent: 64
+  metrics:
+    token: ""
+  audit:
+    retention_days: 0
+```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `server.http.read_header_timeout` | `10s` | 读取请求头的预算，slowloris 的第一道防线 | 否 |
+| `server.http.idle_timeout` | `120s` | keep-alive 连接空闲多久后关闭。正在传输的请求不受影响 | 否 |
+| `server.http.max_header_bytes` | `1048576` | 单个请求头块字节上限，超出直接断开 | 否 |
+| `server.http.body_timeout` | `30s` | **只作用于 `/api/v1`** 的单个请求体读取预算，按请求设置读截止并在响应结束后清除 | 否 |
+| `server.http.max_connections` | `0` | 管理监听器同时保有的连接数上限，`0` 表示不限制；超限的新连接立即关闭而不排队 | 否 |
+| `server.agents.max_connections_per_agent` | `64` | 单个 Agent 身份在本节点可保有的物理 WebSocket 数，达到上限后新连接被拒绝（`session: agent connection capacity reached`），既有连接不受影响 | 否 |
+| `server.metrics.token` | 空 | `/metrics` 的 Bearer 凭据。空值表示匿名可抓取（与历史行为一致）；设置后必须不少于 16 字符 | 否 |
+| `server.audit.retention_days` | `0` | 审计日志保留天数。`0` 表示永久保留；只有正数才会启动清理任务 | 否 |
+
+- **为什么没有 `read_timeout`/`write_timeout`**：这两个是连接级预算，会把所有长连接（WebSocket、WebSSH、大文件下载）一起切断，因此代码里刻意不设置。等价能力由上表的"请求头预算 + 每请求体预算 + 空闲预算"组合提供。
+- **`0` 的两种含义不要混淆**：`server.http.max_connections=0` 是"不限制"；`server.http` 其余四项与 `server.agents.max_connections_per_agent` 的 `0` 或负数是"用内置安全默认值"（负数会在 `check-config` 阶段被拒绝）。写配置时不要靠 `0` 去关闭某个超时——需要放宽就填一个大值。
+- **`body_timeout` 不覆盖 WebSocket 路径**：`/ws/agent`、`/ws/client`、`/ws/webssh/`、`/ws/tcp` 不经过 `/api/v1` 包装器。已认证的 Agent/Client WebSocket 另有空闲读预算（三个 30s 心跳周期，见 `internal/server/runtime.go` 的 `websocketIdleReadTimeout`），半开连接会在那里被发现，而不是靠 HTTP 超时。
+- **与反向代理的取值关系**：`server.http.idle_timeout` 必须 **不小于** Nginx upstream 的 `keepalive_timeout`，否则 Nginx 会复用一条 Server 已关闭的连接并回 502；`server.http.max_connections` 只在 Server 直接暴露公网（没有 Nginx 或 `location /` 直连）时才需要设成与进程容量匹配的正数，Nginx 在前时容量由 `limit_conn` 决定，保持 `0` 即可。完整取值依据见 [Nginx 推荐配置](../deployment/nginx.md#限流与容量取值)。
+- **`max_connections_per_agent` 与 Agent 侧的关系**：`agent.connections.max`（上限 64）是 Agent 自己愿意开的连接数，本键是 Server 愿意接受的数量，两者不自动对齐；把 Server 侧调小会让超出的连接被拒并退避重连，不会踢掉既有连接。
+- **`metrics.token` 与网络白名单二选一即可**：`/metrics` 输出含指标名与标签值，能反推内部拓扑。若已经由反向代理按来源网段放行，就不必再配 token；若 Server 直接暴露，应用层凭据比依赖运维改 nginx 更可靠。健康探针 `/health/live`、`/health/ready` 永远不需要该 token，凭据不会被用来让 LB 误判节点死亡。抓取侧配置见 [`deploy/prometheus/prometheus.yml.example`](../../deploy/prometheus/prometheus.yml.example)。
+- **审计保留是显式决策**：审计日志是证据，`retention_days` 默认 `0` 让升级不会删掉任何历史。启用后由后台每小时执行一次分批删除（单事务 1000 行），首次清理历史大表不会长时间锁表；集群每个节点各跑各的，语句本身幂等，因此不需要分布式锁。删除记录只输出条数与耗时，不含行标识。
+
+上述键都是启动期生效，改动需要重启 Server，不参与管理后台热更新。命令行与环境变量等价：
+
+```bash
+export TUNNELMESH_SERVER_HTTP_IDLE_TIMEOUT=120s
+export TUNNELMESH_SERVER_HTTP_MAX_CONNECTIONS=20000
+export TUNNELMESH_SERVER_AGENTS_MAX_CONNECTIONS_PER_AGENT=32
+export TUNNELMESH_SERVER_METRICS_TOKEN="$(openssl rand -hex 32)"
+export TUNNELMESH_SERVER_AUDIT_RETENTION_DAYS=365
+tunnelmesh-server --server.http.body_timeout=30s check-config
+```
+
+`server.metrics.token` 与 `storage.mysql.dsn`、`tls.key_file` 同属敏感项：`config dump` 与 `RedactedJSON` 输出会把它替换成 `[redacted]`，`json/yaml` 序列化直接省略该字段，日志也只记录"是否配置"，不记录值。
+
 ## 本地模式示例
 
 ```yaml
@@ -352,6 +404,7 @@ Server 默认配置：
 server:
   stream:
     max_concurrent_opens: 256
+    max_active_per_agent: 1024
     max_pending_opens: 1024
     initial_window: 262144
     window_update_threshold: 131072
@@ -366,6 +419,8 @@ server:
     max_entries: 100000
 ```
 
+`max_concurrent_opens` 是**处理宽度**（同时在进行的目标拨号数），`max_active_per_agent` 是**存量水位**（同一个 Agent 此刻保有的活跃流数量）。两者缺一不可：只限并发处理时，一个 Client 可以慢慢打开成千上万条不读的流，把每条流的缓冲与状态永久钉在 Agent 上；`0` 表示不限，负数被 `check-config` 拒绝。超限时 Server 直接回 `open_result` 的 `queue_full`（stage `queue`、可重试），Client 退避后重开，不会把 Agent 拖进拨号队列。
+
 `initial_window` 与 `window_update_threshold` 是 Agent 数据面的真实额度：前者既是 `OPEN_STREAM` 通告给 Agent 的 credit，也是 Server 为每条流预留的接收缓冲上限；后者是回补 `WINDOW_UPDATE` 的累计阈值。二者必须满足 `initial_window - window_update_threshold >= max_frame_payload`，否则发送方在剩余窗口不足一帧时无处可去，配置校验会直接拒绝。`max_frame_payload` 只有 `32768` 一个合法值，因为帧编解码没有协商其它 DATA 尺寸。对端通告的窗口仍会被夹紧，详见 [WebSocket 代理协议模块](../protocol/proxy-modules.md)。
 
 `authorization_cache` 使用数据库中的共享授权修订号失效。SQLite 正向缓存默认 5 秒；MySQL 集群默认 5 分钟，并通过 2 秒修订号轮询保证权限变更尽快生效。轮询失败超过 `max_stale_on_poll_error` 后缓存 fail-closed，新请求会回源数据库。所有 Token、用户、Agent 和策略变更必须与修订号更新处于同一数据库事务。
@@ -378,6 +433,7 @@ Agent 默认使用有界拨号执行器，单个慢目标不会阻塞同一 WebS
 agent:
   streams:
     max_concurrent_dials: 32
+    max_active: 1024
     max_pending_dials: 128
     connect_timeout: 5s
     open_timeout: 8s
@@ -389,7 +445,7 @@ agent:
     icmp_max_concurrent: 64
 ```
 
-`inbound_buffer_bytes` 决定每条流最多缓冲多少 Server→Agent 字节，最小值是两个整帧（65536），低于该值会让正常的背压变成 `RESET`。
+`inbound_buffer_bytes` 决定每条流最多缓冲多少 Server→Agent 字节，最小值是两个整帧（65536），低于该值会让正常的背压变成 `RESET`。`max_active` 是 Agent 自己的存量水位（纵深防御的第二层，语义与 Server 侧 `server.stream.max_active_per_agent` 相同），超限时 Agent 在创建任何流状态之前直接回 `queue_full`；`0` 表示不限。两侧任一层被单独调整都不会破坏协议：这是一个水位，不是协商参数。
 
 | 键 | 默认值 | 含义 | 是否必填 |
 |---|---|---|---|

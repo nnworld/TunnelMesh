@@ -584,9 +584,16 @@ client:
 
 连接池参数、认证环境变量和多 Agent 示例见 [Client 配置示例](../operations/client-configuration-examples.md)。
 
+### 非回环监听与进程退出语义
+
+`tcp`、`udp`、`http` 三种隧道的 `listen` 如果不是回环地址，必须写 `allow_remote: true`（单命令入口对应 `--allow-remote`），否则配置校验与启动都会直接拒绝。这三种隧道没有 SOCKS5/HTTP 代理那样的本地认证，把监听绑到非回环地址等价于**无凭据**把目标服务发布到该网段，所以必须显式确认；`socks5` 与 `http-proxy` 额外要求同时配置 `password`/`basic` 认证。
+
+`run` 与单命令 `forward` 在任一本地监听器的接受循环或读取循环永久失败时（描述符耗尽、监听 socket 被销毁等）立即退出并把错误写到 stderr，退出码非零。这是刻意设计：端口仍然占着但不再收流量的"哑监听器"看起来完全健康，是最难从外部发现的一类故障；让 systemd/Docker 按重启策略拉起进程，比让进程带着坏端口继续上报"在线"更有用。`Close` 与配置里的正常停止不算故障，不会触发退出。
+
 ## 安全建议
 
 - 生产环境必须使用 `wss://`，并校验证书链。
+- 只给需要的隧道写 `allow_remote: true`。非回环的 `tcp`/`udp`/`http` 入口没有任何本地认证，等同于把内网服务无凭据发布到该网段；能只用回环地址就不要绑 `0.0.0.0`。
 - Agent ID、Token 和配置文件权限应限制为服务用户可读。
 - 不要把 Token、密码和 MySQL DSN 提交到 Git。
 - 调整目标网段、端口和 CIDR 策略时，同时检查服务端 policy。

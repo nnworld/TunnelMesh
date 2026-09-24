@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 60 份计划，按日期倒序排列。
+共 61 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-24 | [实施计划：Review P1–P3 加固与客户端观测页排序](2026-09-24-review-p1-p3-hardening.md) | — | [PR：Review P1–P3 加固与客户端观测页排序](../../pull-requests/2026-09-25-review-p1-p3-hardening.md) |
 | 2026-09-24 | [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | — | [PR：一键安装函数级套件不再挂在交互提示上](../../pull-requests/2026-09-24-oneclick-shell-suite-hermetic-stdin.md) |
 | 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁实施计划](2026-09-24-mysql56-contract-ci-gate.md) | — | [PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
 | 2026-09-24 | [MySQL 5.6 本地复现 profile 实施计划](2026-09-24-mysql56-compose-profile.md) | — | [PR：MySQL 5.6 本地复现 profile](../../pull-requests/2026-09-24-mysql56-compose-profile.md)<br>[PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |

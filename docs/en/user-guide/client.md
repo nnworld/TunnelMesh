@@ -91,3 +91,9 @@ client:
 
 This is useful for workstations that need several local mappings at once.
 
+## Non-loopback listeners and process exit
+
+A `tcp`, `udp`, or `http` entry whose `listen` address is not loopback requires `allow_remote: true` (`--allow-remote` for the single-command form); validation and startup both refuse it otherwise, because those three tunnel types have no local credential check, so binding a non-loopback address publishes the target unauthenticated on that segment. `socks5` and `http-proxy` additionally require a `password` or `basic` auth entry.
+
+When any local listener's accept or read loop fails permanently - exhausted descriptors, a destroyed listening socket - `run` and single-command `forward` exit immediately with a non-zero status and write the error to stderr. A port that still looks healthy while serving nothing is the hardest failure to notice from outside, so letting systemd or Docker restart the process beats staying "online" on a broken listener. `Close` and an ordinary configured stop are not failures and never trigger an exit.
+

@@ -86,6 +86,8 @@ Clients 页面用于查看当前用户权限范围内的客户端实例、metada
 
 因此一个在线但 metadata 已过期的客户端会同时显示 `online` 与 `metadata 已过期`；一个早已断开的记录会显示 `offline`，不会再被标成“已过期”。
 
+列表默认排序是最近心跳倒序，服务端使用 `ORDER BY last_seen_at DESC, id DESC`，因此刚断开的实例仍排在最前，便于优先处理。排序键刻意不用 `updated_at`：后台把实例标记为 stale 或过期时会单独抬升 `updated_at`，按它排序会把“刚被清扫器碰过”的行排成假活跃。`id` 只是同一心跳时刻的稳定 tiebreaker。游标由最后一条记录的 `last_seen_at` 与 `id` 共同编码，因此翻页期间即使有新心跳上报也不会重复读取同一行；代价是一条记录在两次翻页之间新上报了心跳时，会出现在后面的页而不是当前页。
+
 表格上方的统计卡片来自服务端对整个筛选结果集的聚合（`GET /api/v1/clients` 响应的 `summary`），不是当前游标页的逐行累加，所以翻页或筛选后仍与全量一致。
 
 未上报 metadata 的实例记录是按物理连接生成的，连接关闭时随即删除；后台清扫任务还会回收没有活跃租约且已过期的同类残留记录。已上报过 `CLIENT_HELLO` 的记录代表真实安装身份，永远不会被自动删除。
@@ -236,6 +238,8 @@ IP 池概览来自 `GET /api/v1/vpn-nodes`，读的是本节点：`allocated` �
 
 Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel/远程服务器/WebSSH 会话操作、metadata 读取和 SSH/TCP proxy 上下文。列表按事件时间倒序显示，同一时间使用审计 ID 倒序作为稳定排序；分页继续沿用 cursor。表格上方可按时间范围、操作者、动作、资源类型和资源 ID 做服务端筛选，点击“查询”后从第一页加载，点击“重置”清空条件并恢复默认列表。列表显示时间、操作者、动作、资源类型和资源 ID；点击“详情”可查看该事件的结构化 JSON 详情。路由创建、更新和删除会记录 Agent、域名、路径、目标地址、端口和状态。日志不记录 metadata 明文、SSH 私钥、SSH 密码、Token 明文、终端字节或 SFTP 文件内容。
 
+审计行默认永久保留：`server.audit.retention_days` 默认 `0`，Server 不会自动删除任何审计历史。只有把它显式配置为正数，Server 才启动保留期清理器，每小时一轮、每轮按最多 1000 行的小批量删除早于保留期的事件，日志只输出删除条数与耗时，不输出行标识。集群里每个节点各自跑一份清理器是安全的（同一批 `DELETE` 以时间为边界，重复执行只删 0 行），不需要分布式锁。删除是不可逆的合规决策：开启前请确认监管留存要求与备份恢复方式，历史很长时第一次清扫的耗时会明显可见。
+
 ## 角色与权限
 
 - `admin`：管理所有 Agent、Policy、Route、Tunnel、Server 节点、用户和审计日志。
@@ -263,6 +267,8 @@ Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`serve
 ## 配置与排障建议
 
 优先级为命令行参数 > 环境变量 > 配置文件 > 默认值。上线前执行 `check-config`，确认本地 SQLite 或集群 MySQL、注册中心、80/443 地址和 TLS 配置正确。出现 401/403 时检查 token 与角色；出现 404 时检查 Agent ID、路由 Host/path 和 wildcard DNS；出现 stale 时检查 Agent WebSocket、租约和系统时间。
+
+`GET /metrics` 默认不需要认证，因此只能面向内网或 Prometheus 暴露；需要再加一道门时配置 `server.metrics.token`（仅通过环境变量注入，至少 16 字符），此后缺少或不匹配 `Authorization: Bearer <token>` 的请求返回 `401`，而 `/health/live` 与 `/health/ready` 不受影响，后台与列表接口也不会回显该值。管理入口的请求头、空闲 keep-alive、请求体与并发连接上限同样有默认保守的边界，取值关系见 [配置参考](../operations/configuration.md) 的“管理入口的超时、上限与保留策略”。
 
 ### Token secret reveal
 

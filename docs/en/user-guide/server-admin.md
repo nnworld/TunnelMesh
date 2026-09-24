@@ -98,6 +98,8 @@ Audit logs record create, update, delete, reveal, and authorization-denied event
 - Detecting mis-scoped tokens.
 - Verifying who changed a route or policy.
 
+Audit rows are kept forever by default: `server.audit.retention_days` is `0`, so an upgrade never destroys history. Only a positive value starts the retention sweeper, which runs hourly and deletes at most 1000 rows per batch, logging counts rather than row identifiers. Purging is an explicit compliance decision; check the required retention window and your backup path before turning it on.
+
 ## Client observability
 
 The Clients page shows client instances, their metadata, and physical WebSocket connections inside the caller's ownership scope. Two independent columns describe two different facts, so metadata freshness is no longer folded into the online state:
@@ -108,6 +110,8 @@ The Clients page shows client instances, their metadata, and physical WebSocket 
 An online Client whose metadata lapsed therefore shows `online` together with `metadata expired`, while a long-dead record shows `offline` instead of "expired". The summary cards above the table come from the server-side aggregate over the whole filtered result set (`summary` in `GET /api/v1/clients`), never from the rows on the current cursor page, so they stay correct while paginating and filtering. The `status` query parameter now accepts `online` and `offline`; the legacy values `stale` and `metadata_unavailable` remain accepted as aliases of `metadataState=expired|unavailable` for one minor release.
 
 Instance records for Clients that never reported metadata are created per physical connection and deleted when that connection closes, and the background sweep also reaps such records that hold no live lease. Records that accepted `CLIENT_HELLO` represent a real installation identity and are never removed automatically.
+
+Rows are ordered by most recent heartbeat first, using `last_seen_at DESC, id DESC`, so a Client that just dropped stays at the top. `updated_at` is deliberately not the sort key: the stale and expiry sweeps raise it on their own, which would rank "recently touched by a sweeper" above "recently alive".
 
 ## Observability
 
@@ -122,7 +126,8 @@ Expose Prometheus metrics from the Server and monitor:
 
 Do not place tokens, credentials, target addresses, or client IPs in metric labels.
 
+`GET /metrics` needs no credentials by default, so keep it off the public entry point. `server.metrics.token` adds an optional `Authorization: Bearer` gate (environment variable only, at least 16 characters) that returns `401` for unauthenticated scrapes while leaving `/health/live` and `/health/ready` open for load balancers.
+
 ## Release downloads
 
 The downloads page links to the current GitHub release, checksums, and manifest. Before upgrading, back up the database, check the schema version, and follow the documented migration and rollback steps.
-

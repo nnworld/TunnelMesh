@@ -1,6 +1,8 @@
 # 可观测性
 
-Server 在管理监听器暴露 `GET /metrics`、`/health/live` 和 `/health/ready`。生产环境建议只允许 Prometheus 所在内网访问 `/metrics`，公网入口通过 Nginx 仅暴露健康检查。
+Server 在管理监听器暴露 `GET /metrics`、`/health/live` 和 `/health/ready`。`/metrics` 默认不要求任何凭据，
+生产环境必须只允许 Prometheus 所在内网访问，公网入口通过 Nginx 仅暴露健康检查；两种受控方式（来源网段
+放行与 `server.metrics.token`）见下文“`/metrics` 的访问控制”。
 
 ## WebSSH/SFTP
 
@@ -57,7 +59,8 @@ WebSSH 会话暴露以下指标。指标只包含状态、方向和稳定错误�
 以及闲置超过同一保留期的登录限流桶，然后重采样三个 Gauge。保留期存在的意义是审计可追溯——审计行
 引用了 device id 或 challenge id，立即删除会在证据链里留下悬空标识符。每条语句都是带时间戳边界的
 幂等 `DELETE`，所以集群里每个节点各跑一份清理器是安全的，重复的一轮只会删掉 0 行并花费一次索引扫描；
-这比引入分布式锁更可靠。清扫间隔与保留期是编译期常量，当前不可配置。
+这比引入分布式锁更可靠。身份认证清理器的间隔与 7 天保留期仍是编译期常量，不可配置；审计日志的保留期是
+另一个开关，见“标签和留存”。
 
 指标里不含用户名、客户端 IP、provider id、challenge id、device token 或 TOTP 码。`/metrics` 无需
 管理会话即可读取，把这些放进标签既会造成攻击者可控的基数，也会泄露账号名。
@@ -99,9 +102,38 @@ probe_kind, operation, cache, scope, decision, reason, route,
 method, step, agent_id, instance_id, server_node_id
 ```
 
+### `/metrics` 的访问控制
+
 `/metrics` 只应对 Prometheus 所在内网开放；公网入口通过 Nginx 只暴露 `/health/live` 与
-`/health/ready`。确实需要认证时优先用来源网段放行，其次才使用只读 token 的
-`authorization.credentials_file`，不要把 token 写进配置文件正文。
+`/health/ready`。两种受控方式二选一，也可以叠加：
+
+1. **来源网段放行**（首选）：`docs/deployment/nginx.md` 的 `location = /metrics` 用 `allow`/`deny`
+   只放行 Prometheus 所在网段。此时 Server 自身不需要再配凭据。
+2. **Bearer token**：设置 `server.metrics.token`（等价环境变量 `TUNNELMESH_SERVER_METRICS_TOKEN`，
+   仅允许环境变量注入、至少 16 字符）。配置后，缺少或不匹配 `Authorization: Bearer <token>` 的抓取
+   返回 `401` 并带 `WWW-Authenticate: Bearer realm="metrics"`；留空（默认）时行为与旧版本完全一致，
+   升级不会让既有抓取失败。该值不会出现在后台页面、列表响应或日志里，配置导出中也是脱敏的。
+
+无论选哪种，`/health/live` 与 `/health/ready` 都不受影响，LB 与容器健康检查继续免凭据可用。Prometheus
+侧用 `authorization.credentials_file` 读取 token，不要把 token 写进 `prometheus.yml` 正文——该文件
+常常被提交进配置仓库。
+
+
+### 管理入口的拒绝与 shedding
+
+`server.http.max_connections` 是连接数准入信号量，超限的新连接会被立即关闭而不是排队（排队连接仍占着
+文件描述符，且客户端只会更久地等待）。被拒的连接计入
+`tunnelmesh_connections_total{component="server",mode="http",result="rejected",error_class="capacity"}`，
+用它区分“容量不够”和“下游故障”：
+
+```bash
+increase(tunnelmesh_connections_total{component="server",mode="http",result="rejected"}[5m])
+```
+
+该 `result` 不在 recording rules 的 `failed|error` 错误率表达式里，这是刻意的：准入丢弃是保护动作，
+不该把整体错误率抬高成告警。需要长期观察时按上面的表达式单独建告警。`tunnelmesh_connections_total`
+的 `mode="http"` 只覆盖管理监听器，Agent 与 Client 的 WebSocket 仍分别使用 `mode="agent"` 与
+`mode="client"`。
 
 校验：
 
@@ -172,6 +204,10 @@ go test ./deploy/... -count=1
 ## 标签和留存
 
 只允许使用 component、mode、protocol、stage、result、error_class、probe_kind、route、reason、method、step 等低基数标签；身份认证指标的 `method` 与 `step` 都是封闭枚举，越界输入归一化为 `unknown`，基数不会随请求内容增长。Token、连接 ID、stream ID、目标地址、客户端 IP、`Proxy-Authorization` 和 metadata 不得进入 Prometheus label。默认保留周期由 Prometheus 决定，建议生产环境 15–30 天，长期趋势使用 recording rules 或远端时序存储。
+
+审计日志的留存由 `server.audit.retention_days` 控制，默认 `0` 表示永久保留、Server 不删除任何审计行；
+配置为正数后，Server 每小时一轮、每轮最多 1000 行地删除早于保留期的事件，日志只输出删除条数与耗时。
+默认值保证升级不会销毁历史，删除永远是显式运维决策。
 
 新增的 `route` 与 `reason` 的基数边界：
 

@@ -48,7 +48,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 - [Docker 部署](deployment/docker.md)、[docker-compose.local.yml](../docker-compose.local.yml)、[docker-compose.cluster.yml](../docker-compose.cluster.yml)
 - [管理后台前端构建与部署](deployment/frontend.md)：embed 模式与 Nginx 独立静态文件模式
-- [Nginx/WSS 推荐配置](deployment/nginx.md)：`/api/`、`/ws/*` 反代优先级与 Upgrade 透传
+- [Nginx/WSS 推荐配置](deployment/nginx.md)：`/api/`、`/ws/*` 反代优先级、Upgrade 透传与限流取值
 - [OpenResty tp-* 代理入口](deployment/openresty-proxy-entry.md)：模板渲染、镜像构建、容量评估、reload 影响与回滚
 - [VPN 网关部署](deployment/vpn-gateway.md)：`-tags vpn` 构建变体与体积实测、公网 UDP 放行、`listen` 与 `endpoint_host`、节点私钥注入、IP 池规划、验证与 5 分钟回滚
 - [跨平台可执行文件打包](deployment/binary-release.md)：构建矩阵、`SHA256SUMS`、`manifest.json`
@@ -76,7 +76,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 
 **观测与排障**
 
-- [可观测性与统一 Grafana Dashboard](operations/observability.md)：连接、stream、探针、WebSSH、tp-* 代理入口与身份认证指标及告警阈值
+- [可观测性与统一 Grafana Dashboard](operations/observability.md)：连接、stream、探针、WebSSH、tp-* 代理入口与身份认证指标及告警阈值，含 `/metrics` 访问控制与审计保留
 - Prometheus 抓取示例与规则见 [deploy/prometheus](../deploy/prometheus)，Dashboard 与 provisioning 见 [deploy/grafana](../deploy/grafana)
 - [全链路网络探针](operations/network-probes.md)：逻辑 traceroute 与 TCP/HTTP/UDP 探针
 - [日志位置与查看方式](operations/logging.md)
