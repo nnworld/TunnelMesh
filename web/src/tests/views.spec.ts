@@ -26,3 +26,23 @@ describe('localized management views', () => {
     expect(source).not.toContain('checksumCommand')
   })
 })
+
+  it('counts client observability cards from the server summary, not the loaded page', () => {
+    const source = readFileSync('src/views/Clients.vue', 'utf8')
+    expect(source).toContain('summary')
+    expect(source).toContain('page.summary')
+    // A counter derived from the current page is what made the cards disagree
+    // with the table, so the derivation must not come back.
+    expect(source).not.toContain("items.value.filter(item => item.status === 'stale')")
+    expect(source).not.toContain('items.value.reduce((total, item) => total + item.activeConnections, 0)')
+  })
+
+  it('renders client presence and metadata freshness as two separate columns', () => {
+    const source = readFileSync('src/views/Clients.vue', 'utf8')
+    expect(source).toContain("t('clients.metadataState')")
+    expect(source).toContain('metadataStateLabel')
+    expect(source).toContain('metadataStateOptions')
+    // Presence must stop encoding metadata freshness.
+    expect(source).not.toContain("status === 'stale'")
+    expect(source).not.toContain("status === 'metadata_unavailable'")
+  })

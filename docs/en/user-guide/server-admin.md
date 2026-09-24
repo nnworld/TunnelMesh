@@ -84,6 +84,17 @@ Audit logs record create, update, delete, reveal, and authorization-denied event
 - Detecting mis-scoped tokens.
 - Verifying who changed a route or policy.
 
+## Client observability
+
+The Clients page shows client instances, their metadata, and physical WebSocket connections inside the caller's ownership scope. Two independent columns describe two different facts, so metadata freshness is no longer folded into the online state:
+
+- `status` is presence: `online` when at least one connection lease is unexpired, otherwise `offline`. It is derived from leases only.
+- `metadataState` is freshness: `fresh` when a snapshot was reported and is inside its TTL, `expired` when a reported snapshot lapsed, and `unavailable` when the Client never sent `CLIENT_HELLO` (older clients), so only basic connection information is known.
+
+An online Client whose metadata lapsed therefore shows `online` together with `metadata expired`, while a long-dead record shows `offline` instead of "expired". The summary cards above the table come from the server-side aggregate over the whole filtered result set (`summary` in `GET /api/v1/clients`), never from the rows on the current cursor page, so they stay correct while paginating and filtering. The `status` query parameter now accepts `online` and `offline`; the legacy values `stale` and `metadata_unavailable` remain accepted as aliases of `metadataState=expired|unavailable` for one minor release.
+
+Instance records for Clients that never reported metadata are created per physical connection and deleted when that connection closes, and the background sweep also reaps such records that hold no live lease. Records that accepted `CLIENT_HELLO` represent a real installation identity and are never removed automatically.
+
 ## Observability
 
 Expose Prometheus metrics from the Server and monitor:

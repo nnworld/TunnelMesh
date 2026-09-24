@@ -43,3 +43,37 @@ describe('clients API', () => {
     expect(result.version).toBe('v1.2.3')
   })
 })
+
+  it('filters metadata state independently from presence', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { items: [] } }) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listClients({ status: 'online', metadataState: 'expired', limit: 50 })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/clients?status=online&metadataState=expired&limit=50', expect.anything())
+  })
+
+  it('reads the server-side whole-population summary', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { items: [], summary: { total: 27, online: 6, activeConnections: 16, activeStreams: 233, metadataUnavailable: 1, metadataStale: 0 } } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const page = await listClients({ limit: 100 })
+
+    expect(page.summary).toEqual({ total: 27, online: 6, activeConnections: 16, activeStreams: 233, metadataUnavailable: 1, metadataStale: 0 })
+  })
+
+  it('keeps presence and metadata state as separate client fields', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { items: [{ id: 'ci-1', status: 'online', metadataState: 'unavailable', capabilities: [] }] } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const page = await listClients()
+
+    expect(page.items[0].status).toBe('online')
+    expect(page.items[0].metadataState).toBe('unavailable')
+  })
