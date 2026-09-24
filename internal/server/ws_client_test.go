@@ -593,11 +593,8 @@ func TestServeClientSessionRelayHonorsClientWindow(t *testing.T) {
 	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 16, Window: 8}
 	select {
 	case control := <-conn.controls:
-		if control.Type != protocol.FrameWindowUpdate || control.Window != 8 {
-			t.Fatalf("forwarded control=%+v, want WINDOW_UPDATE 8", control)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("WINDOW_UPDATE was not forwarded to relay")
+		t.Fatalf("Client WINDOW_UPDATE leaked to Agent relay: %+v", control)
+	case <-time.After(100 * time.Millisecond):
 	}
 	if frame := receiveChannelClientFrame(t, transport); frame.Type != protocol.FrameData || frame.StreamID != 16 || len(frame.Payload) != 8 {
 		t.Fatalf("post-update DATA=%+v, want 8 bytes for stream 16", frame)

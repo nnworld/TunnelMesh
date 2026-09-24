@@ -423,13 +423,6 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 				_ = reset(frame.StreamID)
 				continue
 			}
-			if controlWriter, ok := stream.conn.(interface{ WriteControl(protocol.Frame) error }); ok {
-				if err := controlWriter.WriteControl(frame); err != nil {
-					closeStream(frame.StreamID)
-					_ = reset(frame.StreamID)
-					continue
-				}
-			}
 			select {
 			case stream.windowSignal <- struct{}{}:
 			default:

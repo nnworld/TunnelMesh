@@ -6,13 +6,15 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 25 份记录，按日期倒序排列。
+共 27 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
 | 2026-09-24 | [Migration comment splitter hotfix](2026-09-24-migration-comment-splitter-hotfix.md) | [计划：迁移脚本注释分号解析紧急修复计划](../superpowers/plans/2026-09-24-migration-comment-splitter-hotfix.md) | — |
+| 2026-09-24 | [Client WINDOW_UPDATE 泄漏修复](2026-09-24-client-window-update-leak.md) | [计划：Client WINDOW_UPDATE 泄漏修复](../superpowers/plans/2026-09-24-client-window-update-leak.md) | — |
+| 2026-09-24 | [Client receive-window credit timing fix](2026-09-24-client-receive-window-credit.md) | [计划：Client receive-window credit timing fix p…](../superpowers/plans/2026-09-24-client-receive-window-credit.md) | — |
 | 2026-09-24 | [Client local-forward delayed response](2026-09-24-client-forward-delayed-response.md) | [计划：Client local-forward delayed response fix…](../superpowers/plans/2026-09-24-client-forward-delayed-response.md) | — |
 | 2026-09-23 | [三端一键安装脚本（server / agent / client）](2026-09-23-one-click-install-scripts.md) | [计划：三端一键安装脚本](../superpowers/plans/2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../superpowers/specs/2026-09-23-one-click-install-scripts-design.md) |
 | 2026-09-23 | [Managed-route large response truncation](2026-09-23-managed-route-response-truncation.md) | [计划：托管路由大响应体截断修复](../superpowers/plans/2026-09-23-managed-route-response-truncation.md) | — |
