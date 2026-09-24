@@ -8,13 +8,14 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 46 份计划，按日期倒序排列。
+共 47 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
 | 2026-09-24 | [迁移脚本注释分号解析紧急修复计划](2026-09-24-migration-comment-splitter-hotfix.md) | — | [PR：Migration comment splitter hotfix](../../pull-requests/2026-09-24-migration-comment-splitter-hotfix.md) |
+| 2026-09-24 | [Client receive-window credit timing fix plan](2026-09-24-client-receive-window-credit.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md) |
 | 2026-09-24 | [Client local-forward delayed response fix plan](2026-09-24-client-forward-delayed-response.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md) |
 | 2026-09-23 | [三端一键安装脚本 Implementation Plan](2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../specs/2026-09-23-one-click-install-scripts-design.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
 | 2026-09-23 | [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md)<br>[PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md) |

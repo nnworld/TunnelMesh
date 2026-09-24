@@ -291,6 +291,42 @@ func TestSessionFlowControlSendsThresholdWindowUpdate(t *testing.T) {
 	}
 }
 
+func TestSessionFlowControlWaitsForApplicationReadBeforeWindowUpdate(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	stream, err := session.OpenStreamConn(context.Background(), StreamRequest{StreamID: 10, AgentID: "agent", Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	<-tr.sent
+
+	payload := make([]byte, 131072)
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 10, Payload: payload}
+	if _, err := io.ReadFull(stream, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case frame := <-tr.sent:
+		t.Fatalf("WINDOW_UPDATE before application consumed bytes: %+v", frame)
+	default:
+	}
+
+	remaining := make([]byte, len(payload)-1)
+	if _, err := io.ReadFull(stream, remaining); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case update := <-tr.sent:
+		if update.Type != protocol.FrameWindowUpdate || update.StreamID != 10 || update.Window != uint32(len(payload)) {
+			t.Fatalf("WINDOW_UPDATE=%+v, want %d bytes for stream 10", update, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("threshold WINDOW_UPDATE was not sent after application consumed the frame")
+	}
+}
+
 func TestSessionFlowControlAppliesPeerWindowUpdate(t *testing.T) {
 	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
 	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)

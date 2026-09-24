@@ -690,6 +690,11 @@ func (s *frameStream) Read(p []byte) (int, error) {
 			n := copy(p, s.readBuf)
 			s.readBuf = s.readBuf[n:]
 			s.mu.Unlock()
+			// Return credit only after the application consumes bytes. The
+			// peer's send queue is sized to the advertised window, so credit
+			// returned while bytes are only buffered here can make its next
+			// enqueue exceed that queue and reset a long transfer.
+			s.releaseReceiveWindow(n)
 			return n, nil
 		}
 		s.mu.Unlock()
@@ -701,7 +706,6 @@ func (s *frameStream) Read(p []byte) (int, error) {
 				s.readBuf = append(s.readBuf, payload.Payload...)
 				s.mu.Unlock()
 			}
-			s.releaseReceiveWindow(len(payload.Payload))
 			continue
 		}
 		s.mu.Lock()
@@ -720,7 +724,6 @@ func (s *frameStream) Read(p []byte) (int, error) {
 					s.readBuf = append(s.readBuf, payload.Payload...)
 					s.mu.Unlock()
 				}
-				s.releaseReceiveWindow(len(payload.Payload))
 				continue
 			}
 			s.mu.Lock()
