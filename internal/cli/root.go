@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -380,12 +381,16 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 func NewAgentDispatcherFactory(streams config.AgentStreamConfig) agent.ConnectionSessionFactory {
 	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
 		session.SetCapabilities(agent.AgentStreamCapabilities(streams))
-		return agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
+		dispatcher := agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,
 			ConnectTimeout: streams.ConnectTimeout,
 			OpenTimeout:    streams.OpenTimeout,
 		}, nil)
+		if err := dispatcher.SetInboundBufferBytes(streams.InboundBufferBytes); err != nil {
+			slog.Warn("agent inbound buffer rejected", "configured_bytes", streams.InboundBufferBytes, "error", err)
+		}
+		return dispatcher
 	}
 }
 
