@@ -248,6 +248,10 @@ type LeaseRepository interface {
 type AuditRepository interface {
 	Create(context.Context, AuditLog) error
 	List(context.Context, AuditFilter, string, int) (Page[AuditLog], error)
+	// PurgeOlderThan deletes at most limit audit rows created strictly before
+	// olderThan and reports how many went away. It exists so retention is an
+	// operator decision, expressed in days, applied in bounded batches.
+	PurgeOlderThan(ctx context.Context, olderThan time.Time, limit int) (int, error)
 }
 
 type IdempotencyRepository interface {
@@ -2123,6 +2127,10 @@ func (r *leaseRepo) UpdateConnectionStats(ctx context.Context, v AgentLease) err
 
 type auditRepo struct{ db dbExecutor }
 
+// auditPurgeDefaultBatch bounds a purge when the caller has no opinion, so the
+// helper can never turn into the unbounded delete it exists to prevent.
+const auditPurgeDefaultBatch = 1000
+
 func (r *auditRepo) Create(ctx context.Context, v AuditLog) error {
 	v.ID, v.CreatedAt = stampCreate(v.ID, v.CreatedAt, "audit")
 	if v.Details == "" {
@@ -2131,6 +2139,66 @@ func (r *auditRepo) Create(ctx context.Context, v AuditLog) error {
 	_, err := r.db.ExecContext(ctx, `INSERT INTO audit_logs(id,actor_user_id,action,resource_type,resource_id,details,created_at) VALUES(?,?,?,?,?,?,?)`, v.ID, nullableString(v.ActorUserID), v.Action, v.ResourceType, nullableString(v.ResourceID), v.Details, tm(v.CreatedAt))
 	return err
 }
+
+// placeholders builds the "(?,?,...)" group an IN clause needs, so the delete stays
+// fully parameterised instead of interpolating ids.
+func placeholders(count int) string {
+	if count < 1 {
+		count = 1
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+// PurgeOlderThan deletes the oldest audit rows before the cutoff, bounded by limit.
+//
+// The ids are selected first and deleted by primary key instead of using
+// `DELETE ... LIMIT`, because that form is MySQL-only, and because the two-step
+// version is what makes a first pass over a never-pruned table resumable: each
+// batch is its own short transaction, so an interruption leaves a smaller table
+// rather than a rolled-back one. Rows exactly at the cutoff survive, which keeps
+// "retain N days" inclusive of the boundary record.
+func (r *auditRepo) PurgeOlderThan(ctx context.Context, olderThan time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		limit = auditPurgeDefaultBatch
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM audit_logs WHERE created_at < ? ORDER BY created_at, id LIMIT ?`, tm(olderThan), limit)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	result, err := r.db.ExecContext(ctx, `DELETE FROM audit_logs WHERE id IN (`+placeholders(len(ids))+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
+}
+
 func (r *auditRepo) List(ctx context.Context, filter AuditFilter, cursor string, limit int) (Page[AuditLog], error) {
 	cursor, limit = pageArgs(cursor, limit)
 	q := `SELECT id,actor_user_id,action,resource_type,resource_id,details,created_at FROM audit_logs`

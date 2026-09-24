@@ -35,6 +35,10 @@ func (r *recordingAuditRepository) List(context.Context, storage.AuditFilter, st
 	return storage.Page[storage.AuditLog]{}, nil
 }
 
+func (r *recordingAuditRepository) PurgeOlderThan(context.Context, time.Time, int) (int, error) {
+	return 0, nil
+}
+
 func (r *recordingAuditRepository) recorded() []storage.AuditLog {
 	r.mu.Lock()
 	defer r.mu.Unlock()

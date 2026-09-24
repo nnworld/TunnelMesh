@@ -106,3 +106,66 @@ func assertAuditIDs(t *testing.T, items []AuditLog, want ...string) {
 		}
 	}
 }
+
+// TestAuditRepositoryPurgeOlderThanBatchesByCutoff pins the retention primitive:
+// only rows strictly older than the cutoff go, the batch limit is honoured so a
+// never-pruned table cannot be emptied in one long transaction, and the ids are
+// picked deterministically (oldest first) so repeated passes make progress.
+func TestAuditRepositoryPurgeOlderThanBatchesByCutoff(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	repo := db.Audits()
+	cutoff := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		if err := repo.Create(ctx, AuditLog{
+			ID:     "audit-old-" + string(rune('a'+i)),
+			Action: "expired", ResourceType: "test",
+			CreatedAt: cutoff.Add(-time.Duration(5-i) * time.Hour),
+		}); err != nil {
+			t.Fatalf("create old audit %d: %v", i, err)
+		}
+	}
+	kept := []AuditLog{
+		{ID: "audit-at-cutoff", Action: "boundary", ResourceType: "test", CreatedAt: cutoff},
+		{ID: "audit-newer", Action: "new", ResourceType: "test", CreatedAt: cutoff.Add(time.Hour)},
+	}
+	for _, record := range kept {
+		if err := repo.Create(ctx, record); err != nil {
+			t.Fatalf("create %s: %v", record.ID, err)
+		}
+	}
+
+	deleted, err := repo.PurgeOlderThan(ctx, cutoff, 2)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan() error = %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("PurgeOlderThan() deleted = %d, want the batch size 2", deleted)
+	}
+	page, err := repo.List(ctx, AuditFilter{}, "", 50)
+	if err != nil {
+		t.Fatalf("list after purge: %v", err)
+	}
+	if len(page.Items) != 5 {
+		t.Fatalf("rows after one batch = %d, want 3 old + 2 kept", len(page.Items))
+	}
+	for _, record := range page.Items {
+		if record.CreatedAt.Before(cutoff) && record.Action != "expired" {
+			t.Fatalf("unexpected survivor %q", record.ID)
+		}
+	}
+	// A boundary row created exactly at the cutoff survives: retention is inclusive,
+	// so "keep 30 days" cannot delete the record written at the moment the window
+	// closed and make the count off by one.
+	if _, err := repo.PurgeOlderThan(ctx, cutoff, 100); err != nil {
+		t.Fatalf("second PurgeOlderThan() error = %v", err)
+	}
+	page, err = repo.List(ctx, AuditFilter{}, "", 50)
+	if err != nil {
+		t.Fatalf("list after second purge: %v", err)
+	}
+	assertAuditIDs(t, page.Items, "audit-newer", "audit-at-cutoff")
+	if again, err := repo.PurgeOlderThan(ctx, cutoff, 100); err != nil || again != 0 {
+		t.Fatalf("PurgeOlderThan() on an empty range = (%d, %v), want (0, nil)", again, err)
+	}
+}

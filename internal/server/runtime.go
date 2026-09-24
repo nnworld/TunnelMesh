@@ -54,6 +54,16 @@ type RuntimeConfig struct {
 	ConnectionSelector relay.ConnectionSelector
 	ConnectionRegistry registry.NodeRegistry
 	RemoteRelay        *relay.RelayService
+	// Audit carries server.audit.*. Retention is applied by a sweeper that only
+	// exists when the operator asked for one.
+	Audit config.ServerAuditConfig
+	// Metrics carries server.metrics.*, including the bearer token that guards
+	// /metrics. Its zero value leaves the endpoint open, as it has always been.
+	Metrics config.ServerMetricsConfig
+	// HTTP bounds the management listener. A zero block means the built-in floors,
+	// so an embedder that never heard of server.http is not less protected than one
+	// that read the documentation.
+	HTTP               config.ServerHTTPConfig
 	Stream             config.ServerStreamConfig
 	AuthorizationCache config.AuthorizationCacheConfig
 	Downloads          config.DownloadsConfig
@@ -111,6 +121,9 @@ type ServerRuntime struct {
 	authMaintenanceSweeper       *AuthMaintenanceSweeper
 	authMaintenanceSweeperCancel context.CancelFunc
 	authMaintenanceSweeperDone   chan error
+	auditRetentionSweeper        *AuditRetentionSweeper
+	auditRetentionCancel         context.CancelFunc
+	auditRetentionDone           chan error
 	config                       RuntimeConfig
 	WebSSHEnabled                bool
 	ProxyEntryEnabled            bool
@@ -140,8 +153,9 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	// `server.stream.*` decides the credit this Server grants Agents, so a
 	// deployment that tunes it changes the data plane instead of a comment.
 	localAgentRelay := NewAgentRelayTransport(agentSessions, AgentRelayWindowConfig{
-		AdvertisedWindow: uint32(runtimeConfig.Stream.InitialWindow),
-		UpdateThreshold:  uint32(runtimeConfig.Stream.WindowUpdateThreshold),
+		AdvertisedWindow:         uint32(runtimeConfig.Stream.InitialWindow),
+		UpdateThreshold:          uint32(runtimeConfig.Stream.WindowUpdateThreshold),
+		MaxActiveStreamsPerAgent: runtimeConfig.Stream.MaxActivePerAgent,
 	})
 	serverNodeID := runtimeConfig.NodeID
 	if strings.TrimSpace(serverNodeID) == "" {
@@ -405,6 +419,18 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	go func() {
 		runtime.websshSweeperDone <- runtime.websshSweeper.Run(webSSHSweeperCtx)
 	}()
+	// Audit retention is opt-in: the constructor returns nil unless
+	// server.audit.retention_days is positive, so an upgrade can never delete history by
+	// accident, and a configured policy is guaranteed to have a worker behind it.
+	runtime.auditRetentionSweeper = NewAuditRetentionSweeper(db.Audits(), runtimeConfig.Audit.RetentionDays, DefaultAuditRetentionSweepInterval)
+	if runtime.auditRetentionSweeper != nil {
+		auditRetentionCtx, stopAuditRetention := context.WithCancel(context.Background())
+		runtime.auditRetentionCancel = stopAuditRetention
+		runtime.auditRetentionDone = make(chan error, 1)
+		go func() {
+			runtime.auditRetentionDone <- runtime.auditRetentionSweeper.Run(auditRetentionCtx)
+		}()
+	}
 	runtime.authMaintenanceSweeper = NewAuthMaintenanceSweeper(db, DefaultAuthMaintenanceSweepInterval, DefaultAuthMaintenanceRetention)
 	runtime.authMaintenanceSweeper.SetGauges(runtime.metrics)
 	authSweeperCtx, stopAuthSweeper := context.WithCancel(context.Background())
@@ -432,6 +458,14 @@ func (r *ServerRuntime) Close() error {
 	// flow can be created while the rest of the runtime is being unwound.
 	if vpnErr = r.closeVPNGateway(); vpnErr != nil {
 		slog.Error("vpn_gateway_close_failed", "error", vpnErr)
+	}
+	if r.auditRetentionCancel != nil {
+		r.auditRetentionCancel()
+		if err := <-r.auditRetentionDone; err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("audit retention sweeper stopped with an error", "error", err)
+		}
+		r.auditRetentionCancel = nil
+		r.auditRetentionDone = nil
 	}
 	if r.authMaintenanceSweeperCancel != nil {
 		r.authMaintenanceSweeperCancel()
@@ -595,12 +629,16 @@ func (r *ServerRuntime) Handler() http.Handler {
 	if r == nil {
 		return http.NotFoundHandler()
 	}
-	health := NewHealthHandler(r, promhttp.HandlerFor(r.metricsRegistry, promhttp.HandlerOpts{}))
+	health := NewHealthHandler(r, promhttp.HandlerFor(r.metricsRegistry, promhttp.HandlerOpts{}), MetricsPolicy{Token: r.config.Metrics.Token})
 	var webSSH http.Handler
 	if r.WebSSHEnabled {
 		webSSH = r.WebSSHBroker
 	}
-	return NewWebHandlerWithManagedRoutes(r.API.Handler(), r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, webSSH, r.managedRoutes)
+	// Only the management API gets the body deadline. The WebSocket handlers are
+	// deliberately untouched: an upgrade must be able to stay open for hours, which
+	// is exactly the traffic a per-request read deadline would kill.
+	api := withAPIBodyTimeout(r.API.Handler(), r.config.HTTP.WithSafeDefaults().BodyTimeout)
+	return NewWebHandlerWithManagedRoutes(api, r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, webSSH, r.managedRoutes)
 }
 
 // Live reports process responsiveness and intentionally performs no I/O.
@@ -711,7 +749,9 @@ func (r *ServerRuntime) serveClientWS(conn *websocket.Conn) {
 	if r.metrics != nil {
 		r.metrics.ObserveConnection("server", "client", "started", "")
 	}
-	transport := NewWSFrameTransport(&xNetWSFrameConn{conn: conn})
+	// The client authenticates during the upgrade, so its connection is entitled to the
+	// idle budget from the first frame.
+	transport := NewWSFrameTransport(&xNetWSFrameConn{conn: websocketMessageConn{conn: conn}, idleReadTimeout: websocketIdleReadTimeout})
 	defer func() {
 		if r.metrics != nil {
 			r.metrics.ObserveConnection("server", "client", "closed", "")
@@ -737,7 +777,7 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 		_ = conn.Close()
 		return
 	}
-	tr := &xNetWSFrameConn{conn: conn}
+	tr := &xNetWSFrameConn{conn: websocketMessageConn{conn: conn}}
 	transport := NewWSFrameTransport(tr)
 	helloStarted := time.Now()
 	initial, err := transport.Receive()
@@ -756,10 +796,10 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 		_ = transport.Close()
 		return
 	}
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		_ = transport.Close()
-		return
-	}
+	// Handover from the one-shot hello budget to the per-frame idle budget. Clearing
+	// the deadline here is what used to leave an established Agent connection
+	// unreadable-but-registered forever when the peer vanished without a FIN.
+	tr.idleReadTimeout = websocketIdleReadTimeout
 	if r.metrics != nil {
 		r.metrics.ObserveStage("server", "agent_hello", "success", "", time.Since(helloStarted))
 	}
@@ -825,7 +865,7 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 	if r.metrics != nil {
 		r.metrics.ObserveConnection("server", "agent", "started", "")
 		r.metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, true)
-		r.metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, 64)
+		r.metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, r.AgentSessions.MaxConnectionsPerAgent())
 	}
 	_ = writeAgentConnectionAudit(ctx, r.DB.Audits(), actorUserID, action, registration, nil)
 	defer func() {
@@ -908,7 +948,16 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 		_ = ln.Close()
 		return err
 	}
-	srv := &http.Server{Handler: r.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	if max := r.config.HTTP.MaxConcurrentConnections; max > 0 {
+		rejected := newConnAdmissionListener(serveListener, max, func() {
+			if r.metrics != nil {
+				r.metrics.ObserveConnection("server", "http", "rejected", "capacity")
+			}
+		})
+		serveListener = rejected
+		slog.Info("management listener connection cap enabled", "max_connections", max)
+	}
+	srv := newHTTPServer(r.config.HTTP, r.Handler())
 	// The proxy entry is parented to the caller's context so a SIGTERM stops it
 	// even if shutdown() is never reached, and cancelEntry lets the error paths
 	// stop it immediately.
@@ -1045,18 +1094,70 @@ func relayTLSMaterialComplete(cfg config.RelayConfig) (bool, error) {
 	}
 }
 
-type xNetWSFrameConn struct{ conn *websocket.Conn }
+// websocketIdleReadTimeout is the read budget of one established Agent or Client
+// WebSocket, re-armed before every read.
+//
+// Both peers keep the connection talking at least every 30s (the Agent sends
+// FramePing, the Client sends a metadata update), so three intervals means one lost
+// frame, a GC pause or a slow ping never drops a healthy session, while a half-open
+// connection stops looking alive to this node. Before this budget existed, the read
+// deadline armed for the hello was cleared and never re-armed, so a silently dead
+// connection stayed registered until something unrelated noticed.
+const websocketIdleReadTimeout = 3 * 30 * time.Second
 
-func (c *xNetWSFrameConn) ReadMessage() (int, []byte, error) {
+// wsMessageConn is the part of an x/net WebSocket the frame transport uses. Naming it
+// instead of passing *websocket.Conn around is what makes the idle-read deadline
+// testable without a socket, and keeps the deadline logic away from the codec.
+type wsMessageConn interface {
+	ReceiveMessage() ([]byte, error)
+	SendMessage(payload []byte) error
+	SetReadDeadline(deadline time.Time) error
+	Close() error
+}
+
+// websocketMessageConn adapts the x/net message API to wsMessageConn.
+type websocketMessageConn struct{ conn *websocket.Conn }
+
+func (c websocketMessageConn) ReceiveMessage() ([]byte, error) {
 	var payload []byte
 	if err := websocket.Message.Receive(c.conn, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (c websocketMessageConn) SendMessage(payload []byte) error {
+	return websocket.Message.Send(c.conn, payload)
+}
+
+func (c websocketMessageConn) SetReadDeadline(deadline time.Time) error {
+	return c.conn.SetReadDeadline(deadline)
+}
+
+func (c websocketMessageConn) Close() error { return c.conn.Close() }
+
+type xNetWSFrameConn struct {
+	conn wsMessageConn
+	// idleReadTimeout is zero until the connection is entitled to a long life, which
+	// keeps the short unauthenticated hello budget in charge of the first frame.
+	idleReadTimeout time.Duration
+}
+
+func (c *xNetWSFrameConn) ReadMessage() (int, []byte, error) {
+	if c.idleReadTimeout > 0 {
+		if err := c.conn.SetReadDeadline(time.Now().Add(c.idleReadTimeout)); err != nil {
+			return 0, nil, err
+		}
+	}
+	payload, err := c.conn.ReceiveMessage()
+	if err != nil {
 		return 0, nil, err
 	}
 	return websocket.BinaryFrame, payload, nil
 }
 
 func (c *xNetWSFrameConn) WriteMessage(_ int, payload []byte) error {
-	return websocket.Message.Send(c.conn, payload)
+	return c.conn.SendMessage(payload)
 }
 
 func (c *xNetWSFrameConn) Close() error { return c.conn.Close() }

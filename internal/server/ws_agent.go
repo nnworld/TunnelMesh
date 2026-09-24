@@ -128,7 +128,7 @@ func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionMana
 	if metrics != nil {
 		metrics.ObserveConnection("server", "agent", "started", "")
 		metrics.ObserveAgentConnection(registration.AgentID, session.InstanceID, session.ConnectionID, true)
-		metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, 64)
+		metrics.SetAgentConnectionCapacity(registration.AgentID, session.InstanceID, manager.MaxConnectionsPerAgent())
 	}
 	return serveRegisteredAgentSessionWithMetrics(ctx, manager, registration, session, tr, initial, onFrame, onClose, metrics)
 }
