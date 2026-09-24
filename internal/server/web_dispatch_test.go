@@ -82,14 +82,14 @@ func (f *dispatchFixture) servedBy(rec *httptest.ResponseRecorder) string {
 	return strings.TrimSpace(rec.Body.String())
 }
 
-// The reported defect: https://tm-6000d.claw.qihoo.net/api/skill/claw/cate
+// The reported defect: https://tm-6000d.tm.example.com/api/skill/claw/cate
 // returned the management API envelope
 // {"code":404,"msg":"Not Found","data":{"error":"not found"}} because the /api/
 // prefix was matched before the Host was ever consulted, while /skills on the
 // same Host worked. A Host in the managed-route namespace must hand every path
 // to the route.
 func TestManagedNamespaceHostServesEveryPath(t *testing.T) {
-	host := "tm-6000d.claw.qihoo.net"
+	host := "tm-6000d.tm.example.com"
 	f := newDispatchFixture(func(h, _ string) bool { return h == host })
 	for _, path := range []string{
 		"/api/skill/claw/cate",
@@ -153,7 +153,7 @@ func TestControlPlaneEndpointsReservedOnExplicitDomainRoute(t *testing.T) {
 // The control-plane origin must behave exactly as before: reserved prefixes
 // ahead of the SPA history fallback.
 func TestControlPlaneHostKeepsReservedPathOrder(t *testing.T) {
-	host := "tunnelmesh-admin.claw.qihoo.net"
+	host := "tunnelmesh-admin.example.com"
 	f := newDispatchFixture(func(h, _ string) bool { return strings.HasPrefix(h, "tm-") })
 	cases := map[string]string{
 		"/api/v1/tokens":  "api",
@@ -181,8 +181,8 @@ func TestControlPlaneHostKeepsReservedPathOrder(t *testing.T) {
 // than hard-failing, so the predicate alone never takes a Host away from the
 // control plane.
 func TestUnmatchedManagedNamespaceHostFallsThrough(t *testing.T) {
-	host := "tm-unclaimed.claw.qihoo.net"
-	f := newDispatchFixture(func(h, _ string) bool { return h == "tm-6000d.claw.qihoo.net" })
+	host := "tm-unclaimed.tm.example.com"
+	f := newDispatchFixture(func(h, _ string) bool { return h == "tm-6000d.tm.example.com" })
 	if rec := f.get(host, "/api/v1/tokens"); f.servedBy(rec) != "api" {
 		t.Fatalf("unmatched managed-namespace host did not fall through to the management API")
 	}
@@ -194,7 +194,7 @@ func TestUnmatchedManagedNamespaceHostFallsThrough(t *testing.T) {
 // Health and metrics on the control-plane origin must not depend on route
 // resolution being available.
 func TestControlPlaneHealthSurvivesRouteTableOutage(t *testing.T) {
-	host := "tunnelmesh-admin.claw.qihoo.net"
+	host := "tunnelmesh-admin.example.com"
 	f := newDispatchFixture(func(h, _ string) bool { return true })
 	f.managed.unavailable = true
 	for _, path := range []string{"/health/live", "/metrics", "/ws/agent", "/ws/client"} {

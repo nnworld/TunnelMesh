@@ -25,7 +25,7 @@
 5. **之后**才是按 Host 匹配的托管路由 `managed.TryServeHTTP`（`internal/server/web.go:86`）
 6. 最后是嵌入静态资源与 SPA history fallback
 
-管理 API 对任何不以 `/api/v1/` 开头的路径统一返回 404 `{"error":"not found"}`（`internal/server/api.go:316`）。因此 `https://tm-6000d.claw.qihoo.net/api/xxx` 被第 1 步吃掉，返回上述信封。
+管理 API 对任何不以 `/api/v1/` 开头的路径统一返回 404 `{"error":"not found"}`（`internal/server/api.go:316`）。因此 `https://tm-6000d.tm.example.com/api/xxx` 被第 1 步吃掉，返回上述信封。
 
 同一根因还影响：
 
@@ -101,11 +101,11 @@ Host 落在该命名空间时，决策链在**任何**保留前缀之前就调�
 
 红灯测试（`internal/server/web_dispatch_test.go`，用 `recordingDispatcher` 桩记录被分派的路径）：
 
-1. `TestManagedNamespaceHostServesEveryPath`：`tm-6000d.claw.qihoo.net` 上的 `/api/skill/claw/cate`、`/api/v1/tokens`、`/ws/chat`、`/ws/agent`、`/ws/client`、`/health/live`、`/metrics`、`/skills` 必须全部由上游应答。
+1. `TestManagedNamespaceHostServesEveryPath`：`tm-6000d.tm.example.com` 上的 `/api/skill/claw/cate`、`/api/v1/tokens`、`/ws/chat`、`/ws/agent`、`/ws/client`、`/health/live`、`/metrics`、`/skills` 必须全部由上游应答。
 2. `TestExplicitDomainRouteServesUpstreamAPIAndWSPaths`：`git.example.com` 上的 `/api/v1/repos`、`/ws/git`、`/health`、`/readyz` 必须全部由上游应答。
 3. `TestControlPlaneEndpointsReservedOnExplicitDomainRoute`：同一显式域名 Host 上 `/ws/agent`、`/ws/client`、`/health/live`、`/metrics` 仍由控制面处理，且 dispatcher 未被调用。
 4. `TestControlPlaneHostKeepsReservedPathOrder`：控制面 origin 上 `/api/v1/tokens`→管理 API、`/health/live`与`/metrics`→健康、`/ws/agent`与`/ws/client`→对应 handler、`/ws/webssh/tick`→broker、未知 `/ws/unknown`→404、`/some/spa/route`→SPA fallback。
-5. `TestUnmatchedManagedNamespaceHostFallsThrough`：未被任何路由认领的 `tm-unclaimed.claw.qihoo.net` 仍回落到管理 API 与健康端点。
+5. `TestUnmatchedManagedNamespaceHostFallsThrough`：未被任何路由认领的 `tm-unclaimed.tm.example.com` 仍回落到管理 API 与健康端点。
 6. `TestControlPlaneHealthSurvivesRouteTableOutage`：dispatcher 置为“路由表不可用”（写 503）时，控制面 origin 的 `/health/live`、`/metrics`、`/ws/agent`、`/ws/client` 仍返回 200，且 dispatcher 调用次数为 0。
 
 实际红灯输出（修复前）：

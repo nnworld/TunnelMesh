@@ -25,7 +25,7 @@
 - `persistMetadata`（`internal/server/client_observability.go:181` 起）执行 `json.Marshal(payload.Capabilities)`，nil slice 序列化成 4 字节字符串 `"null"`。
 - `clientInstanceRepo.Upsert` 只对 `""` 归一化为 `"[]"`（`internal/storage/client_repository.go:35`），漏掉 `"null"`，于是库里存的是字符串 `"null"`。
 - `newClientView`（`internal/server/client_api.go:272`）用 `decodeStrings(instance.Capabilities) == nil` 表示「未上报 metadata」：`json.Unmarshal("null", &v)` 成功且 `v` 为 nil，命中该分支。
-- 结果：5 个带完整 hostname/version/listeners 的在线客户端全部显示「metadata 未上报」。线上采样：`client-1b0dee98…`（qihoodeMacBook-Pro，v1.2.6-4-g6241fe3，4 连接 4 流）`capabilities` 字段为 `"null"`，API 返回 `"capabilities":null`、`"status":"metadata_unavailable"`；而 legacy 行（`capabilities="[]"` → `[]string{}` 非 nil）反而返回 `online`。
+- 结果：5 个带完整 hostname/version/listeners 的在线客户端全部显示「metadata 未上报」。线上采样：`client-1b0dee98…`（devbook-pro，v1.2.6-4-g6241fe3，4 连接 4 流）`capabilities` 字段为 `"null"`，API 返回 `"capabilities":null`、`"status":"metadata_unavailable"`；而 legacy 行（`capabilities="[]"` → `[]string{}` 非 nil）反而返回 `online`。
 
 ### 3.2 永久「metadata 已过期」幽灵行
 
@@ -218,5 +218,5 @@ EXPLAIN DELETE FROM client_instance_metadata
 部署后手工核验：
 
 ```bash
-curl -sS 'https://tunnelmesh-admin.claw.qihoo.net/api/v1/clients?limit=50' -H 'accept: application/json' -H "authorization: Bearer $TM_TOKEN" | jq '.data.summary, [.data.items[] | {status, metadataState, activeConnections}]'
+curl -sS 'https://tunnelmesh-admin.example.com/api/v1/clients?limit=50' -H 'accept: application/json' -H "authorization: Bearer $TM_TOKEN" | jq '.data.summary, [.data.items[] | {status, metadataState, activeConnections}]'
 ```
