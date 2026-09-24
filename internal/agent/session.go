@@ -111,6 +111,11 @@ type StreamDispatcher struct {
 	// `agent.streams.inbound_buffer_bytes` and defaults to the credit this Agent
 	// grants, so a configured buffer can never be smaller than the window.
 	inboundBytes int
+	// maxActive is the level ceiling on live streams for this Agent process. The
+	// dial queue only bounds how many dials are in flight, so without this a
+	// single peer can accumulate as many open streams - and target connections -
+	// as it likes. Zero means unlimited, the documented convention.
+	maxActive int
 }
 
 func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
@@ -228,6 +233,15 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if _, exists := d.pending[f.StreamID]; exists {
 			d.mu.Unlock()
 			d.rejectStreamMode(f.StreamID, DialResult{Code: protocol.OpenResultCodeInternalError, Stage: protocol.OpenResultStageProtocol}, strictOpen)
+			return nil
+		}
+		// The ceiling is checked before any state is created so a refused open
+		// cannot leave a cancel func, a generation bump or a dial behind.
+		if d.maxActive > 0 && len(d.streams)+len(d.pending) >= d.maxActive {
+			d.mu.Unlock()
+			d.rejectStreamMode(f.StreamID, DialResult{
+				Code: protocol.OpenResultCodeQueueFull, Stage: protocol.OpenResultStageQueue, Retryable: true,
+			}, strictOpen)
 			return nil
 		}
 		streamCtx, cancel := context.WithCancel(d.ctx)
@@ -379,6 +393,22 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 
 // ActiveStreams returns the number of streams currently owned by this
 // connection. It is used by the connection-pool controller for scaling.
+// SetMaxActiveStreams sets the level ceiling on live streams this Agent will
+// hold. It is a setter rather than a constructor argument because the value comes
+// from the same config bag that already arrives after the transport exists, and
+// 0 keeps the historical unlimited behaviour.
+func (d *StreamDispatcher) SetMaxActiveStreams(max int) {
+	if d == nil {
+		return
+	}
+	if max < 0 {
+		max = 0
+	}
+	d.mu.Lock()
+	d.maxActive = max
+	d.mu.Unlock()
+}
+
 func (d *StreamDispatcher) ActiveStreams() int {
 	if d == nil {
 		return 0
