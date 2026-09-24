@@ -61,10 +61,29 @@
 - `go test ./internal/storage -run 'TestSQLiteRepositoryContract|TestClient' -count=1` → ok。
   过程中暴露并修正了一处断言口径：`expired` 分组的 `ActiveStreams` 只应统计该分组行的租约（3 而非 4）。
 
-真实 MySQL 5.6：见本文件「CI 证据」小节（`mysql56` job 在 `mysql:5.6` 容器上的执行结果）。
+### CI 证据（真实 MySQL 5.6，`mysql56` job）
 
-- `go test ./... -count=1`、`go test -race ./... -count=1 -timeout 30m`、`go vet ./...`、
-  `git diff --check`：见「CI 证据」小节。
+门禁共跑 3 轮，前两轮暴露的都是**从未真正执行过**的 MySQL 测试自身缺陷，正是本 PR 要消除的盲区：
+
+| 轮次 | 结果 | 暴露的问题 | 处理 |
+| --- | --- | --- | --- |
+| 1 | `internal/registry` 契约 pass；`internal/storage` 3 个 FAIL | `TestMySQLRepositoryContract` 与 `TestMySQLV8ToV9…` 报 `Error 1062 Duplicate entry '1'`：`go test` 并行跑两个包，二者对同一个库同时 auto-init，抢同一行 `schema_meta(id=1)`；DDL 重放用裸 `ExecContext`/`strings.Split`，不容重复且 naive 切分会重新踩注释里的分号；`TestMySQLAutoInitDisabled…` 把版本钉在 3，被版本守卫先拒 | CI 步骤加 `-p 1`；改用 `applySchemaStatements`（与生产同一条容错、可识别注释的路径）；版本参数改 `SchemaVersion`，与 SQLite 同名测试对齐 |
+| 2 | 仅剩 `TestMySQLV8ToV9…` FAIL | cleanup 复用 body 已 `Close()` 的句柄 → `sql: database is closed`；此前不可见，因为同一测试更早就在 DDL 重放上失败 | cleanup 自己 `sql.Open` 一个句柄执行恢复 |
+| 3 | pass 1m29s；`build-test` pass 1m2s；`packaging` pass 14s | — | — |
+
+第 3 轮 `TestMySQLRepositoryContract` 不再 skip，`runRepositoryContract` → `runClientRepositoryContract`
+首次在 `mysql:5.6`（`mysqladmin ping` 健康检查通过）上执行，与 SQLite 共用同一套断言全部通过：
+`FOR UPDATE` upsert 与主键复用、`capabilities` 归一化、presence `EXISTS`/`NOT EXISTS`、
+`INSTR` 的 agent 精确匹配、`Summarize` 关联聚合、带 `NOT EXISTS` 守卫的两条 `DELETE`
+（未出现 MySQL 1093）、64 位 `connection_epoch`、复合游标分页。`TestMySQLIdentityRepositoryContract`、
+`TestMySQLAutoInit*`、`TestMySQLV8ToV9AuthorizationRevisionMigration` 与 registry 契约同轮通过。
+
+本地全量门禁（合并前执行）：
+
+- `go vet ./...` → 通过。
+- `go test ./... -count=1` → 全部 ok。
+- `go test -race ./... -count=1 -timeout 30m` → 全部 ok（`internal/server` 467s）。
+- `git diff --check` → 无空白错误。
 - 前端未变更，`web` 门禁与 `scripts/verify-web-embed.sh` 不在影响面内（`build-test` 仍会在 CI 执行）。
 
 ## 发布步骤
