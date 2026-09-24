@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 51 份计划，按日期倒序排列。
+共 52 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-24 | [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | — | [PR：一键安装函数级套件不再挂在交互提示上](../../pull-requests/2026-09-24-oneclick-shell-suite-hermetic-stdin.md) |
 | 2026-09-23 | [VPN 网关 阶段 7：Agent ICMP echo 与能力协商 Implementation Plan](2026-09-23-vpn-phase7-agent-icmp.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [VPN 网关 阶段 6：Server 数据面（WireGuard + netstack）Implementation Plan](2026-09-23-vpn-phase6-server-data-plane.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 6：Server 数据面](../../pull-requests/2026-09-23-vpn-phase6-server-data-plane.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [三端一键安装脚本 Implementation Plan](2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../specs/2026-09-23-one-click-install-scripts-design.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
@@ -70,6 +71,7 @@
 
 以下计划按 AGENTS.md 的紧急修复条款先止损、后补记，正文已标注“补记计划”：
 
+- [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md)（2026-09-24）
 - [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md)（2026-09-23）
 - [ZMODEM 出站写入串行化修复实施计划](2026-09-13-zmodem-write-serialization.md)（2026-09-13）
 - [ZMODEM 停滞处置策略与进度节流实施计划](2026-09-13-zmodem-stall-channel-policy.md)（2026-09-13）
