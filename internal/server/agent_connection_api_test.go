@@ -96,7 +96,7 @@ func newAgentConnectionAPIFixture(t *testing.T) *agentConnectionAPIFixture {
 	session.mu.Lock()
 	session.lastHeartbeat = time.Now().UTC().Add(-time.Second)
 	session.mu.Unlock()
-	api.SetAgentConnections(manager, NewAgentRelayTransport(manager))
+	api.SetAgentConnections(manager, NewAgentRelayTransport(manager, AgentRelayWindowConfig{}))
 	connections := &staticAgentConnectionRegistry{}
 	closeService := &recordingAgentConnectionCloseService{}
 	api.SetClusterAgentConnections(connections, closeService, "server-a")

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -417,12 +418,16 @@ func NewAgentDispatcherFactory(streams config.AgentStreamConfig, echoer *agent.E
 		// Readiness is the engine, not the configuration: a host that refused the
 		// ping socket must not advertise a stream it cannot serve.
 		session.SetCapabilities(agent.AgentStreamCapabilities(streams, echoer != nil))
-		return agent.NewStreamDispatcherWithConfig(agent.Dialer{ICMPEcho: echoer}, nil, session.Send, agent.DialExecutorConfig{
+		dispatcher := agent.NewStreamDispatcherWithConfig(agent.Dialer{ICMPEcho: echoer}, nil, session.Send, agent.DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,
 			ConnectTimeout: streams.ConnectTimeout,
 			OpenTimeout:    streams.OpenTimeout,
 		}, nil)
+		if err := dispatcher.SetInboundBufferBytes(streams.InboundBufferBytes); err != nil {
+			slog.Warn("agent inbound buffer rejected", "configured_bytes", streams.InboundBufferBytes, "error", err)
+		}
+		return dispatcher
 	}
 }
 

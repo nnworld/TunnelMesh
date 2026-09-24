@@ -20,16 +20,55 @@ var (
 // AgentRelayTransport multiplexes local relay streams over the currently
 // registered Agent WebSocket sessions. Agent wire IDs are monotonic and never
 // reused within one process-local authenticated Agent connection incarnation.
+// AgentRelayWindowConfig carries the data-plane credit policy the Server applies
+// to Agent streams. It exists so `server.stream.*` is honoured instead of being
+// documentation only; the zero value reproduces the compiled-in defaults.
+type AgentRelayWindowConfig struct {
+	// AdvertisedWindow is the credit the Server grants an Agent for one stream.
+	// It is also the size of the buffer that enforces it.
+	AdvertisedWindow uint32
+	// UpdateThreshold is how many consumed bytes accumulate before credit is
+	// returned. The invariant `window - threshold >= one frame` is enforced
+	// rather than trusted, because a pump that waits for credit never times out.
+	UpdateThreshold uint32
+}
+
+func (c AgentRelayWindowConfig) advertisedWindow() uint32 {
+	if c.AdvertisedWindow < protocol.MinRefillableWindow || c.AdvertisedWindow > protocol.DefaultServerReceiveWindow {
+		return protocol.DefaultServerReceiveWindow
+	}
+	return c.AdvertisedWindow
+}
+
+// windowFor is the credit granted on one stream: never more than this Server is
+// willing to buffer, and never more than what the requesting side asked for.
+func (c AgentRelayWindowConfig) windowFor(requested uint32) uint32 {
+	window := c.advertisedWindow()
+	if peer := protocol.NegotiateReceiveWindow(requested); peer < window {
+		window = peer
+	}
+	return window
+}
+
+func (c AgentRelayWindowConfig) updateThreshold(window uint32) uint32 {
+	threshold := c.UpdateThreshold
+	if threshold == 0 || threshold > window || window-threshold < protocol.MaxStreamFrame {
+		return protocol.DefaultWindowUpdateThreshold
+	}
+	return threshold
+}
+
 type AgentRelayTransport struct {
 	manager    *AgentSessionManager
+	windows    AgentRelayWindowConfig
 	mu         sync.Mutex
 	streams    map[agentRelayStreamKey]*agentRelayStream
 	allocators map[agentRelayGeneration]*agentRelayIDAllocator
 	closed     bool
 }
 
-func NewAgentRelayTransport(manager *AgentSessionManager) *AgentRelayTransport {
-	return &AgentRelayTransport{manager: manager, streams: make(map[agentRelayStreamKey]*agentRelayStream), allocators: make(map[agentRelayGeneration]*agentRelayIDAllocator)}
+func NewAgentRelayTransport(manager *AgentSessionManager, windows AgentRelayWindowConfig) *AgentRelayTransport {
+	return &AgentRelayTransport{manager: manager, windows: windows, streams: make(map[agentRelayStreamKey]*agentRelayStream), allocators: make(map[agentRelayGeneration]*agentRelayIDAllocator)}
 }
 
 type agentRelayGeneration struct {
@@ -121,12 +160,11 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 		wireID: uint32(allocator.next), controlCh: make(chan protocol.Frame, 16), done: make(chan struct{}),
 		controlSignal: make(chan struct{}, 1), dataSignal: make(chan struct{}, 1),
 	}
-	window := request.InitialWindow
-	if window == 0 {
-		// A zero window means "unlimited" to the Agent, which lets a fast peer
-		// overflow the inbound buffer. Advertise the default credit instead.
-		window = protocol.DefaultServerReceiveWindow
-	}
+	// A zero or undersized window means "unlimited" to a legacy Agent and lets a
+	// fast peer overflow the inbound buffer, while an oversized one would size the
+	// guard itself from an unverifiable number. NegotiateReceiveWindow keeps both
+	// ends on a window that can always be refilled by a whole frame.
+	window := t.windows.windowFor(request.InitialWindow)
 	stream.receiveBudget = int(window)
 	if sendState, stateErr := protocol.NewStreamState(stream.wireID, protocol.DefaultAgentReceiveWindow); stateErr == nil {
 		_ = sendState.OpenLocal()
@@ -588,8 +626,14 @@ func (s *agentRelayStream) releaseReceiveWindow(consumed int) {
 		return
 	}
 	s.receiveUnacked += uint32(consumed)
+	buffered := len(s.readBuf) - s.readPos
+	remaining := uint32(0)
+	if free := s.receiveBudget - buffered; free > 0 {
+		remaining = uint32(free)
+	}
 	update := uint32(0)
-	if s.receiveUnacked >= protocol.DefaultWindowUpdateThreshold {
+	threshold := s.transport.windows.updateThreshold(uint32(max(s.receiveBudget, 0)))
+	if protocol.ShouldFlushWindowUpdate(remaining, s.receiveUnacked, threshold) {
 		update = s.receiveUnacked
 		s.receiveUnacked = 0
 	}

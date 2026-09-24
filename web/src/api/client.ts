@@ -171,7 +171,25 @@ export type DownloadInfo = {
   schemaVersion: number
   assets: DownloadAsset[]
 }
-export type ClientStatus = 'online' | 'offline' | 'stale' | 'metadata_unavailable'
+// Client presence is decided by live WebSocket leases only. Metadata freshness
+// is a separate axis, so an online client is never labelled by a lapsed or
+// missing metadata snapshot (see internal/server/client_api.go newClientView).
+export type ClientStatus = 'online' | 'offline'
+export type ClientMetadataState = 'fresh' | 'expired' | 'unavailable'
+/**
+ * @deprecated 'stale' and 'metadata_unavailable' remain accepted by the API as
+ * aliases of metadataState=expired|unavailable for one minor release. Filter on
+ * ClientMetadataState instead.
+ */
+export type ClientStatusFilter = ClientStatus | 'stale' | 'metadata_unavailable'
+export type ClientListSummary = {
+  total: number
+  online: number
+  activeConnections: number
+  activeStreams: number
+  metadataUnavailable: number
+  metadataStale: number
+}
 export type ClientListener = { protocol: string; listenAddress: string; agentId: string; enabled: boolean }
 export type ClientConnection = {
   connectionId: string
@@ -199,6 +217,7 @@ export type ClientInstance = {
   hostname: string
   processStartAt: string
   status: ClientStatus
+  metadataState: ClientMetadataState
   activeConnections: number
   activeStreams: number
   serverNodeIds: string[]
@@ -207,12 +226,13 @@ export type ClientInstance = {
   capabilities: string[]
   listeners: ClientListener[]
 }
-export type ClientPage = { items: ClientInstance[]; nextCursor?: string; hasMore?: boolean }
+export type ClientPage = { items: ClientInstance[]; nextCursor?: string; hasMore?: boolean; summary?: ClientListSummary }
 export type ClientListParams = {
   ownerUserId?: string
   tokenId?: string
   serverNodeId?: string
-  status?: ClientStatus
+  status?: ClientStatusFilter
+  metadataState?: ClientMetadataState
   agentId?: string
   keyword?: string
   cursor?: string
@@ -373,6 +393,7 @@ export function listClients(params: ClientListParams = {}) {
   const query = new URLSearchParams()
   if (params.ownerUserId) query.set('ownerUserId', params.ownerUserId)
   if (params.status) query.set('status', params.status)
+  if (params.metadataState) query.set('metadataState', params.metadataState)
   if (params.tokenId) query.set('tokenId', params.tokenId)
   if (params.serverNodeId) query.set('serverNodeId', params.serverNodeId)
   if (params.agentId) query.set('agentId', params.agentId)

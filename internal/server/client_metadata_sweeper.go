@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -41,9 +42,17 @@ func (s *ClientMetadataSweeper) Run(ctx context.Context) error {
 	}
 }
 
+// Sweep reconciles Client instance rows and returns how many rows it changed.
+// Expiring lapsed metadata and reaping rows of Clients that never identified
+// themselves are independent facts, so both are attempted and both failures stay
+// observable. Each step is idempotent and the reap only matches rows with no live
+// lease, so a retry after a partial failure is safe and a reconnecting Client is
+// never dropped mid-handshake.
 func (s *ClientMetadataSweeper) Sweep(ctx context.Context, now time.Time) (int64, error) {
 	if s == nil || s.instances == nil {
 		return 0, ErrSessionClosed
 	}
-	return s.instances.MarkExpired(ctx, now)
+	expired, expiredErr := s.instances.MarkExpired(ctx, now)
+	purged, purgeErr := s.instances.PurgeUnreported(ctx, now)
+	return expired + purged, errors.Join(expiredErr, purgeErr)
 }

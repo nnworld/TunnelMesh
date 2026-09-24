@@ -262,7 +262,10 @@ this defect.
 
 SQLite was never affected: its `INTEGER` is already a signed 64-bit value. The
 defect survived because the MySQL-backed contract tests are gated behind
-`TUNNELMESH_TEST_MYSQL_DSN` and do not run in CI. `agent_connection_leases` is
+`TUNNELMESH_TEST_MYSQL_DSN` and did not run in CI. That gap is closed by the
+`mysql56` job, which runs the same contract functions against a real MySQL 5.6
+service container and is a required status check on `main`; see
+[测试与验证](../development/testing.md). `agent_connection_leases` is
 widened in the same step to remove the drift between `migrations/ddl.sql` and
 `v0006_to_v0007/mysql.sql`; agent epochs are small counters today, but a fresh
 MySQL install and an upgraded one must agree on the authoritative schema.

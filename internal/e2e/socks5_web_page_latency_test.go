@@ -242,6 +242,96 @@ func TestSOCKS5WebPageLatency(t *testing.T) {
 		}
 	})
 
+	t.Run("local tcp forward delivers large fixed-length response", func(t *testing.T) {
+		body := bytes.Repeat([]byte("j"), 1382571)
+		target, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer target.Close()
+		go func() {
+			for {
+				conn, err := target.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					request := make([]byte, 4096)
+					_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+					if _, err := conn.Read(request); err != nil {
+						return
+					}
+					_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(body))
+					_, _ = io.Copy(conn, bytes.NewReader(body))
+				}(conn)
+			}
+		}()
+		_, portText, _ := net.SplitHostPort(target.Addr().String())
+		var targetPort int
+		if _, err := fmt.Sscanf(portText, "%d", &targetPort); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if err := fixture.db.Policies().Create(fixture.ctx, storage.AgentPolicy{
+			ID: "latency-local-http", AgentID: latencyAgentID, TargetHost: "127.0.0.1", TargetPort: targetPort,
+			Protocol: "tcp", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		localToken, err := fixture.credentials.Create(fixture.ctx, auth.CreateTokenInput{
+			Type: storage.TokenTypeClient, OwnerUserID: fixture.clientToken.OwnerUserID,
+			Scope: auth.TokenScope{
+				AgentIDs: []string{latencyAgentID}, Protocols: []string{"tcp"},
+				TargetCIDRs: []string{"127.0.0.0/8"}, TargetPorts: []int{targetPort},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		localTransport, err := client.DialWebSocket(fixture.ctx, "ws://"+fixture.httpA.Addr().String()+"/ws/client", localToken.Secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		localSession := client.NewSessionWithOpenMode(localTransport, client.SessionOpenFlowControl)
+		defer localSession.Close()
+		forward, err := client.NewTCPForward(client.NewSessionOpener(localSession), client.TCPForwardConfig{
+			ListenAddr: "127.0.0.1:0", AgentID: latencyAgentID,
+			TargetHost: "127.0.0.1", TargetPort: targetPort, ConnectTimeout: 4 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := forward.Start(fixture.ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer forward.Close()
+
+		conn, err := net.Dial("tcp", forward.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := fmt.Fprintf(conn, "GET /assets/mode.js HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		received, err := io.ReadAll(conn)
+		if err != nil {
+			t.Fatalf("read large HTTP response: %v", err)
+		}
+		headerEnd := bytes.Index(received, []byte("\r\n\r\n"))
+		if headerEnd < 0 {
+			t.Fatalf("response headers missing: %q", received[:min(len(received), 128)])
+		}
+		headers := received[:headerEnd]
+		if !bytes.Contains(headers, []byte(fmt.Sprintf("Content-Length: %d", len(body)))) {
+			t.Fatalf("response headers=%q, want Content-Length %d", headers, len(body))
+		}
+		if got := received[headerEnd+4:]; !bytes.Equal(got, body) {
+			t.Fatalf("response body length=%d, want byte-for-byte %d bytes", len(got), len(body))
+		}
+	})
+
 	t.Run("legacy client with strict agent", func(t *testing.T) {
 		transport, err := dialRawClientWebSocket(fixture.ctx, fixture.httpA.Addr().String(), fixture.clientToken.Secret)
 		if err != nil {

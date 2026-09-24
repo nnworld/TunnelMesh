@@ -593,11 +593,8 @@ func TestServeClientSessionRelayHonorsClientWindow(t *testing.T) {
 	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: 16, Window: 8}
 	select {
 	case control := <-conn.controls:
-		if control.Type != protocol.FrameWindowUpdate || control.Window != 8 {
-			t.Fatalf("forwarded control=%+v, want WINDOW_UPDATE 8", control)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("WINDOW_UPDATE was not forwarded to relay")
+		t.Fatalf("Client WINDOW_UPDATE leaked to Agent relay: %+v", control)
+	case <-time.After(100 * time.Millisecond):
 	}
 	if frame := receiveChannelClientFrame(t, transport); frame.Type != protocol.FrameData || frame.StreamID != 16 || len(frame.Payload) != 8 {
 		t.Fatalf("post-update DATA=%+v, want 8 bytes for stream 16", frame)
@@ -857,17 +854,35 @@ func TestServeClientSessionResetsStreamAfterShortRelayWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport := newScriptedClientTransport(
-		protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 9, Payload: payload},
-		protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 9, Payload: []byte("complete-frame")},
-	)
+	// The upload is written by the stream's own pump, so the session must stay
+	// open while the partial write turns into a RESET: a session that already
+	// returned would retire the queue and drop the frame instead.
+	transport := newChannelClientTransport()
 	opener := &shortWriteNodeTransport{}
-	err = ServeClientSession(context.Background(), ClientSessionPrincipal{ConnectionID: "connection-short-write", Identity: auth.TokenIdentity{TokenID: "token", Type: storage.TokenTypeClient}}, transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener)
-	if err != nil {
-		t.Fatal(err)
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(context.Background(), ClientSessionPrincipal{ConnectionID: "connection-short-write", Identity: auth.TokenIdentity{TokenID: "token", Type: storage.TokenTypeClient}}, transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener)
+	}()
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 9, Payload: payload}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 9, Payload: []byte("complete-frame")}
+	reset := false
+	deadline := time.After(2 * time.Second)
+	for !reset {
+		select {
+		case frame := <-transport.sent:
+			reset = frame.Type == protocol.FrameReset && frame.StreamID == 9
+		case <-deadline:
+			t.Fatal("no RESET after the Agent connection accepted a partial upload")
+		}
 	}
-	if got := waitForResetCount(t, transport, 1); got != 1 {
-		t.Fatalf("RESET count = %d, want 1 after partial relay write", got)
+	close(transport.receive)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session did not stop")
 	}
 }
 
@@ -1363,3 +1378,240 @@ func receiveClientServerFrame(t *testing.T, conn *websocket.Conn) protocol.Frame
 }
 
 func bufioNewReader(reader io.Reader) *bufio.Reader { return bufio.NewReader(reader) }
+
+type stalledAgentConn struct {
+	writes  chan []byte
+	unblock chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newStalledAgentConn() *stalledAgentConn {
+	return &stalledAgentConn{writes: make(chan []byte, 8), unblock: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (c *stalledAgentConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *stalledAgentConn) Write(payload []byte) (int, error) {
+	select {
+	case <-c.unblock:
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+	select {
+	case c.writes <- append([]byte(nil), payload...):
+		return len(payload), nil
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (c *stalledAgentConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+type recordingAgentConn struct {
+	writes chan []byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newRecordingAgentConn() *recordingAgentConn {
+	return &recordingAgentConn{writes: make(chan []byte, 8), closed: make(chan struct{})}
+}
+
+func (c *recordingAgentConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *recordingAgentConn) Write(payload []byte) (int, error) {
+	select {
+	case c.writes <- append([]byte(nil), payload...):
+		return len(payload), nil
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (c *recordingAgentConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// pumpClientTransportFrames keeps the stub transport's Send non-blocking for the
+// whole session. A session flushes frames that are still queued while it exits,
+// so a test that stops reading `sent` would park that flush forever.
+func pumpClientTransportFrames(t *testing.T, transport *channelClientTransport) (<-chan protocol.Frame, func()) {
+	t.Helper()
+	frames := make(chan protocol.Frame, 256)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case frame := <-transport.sent:
+				select {
+				case frames <- frame:
+				default:
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return frames, func() { close(stop) }
+}
+
+func readClientTransportFrame(t *testing.T, frames <-chan protocol.Frame, timeout time.Duration, message string) protocol.Frame {
+	t.Helper()
+	select {
+	case frame := <-frames:
+		return frame
+	case <-time.After(timeout):
+		t.Fatal(message)
+		return protocol.Frame{}
+	}
+}
+
+func clientSessionTestPrincipal(name string) ClientSessionPrincipal {
+	return ClientSessionPrincipal{ConnectionID: name, Identity: auth.TokenIdentity{TokenID: "token", Type: storage.TokenTypeClient}}
+}
+
+func clientSessionOpenFrame(t *testing.T, id uint32) protocol.Frame {
+	t.Helper()
+	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{AgentID: "agent-a", Protocol: "tcp", TargetHost: "target.internal", TargetPort: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: id, Payload: payload}
+}
+
+func TestServeClientSessionUploadToStalledAgentDoesNotBlockOtherStreams(t *testing.T) {
+	transport := newChannelClientTransport()
+	stalled, healthy := newStalledAgentConn(), newRecordingAgentConn()
+	opener := &queuedNodeTransport{connections: []io.ReadWriteCloser{stalled, healthy}, opened: make(chan relay.StreamRequest, 2)}
+	_, stopPump := pumpClientTransportFrames(t, transport)
+	defer stopPump()
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(context.Background(), clientSessionTestPrincipal("connection-upload-isolation"), transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener)
+	}()
+	transport.receive <- clientSessionOpenFrame(t, 1)
+	<-opener.opened
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 1, Payload: []byte("blocked")}
+	transport.receive <- clientSessionOpenFrame(t, 2)
+	select {
+	case <-opener.opened:
+	case <-time.After(3 * time.Second):
+		close(stalled.unblock)
+		<-done
+		t.Fatal("a stalled agent upload blocked the next stream from opening")
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 2, Payload: []byte("hello")}
+	select {
+	case got := <-healthy.writes:
+		if string(got) != "hello" {
+			t.Fatalf("second stream wrote %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		close(stalled.unblock)
+		t.Fatal("one stalled upload froze the whole Client session")
+	}
+	close(stalled.unblock)
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeClientSessionAnswersPingDuringStalledUpload(t *testing.T) {
+	transport := newChannelClientTransport()
+	stalled := newStalledAgentConn()
+	opener := &queuedNodeTransport{connections: []io.ReadWriteCloser{stalled}, opened: make(chan relay.StreamRequest, 1)}
+	frames, stopPump := pumpClientTransportFrames(t, transport)
+	defer stopPump()
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(context.Background(), clientSessionTestPrincipal("connection-ping-during-stall"), transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener)
+	}()
+	transport.receive <- clientSessionOpenFrame(t, 1)
+	<-opener.opened
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 1, Payload: []byte("blocked")}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("still-alive")}
+	frame := readClientTransportFrame(t, frames, 3*time.Second, "the Client frame loop is parked on one stalled upload; PING went unanswered")
+	if frame.Type != protocol.FramePong || string(frame.Payload) != "still-alive" {
+		t.Fatalf("frame while upload stalled = %+v, want PONG", frame)
+	}
+	close(stalled.unblock)
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeClientSessionUploadQueueOverflowResetsSingleStream(t *testing.T) {
+	transport := newChannelClientTransport()
+	stalled, healthy := newStalledAgentConn(), newRecordingAgentConn()
+	opener := &queuedNodeTransport{connections: []io.ReadWriteCloser{stalled, healthy}, opened: make(chan relay.StreamRequest, 2)}
+	frames, stopPump := pumpClientTransportFrames(t, transport)
+	defer stopPump()
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeClientSession(context.Background(), clientSessionTestPrincipal("connection-upload-overflow"), transport, streamAuthorizerFunc(func(context.Context, ClientSessionPrincipal, protocol.StreamOpenPayload) error { return nil }), opener)
+	}()
+	transport.receive <- clientSessionOpenFrame(t, 1)
+	<-opener.opened
+	chunk := make([]byte, protocol.MaxStreamFrame)
+	for i := range chunk {
+		chunk[i] = 'x'
+	}
+	// The pump holds one chunk and the queue the advertised window, so the
+	// refusal arrives a frame past that. Pushing until then is fast; waiting for
+	// a reply on every push would only make the test slow.
+	var reset protocol.Frame
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && reset.Type != protocol.FrameReset {
+		transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 1, Payload: chunk}
+		pending := true
+		for pending {
+			select {
+			case frame := <-frames:
+				if frame.Type == protocol.FrameReset && frame.StreamID == 1 {
+					reset = frame
+				}
+			default:
+				pending = false
+			}
+		}
+	}
+	if reset.Type != protocol.FrameReset {
+		close(stalled.unblock)
+		t.Fatal("an oversized upload queue did not reset its own stream")
+	}
+	transport.receive <- clientSessionOpenFrame(t, 2)
+	select {
+	case <-opener.opened:
+	case <-time.After(3 * time.Second):
+		close(stalled.unblock)
+		t.Fatal("session unusable after one stream was reset")
+	}
+	transport.receive <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 2, Payload: []byte("survived")}
+	select {
+	case got := <-healthy.writes:
+		if string(got) != "survived" {
+			t.Fatalf("surviving stream wrote %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		close(stalled.unblock)
+		t.Fatal("the surviving stream never got its bytes")
+	}
+	close(stalled.unblock)
+	close(transport.receive)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

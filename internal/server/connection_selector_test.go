@@ -57,7 +57,7 @@ func TestAgentConnectionSelectorPrefersHealthyLeastLoadedLocalConnection(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
 		AgentID: "agent-select", TargetConnectionID: "conn-a", Protocol: "tcp", TargetHost: "10.0.0.1", TargetPort: 22,
@@ -229,7 +229,7 @@ func TestAgentConnectionSelectorFallsBackToRemote(t *testing.T) {
 	if err := closed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	remote := &fixedConnectionRegistry{connections: []registry.NodeOwner{{
 		AgentID: "agent-remote", ConnectionID: "conn-remote", ServerNodeID: "server-remote",
@@ -252,7 +252,7 @@ func TestAgentConnectionSelectorObservesSelection(t *testing.T) {
 	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-selection", NodeID: "node-a", ConnectionID: "conn-a", ConnectionEpoch: 1, Epoch: 1}, newFakeTransport()); err != nil {
 		t.Fatal(err)
 	}
-	selector := NewAgentConnectionSelector(manager, NewAgentRelayTransport(manager), &fixedConnectionRegistry{}, "server-local")
+	selector := NewAgentConnectionSelector(manager, NewAgentRelayTransport(manager, AgentRelayWindowConfig{}), &fixedConnectionRegistry{}, "server-local")
 	selector.SetMetrics(metrics)
 	if _, err := selector.Select(context.Background(), "agent-selection", "tcp"); err != nil {
 		t.Fatal(err)

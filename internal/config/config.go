@@ -771,8 +771,28 @@ func validateServerStream(cfg ServerStreamConfig) []string {
 	if cfg.WindowUpdateThreshold <= 0 || cfg.WindowUpdateThreshold > cfg.InitialWindow {
 		problems = append(problems, "server stream window update threshold must be positive and no greater than the initial window")
 	}
-	if cfg.MaxFramePayload <= 0 || cfg.MaxFramePayload > 1<<20 {
-		problems = append(problems, "server stream max frame payload must be positive and no greater than 1048576")
+	// The frame codec has one DATA size and no negotiation for it, so any other
+	// number here would be accepted, stored and ignored.
+	if cfg.MaxFramePayload != ServerStreamMaxFramePayload {
+		problems = append(problems, fmt.Sprintf("server stream max frame payload must be %d: the frame codec has no negotiation for another size", ServerStreamMaxFramePayload))
+	}
+	// A sender that cannot fit one whole frame inside the remaining window has no
+	// way to ask for credit, so this combination stalls a stream forever.
+	if cfg.InitialWindow > 0 && cfg.WindowUpdateThreshold > 0 &&
+		cfg.InitialWindow-cfg.WindowUpdateThreshold < ServerStreamMaxFramePayload {
+		problems = append(problems, fmt.Sprintf("server stream initial window must exceed the update threshold by at least %d bytes", ServerStreamMaxFramePayload))
+	}
+	return problems
+}
+
+// ServerStreamMaxFramePayload is the only DATA payload size the frame codec
+// speaks, and the floor every per-stream buffer is measured against.
+const ServerStreamMaxFramePayload = 32768
+
+func validateInboundBuffer(scope string, bytes int) []string {
+	var problems []string
+	if bytes < 2*ServerStreamMaxFramePayload {
+		problems = append(problems, fmt.Sprintf("%s inbound buffer bytes must be at least %d", scope, 2*ServerStreamMaxFramePayload))
 	}
 	return problems
 }
@@ -940,9 +960,7 @@ func validateAgentStreams(cfg AgentStreamConfig) []string {
 	if cfg.OpenTimeout <= 0 {
 		problems = append(problems, "agent stream open timeout must be positive")
 	}
-	if cfg.InboundBufferBytes <= 0 {
-		problems = append(problems, "agent stream inbound buffer bytes must be positive")
-	}
+	problems = append(problems, validateInboundBuffer("agent stream", cfg.InboundBufferBytes)...)
 	// Validated only while enabled, exactly like server.vpn.icmp_*: a disabled
 	// engine is never opened, so an unset address must not stop the agent from
 	// serving the tunnels it does provide.
@@ -968,9 +986,7 @@ func validateClientStreams(cfg ClientStreamConfig) []string {
 	if cfg.OpenTimeout <= 0 {
 		problems = append(problems, "client stream open timeout must be positive")
 	}
-	if cfg.InboundBufferBytes <= 0 {
-		problems = append(problems, "client stream inbound buffer bytes must be positive")
-	}
+	problems = append(problems, validateInboundBuffer("client stream", cfg.InboundBufferBytes)...)
 	return problems
 }
 

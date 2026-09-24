@@ -83,6 +83,7 @@ type Session struct {
 	windowUpdateThreshold uint32
 	metadataCollector     *ClientMetadataCollector
 	metadataRevision      uint64
+	inboundBytes          int
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -93,16 +94,47 @@ func NewSessionWithOpenMode(tr FrameTransport, mode SessionOpenMode) *Session {
 	return NewSessionWithOpenModeAndMetadata(tr, mode, nil)
 }
 
+// ErrInboundBufferTooSmall rejects a per-stream buffer that cannot hold the
+// credit the Client advertises.
+var ErrInboundBufferTooSmall = errors.New("client: inbound buffer must be at least two frames")
+
+// SetInboundBufferBytes sizes the per-stream queues from configuration. It must
+// run before the session serves frames. A bound under two frames is rejected:
+// the queue has to hold the credit the Client advertises, otherwise ordinary
+// backpressure would surface as a reset stream.
+func (s *Session) SetInboundBufferBytes(bytes int) error {
+	if bytes < 2*protocol.MaxStreamFrame {
+		return ErrInboundBufferTooSmall
+	}
+	s.mu.Lock()
+	s.inboundBytes = bytes
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) inboundBufferBytes() int {
+	if s == nil {
+		return defaultStreamWindow
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inboundBytes > 0 {
+		return s.inboundBytes
+	}
+	return defaultStreamWindow
+}
+
 func NewSessionWithOpenModeAndMetadata(tr FrameTransport, mode SessionOpenMode, collector *ClientMetadataCollector) *Session {
 	s := &Session{
 		transport: tr, done: make(chan struct{}),
 		streams: make(map[uint32]*frameStream), datagrams: make(map[uint32]*frameDatagramStream),
 		pendingPings:      make(map[uint64]chan struct{}),
 		metadataCollector: collector,
+		inboundBytes:      defaultStreamWindow,
 	}
 	if tr != nil {
 		s.writer = streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
-			ControlQueueSize: 64, StreamQueueBytes: 262144, QuantumBytes: 32768,
+			ControlQueueSize: 64, StreamQueueBytes: s.inboundBufferBytes(), QuantumBytes: protocol.MaxStreamFrame,
 		})
 		go s.runWriter()
 	}
@@ -668,7 +700,7 @@ func (s *frameStream) deliverOpenResult(payload protocol.OpenResultPayload) bool
 
 func newFrameStream(s *Session, id uint32) *frameStream {
 	stream := &frameStream{
-		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(262144),
+		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
 		readSignal: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 	if s.OpenMode().supportsFlowControl() {
@@ -690,6 +722,11 @@ func (s *frameStream) Read(p []byte) (int, error) {
 			n := copy(p, s.readBuf)
 			s.readBuf = s.readBuf[n:]
 			s.mu.Unlock()
+			// Return credit only after the application consumes bytes. The
+			// peer's send queue is sized to the advertised window, so credit
+			// returned while bytes are only buffered here can make its next
+			// enqueue exceed that queue and reset a long transfer.
+			s.releaseReceiveWindow(n)
 			return n, nil
 		}
 		s.mu.Unlock()
@@ -701,7 +738,6 @@ func (s *frameStream) Read(p []byte) (int, error) {
 				s.readBuf = append(s.readBuf, payload.Payload...)
 				s.mu.Unlock()
 			}
-			s.releaseReceiveWindow(len(payload.Payload))
 			continue
 		}
 		s.mu.Lock()
@@ -720,7 +756,6 @@ func (s *frameStream) Read(p []byte) (int, error) {
 					s.readBuf = append(s.readBuf, payload.Payload...)
 					s.mu.Unlock()
 				}
-				s.releaseReceiveWindow(len(payload.Payload))
 				continue
 			}
 			s.mu.Lock()
@@ -867,8 +902,12 @@ func (s *frameStream) releaseReceiveWindow(n int) {
 	}
 	s.mu.Lock()
 	s.receiveUnacked += uint32(n)
+	remaining := uint32(0)
+	if flow := s.flow; flow != nil {
+		remaining = flow.ReceiveWindow()
+	}
 	update := uint32(0)
-	if s.receiveUnacked >= s.session.windowUpdateThreshold {
+	if protocol.ShouldFlushWindowUpdate(remaining, s.receiveUnacked, s.session.windowUpdateThreshold) {
 		update = s.receiveUnacked
 		s.receiveUnacked = 0
 	}
@@ -904,7 +943,7 @@ type frameDatagramStream struct {
 
 func newFrameDatagramStream(s *Session, id uint32) *frameDatagramStream {
 	return &frameDatagramStream{
-		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(262144),
+		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
 		readSignal: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 }

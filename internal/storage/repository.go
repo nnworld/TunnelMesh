@@ -268,6 +268,14 @@ type ClientInstanceRepository interface {
 	TouchInstance(context.Context, string, string, time.Time, time.Time) error
 	MarkStale(context.Context, string, time.Time) error
 	MarkExpired(context.Context, time.Time) (int64, error)
+	// Summarize aggregates the whole filtered population at time at.
+	Summarize(context.Context, ClientInstanceFilter, time.Time) (ClientInstanceSummary, error)
+	// DeleteUnreported removes an instance row that never accepted a
+	// CLIENT_HELLO. Reported rows are durable install identity and are kept.
+	DeleteUnreported(context.Context, string) error
+	// PurgeUnreported deletes never-reported rows with no live lease whose TTL
+	// lapsed; these are per-connection legacy records left by reconnects.
+	PurgeUnreported(context.Context, time.Time) (int64, error)
 }
 
 type ClientConnectionRepository interface {

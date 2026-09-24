@@ -17,7 +17,7 @@ import (
 func newAgentConnectionLeaseFixture(t *testing.T) (*AgentSessionManager, *AgentRelayTransport, *AgentSession, *AgentConnectionLeaseController) {
 	t.Helper()
 	manager := NewAgentSessionManager(AgentSessionConfig{})
-	localRelay := NewAgentRelayTransport(manager)
+	localRelay := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	session, err := manager.Register(context.Background(), AgentRegistration{
 		AgentID: "agent-lease", NodeID: "node-agent", Epoch: 12,
 		InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 12,
@@ -37,7 +37,7 @@ func TestAgentConnectionLeaseControllerRegistersRenewsAndReleases(t *testing.T) 
 	t.Cleanup(func() { _ = db.Close() })
 	reg := registry.NewDatabaseRegistry(db)
 	manager := NewAgentSessionManager(AgentSessionConfig{})
-	localRelay := NewAgentRelayTransport(manager)
+	localRelay := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	session, err := manager.Register(context.Background(), AgentRegistration{
 		AgentID: "agent-lease", NodeID: "node-agent", Epoch: 12,
 		InstanceID: "instance-a", ConnectionID: "conn-a", ConnectionEpoch: 12,

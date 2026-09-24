@@ -95,6 +95,17 @@ func (q *BoundedFrameQueue) popLocked() (protocol.Frame, bool) {
 	return frame, true
 }
 
+// Capacity reports the byte bound this queue was created with. Operators use it
+// to confirm a configured buffer size actually reached the data plane.
+func (q *BoundedFrameQueue) Capacity() int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.maxBytes
+}
+
 func (q *BoundedFrameQueue) LastWait() time.Duration {
 	if q == nil {
 		return 0
@@ -120,6 +131,19 @@ func (q *BoundedFrameQueue) Bytes() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.bytes
+}
+
+// CloseAfterDrain stops accepting frames and wakes blocked consumers, but keeps
+// the bytes already queued deliverable. A retiring stream that must still see the
+// request it was sent uses this; Close discards them.
+func (q *BoundedFrameQueue) CloseAfterDrain() {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
 }
 
 func (q *BoundedFrameQueue) Close() {

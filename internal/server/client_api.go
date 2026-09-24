@@ -44,6 +44,7 @@ type ClientView struct {
 	Hostname          string                    `json:"hostname"`
 	ProcessStartAt    time.Time                 `json:"processStartAt"`
 	Status            string                    `json:"status"`
+	MetadataState     string                    `json:"metadataState"`
 	ActiveConnections int                       `json:"activeConnections"`
 	ActiveStreams     int                       `json:"activeStreams"`
 	ServerNodeIDs     []string                  `json:"serverNodeIds"`
@@ -51,6 +52,18 @@ type ClientView struct {
 	Metadata          map[string]string         `json:"metadata"`
 	Capabilities      []string                  `json:"capabilities"`
 	Listeners         []protocol.ClientListener `json:"listeners"`
+}
+
+// ClientListSummary counts the whole filtered Client population. The console
+// renders these numbers next to a cursor-paginated table, so they must come
+// from the same server-side filter instead of the rows on the current page.
+type ClientListSummary struct {
+	Total               int64 `json:"total"`
+	Online              int64 `json:"online"`
+	ActiveConnections   int64 `json:"activeConnections"`
+	ActiveStreams       int64 `json:"activeStreams"`
+	MetadataUnavailable int64 `json:"metadataUnavailable"`
+	MetadataStale       int64 `json:"metadataStale"`
 }
 
 // ClientConnectionView is a durable physical WebSocket lease snapshot.
@@ -153,13 +166,27 @@ func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Princip
 	} else if !isAdmin(p) {
 		filter.OwnerUserID = p.UserID
 	}
-	status := strings.TrimSpace(r.URL.Query().Get("status"))
-	if status != "" {
+	// status carries presence; the two legacy freshness values stay accepted as
+	// deprecated aliases so a bookmarked console keeps working for one MINOR.
+	if status := strings.TrimSpace(r.URL.Query().Get("status")); status != "" {
 		switch status {
-		case "online", "offline", "stale", "metadata_unavailable":
+		case "online", "offline":
 			filter.Status = status
+		case "stale":
+			filter.MetadataState = "expired"
+		case "metadata_unavailable":
+			filter.MetadataState = "unavailable"
 		default:
 			writeAPIError(w, http.StatusBadRequest, "invalid client status")
+			return
+		}
+	}
+	if state := strings.TrimSpace(r.URL.Query().Get("metadataState")); state != "" {
+		switch state {
+		case "reported", "fresh", "unavailable", "expired":
+			filter.MetadataState = state
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid client metadata state")
 			return
 		}
 	}
@@ -167,6 +194,16 @@ func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Princip
 	if err != nil {
 		writeStorageError(w, err)
 		return
+	}
+	storedSummary, err := a.clientInstances.Summarize(r.Context(), filter, time.Now().UTC())
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	summary := ClientListSummary{
+		Total: storedSummary.Total, Online: storedSummary.Online,
+		ActiveConnections: storedSummary.ActiveConnections, ActiveStreams: storedSummary.ActiveStreams,
+		MetadataUnavailable: storedSummary.MetadataUnavailable, MetadataStale: storedSummary.MetadataStale,
 	}
 	ids := make([]string, 0, len(page.Items))
 	for _, instance := range page.Items {
@@ -185,7 +222,18 @@ func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Princip
 	for _, instance := range page.Items {
 		items = append(items, newClientView(instance, connectionByInstance[instance.ID]))
 	}
-	writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
+	data := pageData(items, page.NextCursor, page.HasMore)
+	data["summary"] = summary
+	writeJSON(w, http.StatusOK, data)
+}
+
+// clientMetadataReported reports whether the instance ever accepted a
+// CLIENT_HELLO. persistMetadata marshals a payload whose instance_id is both
+// mandatory and non-omitempty, so the empty object is only ever written by
+// RegisterLegacy and cannot be forged by a Client.
+func clientMetadataReported(instance storage.ClientInstance) bool {
+	metadata := strings.TrimSpace(instance.Metadata)
+	return metadata != "" && metadata != "{}"
 }
 
 func (a *API) closeClientConnection(w http.ResponseWriter, r *http.Request, p auth.Principal, instance storage.ClientInstance, connectionID string) {
@@ -247,6 +295,7 @@ func clientInstanceReadable(p auth.Principal, instance storage.ClientInstance) b
 func newClientView(instance storage.ClientInstance, connections []storage.ClientConnectionLease) ClientView {
 	var payload protocol.ClientMetadataPayload
 	_ = json.Unmarshal([]byte(instance.Metadata), &payload)
+	capabilities := decodeStrings(instance.Capabilities)
 	metadata := make(map[string]string, len(payload.Items))
 	for _, item := range payload.Items {
 		metadata[item.Name] = item.Value
@@ -266,21 +315,32 @@ func newClientView(instance storage.ClientInstance, connections []storage.Client
 	}
 	sort.Strings(tokenIDs)
 	sort.Strings(serverNodeIDs)
+	// Presence and metadata freshness are orthogonal facts. Conflating them made
+	// a healthy Client read as "metadata 未上报" and a long-dead row read as
+	// "metadata 已过期" rather than offline.
 	status := "offline"
-	if instance.Stale {
-		status = "stale"
-	} else if decodeStrings(instance.Capabilities) == nil {
-		status = "metadata_unavailable"
-	} else if activeConnections > 0 {
+	if activeConnections > 0 {
 		status = "online"
+	}
+	metadataState := "fresh"
+	if !clientMetadataReported(instance) {
+		metadataState = "unavailable"
+	} else if instance.Stale {
+		metadataState = "expired"
+	}
+	if capabilities == nil {
+		// Rows written before capabilities were normalised still hold the JSON
+		// literal null; the contract is an array.
+		capabilities = []string{}
 	}
 	return ClientView{
 		ID: instance.ID, InstanceID: instance.InstanceID, OwnerUserID: instance.OwnerUserID,
 		TokenIDs: tokenIDs, AgentIDs: payload.AgentIDs, Version: payload.Version, Commit: payload.Commit,
 		Platform: payload.Platform, Hostname: payload.Hostname, ProcessStartAt: payload.ProcessStartAt,
-		Status: status, ActiveConnections: activeConnections, ActiveStreams: activeStreams,
+		Status: status, MetadataState: metadataState,
+		ActiveConnections: activeConnections, ActiveStreams: activeStreams,
 		ServerNodeIDs: serverNodeIDs, LastSeenAt: instance.LastSeenAt, Metadata: metadata,
-		Capabilities: decodeStrings(instance.Capabilities), Listeners: payload.Listeners,
+		Capabilities: capabilities, Listeners: payload.Listeners,
 	}
 }
 

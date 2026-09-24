@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -40,12 +41,32 @@ const (
 	streamQueueBytes = protocol.DefaultServerReceiveWindow
 )
 
+// defaultInboundQueueBytes bounds how much Server-to-Agent DATA one stream may hold
+// before the target consumed it. Credit is returned only after the target write
+// succeeds, so a peer that respects its advertised window can never queue more
+// than the credit it was granted; a full inbound queue therefore reports a
+// protocol violation, never ordinary backpressure.
+const defaultInboundQueueBytes = defaultAgentReceiveWindow
+
+// errInboundQueueFull reports a peer that sent more DATA than its advertised
+// window allowed. It fails one stream, never the Agent session.
+var errInboundQueueFull = errors.New("agent: inbound stream queue full")
+
+// ErrInboundBufferTooSmall rejects a per-stream buffer that cannot hold the
+// credit this Agent advertises, which would turn ordinary backpressure into a
+// reset stream.
+var ErrInboundBufferTooSmall = errors.New("agent: inbound buffer must be at least two frames")
+
 type StreamOpenPayload = protocol.StreamOpenPayload
 type StreamDialFunc func(context.Context, string, string, int) (io.ReadWriteCloser, error)
 type streamPayloadDialFunc func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error)
 type FrameSender func(protocol.Frame) error
 type streamEntry struct {
-	conn           io.ReadWriteCloser
+	conn io.ReadWriteCloser
+	// inbound and pumpDone move target writes off the session's single frame
+	// reader, so one target that stops reading stalls only its own stream.
+	inbound        *streamsession.BoundedFrameQueue
+	pumpDone       chan struct{}
 	generation     uint64
 	protocol       string
 	localHalf      bool
@@ -61,6 +82,7 @@ type streamEntry struct {
 type pendingStream struct {
 	cancel        context.CancelFunc
 	data          [][]byte
+	pendingBytes  int
 	halfClosed    bool
 	strict        bool
 	initialWindow uint32
@@ -75,6 +97,7 @@ type StreamDispatcher struct {
 	send        FrameSender
 	metrics     *observability.Metrics
 	readers     sync.WaitGroup
+	writers     sync.WaitGroup
 	closed      bool
 	pending     map[uint32]*pendingStream
 	executor    *DialExecutor
@@ -84,6 +107,10 @@ type StreamDispatcher struct {
 	// capability the server does not know it has.
 	icmpEcho    bool
 	ttfbSamples latencySamples
+	// inboundBytes is the per-stream queue bound; it comes from
+	// `agent.streams.inbound_buffer_bytes` and defaults to the credit this Agent
+	// grants, so a configured buffer can never be smaller than the window.
+	inboundBytes int
 }
 
 func NewStreamDispatcher(d Dialer, override StreamDialFunc) *StreamDispatcher {
@@ -239,7 +266,21 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 				}
 				d.mu.Lock()
 				if current, exists := d.pending[f.StreamID]; exists {
+					if current.pendingBytes+len(f.Payload) > d.inboundBufferBytesLocked() {
+						// The dial is still running and the peer has queued a whole window
+						// already. Failing this stream bounds what one slow target can cost;
+						// leaving it open would grow the buffer with the dial timeout.
+						delete(d.pending, f.StreamID)
+						d.mu.Unlock()
+						if current.cancel != nil {
+							current.cancel()
+						}
+						d.executor.Cancel(f.StreamID)
+						_ = d.sendReset(f.StreamID)
+						return nil
+					}
 					current.data = append(current.data, append([]byte(nil), f.Payload...))
+					current.pendingBytes += len(f.Payload)
 				}
 				d.mu.Unlock()
 				return nil
@@ -250,22 +291,12 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if localHalf {
 			return d.rejectAndClose(f.StreamID, entry, protocol.ErrInvalidFrame)
 		}
-		if entry.receiveState != nil {
-			if err := entry.receiveState.Handle(f); err != nil {
-				return d.rejectAndClose(f.StreamID, entry, err)
-			}
-		}
-		written, err := entry.conn.Write(f.Payload)
-		if d.metrics != nil && written > 0 {
-			d.metrics.ObserveBytes("agent", "inbound", entry.protocol, int64(written))
-		}
-		if err == nil && written != len(f.Payload) {
-			err = io.ErrShortWrite
-		}
-		if err != nil {
+		// The payload is queued, never written here: this call is the only frame
+		// reader for every stream multiplexed on the connection, so a target that
+		// stops reading must not freeze the others with it.
+		if err := d.admitInbound(f.StreamID, entry, f.Payload); err != nil {
 			return d.rejectAndClose(f.StreamID, entry, err)
 		}
-		d.releaseReceiveWindow(f.StreamID, entry, written)
 		return nil
 	case protocol.FrameHalfClose:
 		d.mu.Lock()
@@ -314,6 +345,7 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 			// RESET is stream-local. A target that is already closed by its
 			// reader/writer goroutine must not escalate into a session error.
 			_ = entry.conn.Close()
+			entry.stopInbound()
 		}
 		return nil
 	case protocol.FrameWindowUpdate:
@@ -420,8 +452,11 @@ func (d *StreamDispatcher) completeDial(id uint32, proto string, result DialResu
 		}
 		entry.windowSignal = make(chan struct{}, 1)
 	}
+	entry.inbound = streamsession.NewBoundedFrameQueue(d.inboundBufferBytesLocked())
+	entry.pumpDone = make(chan struct{})
 	d.streams[id] = entry
-	d.readers.Add(1)
+	d.writers.Add(1)
+	go d.pumpTarget(id, entry)
 	strict := pending != nil && pending.strict
 	d.mu.Unlock()
 	var openResultErr error
@@ -431,8 +466,11 @@ func (d *StreamDispatcher) completeDial(id uint32, proto string, result DialResu
 	if d.metrics != nil {
 		d.metrics.ObserveStream(proto, "accepted", "")
 	}
+	// Early DATA goes through the same admission path as later DATA, so its
+	// credit is accounted exactly once and it stays ordered ahead of a
+	// half-close that already arrived.
 	for _, payload := range earlyData {
-		if _, err := entry.conn.Write(payload); err != nil {
+		if err := d.admitInbound(id, entry, payload); err != nil {
 			_ = d.rejectAndClose(id, entry, err)
 			return
 		}
@@ -447,6 +485,7 @@ func (d *StreamDispatcher) completeDial(id uint32, proto string, result DialResu
 		_ = d.rejectAndClose(id, entry, openResultErr)
 		return
 	}
+	d.readers.Add(1)
 	go d.readBack(id, entry)
 }
 
@@ -457,8 +496,24 @@ func (d *StreamDispatcher) handleHalfClose(id uint32, entry *streamEntry) error 
 		return nil
 	}
 	entry.localHalf = true
-	complete := entry.remoteHalf
 	d.mu.Unlock()
+	// The target half-close is queued behind the DATA already admitted for this
+	// stream. Closing the write half here would overtake bytes that have not
+	// reached the target yet, truncating the request.
+	if entry.inbound == nil {
+		return d.closeTargetWrite(id, entry)
+	}
+	if !entry.inbound.TryPush(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: id}) {
+		// The queue is already closed, so this stream is being retired.
+		return nil
+	}
+	return nil
+}
+
+// closeTargetWrite shuts the Agent-to-Server direction of one target connection
+// and finishes the stream when the read direction already ended. It runs on the
+// stream's writer pump, never on the session's frame reader.
+func (d *StreamDispatcher) closeTargetWrite(id uint32, entry *streamEntry) error {
 	halfCloser, ok := entry.conn.(interface{ CloseWrite() error })
 	if !ok {
 		return errors.New("agent: target stream does not support half-close")
@@ -466,15 +521,73 @@ func (d *StreamDispatcher) handleHalfClose(id uint32, entry *streamEntry) error 
 	if err := halfCloser.CloseWrite(); err != nil {
 		return err
 	}
+	d.mu.Lock()
+	complete := entry.remoteHalf
 	if complete {
-		d.mu.Lock()
 		if current, exists := d.streams[id]; exists && current == entry {
 			delete(d.streams, id)
 		}
-		d.mu.Unlock()
+	}
+	d.mu.Unlock()
+	if complete {
+		entry.stopInbound()
 		return entry.conn.Close()
 	}
 	return nil
+}
+
+// admitInbound accounts one inbound payload against the receive window and hands
+// it to the stream's writer pump. It is the only entry point for Server-to-Agent
+// DATA, so bytes that arrived while the dial was pending are credited exactly
+// like bytes that arrive afterwards.
+func (d *StreamDispatcher) admitInbound(id uint32, entry *streamEntry, payload []byte) error {
+	if entry.inbound == nil {
+		return errInboundQueueFull
+	}
+	if entry.receiveState != nil {
+		if err := entry.receiveState.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: payload}); err != nil {
+			return err
+		}
+	}
+	if !entry.inbound.TryPush(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: payload}) {
+		return errInboundQueueFull
+	}
+	return nil
+}
+
+// pumpTarget is the single writer for one target connection. It is what keeps the
+// frame reader responsive: a blocking target write parks only this goroutine and
+// this stream's bounded inbound queue.
+func (d *StreamDispatcher) pumpTarget(id uint32, entry *streamEntry) {
+	defer close(entry.pumpDone)
+	defer d.writers.Done()
+	for {
+		frame, ok := entry.inbound.Pop()
+		if !ok {
+			return
+		}
+		if frame.Type == protocol.FrameHalfClose {
+			if err := d.closeTargetWrite(id, entry); err != nil {
+				_ = d.rejectAndClose(id, entry, err)
+				return
+			}
+			continue
+		}
+		written, err := entry.conn.Write(frame.Payload)
+		if d.metrics != nil && written > 0 {
+			d.metrics.ObserveBytes("agent", "inbound", entry.protocol, int64(written))
+		}
+		if err == nil && written != len(frame.Payload) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			_ = d.rejectAndClose(id, entry, err)
+			return
+		}
+		// Credit returns only after the target took the bytes, which is what
+		// bounds the inbound queue by the advertised window.
+		d.releaseReceiveWindow(id, entry, written)
+	}
 }
 
 func (d *StreamDispatcher) rejectStream(id uint32, result DialResult) {
@@ -600,6 +713,10 @@ func (d *StreamDispatcher) readBack(id uint32, entry *streamEntry) {
 				}
 			}
 			if complete {
+				// The read direction ended, but DATA the peer sent earlier still has to
+				// reach the target, so the queue is closed for new pushes rather than
+				// discarded.
+				entry.finishInbound()
 				_ = entry.conn.Close()
 			}
 			return
@@ -645,8 +762,12 @@ func (d *StreamDispatcher) releaseReceiveWindow(id uint32, entry *streamEntry, s
 	}
 	entry.flowMu.Lock()
 	entry.receiveUnacked += uint32(size)
+	remaining := uint32(0)
+	if entry.receiveState != nil {
+		remaining = entry.receiveState.ReceiveWindow()
+	}
 	update := uint32(0)
-	if entry.receiveUnacked >= defaultAgentWindowUpdateThreshold {
+	if protocol.ShouldFlushWindowUpdate(remaining, entry.receiveUnacked, defaultAgentWindowUpdateThreshold) {
 		update = entry.receiveUnacked
 		entry.receiveUnacked = 0
 	}
@@ -667,6 +788,9 @@ func (d *StreamDispatcher) sendReset(id uint32) error {
 }
 
 func (d *StreamDispatcher) rejectAndClose(id uint32, entry *streamEntry, reason error) error {
+	slog.WarnContext(d.ctx, "agent_stream_send_reset",
+		"protocol", entry.protocol, "stream_id", id,
+		"error_class", observability.NormalizeErrorClass(reason))
 	d.removeAndClose(id, entry)
 	if d.send == nil {
 		return reason
@@ -680,7 +804,47 @@ func (d *StreamDispatcher) removeAndClose(id uint32, entry *streamEntry) {
 		delete(d.streams, id)
 	}
 	d.mu.Unlock()
+	entry.stopInbound()
 	_ = entry.conn.Close()
+}
+
+// SetInboundBufferBytes configures the per-stream inbound queue before the
+// dispatcher serves frames. Anything below two frames is rejected because the
+// queue must absorb a full frame plus the one being read.
+func (d *StreamDispatcher) SetInboundBufferBytes(bytes int) error {
+	if bytes < 2*protocol.MaxStreamFrame {
+		return ErrInboundBufferTooSmall
+	}
+	d.mu.Lock()
+	d.inboundBytes = bytes
+	d.mu.Unlock()
+	return nil
+}
+
+// inboundBufferBytesLocked is the per-stream queue bound. Both call sites run
+// under d.mu, and this dispatcher's mutex is not reentrant.
+func (d *StreamDispatcher) inboundBufferBytesLocked() int {
+	if d.inboundBytes > 0 {
+		return d.inboundBytes
+	}
+	return defaultInboundQueueBytes
+}
+
+// stopInbound retires a stream immediately: queued bytes belong to a stream that
+// is being reset, so the pump drops them and exits.
+func (e *streamEntry) stopInbound() {
+	if e != nil && e.inbound != nil {
+		e.inbound.Close()
+	}
+}
+
+// finishInbound ends a stream's inbound direction without discarding bytes the
+// peer already paid for, which is what lets a target receive a request that
+// arrived just before its response direction reached EOF.
+func (e *streamEntry) finishInbound() {
+	if e != nil && e.inbound != nil {
+		e.inbound.CloseAfterDrain()
+	}
 }
 func (d *StreamDispatcher) Close() error {
 	d.cancel()
@@ -693,16 +857,24 @@ func (d *StreamDispatcher) Close() error {
 	}
 	d.closed = true
 	connections := make([]io.Closer, 0, len(d.streams))
+	inbounds := make([]*streamsession.BoundedFrameQueue, 0, len(d.streams))
 	for id, entry := range d.streams {
 		delete(d.streams, id)
 		connections = append(connections, entry.conn)
+		if entry.inbound != nil {
+			inbounds = append(inbounds, entry.inbound)
+		}
 	}
 	d.mu.Unlock()
+	for _, queue := range inbounds {
+		queue.Close()
+	}
 	var closeErr error
 	for _, conn := range connections {
 		closeErr = errors.Join(closeErr, conn.Close())
 	}
 	d.readers.Wait()
+	d.writers.Wait()
 	return errors.Join(closeErr, executorErr)
 }
 

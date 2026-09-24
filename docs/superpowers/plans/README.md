@@ -8,13 +8,21 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 52 份计划，按日期倒序排列。
+共 60 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
 | 2026-09-24 | [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | — | [PR：一键安装函数级套件不再挂在交互提示上](../../pull-requests/2026-09-24-oneclick-shell-suite-hermetic-stdin.md) |
+| 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁实施计划](2026-09-24-mysql56-contract-ci-gate.md) | — | [PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
+| 2026-09-24 | [MySQL 5.6 本地复现 profile 实施计划](2026-09-24-mysql56-compose-profile.md) | — | [PR：MySQL 5.6 本地复现 profile](../../pull-requests/2026-09-24-mysql56-compose-profile.md)<br>[PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
+| 2026-09-24 | [迁移脚本注释分号解析紧急修复计划](2026-09-24-migration-comment-splitter-hotfix.md) | — | [PR：Migration comment splitter hotfix](../../pull-requests/2026-09-24-migration-comment-splitter-hotfix.md) |
+| 2026-09-24 | [Agent / Server / Client 数据面流控与阻塞隔离加固 Implementation Plan](2026-09-24-dataplane-flow-control-hardening.md) | [规格：SOCKS5 网页首屏延迟优化](../specs/2026-09-10-socks5-web-page-latency-design.md) | [PR：Agent / Server / Client 数据面流控与阻塞隔离加固](../../pull-requests/2026-09-24-dataplane-flow-control-hardening.md) |
+| 2026-09-24 | [Client WINDOW_UPDATE 泄漏修复实施计划](2026-09-24-client-window-update-leak.md) | — | [PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md)<br>[PR：Client WINDOW_UPDATE 泄漏修复](../../pull-requests/2026-09-24-client-window-update-leak.md) |
+| 2026-09-24 | [客户端观测状态模型修复实施计划](2026-09-24-client-status-metadata-state.md) | — | [PR：Client 观测状态模型修复](../../pull-requests/2026-09-24-client-status-metadata-state.md) |
+| 2026-09-24 | [Client receive-window credit timing fix plan](2026-09-24-client-receive-window-credit.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md) |
+| 2026-09-24 | [Client local-forward delayed response fix plan](2026-09-24-client-forward-delayed-response.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md) |
 | 2026-09-23 | [VPN 网关 阶段 7：Agent ICMP echo 与能力协商 Implementation Plan](2026-09-23-vpn-phase7-agent-icmp.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [VPN 网关 阶段 6：Server 数据面（WireGuard + netstack）Implementation Plan](2026-09-23-vpn-phase6-server-data-plane.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 6：Server 数据面](../../pull-requests/2026-09-23-vpn-phase6-server-data-plane.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [三端一键安装脚本 Implementation Plan](2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../specs/2026-09-23-one-click-install-scripts-design.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
@@ -72,6 +80,7 @@
 以下计划按 AGENTS.md 的紧急修复条款先止损、后补记，正文已标注“补记计划”：
 
 - [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md)（2026-09-24）
+- [Client WINDOW_UPDATE 泄漏修复实施计划](2026-09-24-client-window-update-leak.md)（2026-09-24）
 - [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md)（2026-09-23）
 - [ZMODEM 出站写入串行化修复实施计划](2026-09-13-zmodem-write-serialization.md)（2026-09-13）
 - [ZMODEM 停滞处置策略与进度节流实施计划](2026-09-13-zmodem-stall-channel-policy.md)（2026-09-13）

@@ -74,6 +74,7 @@ describe('application shell', () => {
     expect(source).toContain('clientDetailTitle')
     expect(source).toContain('closeConnection')
     expect(source).toContain('connectionEpoch')
-    expect(source).toContain('metadata_unavailable')
+    expect(source).toContain('metadataStateOptions')
+    expect(source).toContain("'unavailable'")
   })
 })

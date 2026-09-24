@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,10 @@ type clientRelayStream struct {
 	sendState        *protocol.StreamState
 	windowSignal     chan struct{}
 	flowMu           sync.Mutex
+	// inbound holds Client-to-Agent DATA that the pump has not handed over yet.
+	// It is what keeps the shared frame loop off the critical path of a stalled
+	// Agent, so it must stay byte-bounded and be closed with the stream.
+	inbound *streamsession.BoundedFrameQueue
 }
 
 // ServeClientSession multiplexes one authenticated Client connection onto the
@@ -97,14 +102,27 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 		delete(streams, id)
 		mu.Unlock()
 		if stream != nil {
+			stream.inbound.Close()
 			_ = stream.conn.Close()
 		}
 		if clientObservability != nil {
 			_ = clientObservability.StreamClosed(principal)
 		}
 	}
+	reset := func(id uint32) error {
+		if id == 0 {
+			return nil
+		}
+		return sendControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
+	}
 	newRelayStream := func(id uint32, conn io.ReadWriteCloser, proto string, initialWindow uint32) *clientRelayStream {
 		stream := &clientRelayStream{conn: conn, protocol: proto}
+		// Every positive window is honoured exactly as the Client advertised it.
+		// Enlarging one would overrun the peer's inbound buffer, and ignoring flow
+		// control for a small one would do the same with extra steps; a sub-frame
+		// window is served by relayToClient, which caps each read to the credit that
+		// is available right now, so the stream crawls instead of stalling on a wait
+		// for a whole frame that can never be granted.
 		if id != 0 && initialWindow > 0 {
 			if sendState, err := protocol.NewStreamState(id, initialWindow); err == nil && sendState != nil {
 				_ = sendState.OpenLocal()
@@ -112,29 +130,31 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 				stream.windowSignal = make(chan struct{}, 1)
 			}
 		}
+		// The queue is credit the pump needs to make progress while the Agent is
+		// slow, so it is sized from the same window this stream runs on: overflow
+		// then means the Client ignored its own credit, never ordinary
+		// backpressure. Streams without a usable window get the advertised
+		// default, which bounds memory per stream the same way.
+		stream.inbound = streamsession.NewBoundedFrameQueue(int(protocol.NegotiateReceiveWindow(initialWindow)))
+		go pumpClientUpload(id, stream, &mu, streams, metrics, closeStream, reset)
 		return stream
 	}
 	defer func() {
 		mu.Lock()
-		remaining := make([]io.Closer, 0, len(streams))
+		remaining := make([]*clientRelayStream, 0, len(streams))
 		for id, stream := range streams {
 			delete(streams, id)
-			remaining = append(remaining, stream.conn)
+			remaining = append(remaining, stream)
 		}
 		mu.Unlock()
 		for _, stream := range remaining {
-			_ = stream.Close()
+			stream.inbound.Close()
+			_ = stream.conn.Close()
 		}
 		for _, future := range openings {
 			future.Cancel()
 		}
 	}()
-	reset := func(id uint32) error {
-		if id == 0 {
-			return nil
-		}
-		return sendControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
-	}
 	sendOpenResult := func(id uint32, result protocol.OpenResultPayload) error {
 		payload, err := protocol.EncodeOpenResultPayload(result)
 		if err != nil {
@@ -312,7 +332,7 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 						closeStream(id)
 						return
 					}
-					go relayToClient(id, stream, writer, &mu, streams)
+					go relayToClient(ctx, id, stream, writer, &mu, streams)
 					if clientObservability != nil {
 						_ = clientObservability.StreamOpened(principal)
 					}
@@ -341,7 +361,7 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 			mu.Lock()
 			streams[frame.StreamID] = stream
 			mu.Unlock()
-			go relayToClient(frame.StreamID, stream, writer, &mu, streams)
+			go relayToClient(ctx, frame.StreamID, stream, writer, &mu, streams)
 			if clientObservability != nil {
 				_ = clientObservability.StreamOpened(principal)
 			}
@@ -365,14 +385,14 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 				_ = reset(frame.StreamID)
 				continue
 			}
-			written, err := stream.conn.Write(frame.Payload)
-			if metrics != nil && written > 0 {
-				metrics.ObserveBytes("server", "outbound", stream.protocol, int64(written))
-			}
-			if err == nil && written != len(frame.Payload) {
-				err = io.ErrShortWrite
-			}
-			if err != nil {
+			// Handing the bytes to the stream's pump is the whole job here. The
+			// Agent connection is written by exactly one goroutine per stream, so
+			// a peer that stops reading parks its own pump instead of the frame
+			// loop that also carries OPEN_STREAM, PING and every other stream.
+			if !stream.inbound.TryPush(frame) {
+				slog.WarnContext(ctx, "client_stream_queue_full_reset",
+					"protocol", stream.protocol, "stream_id", frame.StreamID,
+					"error_class", "flow_control")
 				closeStream(frame.StreamID)
 				_ = reset(frame.StreamID)
 			}
@@ -396,18 +416,16 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 				_ = reset(frame.StreamID)
 				continue
 			}
-			halfCloser, ok := stream.conn.(interface{ CloseWrite() error })
-			if !ok || halfCloser.CloseWrite() != nil {
-				closeStream(frame.StreamID)
-				_ = reset(frame.StreamID)
+			if stream.inbound.TryPush(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: frame.StreamID}) {
 				continue
 			}
-			mu.Lock()
-			complete := stream.relayHalfClosed
-			mu.Unlock()
-			if complete {
-				closeStream(frame.StreamID)
-			}
+			// The pump is already gone, so nobody will half-close the Agent side
+			// for us. Retire the stream rather than leave it open forever.
+			slog.WarnContext(ctx, "client_stream_queue_full_reset",
+				"protocol", stream.protocol, "stream_id", frame.StreamID,
+				"error_class", "stream_closed")
+			closeStream(frame.StreamID)
+			_ = reset(frame.StreamID)
 		case protocol.FrameWindowUpdate:
 			mu.Lock()
 			stream := streams[frame.StreamID]
@@ -422,13 +440,6 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 				closeStream(frame.StreamID)
 				_ = reset(frame.StreamID)
 				continue
-			}
-			if controlWriter, ok := stream.conn.(interface{ WriteControl(protocol.Frame) error }); ok {
-				if err := controlWriter.WriteControl(frame); err != nil {
-					closeStream(frame.StreamID)
-					_ = reset(frame.StreamID)
-					continue
-				}
 			}
 			select {
 			case stream.windowSignal <- struct{}{}:
@@ -457,7 +468,62 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 	}
 }
 
-func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.FairFrameWriter, mu *sync.Mutex, streams map[uint32]*clientRelayStream) {
+// retireClientStream drops a stream that is no longer current and releases both
+// of its goroutines: the Agent-side reader and the Client-side upload pump.
+// Closing the inbound queue is what lets a pump blocked in Pop return, so every
+// path that removes a stream from the map must go through here.
+func retireClientStream(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream) {
+	mu.Lock()
+	if streams[id] == stream {
+		delete(streams, id)
+	}
+	mu.Unlock()
+	stream.inbound.Close()
+	_ = stream.conn.Close()
+}
+
+// pumpClientUpload is the single writer for one Client-to-Agent stream. A target
+// that stops taking bytes parks only this goroutine and this stream's bounded
+// inbound queue, never the shared Client frame loop.
+func pumpClientUpload(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, metrics *observability.Metrics, closeStream func(uint32), reset func(uint32) error) {
+	for {
+		frame, ok := stream.inbound.Pop()
+		if !ok {
+			return
+		}
+		if frame.Type == protocol.FrameHalfClose {
+			halfCloser, ok := stream.conn.(interface{ CloseWrite() error })
+			if !ok || halfCloser.CloseWrite() != nil {
+				closeStream(id)
+				_ = reset(id)
+				return
+			}
+			mu.Lock()
+			complete := stream.relayHalfClosed
+			mu.Unlock()
+			if complete {
+				closeStream(id)
+			}
+			continue
+		}
+		written, err := stream.conn.Write(frame.Payload)
+		if metrics != nil && written > 0 {
+			metrics.ObserveBytes("server", "outbound", stream.protocol, int64(written))
+		}
+		if err == nil && written != len(frame.Payload) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			// A write error ends this stream, not the session: the other
+			// streams and the frame loop must keep running.
+			closeStream(id)
+			_ = reset(id)
+			return
+		}
+	}
+}
+
+func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, writer *streamsession.FairFrameWriter, mu *sync.Mutex, streams map[uint32]*clientRelayStream) {
 	bufferSize := 32 << 10
 	if strings.EqualFold(stream.protocol, "udp") {
 		bufferSize = protocol.MaxPayload
@@ -471,18 +537,17 @@ func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.F
 				control.Version = protocol.CurrentVersion
 				control.StreamID = id
 				if err := writer.EnqueueControl(control); err != nil {
-					mu.Lock()
-					if streams[id] == stream {
-						delete(streams, id)
-					}
-					mu.Unlock()
-					_ = stream.conn.Close()
+					retireClientStream(id, stream, mu, streams)
 					return
 				}
 				continue
 			}
 		}
-		n, err := stream.conn.Read(buffer)
+		limit, ok := clientSendLimit(id, stream, mu, streams, bufferSize)
+		if !ok {
+			return
+		}
+		n, err := stream.conn.Read(buffer[:limit])
 		if n > 0 {
 			mu.Lock()
 			current := streams[id]
@@ -491,21 +556,14 @@ func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.F
 				return
 			}
 			if err := waitForClientWindow(id, stream, mu, streams, n); err != nil {
-				mu.Lock()
-				if streams[id] == stream {
-					delete(streams, id)
-				}
-				mu.Unlock()
-				_ = stream.conn.Close()
+				retireClientStream(id, stream, mu, streams)
 				return
 			}
 			if sendErr := writer.EnqueueData(id, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buffer[:n]...)}); sendErr != nil {
-				mu.Lock()
-				if streams[id] == stream {
-					delete(streams, id)
-				}
-				mu.Unlock()
-				_ = stream.conn.Close()
+				slog.WarnContext(ctx, "client_stream_queue_full_reset",
+					"protocol", stream.protocol, "stream_id", id,
+					"error_class", observability.NormalizeErrorClass(sendErr))
+				retireClientStream(id, stream, mu, streams)
 				// The peer must learn the byte stream ended early. Dropping the
 				// stream silently leaves the Client holding a short body, which
 				// surfaces as a truncated download with nothing in the log to
@@ -527,23 +585,13 @@ func relayToClient(id uint32, stream *clientRelayStream, writer *streamsession.F
 				return
 			}
 			if !errors.Is(err, io.EOF) {
-				mu.Lock()
-				if streams[id] == stream {
-					delete(streams, id)
-				}
-				mu.Unlock()
-				_ = stream.conn.Close()
+				retireClientStream(id, stream, mu, streams)
 				_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
 				return
 			}
 			_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: id})
 			if complete {
-				mu.Lock()
-				if streams[id] == stream {
-					delete(streams, id)
-				}
-				mu.Unlock()
-				_ = stream.conn.Close()
+				retireClientStream(id, stream, mu, streams)
 			}
 			return
 		}
@@ -563,6 +611,37 @@ func newClientConnectionEpoch() (int64, error) {
 		epoch = 1
 	}
 	return epoch, nil
+}
+
+// clientSendLimit reports how many bytes may be read from the Agent for one DATA
+// frame right now: at most one frame, and never more than the credit the Client
+// still holds. Only this goroutine spends send credit, and WINDOW_UPDATE only
+// adds to it, so a read capped by the current value can never over-commit.
+// Returning false means the stream is gone and the caller must stop.
+func clientSendLimit(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, want int) (int, bool) {
+	if stream.sendState == nil {
+		return want, true
+	}
+	for {
+		if available := int(stream.sendState.SendWindow()); available > 0 {
+			if available > want {
+				available = want
+			}
+			return available, true
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-stream.windowSignal:
+			timer.Stop()
+		case <-timer.C:
+		}
+		mu.Lock()
+		current, ok := streams[id]
+		mu.Unlock()
+		if !ok || current != stream {
+			return 0, false
+		}
+	}
 }
 
 func waitForClientWindow(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, size int) error {

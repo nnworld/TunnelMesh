@@ -116,6 +116,26 @@ export TUNNELMESH_REGISTRY_TYPE=etcd
 export TUNNELMESH_REGISTRY_ENDPOINTS='https://etcd-1:2379,https://etcd-2:2379'
 ```
 
+### MySQL 5.6 契约环境（可选）
+
+`mysql56` 是一份 **opt-in 的一次性测试库**，用来在本地复现 CI `mysql56` 检查的项目下限版本
+（`mysql:5.6`，见 [测试与验证](../development/testing.md)）。它不在集群栈里启动：只有显式带
+`--profile mysql56` 才会拉起，独立 volume、无 TLS、只绑 `127.0.0.1:3307`，
+所以既不会污染集群的 `mysql` 服务，也不会暴露到网络上。
+
+```bash
+docker compose -f docker-compose.cluster.yml --profile mysql56 up -d mysql56
+```
+
+它比 CI 服务容器多做一件事：挂载 `deploy/mysql56/utf8mb4.cnf` 复现生产的
+`utf8mb4_general_ci`，因此能验证 `migrations/ddl.sql` 在 5.6 的 767-byte 索引前缀限制下建得起来。
+口令默认为占位值，用 `MYSQL56_TEST_PASSWORD` / `MYSQL56_ROOT_PASSWORD` 覆盖即可；两者只服务本地
+测试库，**不得**用于任何真实数据。销毁数据：
+
+```bash
+docker compose -f docker-compose.cluster.yml --profile mysql56 down -v mysql56
+```
+
 ## 运行时配置
 
 ```bash

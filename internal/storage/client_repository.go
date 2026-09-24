@@ -36,7 +36,11 @@ func (r *clientInstanceRepo) Upsert(ctx context.Context, instance ClientInstance
 	if instance.Metadata == "" {
 		instance.Metadata = "{}"
 	}
-	if instance.Capabilities == "" {
+	// `capabilities,omitempty` means a Client that never advertises capabilities
+	// marshals to JSON null, and json.Marshal(nil slice) is also "null". Only
+	// "[]" is a usable empty array, so normalise here instead of letting a
+	// non-JSON literal reach every reader of this column.
+	if instance.Capabilities == "" || instance.Capabilities == "null" {
 		instance.Capabilities = "[]"
 	}
 
@@ -154,6 +158,69 @@ func (r *clientInstanceRepo) MarkExpired(ctx context.Context, at time.Time) (int
 		at = time.Now().UTC()
 	}
 	res, err := r.db.ExecContext(ctx, `UPDATE client_instance_metadata SET stale=1,updated_at=? WHERE stale=0 AND (expires_at IS NULL OR expires_at<=?)`, tm(at), tm(at))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Summarize reports counters for the whole filtered population. It reuses the
+// exact list conditions so a counter can never describe rows the caller is not
+// allowed to see, and it avoids database-side time functions because the schema
+// stores RFC3339 text rather than DATETIME.
+func (r *clientInstanceRepo) Summarize(ctx context.Context, filter ClientInstanceFilter, at time.Time) (ClientInstanceSummary, error) {
+	if r == nil || r.db == nil {
+		return ClientInstanceSummary{}, errors.New("client instance repository is unavailable")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	conditions, args := clientInstanceConditions(filter, at)
+	where := ""
+	if len(conditions) > 0 {
+		where = ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	summary := ClientInstanceSummary{}
+	summarySQL := `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM client_connection_leases c WHERE c.client_instance_id=client_instance_metadata.id AND c.expires_at>?) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN metadata='{}' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN stale=1 AND metadata<>'{}' THEN 1 ELSE 0 END),0)
+		FROM client_instance_metadata` + where
+	row := r.db.QueryRowContext(ctx, summarySQL, append([]any{tm(at)}, args...)...)
+	if err := row.Scan(&summary.Total, &summary.Online, &summary.MetadataUnavailable, &summary.MetadataStale); err != nil {
+		return ClientInstanceSummary{}, err
+	}
+	// Live leases are counted over the same population, not over the page.
+	leaseSQL := `SELECT COUNT(*), COALESCE(SUM(active_streams),0) FROM client_connection_leases
+		WHERE expires_at>? AND client_instance_id IN (SELECT id FROM client_instance_metadata` + where + `)`
+	if err := r.db.QueryRowContext(ctx, leaseSQL, append([]any{tm(at)}, args...)...).Scan(&summary.ActiveConnections, &summary.ActiveStreams); err != nil {
+		return ClientInstanceSummary{}, err
+	}
+	return summary, nil
+}
+
+func (r *clientInstanceRepo) DeleteUnreported(ctx context.Context, id string) error {
+	if id == "" {
+		return sql.ErrNoRows
+	}
+	res, err := r.db.ExecContext(ctx, `DELETE FROM client_instance_metadata WHERE id=? AND metadata='{}'`, id)
+	return checkAffected(res, err)
+}
+
+// PurgeUnreported reaps never-reported rows left behind by a Client that
+// reconnects without CLIENT_HELLO. The TTL guard keeps a row that is mid-handshake
+// alive, and the lease guard keeps a currently connected Client alive.
+func (r *clientInstanceRepo) PurgeUnreported(ctx context.Context, at time.Time) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("client instance repository is unavailable")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	res, err := r.db.ExecContext(ctx, `DELETE FROM client_instance_metadata
+		WHERE metadata='{}' AND (expires_at IS NULL OR expires_at<=?)
+		AND NOT EXISTS (SELECT 1 FROM client_connection_leases c WHERE c.client_instance_id=client_instance_metadata.id AND c.expires_at>?)`,
+		tm(at), tm(at))
 	if err != nil {
 		return 0, err
 	}
@@ -348,13 +415,28 @@ func clientInstanceConditions(filter ClientInstanceFilter, now time.Time) ([]str
 	case "offline":
 		conditions = append(conditions, `NOT EXISTS (SELECT 1 FROM client_connection_leases c WHERE c.client_instance_id=client_instance_metadata.id AND c.expires_at>?)`)
 		args = append(args, tm(now))
-	case "stale":
-		conditions = append(conditions, `stale=1`)
-	case "metadata_unavailable":
-		conditions = append(conditions, `(capabilities='' OR capabilities='[]')`)
 	default:
 		// An unsupported status cannot match any row; the API layer validates
 		// this value, while the repository remains safe if called directly.
+		conditions = append(conditions, `1=0`)
+	}
+	// Metadata freshness is orthogonal to presence. A CLIENT_HELLO row always
+	// carries a marshalled payload with a non-empty instance_id, so the literal
+	// `{}` written by RegisterLegacy is the only durable, non-forgeable signal
+	// that this Client never reported metadata.
+	// reported is the "CLIENT_HELLO ever accepted" alias of fresh|expired, so a
+	// caller can ask for either the whole reported population or one freshness.
+	switch filter.MetadataState {
+	case "":
+	case "reported":
+		conditions = append(conditions, `metadata<>'{}'`)
+	case "unavailable":
+		conditions = append(conditions, `metadata='{}'`)
+	case "expired":
+		conditions = append(conditions, `stale=1 AND metadata<>'{}'`)
+	case "fresh":
+		conditions = append(conditions, `stale=0 AND metadata<>'{}'`)
+	default:
 		conditions = append(conditions, `1=0`)
 	}
 	if filter.AgentID != "" {

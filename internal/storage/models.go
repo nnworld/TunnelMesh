@@ -517,14 +517,31 @@ type AgentLease struct {
 // Lease is a compatibility alias used by registry adapters.
 type Lease = AgentLease
 
+// ClientInstanceFilter narrows the Client observability list. Status is
+// presence only; metadata freshness is a separate axis so a connected Client is
+// never labelled by an expired or missing metadata snapshot.
 type ClientInstanceFilter struct {
-	OwnerUserID  string
-	TokenID      string
-	ServerNodeID string
-	Status       string
-	AgentID      string
-	Keyword      string
+	OwnerUserID   string
+	TokenID       string
+	ServerNodeID  string
+	Status        string
+	MetadataState string
+	AgentID       string
+	Keyword       string
 }
+
+// ClientInstanceSummary aggregates the whole filtered Client population, not a
+// single cursor page, so the console counters cannot disagree with the table.
+type ClientInstanceSummary struct {
+	Total               int64
+	Online              int64
+	ActiveConnections   int64
+	ActiveStreams       int64
+	MetadataUnavailable int64
+	MetadataStale       int64
+}
+
+func (s ClientInstanceSummary) IsZero() bool { return s == ClientInstanceSummary{} }
 
 type ClientConnectionFilter struct {
 	ClientInstanceID string

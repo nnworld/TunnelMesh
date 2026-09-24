@@ -49,8 +49,37 @@ cd web && npm run build && cd ..
 
 ## MySQL 与 etcd 相关验证
 
-- Repository contract test 默认跑 SQLite 方言；设置 `TUNNELMESH_TEST_MYSQL_DSN` 后才会对真实
-  MySQL 执行同一套契约测试。
+- CI 的 `mysql56` job 起一个 `mysql:5.6` 服务容器（项目声明的最低支持版本，生产实例为
+  `5.6.51-91.0-log`），用它执行与 SQLite **同一个** contract 函数：
+  `runRepositoryContract`（含 `runClientRepositoryContract`）、`runIdentityRepositoryContract`
+  与 registry 的 `runRegistryContract`。因此 MySQL 方言专属的 SQL 错误（`FOR UPDATE`、
+  `EXISTS` 相关子查询、带守卫的 `DELETE`、`connection_epoch` 位宽）不再只能靠生产报错发现。
+  `mysql56` 是 main 的必需状态检查。
+- 本地复跑用 `docker-compose.cluster.yml` 里 opt-in 的 `mysql56` profile 起同一个下限版本。它是
+  一次性测试库：无 TLS、只绑 `127.0.0.1:3307`、独立 volume，且不会随集群栈启动。
+
+```bash
+docker compose -f docker-compose.cluster.yml --profile mysql56 up -d mysql56
+TUNNELMESH_TEST_MYSQL_DSN='tunnelmesh:tunnelmesh@tcp(127.0.0.1:3307)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true' \
+  go test -p 1 ./internal/storage ./internal/registry -count=1 -run MySQL
+```
+
+  - `OpenMySQL` 默认 `auto-init=true`，所以需要**空库**和建表权限；要重来一遍就
+    `docker compose -f docker-compose.cluster.yml --profile mysql56 down -v mysql56`。
+  - `multiStatements=true` 是必需的：迁移测试用一次 `ExecContext` 执行整段 DDL，与 auto-init
+    路径一致。
+  - `-p 1` 是正确性要求，不是调优：两个包对同一个库各自 auto-init，并行会抢
+    `schema_meta(id=1)` 这一行并报 `Error 1062`。
+  - 口令用 `MYSQL56_TEST_PASSWORD` / `MYSQL56_ROOT_PASSWORD` 覆盖默认占位值即可；这两者只服务
+    本地测试库，不是生产凭据。
+- CI 与本地 profile 的分工：CI 服务容器只能用镜像默认 charset（5.6 是 latin1），能证明 SQL
+  语法/语义，证明不了 utf8mb4 下的 InnoDB 767-byte 前缀；`mysql56` profile 挂载
+  `deploy/mysql56/utf8mb4.cnf` 复现生产的 `utf8mb4_general_ci`（不放宽 `innodb_large_prefix`），
+  所以「DDL 在生产 charset 下建得起来」由本地 profile 覆盖。CI 镜像与 profile 镜像的一致性由
+  `deploy/mysql56/mysql56_service_test.go` 守护。
+- `docker-compose.cluster.yml` 的 `mysql:8.4` 是集群开发环境默认，**不能**替代 5.6 下限验证：
+  8.x 会放行 5.6 拒绝的语法。8.4 版本矩阵仍属 deferred，见
+  [项目完整性清单](../operations/completeness-checklist.md)。
 - etcd 注册发现当前只保留实现与文档接口，真实集成测试属于 deferred 项，见
   [项目完整性清单](../operations/completeness-checklist.md)。
 

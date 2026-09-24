@@ -201,4 +201,6 @@ go test ./deploy/... -count=1
 
 探针当前的可用边界、指标查询和端到端 API 状态见 [全链路网络探针](network-probes.md)。
 
-真实 MySQL contract 测试依赖 `TUNNELMESH_TEST_MYSQL_DSN`；未配置时只能运行 SQLite contract，不能将其标记为 MySQL 已验证。
+客户端观测用到的 SQL（presence `EXISTS`、`metadata='{}'` 时效轴、`Summarize` 关联聚合、带守卫的 `DELETE`、64 位 `connection_epoch`）
+已在 CI 的 `mysql56` job 上对真实 MySQL 5.6 执行同一套契约测试，`mysql56` 是 main 的必需检查。本地手工复跑需要设置
+`TUNNELMESH_TEST_MYSQL_DSN`，未设置时只会运行 SQLite 方言，不能据此标记为 MySQL 已验证，见 [测试与验证](../development/testing.md)。

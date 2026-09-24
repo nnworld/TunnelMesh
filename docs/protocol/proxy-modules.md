@@ -41,7 +41,11 @@ legacy Agent、legacy Client 和 legacy 远端 Server 继续使用原字节流�
 
 选择 `tunnelmesh.v1.open-result.flow-control` 后，`OPEN_STREAM.Window` 携带初始接收窗口，当前默认为 256 KiB。发送方在发送 DATA 前扣减 send window，超过窗口返回 `RESOURCE_EXHAUSTED`；接收方消费数据后累计到 128 KiB 阈值，发送对应增量的 `WINDOW_UPDATE`。窗口更新为 0、导致 uint32 溢出或作用于已关闭流时按协议错误处理。
 
+用于建缓冲的窗口数值一律经 `protocol.NegotiateReceiveWindow` 夹紧：小于 `128 KiB + 32 KiB`（阈值加一个整帧）或超过 512 KiB 的数值回落为默认窗口。原因是所有 pump 等待 credit 都没有超时，一个永远无法再容纳整帧的窗口会让流永久停摆；过大的数值则会把执行窗口的缓冲区撑成不可验证的尺寸。夹紧不改变对端通告的 credit：Server→Client 一跳严格按 Client 通告的窗口发送，`relayToClient` 把每次读取限制在当前可用 credit 内，因此小于整帧的窗口只会变慢。三条不变量与被否决的替代方案见 [ADR 0002](../architecture/adr/0002-dataplane-window-credit-invariants.md)。
+
 本地 Agent relay 连接支持带外 `WINDOW_UPDATE` 控制读写，不会把控制帧混入 DATA 字节流。跨 Server gRPC relay 使用一个单字节 envelope 区分消息：`0x00` 表示数据，`0x01` 表示编码后的协议控制帧。该 envelope 是 relay 内部封装，不改变 Client/Agent 的 WebSocket wire format。
+
+Client 发给 Server 的 `WINDOW_UPDATE` 只补充 Server→Client 这一跳的发送窗口，不能镜像给 Agent。Agent→Server 的额度由 Server 消费 Agent relay 字节后独立回补。两条链路的额度都在 Server 终止，避免同一字节增量被重复计 credit 后冲破 Agent 侧接收缓冲。
 
 legacy 子协议不启用 `OPEN_STREAM.Window` 语义，仍使用有界队列和 `RESET` 保护内存；已建立的 strict/flow-control 连接不会中途切换语义。
 

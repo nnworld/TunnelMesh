@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -132,7 +135,9 @@ func (f *TCPForward) handleConn(local net.Conn) {
 		return
 	}
 	defer remote.Close()
-	bridge(local, remote)
+	if err := bridge(local, remote); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("client: tcp forward bridge failed: %v", err)
+	}
 }
 
 type HTTPForwardConfig struct {
@@ -143,12 +148,13 @@ type HTTPForwardConfig struct {
 }
 
 type UDPForwardConfig struct {
-	ListenAddr  string
-	AgentID     string
-	TargetHost  string
-	TargetPort  int
-	IdleTimeout time.Duration
-	MaxDatagram int
+	ListenAddr      string
+	AgentID         string
+	TargetHost      string
+	TargetPort      int
+	IdleTimeout     time.Duration
+	MaxDatagram     int
+	MaxAssociations int
 }
 
 type UDPForward struct {
@@ -163,7 +169,7 @@ func NewUDPForward(opener StreamOpener, cfg UDPForwardConfig) (*UDPForward, erro
 	if strings.TrimSpace(cfg.ListenAddr) == "" {
 		return nil, errors.New("client: listen address required")
 	}
-	m, err := NewUDPAssociationManager(opener, UDPAssociationConfig{AgentID: cfg.AgentID, TargetHost: cfg.TargetHost, TargetPort: cfg.TargetPort, IdleTimeout: cfg.IdleTimeout, MaxDatagram: cfg.MaxDatagram})
+	m, err := NewUDPAssociationManager(opener, UDPAssociationConfig{AgentID: cfg.AgentID, TargetHost: cfg.TargetHost, TargetPort: cfg.TargetPort, IdleTimeout: cfg.IdleTimeout, MaxDatagram: cfg.MaxDatagram, MaxAssociations: cfg.MaxAssociations})
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +370,16 @@ func forwardHTTP(w http.ResponseWriter, r *http.Request, stream io.ReadWriteClos
 			return
 		}
 		_ = rw.Flush()
+		// net/http may already have read the first frame the browser sent
+		// behind the upgrade request. Anything still in the hijack buffer
+		// belongs to the tunneled protocol, so it must reach the tunnel before
+		// bridge starts reading the socket again.
+		if buffered := rw.Reader.Buffered(); buffered > 0 {
+			if _, err := io.CopyN(stream, rw.Reader, int64(buffered)); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
 		if n := br.Buffered(); n > 0 {
 			buffered, readErr := br.Peek(n)
 			if readErr == nil {
@@ -386,12 +402,29 @@ func forwardHTTP(w http.ResponseWriter, r *http.Request, stream io.ReadWriteClos
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	copyLocalResponse(r, w, resp)
+}
+
+// copyLocalResponse writes the target response to the local listener and says
+// so when it stops early. A browser only sees a broken Content-Length; without
+// this line neither end records that the body was truncated.
+func copyLocalResponse(r *http.Request, w http.ResponseWriter, resp *http.Response) {
+	copied, err := io.Copy(w, resp.Body)
+	if err == nil && resp.ContentLength >= 0 && copied < resp.ContentLength {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		slog.WarnContext(r.Context(), "client_response_truncated",
+			"protocol", "http", "status_code", resp.StatusCode,
+			"content_length", resp.ContentLength, "bytes_copied", copied,
+			"error_class", observability.NormalizeErrorClass(err))
+	}
 }
 
 // bridge uses independent bounded buffers so a slow upload does not prevent
-// the remote response from being drained. Closing both endpoints after one
-// side reaches EOF provides deterministic cleanup for SSH/raw TCP clients.
+// the remote response from being drained. A successful directional half-close
+// leaves the opposite direction open until EOF or external close; a wall-clock
+// cutoff would turn a slow but healthy response into a truncated body.
 func bridge(a, b io.ReadWriteCloser) error {
 	results := make(chan copyResult, 2)
 	copyOne := func(dst io.Writer, src io.Reader, halfClose io.Writer) {
@@ -425,13 +458,9 @@ func bridge(a, b io.ReadWriteCloser) error {
 		return first.err
 	}
 	var second copyResult
-	select {
-	case second = <-results:
-	case <-time.After(time.Second):
-		_ = a.Close()
-		_ = b.Close()
-		return first.err
-	}
+	// Waiting without a timeout is intentional: the peer controls when the
+	// remaining direction finishes, and the caller can still close either end.
+	second = <-results
 	_ = a.Close()
 	_ = b.Close()
 	if errors.Is(first.err, io.EOF) {
@@ -452,6 +481,16 @@ type bufferedStream struct {
 }
 
 func (s *bufferedStream) Close() error { return s.closer.Close() }
+
+// CloseWrite shuts only the tunnel-to-target direction. Without it, bridge
+// cannot half-close an upgraded stream and falls back to closing both ends,
+// which throws away a response the peer is still sending.
+func (s *bufferedStream) CloseWrite() error {
+	if halfCloser, ok := s.Writer.(interface{ CloseWrite() error }); ok {
+		return halfCloser.CloseWrite()
+	}
+	return errors.New("client: stream does not support half-close")
+}
 
 type RetryConfig struct {
 	MaxAttempts int

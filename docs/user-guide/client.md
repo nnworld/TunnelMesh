@@ -49,6 +49,8 @@ Client 的 UDP 能力是 `forward udp`：由用户侧发起、经 Server 到达 
 
 ## 4. TCP 转发
 
+TCP 转发保留方向性半关闭语义：本地请求写完后，远端响应方向会继续打开，直到响应 EOF 或任一端被关闭。大文件下载不会因为响应耗时超过请求而被提前截断。
+
 把本地 `127.0.0.1:15432` 转发到 Agent 所在内网的 `db.internal:5432`：
 
 ```bash
@@ -70,6 +72,8 @@ tunnelmesh-client forward udp \
   --target-host 10.0.0.53 \
   --target-port 53
 ```
+
+每个本地源地址对应一条隧道流，默认最多 1024 条 association；达到上限时淘汰最久未使用的条目，若全部在同一时刻被使用则丢弃新报文并记录，避免本机任意进程把 Agent 拨号池耗尽。需要更大规模时在 `client.tunnels` 或进程参数中提高该上限前先确认 Agent 的并发能力。
 
 `forward udp` 的监听端口在用户本机，公网侧没有与之对应的 UDP 监听；需要让公网用户访问内网 UDP 服务时，可在目标网络内放置 UDP 网关，再通过 TCP/HTTP 等受支持入口接入，或等待内嵌 VPN 网关交付（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
 

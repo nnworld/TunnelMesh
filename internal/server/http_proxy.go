@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/relay"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
 )
@@ -87,7 +89,7 @@ func (h *HTTPProxyHandler) ServeRoute(w http.ResponseWriter, r *http.Request, ro
 		return
 	}
 	defer resp.Body.Close()
-	copyResponse(w, resp)
+	_ = copyResponse(r.Context(), w, resp)
 }
 
 func (h *HTTPProxyHandler) handleUpgrade(w http.ResponseWriter, r *http.Request, route routing.Route) {
@@ -167,14 +169,28 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
+// copyResponse relays a target response and reports a body that stopped early.
+// Returning the error keeps the caller's control flow unchanged while making the
+// truncation visible: a short body against an advertised Content-Length is the
+// same failure a browser reports as ERR_CONTENT_LENGTH_MISMATCH.
+func copyResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response) error {
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	copied, err := io.Copy(w, resp.Body)
+	if err == nil && resp.ContentLength >= 0 && copied < resp.ContentLength {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "proxy_response_truncated",
+			"protocol", "http", "status_code", resp.StatusCode,
+			"content_length", resp.ContentLength, "bytes_copied", copied,
+			"error_class", observability.NormalizeErrorClass(err))
+	}
+	return err
 }
 
 // streamNetConn gives callers that need net.Conn (for example an http.Transport

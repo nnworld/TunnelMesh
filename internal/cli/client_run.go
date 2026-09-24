@@ -52,6 +52,9 @@ func runClientTunnels(cmd *cobra.Command, cfg config.Config) error {
 		},
 		Metadata: metadata,
 		Runner:   runClientSessionPool,
+		WebSocket: client.WebSocketRunOptions{
+			InboundBufferBytes: cfg.Client.Stream.InboundBufferBytes,
+		},
 	})
 
 	for _, tunnel := range cfg.Client.Tunnels {
