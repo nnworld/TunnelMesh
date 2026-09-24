@@ -223,13 +223,18 @@ func TestValidateStreamLatencyLimits(t *testing.T) {
 		{name: "server pending opens", edit: func(c *config.Config) { c.Server.Stream.MaxPendingOpens = -1 }, want: "server stream max pending opens must be positive"},
 		{name: "server initial window", edit: func(c *config.Config) { c.Server.Stream.InitialWindow = 0 }, want: "server stream initial window must be positive"},
 		{name: "server window threshold", edit: func(c *config.Config) { c.Server.Stream.WindowUpdateThreshold = 262145 }, want: "server stream window update threshold must be positive and no greater than the initial window"},
-		{name: "server frame payload", edit: func(c *config.Config) { c.Server.Stream.MaxFramePayload = 1<<20 + 1 }, want: "server stream max frame payload must be positive and no greater than 1048576"},
+		{name: "server frame payload", edit: func(c *config.Config) { c.Server.Stream.MaxFramePayload = 1 << 20 }, want: "server stream max frame payload must be 32768"},
+		{name: "server window headroom", edit: func(c *config.Config) {
+			c.Server.Stream.InitialWindow = 65536
+			c.Server.Stream.WindowUpdateThreshold = 40000
+		}, want: "server stream initial window must exceed the update threshold by at least 32768 bytes"},
 		{name: "auth cache positive ttl", edit: func(c *config.Config) { c.Server.AuthorizationCache.LocalPositiveTTL = 0 }, want: "authorization cache local positive TTL must be positive"},
 		{name: "auth cache entries", edit: func(c *config.Config) { c.Server.AuthorizationCache.MaxEntries = 0 }, want: "authorization cache max entries must be positive"},
 		{name: "agent concurrent dials", edit: func(c *config.Config) { c.Agent.Streams.MaxConcurrentDials = 0 }, want: "agent stream max concurrent dials must be positive"},
 		{name: "agent pending dials", edit: func(c *config.Config) { c.Agent.Streams.MaxPendingDials = -1 }, want: "agent stream max pending dials must be positive"},
 		{name: "agent connect timeout", edit: func(c *config.Config) { c.Agent.Streams.ConnectTimeout = 0 }, want: "agent stream connect timeout must be positive"},
-		{name: "agent inbound buffer", edit: func(c *config.Config) { c.Agent.Streams.InboundBufferBytes = -1 }, want: "agent stream inbound buffer bytes must be positive"},
+		{name: "agent inbound buffer", edit: func(c *config.Config) { c.Agent.Streams.InboundBufferBytes = -1 }, want: "agent stream inbound buffer bytes must be at least 65536"},
+		{name: "client inbound buffer", edit: func(c *config.Config) { c.Client.Stream.InboundBufferBytes = 32768 }, want: "client stream inbound buffer bytes must be at least 65536"},
 		{name: "client open timeout", edit: func(c *config.Config) { c.Client.Stream.OpenTimeout = 0 }, want: "client stream open timeout must be positive"},
 		{name: "remote validation ttl", edit: func(c *config.Config) { c.Client.RemoteValidation.PositiveTTL = -time.Second }, want: "remote validation positive TTL must be positive"},
 		{name: "remote validation entries", edit: func(c *config.Config) { c.Client.RemoteValidation.MaxEntries = 0 }, want: "remote validation max entries must be positive"},
