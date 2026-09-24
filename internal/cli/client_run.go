@@ -57,20 +57,27 @@ func runClientTunnels(cmd *cobra.Command, cfg config.Config) error {
 		},
 	})
 
+	// One context governs the listeners, the session pool and the watchers, so any
+	// of the three can unwind the whole run.
+	runCtx, cancelRun := context.WithCancel(cmd.Context())
+	defer cancelRun()
+
+	watcher := newForwardServeWatcher(len(cfg.Client.Tunnels))
 	for _, tunnel := range cfg.Client.Tunnels {
 		forward, description, err := newConfiguredClientForward(manager.Opener(tunnel.AgentID), cfg.Client, tunnel)
 		if err != nil {
 			return err
 		}
-		if err := forward.Start(cmd.Context()); err != nil {
+		if err := forward.Start(runCtx); err != nil {
 			_ = forward.Close()
 			return err
 		}
 		active = append(active, forward)
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), description)
+		watcher.watch(runCtx, description, cancelRun, forward.Err())
 	}
 
-	return manager.Run(cmd.Context())
+	return superviseClientRun(func() error { return manager.Run(runCtx) }, watcher)
 }
 
 // clientRuntimeMetadata builds the shared observability snapshot for every
@@ -129,18 +136,21 @@ func newConfiguredClientForward(opener client.StreamOpener, cfg config.ClientCon
 		forward, err := client.NewTCPForward(opener, client.TCPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			AllowRemote: tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("tcp tunnel %s listening on %s", tunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "udp":
 		forward, err := client.NewUDPForward(opener, client.UDPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			AllowRemote: tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("udp tunnel %s listening on %s", tunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "http":
 		forward, err := client.NewHTTPForward(opener, client.HTTPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			AllowRemote: tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("http tunnel %s listening on %s", tunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "socks5":
@@ -212,9 +222,13 @@ func newConfiguredHTTPProxyForward(opener client.StreamOpener, cfg config.Client
 	})
 }
 
+// clientForward is a local ingress started by `client run`. Err is part of the
+// contract, not an optional extra: a forwarder that cannot say why its listener
+// stopped is indistinguishable from a healthy one when the port goes deaf.
 type clientForward interface {
 	Start(context.Context) error
 	Close() error
+	Err() <-chan error
 }
 
 func tunnelDisplayName(t config.TunnelConfig) string {

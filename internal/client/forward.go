@@ -36,12 +36,16 @@ type TCPForwardConfig struct {
 	TargetHost     string
 	TargetPort     int
 	ConnectTimeout time.Duration
+	// AllowRemote is the explicit acknowledgement that a non-loopback listener
+	// publishes an unauthenticated tunnel to the target service.
+	AllowRemote bool
 }
 
 type TCPForward struct {
 	opener StreamOpener
 	cfg    TCPForwardConfig
 	ln     *TCPListener
+	serve  *serveSignal
 	mu     sync.Mutex
 	closed bool
 	active map[net.Conn]struct{}
@@ -57,8 +61,15 @@ func NewTCPForward(opener StreamOpener, cfg TCPForwardConfig) (*TCPForward, erro
 	if strings.TrimSpace(cfg.TargetHost) == "" || cfg.TargetPort < 1 || cfg.TargetPort > 65535 {
 		return nil, errors.New("client: target host and port required")
 	}
-	return &TCPForward{opener: opener, cfg: cfg, active: make(map[net.Conn]struct{})}, nil
+	if err := requireLoopbackListen("TCP", cfg.ListenAddr, cfg.AllowRemote); err != nil {
+		return nil, err
+	}
+	return &TCPForward{opener: opener, cfg: cfg, active: make(map[net.Conn]struct{}), serve: newServeSignal()}, nil
 }
+
+// Err reports the accept-loop failure once the listener stops for a reason other
+// than a clean Close.
+func (f *TCPForward) Err() <-chan error { return f.serve.Err() }
 
 func (f *TCPForward) Start(ctx context.Context) error {
 	f.mu.Lock()
@@ -74,7 +85,7 @@ func (f *TCPForward) Start(ctx context.Context) error {
 		return err
 	}
 	f.ln = ln
-	go func() { _ = ln.Serve() }()
+	go func() { f.serve.publish(ln.Serve()) }()
 	return nil
 }
 func (f *TCPForward) Addr() net.Addr {
@@ -94,6 +105,8 @@ func (f *TCPForward) Close() error {
 	f.closed = true
 	ln := f.ln
 	f.mu.Unlock()
+	// A deliberate Close is not a listener failure, so release watchers first.
+	f.serve.close()
 	if ln != nil {
 		err := ln.Close()
 		f.mu.Lock()
@@ -141,10 +154,11 @@ func (f *TCPForward) handleConn(local net.Conn) {
 }
 
 type HTTPForwardConfig struct {
-	ListenAddr string
-	AgentID    string
-	TargetHost string
-	TargetPort int
+	ListenAddr  string
+	AgentID     string
+	TargetHost  string
+	TargetPort  int
+	AllowRemote bool
 }
 
 type UDPForwardConfig struct {
@@ -155,6 +169,7 @@ type UDPForwardConfig struct {
 	IdleTimeout     time.Duration
 	MaxDatagram     int
 	MaxAssociations int
+	AllowRemote     bool
 }
 
 type UDPForward struct {
@@ -163,18 +178,25 @@ type UDPForward struct {
 	conn    *net.UDPConn
 	mu      sync.Mutex
 	closed  bool
+	serve   *serveSignal
 }
 
 func NewUDPForward(opener StreamOpener, cfg UDPForwardConfig) (*UDPForward, error) {
 	if strings.TrimSpace(cfg.ListenAddr) == "" {
 		return nil, errors.New("client: listen address required")
 	}
+	if err := requireLoopbackListen("UDP", cfg.ListenAddr, cfg.AllowRemote); err != nil {
+		return nil, err
+	}
 	m, err := NewUDPAssociationManager(opener, UDPAssociationConfig{AgentID: cfg.AgentID, TargetHost: cfg.TargetHost, TargetPort: cfg.TargetPort, IdleTimeout: cfg.IdleTimeout, MaxDatagram: cfg.MaxDatagram, MaxAssociations: cfg.MaxAssociations})
 	if err != nil {
 		return nil, err
 	}
-	return &UDPForward{manager: m, cfg: cfg}, nil
+	return &UDPForward{manager: m, cfg: cfg, serve: newServeSignal()}, nil
 }
+
+// Err reports the socket read failure that ended the datagram loop.
+func (f *UDPForward) Err() <-chan error { return f.serve.Err() }
 func (f *UDPForward) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -230,6 +252,9 @@ func (f *UDPForward) readLoop(ctx context.Context) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			if !errors.Is(err, net.ErrClosed) {
+				f.serve.publish(err)
+			}
 			return
 		}
 		if err := f.manager.HandleDatagram(ctx, src, buf[:n]); err != nil {
@@ -255,6 +280,7 @@ func (f *UDPForward) Close() error {
 	conn := f.conn
 	f.conn = nil
 	f.mu.Unlock()
+	f.serve.close()
 	_ = f.manager.Close()
 	if conn != nil {
 		return conn.Close()
@@ -267,6 +293,7 @@ type HTTPForward struct {
 	cfg    HTTPForwardConfig
 	server *http.Server
 	ln     net.Listener
+	serve  *serveSignal
 	mu     sync.Mutex
 }
 
@@ -277,8 +304,14 @@ func NewHTTPForward(opener StreamOpener, cfg HTTPForwardConfig) (*HTTPForward, e
 	if strings.TrimSpace(cfg.ListenAddr) == "" || strings.TrimSpace(cfg.TargetHost) == "" || cfg.TargetPort < 1 || cfg.TargetPort > 65535 {
 		return nil, errors.New("client: invalid HTTP forward config")
 	}
-	return &HTTPForward{opener: opener, cfg: cfg}, nil
+	if err := requireLoopbackListen("HTTP", cfg.ListenAddr, cfg.AllowRemote); err != nil {
+		return nil, err
+	}
+	return &HTTPForward{opener: opener, cfg: cfg, serve: newServeSignal()}, nil
 }
+
+// Err reports the serve failure that ended the HTTP listener, if any.
+func (f *HTTPForward) Err() <-chan error { return f.serve.Err() }
 func (f *HTTPForward) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -296,7 +329,10 @@ func (f *HTTPForward) Start(ctx context.Context) error {
 	server := &http.Server{Handler: http.HandlerFunc(f.handleHTTP)}
 	f.server = server
 	go func() {
-		_ = server.Serve(ln)
+		err := server.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			f.serve.publish(err)
+		}
 	}()
 	if ctx != nil {
 		go func() {
@@ -320,6 +356,7 @@ func (f *HTTPForward) Close() error {
 	ln := f.ln
 	f.server, f.ln = nil, nil
 	f.mu.Unlock()
+	f.serve.close()
 	if srv != nil {
 		_ = srv.Close()
 	}
