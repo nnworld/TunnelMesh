@@ -440,7 +440,7 @@ func schemaMetaExists(ctx context.Context, db *sql.DB, driver string) (bool, err
 }
 
 func applySchemaStatements(ctx context.Context, db *sql.DB, script string, tolerateDuplicates bool) error {
-	for _, statement := range strings.Split(script, ";") {
+	for _, statement := range splitSQLStatements(script) {
 		statement = strings.TrimSpace(statement)
 		if statement == "" {
 			continue
@@ -453,6 +453,72 @@ func applySchemaStatements(ctx context.Context, db *sql.DB, script string, toler
 		}
 	}
 	return nil
+}
+
+// splitSQLStatements separates a SQL script on statement semicolons while
+// ignoring semicolons inside comments, strings, and quoted identifiers. The
+// prior strings.Split implementation treated every byte as SQL, so a semicolon
+// in a migration comment could split the script into an invalid fragment.
+func splitSQLStatements(script string) []string {
+	statements := make([]string, 0, 8)
+	var current strings.Builder
+	var quote byte
+	inLineComment := false
+	inBlockComment := false
+
+	for index := 0; index < len(script); index++ {
+		char := script[index]
+		switch {
+		case inLineComment:
+			if char == '\n' {
+				inLineComment = false
+				current.WriteByte(char)
+			}
+		case inBlockComment:
+			if char == '*' && index+1 < len(script) && script[index+1] == '/' {
+				inBlockComment = false
+				index++
+				current.WriteByte(' ')
+			}
+		case quote != 0:
+			current.WriteByte(char)
+			if (quote == '\'' || quote == '"') && char == '\\' && index+1 < len(script) {
+				index++
+				current.WriteByte(script[index])
+				continue
+			}
+			if char == quote {
+				if index+1 < len(script) && script[index+1] == quote {
+					index++
+					current.WriteByte(script[index])
+					continue
+				}
+				quote = 0
+			}
+		case char == '\'' || char == '"' || char == '`':
+			quote = char
+			current.WriteByte(char)
+		case char == '-' && index+1 < len(script) && script[index+1] == '-':
+			inLineComment = true
+			index++
+		case char == '#':
+			inLineComment = true
+		case char == '/' && index+1 < len(script) && script[index+1] == '*':
+			inBlockComment = true
+			index++
+		case char == ';':
+			if statement := strings.TrimSpace(current.String()); statement != "" {
+				statements = append(statements, statement)
+			}
+			current.Reset()
+		default:
+			current.WriteByte(char)
+		}
+	}
+	if statement := strings.TrimSpace(current.String()); statement != "" {
+		statements = append(statements, statement)
+	}
+	return statements
 }
 func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 	var v int
