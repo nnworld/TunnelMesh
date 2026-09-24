@@ -30,6 +30,22 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
 - SQLite 检查挂载目录是否可写；容器中通常是 `/var/lib/tunnelmesh`。
 - MySQL 检查账号是否有建表、索引和事务权限。
 
+### MySQL：迁移注释分号导致 `Error 1064`
+
+现象：升级到 Schema v15 时 Server 启动失败，日志出现：
+
+```text
+apply migration v0014_to_v0015: Error 1064 (42000):
+You have an error in your SQL syntax ...
+near 'every later write filters on ...'
+```
+
+根因：`v0014_to_v0015/mysql.sql` 的注释中包含 `insert; every later write...`，旧版迁移执行器使用 `strings.Split(script, ";")`，把注释里的分号当成语句边界。第二段因此以注释正文开头，被 MySQL 当成非法 SQL。第一条 `ALTER TABLE` 位于该非法片段之后，尚未执行，`schema_meta` 仍停留在 14。
+
+止损：回退到上一个可启动的 Server 版本。因为迁移未执行、版本未推进，旧版二进制可以直接打开当前数据库。
+
+处置：升级到包含安全 SQL 分割器的 Server 版本后重试。该版本会忽略 `--`、`#`、`/* ... */` 注释中的分号，并保留字符串和引用标识符中的分号；已发布的 `v0014_to_v0015` 脚本本身不变，retry 会继续执行两条 `ALTER TABLE`。不要手工修改 `schema_meta.version`。
+
 ### MySQL 5.6：`Error 1071 Specified key was too long`
 
 MySQL 5.6 在默认 InnoDB 配置下通常只有 767 字节的索引前缀上限。旧版
