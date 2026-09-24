@@ -8,7 +8,7 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 51 份计划，按日期倒序排列。
+共 52 份计划，按日期倒序排列。
 
 ## 计划清单
 
@@ -17,6 +17,7 @@
 | 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁实施计划](2026-09-24-mysql56-contract-ci-gate.md) | — | [PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
 | 2026-09-24 | [MySQL 5.6 本地复现 profile 实施计划](2026-09-24-mysql56-compose-profile.md) | — | [PR：MySQL 5.6 本地复现 profile](../../pull-requests/2026-09-24-mysql56-compose-profile.md)<br>[PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
 | 2026-09-24 | [迁移脚本注释分号解析紧急修复计划](2026-09-24-migration-comment-splitter-hotfix.md) | — | [PR：Migration comment splitter hotfix](../../pull-requests/2026-09-24-migration-comment-splitter-hotfix.md) |
+| 2026-09-24 | [Agent / Server / Client 数据面流控与阻塞隔离加固 Implementation Plan](2026-09-24-dataplane-flow-control-hardening.md) | [规格：SOCKS5 网页首屏延迟优化](../specs/2026-09-10-socks5-web-page-latency-design.md) | [PR：Agent / Server / Client 数据面流控与阻塞隔离加固](../../pull-requests/2026-09-24-dataplane-flow-control-hardening.md) |
 | 2026-09-24 | [Client WINDOW_UPDATE 泄漏修复实施计划](2026-09-24-client-window-update-leak.md) | — | [PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md)<br>[PR：Client WINDOW_UPDATE 泄漏修复](../../pull-requests/2026-09-24-client-window-update-leak.md) |
 | 2026-09-24 | [客户端观测状态模型修复实施计划](2026-09-24-client-status-metadata-state.md) | — | [PR：Client 观测状态模型修复](../../pull-requests/2026-09-24-client-status-metadata-state.md) |
 | 2026-09-24 | [Client receive-window credit timing fix plan](2026-09-24-client-receive-window-credit.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md) |
