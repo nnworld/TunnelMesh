@@ -60,3 +60,32 @@ func TestBoundedFrameQueueCloseDrainsAndStops(t *testing.T) {
 		t.Fatal("closed queue returned a queued frame")
 	}
 }
+
+func TestBoundedFrameQueueCloseAfterDrainDeliversQueuedFrames(t *testing.T) {
+	queue := NewBoundedFrameQueue(1024)
+	if !queue.TryPush(protocol.Frame{Type: protocol.FrameData, Payload: []byte("queued")}) {
+		t.Fatal("push failed")
+	}
+	queue.CloseAfterDrain()
+	if queue.TryPush(protocol.Frame{Type: protocol.FrameData, Payload: []byte("late")}) {
+		t.Fatal("push succeeded after a graceful close")
+	}
+	frame, ok := queue.Pop()
+	if !ok || string(frame.Payload) != "queued" {
+		t.Fatalf("Pop after CloseAfterDrain=(%+v,%v), want the queued frame", frame, ok)
+	}
+	if _, ok := queue.Pop(); ok {
+		t.Fatal("Pop must report done once a gracefully closed queue is empty")
+	}
+}
+
+func TestBoundedFrameQueueCloseDiscardsQueuedFrames(t *testing.T) {
+	queue := NewBoundedFrameQueue(1024)
+	if !queue.TryPush(protocol.Frame{Type: protocol.FrameData, Payload: []byte("void")}) {
+		t.Fatal("push failed")
+	}
+	queue.Close()
+	if _, ok := queue.Pop(); ok {
+		t.Fatal("a discarded queue must not deliver frames")
+	}
+}
