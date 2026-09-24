@@ -60,6 +60,59 @@ func (s *closeWriteStream) CloseWrite() error {
 	return nil
 }
 
+type delayedRemoteStream struct {
+	release   chan struct{}
+	remaining []byte
+	closed    chan struct{}
+}
+
+func (s *delayedRemoteStream) Read(p []byte) (int, error) {
+	<-s.release
+	if len(s.remaining) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, s.remaining)
+	s.remaining = s.remaining[n:]
+	return n, nil
+}
+
+func (*delayedRemoteStream) Write(p []byte) (int, error) { return len(p), nil }
+func (*delayedRemoteStream) CloseWrite() error           { return nil }
+func (s *delayedRemoteStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+type bridgeLocalStream struct {
+	requests       chan []byte
+	responses      chan []byte
+	closeResponses sync.Once
+}
+
+func (s *bridgeLocalStream) Read(p []byte) (int, error) {
+	data, ok := <-s.requests
+	if !ok {
+		return 0, io.EOF
+	}
+	return copy(p, data), nil
+}
+
+func (s *bridgeLocalStream) Write(p []byte) (int, error) {
+	s.responses <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func (s *bridgeLocalStream) CloseWrite() error {
+	s.closeResponses.Do(func() { close(s.responses) })
+	return nil
+}
+
+func (s *bridgeLocalStream) Close() error { return s.CloseWrite() }
+
 func newTestStream(read []byte) *testStream {
 	return &testStream{read: bytes.NewBuffer(read), closed: make(chan struct{})}
 }
@@ -152,6 +205,41 @@ func TestTCPForwardListenerLifecycleAndByteCopy(t *testing.T) {
 	}
 	if _, err := net.DialTimeout("tcp", fwd.Addr().String(), 50*time.Millisecond); err == nil {
 		t.Fatal("listener still accepting after Close")
+	}
+}
+
+func TestBridgeWaitsForDelayedResponseAfterLocalHalfClose(t *testing.T) {
+	response := bytes.Repeat([]byte("delayed-response"), 32*1024)
+	remote := &delayedRemoteStream{
+		release:   make(chan struct{}),
+		remaining: response,
+		closed:    make(chan struct{}),
+	}
+	requests := make(chan []byte, 1)
+	requests <- []byte("request")
+	close(requests)
+	local := &bridgeLocalStream{
+		requests:  requests,
+		responses: make(chan []byte),
+	}
+	done := make(chan error, 1)
+	go func() { done <- bridge(local, remote) }()
+
+	time.AfterFunc(1500*time.Millisecond, func() { close(remote.release) })
+	received := make([]byte, 0, len(response))
+	for data := range local.responses {
+		received = append(received, data...)
+	}
+	if !bytes.Equal(received, response) {
+		t.Fatalf("received %d bytes, want %d", len(received), len(response))
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatalf("bridge error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not finish")
 	}
 }
 
