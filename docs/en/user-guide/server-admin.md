@@ -75,6 +75,20 @@ The admin console includes a browser terminal and SFTP file browser.
 
 Use these features only for authorized internal hosts and review access in the audit log.
 
+## VPN gateway peers
+
+The **VPN Gateway** page (`/vpn`) issues peers for native WireGuard clients: each peer gets a VPN address plus an allowed-IP and allowed-port scope, and egress still happens from the Agent. The page is not admin-gated - ordinary users see the peers they own and administrators see all of them - and that filter runs inside the server-side paginated query, not in the browser. Lists use cursor paging, search by name or comment, and an active / disabled / revoked filter.
+
+**The management plane ships in this release; the data plane depends on the build variant.** Peers can be issued, edited, rotated, revoked, and audited, but a tunnel only comes up when the Server is a `-tags vpn` build with `server.vpn.enabled: true`. The release binaries and images do not carry that tag yet, and the console does not detect which variant it is talking to - it only issues configuration, so confirm the build variant before importing a peer file. See [VPN gateway deployment](../../deployment/vpn-gateway.md).
+
+Form validation mirrors the server byte for byte: names are 1-255 characters without control characters; allowed IPs are comma-separated IPv4 CIDRs, a bare address is normalised to `/32`, and an empty list means no reachable target; allowed ports are comma-separated integers from 1 to 65535, empty meaning unlimited; an expiry must be in the future, empty meaning never; `0` on a flow or packet ceiling means unlimited. Frontend checks only save a round trip - the server validates again. Edits submit changed fields only, and collections are compared as sets, so rewriting the order of `allowed_ips` is not a policy change and produces no audit entry.
+
+"Allow ICMP echo" follows the egress Agent's real capability: the Agent must be online and have negotiated `stream_icmp_echo.v1`, otherwise issuing returns `409 vpn_agent_capability_missing`. The node-level `server.vpn.icmp_enabled` is a ceiling, not a promise - when it is off, Agents are not even asked. One cluster limitation is known and deliberate: capabilities live in the session on the node the Agent is connected to, not in the connection lease, so a request that lands elsewhere still issues successfully while the audit detail records `icmpCapability: unverified`. Refusing on "cannot check" would make issuance depend on which node answered.
+
+Rotation and revocation are terminal and require confirmation. After a rotation the previous configuration stops working immediately while the address stays, so it must be redistributed; revocation keeps the record, and the public key and address are never reused. Issue, edit, rotate, revoke, and reveal are all audited. The private key is shown once: the client-setup drawer asks for `REVEAL`, an explicit risk acknowledgement, and an `Idempotency-Key` before calling `POST /api/v1/vpn-peers/{peerId}/config:reveal`, whose answer is `Cache-Control: no-store` and is never persisted in plaintext. Audit entries record the peer id and the action, never key material.
+
+Active flows are a separate drawer because setup is true offline while flows are a live read that can fail. The list comes from the memory of the gateway serving that peer and is a snapshot, not history: a flow leaves it as soon as it closes, is reaped, or is revoked, nothing is persisted, and there is no cursor because one peer's flow set is bounded by `server.vpn.max_flows_per_peer`. A peer served by another node, or a server with no running gateway, returns `501` rather than an empty list - "no traffic" and "the traffic is on another node" are different facts. The IP pool overview comes from `GET /api/v1/vpn-nodes` and reports `allocated` and `capacity` from the subnet lease and the peer table rather than deriving them from the prefix, because a derived capacity would be a promise the issuing node may not keep.
+
 ## Audit logs
 
 Audit logs record create, update, delete, reveal, and authorization-denied events with actor, action, resource type, and resource ID. Use them for:

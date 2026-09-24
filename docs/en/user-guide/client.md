@@ -24,7 +24,7 @@ Supported local forward types:
 - `socks5`
 - `http-proxy`
 
-UDP forwarding preserves datagram boundaries and source associations.
+UDP forwarding preserves datagram boundaries and source associations. It starts on the user's machine, and the Server carries it to the Agent - there is no public UDP listener behind it. The Server has a separate WireGuard VPN gateway ingress ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), built only with `-tags vpn`) that does not go through the Client; see the [VPN gateway guide](../../user-guide/vpn.md).
 
 ## SOCKS5 and HTTP proxy modes
 
