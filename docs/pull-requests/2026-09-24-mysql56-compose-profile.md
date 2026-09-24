@@ -66,6 +66,10 @@ charset（`utf8mb4_general_ci`）下 `migrations/ddl.sql` 是否满足 MySQL 5.6
   由本次新增的 `packaging` job 步骤作为替代证据：`docker compose -f docker-compose.cluster.yml
   config`（默认不含 `mysql56`）与 `... --profile mysql56 config`（含 `mysql56`）。真正的
   `up -d mysql56` + 契约复跑需在装有 Docker 的机器上按 `docs/development/testing.md` 的命令执行。
+  本 PR 的 `packaging` 检查通过（7s），说明这两条 compose 校验**已在 CI 真实执行**：默认渲染匹配
+  不到 `^  mysql56:`（profile 确实不随集群栈启动，且插值不需要任何 `MYSQL56_*` 变量，三步引导不受
+  影响），`--profile mysql56` 渲染能匹配到该服务（healthcheck、conf.d 只读挂载、
+  `${MYSQL56_*:-占位}` 插值与顶层卷声明都可解析）。
 - 其余门禁：`go vet ./...`、`go test ./... -count=1`、`go test -race ./... -count=1 -timeout 30m`、
   `git diff --check`。前端未变更。
 
