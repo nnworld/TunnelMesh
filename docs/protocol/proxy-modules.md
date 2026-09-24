@@ -43,6 +43,8 @@ legacy Agent、legacy Client 和 legacy 远端 Server 继续使用原字节流�
 
 本地 Agent relay 连接支持带外 `WINDOW_UPDATE` 控制读写，不会把控制帧混入 DATA 字节流。跨 Server gRPC relay 使用一个单字节 envelope 区分消息：`0x00` 表示数据，`0x01` 表示编码后的协议控制帧。该 envelope 是 relay 内部封装，不改变 Client/Agent 的 WebSocket wire format。
 
+Client 发给 Server 的 `WINDOW_UPDATE` 只补充 Server→Client 这一跳的发送窗口，不能镜像给 Agent。Agent→Server 的额度由 Server 消费 Agent relay 字节后独立回补。两条链路的额度都在 Server 终止，避免同一字节增量被重复计 credit 后冲破 Agent 侧接收缓冲。
+
 legacy 子协议不启用 `OPEN_STREAM.Window` 语义，仍使用有界队列和 `RESET` 保护内存；已建立的 strict/flow-control 连接不会中途切换语义。
 
 ## 限制与安全

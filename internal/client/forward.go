@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -132,7 +133,9 @@ func (f *TCPForward) handleConn(local net.Conn) {
 		return
 	}
 	defer remote.Close()
-	bridge(local, remote)
+	if err := bridge(local, remote); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("client: tcp forward bridge failed: %v", err)
+	}
 }
 
 type HTTPForwardConfig struct {
