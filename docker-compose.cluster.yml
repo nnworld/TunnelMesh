@@ -10,6 +10,34 @@ services:
       - tunnelmesh-mysql-data:/var/lib/mysql
     restart: unless-stopped
 
+  # Disposable MySQL 5.6 instance for the project's supported floor version,
+  # opt-in through the `mysql56` profile so it never starts with the cluster
+  # stack. CI runs the same version and the same contract tests; this service
+  # exists so a contributor can reproduce a red mysql56 check locally, and
+  # unlike the CI service container it also uses production's utf8mb4 charset
+  # (deploy/mysql56/utf8mb4.cnf). Steps: docs/development/testing.md.
+  # No TLS and no real data: keep the host binding on loopback.
+  mysql56:
+    image: mysql:5.6
+    profiles: ["mysql56"]
+    environment:
+      MYSQL_DATABASE: tunnelmesh_test
+      MYSQL_USER: tunnelmesh
+      MYSQL_PASSWORD: ${MYSQL56_TEST_PASSWORD:-tunnelmesh}
+      MYSQL_ROOT_PASSWORD: ${MYSQL56_ROOT_PASSWORD:-tunnelmesh-root}
+    ports:
+      # 3307 so a local MySQL 8 on the default port and the cluster `mysql`
+      # service above both keep working.
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - tunnelmesh-mysql56-test-data:/var/lib/mysql
+      - ./deploy/mysql56/utf8mb4.cnf:/etc/mysql/conf.d/tunnelmesh.cnf:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL56_ROOT_PASSWORD:-tunnelmesh-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
   server-1:
     build:
       context: .
@@ -92,3 +120,4 @@ services:
 
 volumes:
   tunnelmesh-mysql-data:
+  tunnelmesh-mysql56-test-data:
