@@ -74,4 +74,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run MySQL 5.6 repository and registry contracts
-        run: go test ./internal/storage ./internal/registry -count=1 -run MySQL
+        # -p 1 is required, not a tuning knob: both packages open the same
+        # schema_meta in one database and auto-init inserts its single row, so
+        # running the packages in parallel loses a race on INSERT id=1.
+        run: go test -p 1 ./internal/storage ./internal/registry -count=1 -run MySQL

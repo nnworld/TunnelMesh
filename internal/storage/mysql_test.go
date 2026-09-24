@@ -155,7 +155,7 @@ func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 		raw.Close()
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+	if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
 		raw.Close()
 		t.Fatalf("prepare MySQL schema: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+		if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
 			t.Errorf("restore MySQL schema: %v", err)
 		}
 		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
@@ -210,12 +210,16 @@ func TestMySQLAutoInitRejectsMissingV2MigrationChain(t *testing.T) {
 	}
 }
 
+// TestMySQLAutoInitDisabledRejectsMissingServiceTokensTable keeps the schema at
+// the current version so the only remaining defect is the missing table: with an
+// old version the version guard rejects the database first, which is what the
+// SQLite twin asserts and what the MySQL variant must assert too.
 func TestMySQLAutoInitDisabledRejectsMissingServiceTokensTable(t *testing.T) {
 	dsn := os.Getenv("TUNNELMESH_TEST_MYSQL_DSN")
 	if dsn == "" {
 		t.Skip("TUNNELMESH_TEST_MYSQL_DSN is not set")
 	}
-	prepareMySQLServiceTokenSchemaTest(t, dsn, 3)
+	prepareMySQLServiceTokenSchemaTest(t, dsn, SchemaVersion)
 
 	if _, err := OpenMySQL(context.Background(), dsn, false); err == nil || !strings.Contains(err.Error(), "service_tokens") {
 		t.Fatalf("error=%v, want missing service_tokens table", err)
@@ -232,15 +236,14 @@ func prepareMySQLServiceTokenSchemaTest(t *testing.T, dsn string, version int) *
 		raw.Close()
 		t.Fatal(err)
 	}
-	for _, statement := range strings.Split(migrations.DDL, ";") {
-		statement = strings.TrimSpace(statement)
-		if statement == "" {
-			continue
-		}
-		if _, err := raw.ExecContext(context.Background(), statement); err != nil && !isDuplicateError(err) {
-			raw.Close()
-			t.Fatalf("prepare MySQL schema: %v", err)
-		}
+	// applySchemaStatements is the same duplicate-tolerant, comment-aware path
+	// production uses. Executing the DDL statement by statement without skipping
+	// duplicates makes this helper unusable on a database another MySQL test in
+	// this package already seeded, and strings.Split re-introduces the bug that
+	// splitSQLStatements exists to fix.
+	if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
+		raw.Close()
+		t.Fatalf("prepare MySQL schema: %v", err)
 	}
 	statements := []struct {
 		query string
@@ -257,14 +260,8 @@ func prepareMySQLServiceTokenSchemaTest(t *testing.T, dsn string, version int) *
 		}
 	}
 	t.Cleanup(func() {
-		for _, statement := range strings.Split(migrations.DDL, ";") {
-			statement = strings.TrimSpace(statement)
-			if statement == "" {
-				continue
-			}
-			if _, err := raw.ExecContext(context.Background(), statement); err != nil && !isDuplicateError(err) {
-				t.Errorf("restore MySQL schema: %v", err)
-			}
+		if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
+			t.Errorf("restore MySQL schema: %v", err)
 		}
 		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
 			t.Errorf("restore MySQL schema version: %v", err)
