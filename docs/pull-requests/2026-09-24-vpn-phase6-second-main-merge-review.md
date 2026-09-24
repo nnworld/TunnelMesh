@@ -135,4 +135,5 @@ MySQL 5.6.51 上跑绿后才能宣称。
 
 ## 集成状态
 
-`7abeb47` 及本轮修复尚未推送；`HEAD..origin/main` 为空，即本分支已包含 main 全部内容。
+本分支已包含 main 全部内容（`HEAD..origin/main` 为空）。本文与 `2c58208`/`567f3c8`/`f69aac7`
+一并推送；文末两条建议由 [后续记录](2026-09-24-vpn-en-mirror-and-ci-dsn-hygiene.md) 完成。
