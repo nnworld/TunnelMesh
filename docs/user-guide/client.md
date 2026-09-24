@@ -49,6 +49,8 @@ tunnelmesh-client --config tunnelmesh.yaml status
 
 ## 4. TCP 转发
 
+TCP 转发保留方向性半关闭语义：本地请求写完后，远端响应方向会继续打开，直到响应 EOF 或任一端被关闭。大文件下载不会因为响应耗时超过请求而被提前截断。
+
 把本地 `127.0.0.1:15432` 转发到 Agent 所在内网的 `db.internal:5432`：
 
 ```bash

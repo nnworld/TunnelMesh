@@ -390,8 +390,9 @@ func forwardHTTP(w http.ResponseWriter, r *http.Request, stream io.ReadWriteClos
 }
 
 // bridge uses independent bounded buffers so a slow upload does not prevent
-// the remote response from being drained. Closing both endpoints after one
-// side reaches EOF provides deterministic cleanup for SSH/raw TCP clients.
+// the remote response from being drained. A successful directional half-close
+// leaves the opposite direction open until EOF or external close; a wall-clock
+// cutoff would turn a slow but healthy response into a truncated body.
 func bridge(a, b io.ReadWriteCloser) error {
 	results := make(chan copyResult, 2)
 	copyOne := func(dst io.Writer, src io.Reader, halfClose io.Writer) {
@@ -425,13 +426,9 @@ func bridge(a, b io.ReadWriteCloser) error {
 		return first.err
 	}
 	var second copyResult
-	select {
-	case second = <-results:
-	case <-time.After(time.Second):
-		_ = a.Close()
-		_ = b.Close()
-		return first.err
-	}
+	// Waiting without a timeout is intentional: the peer controls when the
+	// remaining direction finishes, and the caller can still close either end.
+	second = <-results
 	_ = a.Close()
 	_ = b.Close()
 	if errors.Is(first.err, io.EOF) {
