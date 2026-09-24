@@ -35,7 +35,7 @@ func TestAgentRelayTransportOpenStreamResultWaitsForStrictFailure(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	type openResult struct {
@@ -46,14 +46,14 @@ func TestAgentRelayTransportOpenStreamResultWaitsForStrictFailure(t *testing.T) 
 	resultCh := make(chan openResult, 1)
 	go func() {
 		stream, result, openErr := mux.OpenStreamResult(context.Background(), relay.StreamRequest{
-			AgentID: "agent-strict-open", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 4096,
+			AgentID: "agent-strict-open", StrictOpen: true, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 262144,
 		})
 		resultCh <- openResult{stream: stream, result: result, err: openErr}
 	}()
 
 	open := receiveAgentRelayFrame(t, agentTransport)
-	if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 || open.Window != 4096 {
-		t.Fatalf("OPEN frame = %+v, want strict OPEN_STREAM with window 4096", open)
+	if open.Type != protocol.FrameOpenStream || open.Flags&protocol.FlagStrictOpen == 0 || open.Window != 262144 {
+		t.Fatalf("OPEN frame = %+v, want strict OPEN_STREAM with window 262144", open)
 	}
 	select {
 	case got := <-resultCh:
@@ -94,7 +94,7 @@ func TestAgentRelayTransportStrictOpenRejectsLegacyAgentWithoutSending(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -119,19 +119,19 @@ func TestAgentRelayTransportPropagatesWindowControlFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
-		AgentID: "agent-window", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 4096,
+		AgentID: "agent-window", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 262144,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stream.Close()
 	open := receiveAgentRelayFrame(t, agentTransport)
-	if open.Type != protocol.FrameOpenStream || open.Window != 4096 {
-		t.Fatalf("OPEN=%+v, want initial window 4096", open)
+	if open.Type != protocol.FrameOpenStream || open.Window != 262144 {
+		t.Fatalf("OPEN=%+v, want the requested initial window 262144", open)
 	}
 
 	controlWriter, ok := stream.(interface{ WriteControl(protocol.Frame) error })
@@ -186,7 +186,7 @@ func TestAgentRelayTransportOpenStreamResultPropagatesStableFailureCodes(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			mux := NewAgentRelayTransport(manager)
+			mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 			defer mux.Close()
 			resultCh := make(chan relay.RelayOpenResult, 1)
 			go func() {
@@ -229,7 +229,7 @@ func TestAgentRelayTransportOpenStreamResultTimeoutResetsOnlyStream(t *testing.T
 	}, agentTransport); err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -255,7 +255,7 @@ func TestAgentRelayTransportOpenStreamResultDuplicateAndEarlyDataAreIsolated(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	type openResult struct {
 		stream io.ReadWriteCloser
@@ -318,7 +318,7 @@ func TestAgentRelayTransportAllocatesIndependentWireIDsAndFencesReconnectGenerat
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	first, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-mux", StreamID: 7, Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -373,7 +373,7 @@ func TestAgentRelayTransportResolvesDynamicAgentIDCaseInsensitively(t *testing.T
 	}, agentTransport); err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -419,7 +419,7 @@ func TestAgentRelayTransportKeysStreamsByAgentConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	firstStream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -469,7 +469,7 @@ func TestAgentRelayTransportRejectsAmbiguousCaseInsensitiveAgentID(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	if _, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -495,7 +495,7 @@ func TestAgentRelayTransportSameEpochReplacementFencesDelayedOldCallbacksAndTear
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	oldStream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-same-epoch", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -548,7 +548,7 @@ func TestAgentRelayTransportLegacyEpochCallbackRoutesUniqueCurrentSession(t *tes
 	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-legacy-api", NodeID: "node", Epoch: 7}, transport); err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-legacy-api", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -571,7 +571,7 @@ func TestAgentRelayTransportConcurrentOldTeardownAndSameEpochRegistration(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	manager.RemoveSession("agent-generation-race", oldSession)
 
@@ -622,7 +622,7 @@ func TestAgentRelayTransportResetOverridesPriorRemoteHalfClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-reset", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -650,7 +650,7 @@ func TestAgentRelayTransportRejectsOldGenerationDataAfterReplacementRegistration
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-fence", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -677,7 +677,7 @@ func TestAgentRelayTransportCloseDoesNotEchoRemoteReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-no-echo", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -704,7 +704,7 @@ func TestAgentRelayTransportRejectsWireIDWrapAndResetsForNewEpoch(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	mux.allocators[agentRelayGeneration{
 		agentID: "agent-exhaust", connectionID: firstSession.ConnectionID, connectionEpoch: firstSession.ConnectionEpoch, serverGeneration: firstSession.serverGeneration,
@@ -749,7 +749,7 @@ func TestAgentRelayTransportRejectsDataAfterRemoteHalfClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{AgentID: "agent-half-data", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22})
 	if err != nil {
@@ -788,7 +788,7 @@ func TestAgentRelayStreamAdvertisesDefaultWindowAndReleasesItOnRead(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	// Server-originated opens must advertise a receive window: without one the
@@ -833,7 +833,7 @@ func TestAgentRelayStreamWriteBlocksOnAgentSendWindowAndResumesOnUpdate(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -882,7 +882,7 @@ func TestAgentRelayStreamCloseWakesBlockedWrite(t *testing.T) {
 	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-send-window-close", NodeID: "node", Epoch: 1}, agentTransport); err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -924,7 +924,7 @@ func TestAgentRelayStreamAcceptsManySmallFramesWithinWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -1012,7 +1012,7 @@ func TestAgentRelayStreamSurvivesUndrainedWindowUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := NewAgentRelayTransport(manager)
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
 	defer mux.Close()
 
 	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
@@ -1048,5 +1048,74 @@ func TestAgentRelayStreamSurvivesUndrainedWindowUpdates(t *testing.T) {
 		if frame.Type == protocol.FrameReset {
 			t.Fatalf("unexpected RESET after undrained WINDOW_UPDATE flood: %+v", frame)
 		}
+	}
+}
+
+// A window the Agent can never refill by one whole frame would stall the stream
+// forever, because waiting for credit has no timeout. The Server clamps it to the
+// window it can actually honour instead of honouring the number it was given.
+func TestAgentRelayClampsUndersizedPeerWindow(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-clamp", NodeID: "node", Epoch: 1}, agentTransport); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
+	defer mux.Close()
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-clamp", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if open.Window != protocol.DefaultServerReceiveWindow {
+		t.Fatalf("OPEN window = %d, want the clamped %d", open.Window, protocol.DefaultServerReceiveWindow)
+	}
+}
+
+// `server.stream.initial_window` must reach the data plane: it is both the credit
+// advertised to the Agent and the size of the buffer that enforces it.
+func TestAgentRelayHonoursConfiguredWindow(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	if _, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-configured", NodeID: "node", Epoch: 1}, agentTransport); err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{AdvertisedWindow: 262144, UpdateThreshold: 131072})
+	defer mux.Close()
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-configured", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+	if open.Window != 262144 {
+		t.Fatalf("OPEN window = %d, want the configured 262144", open.Window)
+	}
+	relayStream, ok := stream.(*agentRelayStream)
+	if !ok {
+		t.Fatalf("stream type %T", stream)
+	}
+	if relayStream.receiveBudget != 262144 {
+		t.Fatalf("receiveBudget = %d, want it sized from the configured window", relayStream.receiveBudget)
+	}
+	if got := relayStream.transport.windows.updateThreshold(uint32(relayStream.receiveBudget)); got != 131072 {
+		t.Fatalf("updateThreshold = %d, want the configured 131072", got)
+	}
+}
+
+// A configured threshold that would leave less than one frame of headroom is not
+// honoured, because a sender that cannot fit a frame has no way to ask for credit.
+func TestAgentRelayRejectsWindowWithoutFrameHeadroom(t *testing.T) {
+	windows := AgentRelayWindowConfig{AdvertisedWindow: 262144, UpdateThreshold: 262144 - 1024}
+	if got := windows.updateThreshold(windows.advertisedWindow()); got != protocol.DefaultWindowUpdateThreshold {
+		t.Fatalf("updateThreshold = %d, want the safe default", got)
+	}
+	if got := (AgentRelayWindowConfig{AdvertisedWindow: 1 << 30}).advertisedWindow(); got != protocol.DefaultServerReceiveWindow {
+		t.Fatalf("advertisedWindow = %d, want the cap for an unverifiable request", got)
 	}
 }
