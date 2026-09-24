@@ -773,7 +773,11 @@ func TestMySQLV15ToV16VPNMigration(t *testing.T) {
 		raw.Close()
 		t.Fatal(err)
 	}
-	if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+	// applySchemaStatements is the duplicate-tolerant path: TestMySQLRepositoryContract
+	// already seeded schema_meta(id=1) and the authorization revision row in the
+	// same database, and the mysql56 CI job runs these packages with -p 1, so a
+	// plain multi-statement ExecContext of the full DDL fails on 1062 here.
+	if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
 		raw.Close()
 		t.Fatalf("prepare MySQL schema: %v", err)
 	}
@@ -784,15 +788,21 @@ func TestMySQLV15ToV16VPNMigration(t *testing.T) {
 			t.Fatalf("prepare v15 schema: %v", err)
 		}
 	}
+	// The restore needs a handle of its own: the body closes raw so the migrated
+	// database is the only pool while the upgrade runs, and a closed database/sql
+	// handle cannot execute the cleanup statements.
 	t.Cleanup(func() {
-		if _, err := raw.ExecContext(context.Background(), migrations.DDL); err != nil {
+		restore, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Errorf("reopen MySQL schema test database: %v", err)
+			return
+		}
+		defer func() { _ = restore.Close() }()
+		if err := applySchemaStatements(context.Background(), restore, migrations.DDL, true); err != nil {
 			t.Errorf("restore MySQL schema: %v", err)
 		}
-		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+		if _, err := restore.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
 			t.Errorf("restore MySQL schema version: %v", err)
-		}
-		if err := raw.Close(); err != nil {
-			t.Errorf("close MySQL schema test database: %v", err)
 		}
 	})
 	if err := raw.Close(); err != nil {
@@ -872,4 +882,90 @@ func TestMySQLV14ToV15WidensConnectionEpoch(t *testing.T) {
 			t.Fatalf("full DDL %s still declares a 32-bit connection_epoch: %s", table, section)
 		}
 	}
+}
+
+// TestMySQLGatedTestsNeverExecWholeDDLScripts is a static gate for the tests
+// that only run when TUNNELMESH_TEST_MYSQL_DSN is set. Two of those bugs reached
+// CI (4fc8213, e8b7c0d): handing a whole migrations/ddl.sql to one ExecContext
+// either fails on the schema_meta row that an earlier test in the same database
+// already seeded, or fails to parse at all when the DSN lacks multiStatements.
+// The auto-init path in db.go uses the duplicate-tolerant, statement-splitting
+// applySchemaStatements, so MySQL-backed tests must use it too.
+func TestMySQLGatedTestsNeverExecWholeDDLScripts(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	checked := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for _, fn := range splitTopLevelFuncs(string(source)) {
+			// Opening a mysql handle is what makes a function — test or helper —
+			// part of the gated set; SQLite tests may exec multi-statement scripts
+			// because that driver accepts them.
+			if !strings.Contains(fn.body, `sql.Open("mysql"`) {
+				continue
+			}
+			checked++
+			for _, line := range strings.Split(fn.body, "\n") {
+				index := strings.Index(line, "migrations.DDL")
+				if index < 0 {
+					continue
+				}
+				prefix := line[:index]
+				if strings.Contains(prefix, "applySchemaStatements(") || !strings.Contains(prefix, ".Exec") {
+					continue
+				}
+				t.Errorf("%s: %s executes a whole DDL script in one statement call, which breaks under the mysql56 CI job; use "+
+					"applySchemaStatements(ctx, db, migrations.DDL, true): %s", name, fn.name, strings.TrimSpace(line))
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no MySQL-backed test functions were scanned: the gate is looking at the wrong marker")
+	}
+}
+
+// mysqlTestFunc is one top-level declaration from a test file, identified by name
+// with every line of its body attached.
+type mysqlTestFunc struct {
+	name string
+	body string
+}
+
+// splitTopLevelFuncs groups a gofmt'd source file by its top-level func lines.
+// Deliberately textual rather than a syntax import: a declaration always starts at
+// column zero after gofmt, and nested closures are indented, so the boundaries are
+// exact for the purpose above while staying simple enough to keep.
+func splitTopLevelFuncs(source string) []mysqlTestFunc {
+	var funcs []mysqlTestFunc
+	var current *mysqlTestFunc
+	var lines []string
+	for _, line := range strings.Split(source, "\n") {
+		if strings.HasPrefix(line, "func ") {
+			if current != nil {
+				current.body = strings.Join(lines, "\n")
+			}
+			signature := strings.TrimPrefix(line, "func ")
+			name := signature
+			if paren := strings.Index(signature, "("); paren >= 0 {
+				name = signature[:paren]
+			}
+			funcs = append(funcs, mysqlTestFunc{name: name})
+			current = &funcs[len(funcs)-1]
+			lines = nil
+		}
+		lines = append(lines, line)
+	}
+	if current != nil {
+		current.body = strings.Join(lines, "\n")
+	}
+	return funcs
 }
