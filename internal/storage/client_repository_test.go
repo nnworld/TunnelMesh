@@ -371,3 +371,68 @@ func TestClientInstancePurgeUnreportedOrphans(t *testing.T) {
 		}
 	}
 }
+
+// TestClientInstanceRepositoryOrdersByLastHeartbeatDescending is the observation-page
+// contract: the list must start with the client that reported most recently.
+//
+// updated_at is not usable for that order because the stale and expiry sweeps bump it
+// to "now" without any client activity, which would float dead clients to the top of
+// the page an operator uses to find live ones.
+func TestClientInstanceRepositoryOrdersByLastHeartbeatDescending(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	seed := func(id string, ago time.Duration) {
+		t.Helper()
+		seen := base.Add(-ago)
+		if _, err := db.ClientInstances().Upsert(ctx, ClientInstance{
+			ID: id, OwnerUserID: "owner-1", InstanceID: id, Metadata: "{}", Capabilities: "[]",
+			ReportedAt: seen, LastSeenAt: seen, UpdatedAt: seen,
+		}); err != nil {
+			t.Fatalf("upsert %s: %v", id, err)
+		}
+	}
+	seed("client-a", 30*time.Minute)
+	seed("client-b", 10*time.Minute)
+	seed("client-c", 5*time.Minute)
+	seed("client-d", 5*time.Minute) // ties with client-c, so the id tiebreak decides
+
+	// A sweep marks the oldest client stale one hour later: its updated_at is now the
+	// newest in the table, and it must still be listed last.
+	if err := db.ClientInstances().MarkStale(ctx, "client-a", base.Add(time.Hour)); err != nil {
+		t.Fatalf("MarkStale: %v", err)
+	}
+
+	first, err := db.ClientInstances().List(ctx, ClientInstanceFilter{OwnerUserID: "owner-1"}, "", 2)
+	if err != nil {
+		t.Fatalf("list first page: %v", err)
+	}
+	assertClientInstanceIDs(t, first.Items, "client-d", "client-c")
+	if !first.HasMore || first.NextCursor == "" {
+		t.Fatalf("first page = %+v, want a cursor", first)
+	}
+	second, err := db.ClientInstances().List(ctx, ClientInstanceFilter{OwnerUserID: "owner-1"}, first.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("list second page: %v", err)
+	}
+	assertClientInstanceIDs(t, second.Items, "client-b", "client-a")
+	if second.HasMore {
+		t.Fatalf("second page = %+v, want the last page", second.Items)
+	}
+}
+
+func assertClientInstanceIDs(t *testing.T, items []ClientInstance, want ...string) {
+	t.Helper()
+	got := make([]string, 0, len(items))
+	for _, item := range items {
+		got = append(got, item.ID)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("client instance ids = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("client instance ids = %v, want %v", got, want)
+		}
+	}
+}

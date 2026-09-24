@@ -844,7 +844,7 @@ paths:
   /api/v1/clients:
     get:
       summary: List Client instances within the caller's ownership scope
-      description: Administrators may filter across owners. Ordinary users are always restricted to their own Clients in the repository query, before cursor pagination.
+      description: Results are ordered by last heartbeat descending, with the instance ID as a deterministic tie-breaker, so the Clients that reported most recently are on the first page. The stale and expiry sweeps update the row timestamp without any Client activity, which is why that timestamp is not the sort key. Administrators may filter across owners. Ordinary users are always restricted to their own Clients in the repository query, before cursor pagination.
       security: [{bearerAuth: []}]
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
