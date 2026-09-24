@@ -60,14 +60,16 @@ cd web && npm run build && cd ..
 
 ```bash
 docker compose -f docker-compose.cluster.yml --profile mysql56 up -d mysql56
-TUNNELMESH_TEST_MYSQL_DSN='tunnelmesh:tunnelmesh@tcp(127.0.0.1:3307)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true' \
+TUNNELMESH_TEST_MYSQL_DSN='tunnelmesh:tunnelmesh@tcp(127.0.0.1:3307)/tunnelmesh_test?parseTime=true&tls=false' \
   go test -p 1 ./internal/storage ./internal/registry -count=1 -run MySQL
 ```
 
   - `OpenMySQL` 默认 `auto-init=true`，所以需要**空库**和建表权限；要重来一遍就
     `docker compose -f docker-compose.cluster.yml --profile mysql56 down -v mysql56`。
-  - `multiStatements=true` 是必需的：迁移测试用一次 `ExecContext` 执行整段 DDL，与 auto-init
-    路径一致。
+  - **不需要** `multiStatements`：整段 DDL 与增量脚本一律由 `applySchemaStatements` 拆成单语句逐条
+    执行，测试与 auto-init 走同一条路径。该参数在 `4fc8213`/`e8b7c0d` 之前确实是必需的（当时把整段
+    DDL 交给一次 `ExecContext`）；`TestMySQLGatedTestsNeverExecWholeDDLScripts` 负责拦住它的回归，
+    所以不要为了「保险」把它加回 DSN——那只会让下一份文档继续宣称一个不存在的前提。
   - `-p 1` 是正确性要求，不是调优：两个包对同一个库各自 auto-init，并行会抢
     `schema_meta(id=1)` 这一行并报 `Error 1062`。
   - 口令用 `MYSQL56_TEST_PASSWORD` / `MYSQL56_ROOT_PASSWORD` 覆盖默认占位值即可；这两者只服务

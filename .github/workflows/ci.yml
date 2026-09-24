@@ -80,9 +80,12 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     env:
-      # multiStatements is required because the migration tests execute a whole
-      # DDL script in one ExecContext, exactly like the auto-init path.
-      TUNNELMESH_TEST_MYSQL_DSN: tunnelmesh:tunnelmesh@tcp(127.0.0.1:3306)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true
+      # No multiStatements: applySchemaStatements splits every DDL and migration
+      # script into single statements, in the tests and on the auto-init path
+      # alike. The flag was required until e8b7c0d moved the whole-script
+      # ExecContext calls onto that splitter, and TestMySQLGatedTestsNeverExecWholeDDLScripts
+      # keeps it from coming back as a hidden dependency of this DSN again.
+      TUNNELMESH_TEST_MYSQL_DSN: tunnelmesh:tunnelmesh@tcp(127.0.0.1:3306)/tunnelmesh_test?parseTime=true&tls=false
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
