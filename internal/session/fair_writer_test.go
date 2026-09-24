@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -241,4 +242,146 @@ func TestFairFrameWriterReturnsSenderError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Run did not return sender error")
 	}
+}
+
+func assertSentPayload(t *testing.T, sent <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-sent:
+		if got != want {
+			t.Fatalf("payload=%q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for payload %q", want)
+	}
+}
+
+func TestFairFrameWriterRetiresEmptyStreamQueues(t *testing.T) {
+	sent := make(chan protocol.Frame, 128)
+	writer := NewFairFrameWriter(func(frame protocol.Frame) error {
+		sent <- frame
+		return nil
+	}, FairWriterConfig{ControlQueueSize: 4, StreamQueueBytes: 1024, QuantumBytes: 32})
+	defer writer.Close()
+
+	for id := uint32(1); id <= 64; id++ {
+		if err := writer.EnqueueData(id, protocol.Frame{Type: protocol.FrameData, StreamID: id, Payload: []byte("x")}); err != nil {
+			t.Fatalf("enqueue stream %d: %v", id, err)
+		}
+	}
+	if got := writer.StreamQueueCount(); got != 64 {
+		t.Fatalf("queues before run=%d, want 64", got)
+	}
+	runDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { runDone <- writer.Run(ctx) }()
+
+	for i := 0; i < 64; i++ {
+		select {
+		case <-sent:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out after %d frames", i)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for writer.StreamQueueCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-runDone
+	if got := writer.StreamQueueCount(); got != 0 {
+		t.Fatalf("queues after drain=%d, want 0", got)
+	}
+	if len(writer.order) != 0 {
+		t.Fatalf("round-robin list after drain=%d, want 0", len(writer.order))
+	}
+}
+
+func TestFairFrameWriterPreservesOrderAcrossQueueRetirement(t *testing.T) {
+	sent := make(chan string, 64)
+	writer := NewFairFrameWriter(func(frame protocol.Frame) error {
+		sent <- string(frame.Payload)
+		return nil
+	}, FairWriterConfig{ControlQueueSize: 4, StreamQueueBytes: 1024, QuantumBytes: 32})
+	defer writer.Close()
+	runDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { runDone <- writer.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-runDone
+	}()
+
+	if err := writer.EnqueueData(7, protocol.Frame{Type: protocol.FrameData, StreamID: 7, Payload: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	// Draining "a" makes stream 7 idle, which is exactly when its queue may be
+	// retired. Reusing the ID afterwards must still deliver FIFO.
+	assertSentPayload(t, sent, "a")
+	for _, payload := range []string{"b", "c", "d"} {
+		if err := writer.EnqueueData(7, protocol.Frame{Type: protocol.FrameData, StreamID: 7, Payload: []byte(payload)}); err != nil {
+			t.Fatal(err)
+		}
+		assertSentPayload(t, sent, payload)
+	}
+}
+
+func TestFairFrameWriterScanStaysBoundedAcrossManyStreams(t *testing.T) {
+	writer := NewFairFrameWriter(func(protocol.Frame) error { return nil }, FairWriterConfig{
+		ControlQueueSize: 4, StreamQueueBytes: 1024, QuantumBytes: 32,
+	})
+	defer writer.Close()
+	runDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { runDone <- writer.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-runDone
+	}()
+
+	for id := uint32(1); id <= 5000; id++ {
+		if err := writer.EnqueueData(id, protocol.Frame{Type: protocol.FrameData, StreamID: id, Payload: []byte("x")}); err != nil {
+			t.Fatalf("enqueue stream %d: %v", id, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for writer.StreamQueueCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := writer.StreamQueueCount(); got > 8 {
+		t.Fatalf("held queues after 5000 streams=%d, want a bounded number", got)
+	}
+	if got := len(writer.order); got > 8 {
+		t.Fatalf("round-robin list after 5000 streams=%d, want a bounded length", got)
+	}
+}
+
+func TestFairFrameWriterConcurrentEnqueueDuringRetirement(t *testing.T) {
+	writer := NewFairFrameWriter(func(protocol.Frame) error { return nil }, FairWriterConfig{
+		ControlQueueSize: 4, StreamQueueBytes: 1 << 20, QuantumBytes: 1024,
+	})
+	defer writer.Close()
+	runDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { runDone <- writer.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-runDone
+	}()
+
+	var group sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		group.Add(1)
+		go func(worker int) {
+			defer group.Done()
+			for round := 0; round < 250; round++ {
+				id := uint32(1 + (worker+round)%16)
+				if err := writer.EnqueueData(id, protocol.Frame{Type: protocol.FrameData, StreamID: id, Payload: []byte("payload")}); err != nil {
+					t.Errorf("worker %d round %d stream %d: %v", worker, round, id, err)
+					return
+				}
+			}
+		}(worker)
+	}
+	group.Wait()
 }
