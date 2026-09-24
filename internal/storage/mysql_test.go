@@ -169,15 +169,21 @@ func TestMySQLV8ToV9AuthorizationRevisionMigration(t *testing.T) {
 			t.Fatalf("prepare v8 schema: %v", err)
 		}
 	}
+	// The restore needs a handle of its own. The body closes raw so the migrated
+	// database is the only pool while the upgrade runs, and a closed
+	// database/sql handle cannot execute the cleanup statements.
 	t.Cleanup(func() {
-		if err := applySchemaStatements(context.Background(), raw, migrations.DDL, true); err != nil {
+		restore, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Errorf("reopen MySQL schema test database: %v", err)
+			return
+		}
+		defer func() { _ = restore.Close() }()
+		if err := applySchemaStatements(context.Background(), restore, migrations.DDL, true); err != nil {
 			t.Errorf("restore MySQL schema: %v", err)
 		}
-		if _, err := raw.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
+		if _, err := restore.ExecContext(context.Background(), `UPDATE schema_meta SET version=? WHERE id=1`, SchemaVersion); err != nil {
 			t.Errorf("restore MySQL schema version: %v", err)
-		}
-		if err := raw.Close(); err != nil {
-			t.Errorf("close MySQL schema test database: %v", err)
 		}
 	})
 	if err := raw.Close(); err != nil {
