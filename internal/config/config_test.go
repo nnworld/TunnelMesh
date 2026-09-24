@@ -154,7 +154,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantServerStream := config.ServerStreamConfig{
-		MaxConcurrentOpens: 256, MaxPendingOpens: 1024,
+		MaxConcurrentOpens: 256, MaxActivePerAgent: 1024, MaxPendingOpens: 1024,
 		InitialWindow: 262144, WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
 	}
 	if cfg.Server.Stream != wantServerStream {
@@ -169,7 +169,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 		t.Fatalf("Server.AuthorizationCache = %+v, want %+v", cfg.Server.AuthorizationCache, wantAuthCache)
 	}
 	wantAgentStreams := config.AgentStreamConfig{
-		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		MaxConcurrentDials: 32, MaxActive: 1024, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
 		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
@@ -191,7 +191,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 
 func applyStreamLatencyDefaults(cfg *config.Config) {
 	cfg.Server.Stream = config.ServerStreamConfig{
-		MaxConcurrentOpens: 256, MaxPendingOpens: 1024, InitialWindow: 262144,
+		MaxConcurrentOpens: 256, MaxActivePerAgent: 1024, MaxPendingOpens: 1024, InitialWindow: 262144,
 		WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
 	}
 	cfg.Server.AuthorizationCache = config.AuthorizationCacheConfig{
@@ -200,7 +200,7 @@ func applyStreamLatencyDefaults(cfg *config.Config) {
 		MaxStaleOnPollError: 5 * time.Second, MaxEntries: 100000,
 	}
 	cfg.Agent.Streams = config.AgentStreamConfig{
-		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		MaxConcurrentDials: 32, MaxActive: 1024, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
 		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
@@ -553,6 +553,21 @@ func TestValidateRejectsInvalidSOCKS5TunnelConfiguration(t *testing.T) {
 			name: "invalid auth mode",
 			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n      agent_id: agent-a\n      auth_mode: token\n",
 			want: "socks5 auth mode must be none or password",
+		},
+		{
+			name: "remote tcp listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: tcp\n      listen: 0.0.0.0:10867\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 5432\n",
+			want: "non-loopback tcp tunnel requires allow_remote",
+		},
+		{
+			name: "remote udp listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: udp\n      listen: 0.0.0.0:10868\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 5432\n",
+			want: "non-loopback udp tunnel requires allow_remote",
+		},
+		{
+			name: "remote http listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: http\n      listen: 0.0.0.0:10869\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 8080\n",
+			want: "non-loopback http tunnel requires allow_remote",
 		},
 		{
 			name: "remote listener without explicit permission",
@@ -1565,5 +1580,156 @@ func TestVPNLoadFailsOnAnUnusablePool(t *testing.T) {
 	}
 	if !strings.Contains(message, "ip_pool") {
 		t.Errorf("the error must name the offending key, got %q", message)
+	}
+}
+
+// TestValidateServerHTTPBoundsRejectsNegatives pins that an operator cannot turn a
+// bound off with a negative number: zero means "built-in safe default", so a
+// negative value is a typo that must fail fast at startup.
+func TestValidateServerHTTPBoundsRejectsNegatives(t *testing.T) {
+	base, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "read header timeout", edit: func(c *config.Config) { c.Server.HTTP.ReadHeaderTimeout = -time.Second }, want: "server http read header timeout must not be negative"},
+		{name: "idle timeout", edit: func(c *config.Config) { c.Server.HTTP.IdleTimeout = -time.Second }, want: "server http idle timeout must not be negative"},
+		{name: "max header bytes", edit: func(c *config.Config) { c.Server.HTTP.MaxHeaderBytes = -1 }, want: "server http max header bytes must not be negative"},
+		{name: "body timeout", edit: func(c *config.Config) { c.Server.HTTP.BodyTimeout = -time.Second }, want: "server http body timeout must not be negative"},
+		{name: "max connections", edit: func(c *config.Config) { c.Server.HTTP.MaxConcurrentConnections = -5 }, want: "server http max connections must not be negative"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// Zero connection shedding is the documented default and must validate, so an
+	// upgrade cannot start refusing connections.
+	cfg := base
+	cfg.Server.HTTP = config.ServerHTTPConfig{}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() with the zero HTTP block error = %v, want no error", err)
+	}
+}
+
+// TestServerHTTPDefaultsMatchSafeFloors keeps the viper defaults and the
+// WithSafeDefaults floors in sync, which is what lets a hand-built RuntimeConfig be
+// as protected as a loaded configuration file.
+func TestServerHTTPDefaultsMatchSafeFloors(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.HTTP.MaxConcurrentConnections != 0 {
+		t.Fatalf("MaxConcurrentConnections = %d, want 0 so upgrading changes nothing", cfg.Server.HTTP.MaxConcurrentConnections)
+	}
+	if got, want := cfg.Server.HTTP, (config.ServerHTTPConfig{}).WithSafeDefaults(); got != want {
+		t.Fatalf("loaded HTTP block = %+v, want the safe defaults %+v", got, want)
+	}
+}
+
+// TestServerHTTPEnvironmentOverrides proves the new keys follow the same
+// TUNNELMESH_ prefix rule as every other setting.
+func TestServerHTTPEnvironmentOverrides(t *testing.T) {
+	t.Setenv("TUNNELMESH_SERVER_HTTP_IDLE_TIMEOUT", "45s")
+	t.Setenv("TUNNELMESH_SERVER_HTTP_MAX_CONNECTIONS", "64")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.HTTP.IdleTimeout != 45*time.Second {
+		t.Fatalf("IdleTimeout = %v, want 45s", cfg.Server.HTTP.IdleTimeout)
+	}
+	if cfg.Server.HTTP.MaxConcurrentConnections != 64 {
+		t.Fatalf("MaxConcurrentConnections = %d, want 64", cfg.Server.HTTP.MaxConcurrentConnections)
+	}
+}
+
+// TestServerAgentConnectionCapacityDefaults pins that the advertised and enforced
+// per-Agent connection ceiling come from one key, and that dropping the block keeps
+// the number the protocol has always advertised.
+func TestServerAgentConnectionCapacityDefaults(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Agents.MaxConnectionsPerAgent != config.DefaultAgentMaxConnectionsPerAgent {
+		t.Fatalf("MaxConnectionsPerAgent = %d, want the default %d", cfg.Server.Agents.MaxConnectionsPerAgent, config.DefaultAgentMaxConnectionsPerAgent)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	// Zero is the "apply the default" value, so a hand-built Config cannot be
+	// rejected for omitting the block, and only a negative number is a typo.
+	zero := cfg
+	zero.Server.Agents.MaxConnectionsPerAgent = 0
+	if err := config.Validate(zero); err != nil {
+		t.Fatalf("Validate() with a zero ceiling error = %v, want the default ceiling", err)
+	}
+	negative := cfg
+	negative.Server.Agents.MaxConnectionsPerAgent = -1
+	if err := config.Validate(negative); err == nil || !strings.Contains(err.Error(), "server agents max connections per agent must not be negative") {
+		t.Fatalf("Validate() with a negative ceiling error = %v, want a refusal", err)
+	}
+	t.Setenv("TUNNELMESH_SERVER_AGENTS_MAX_CONNECTIONS_PER_AGENT", "8")
+	fromEnv, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment override error = %v", err)
+	}
+	if fromEnv.Server.Agents.MaxConnectionsPerAgent != 8 {
+		t.Fatalf("MaxConnectionsPerAgent = %d, want the environment value 8", fromEnv.Server.Agents.MaxConnectionsPerAgent)
+	}
+}
+
+// TestServerMetricsTokenPolicy covers the three states an operator can choose: no
+// token (endpoint open as before), a strong token, and a token too short to be worth
+// brute-forcing across a public listener.
+func TestServerMetricsTokenPolicy(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Metrics.Token != "" {
+		t.Fatalf("default token = %q, want empty so /metrics keeps its current behaviour", cfg.Server.Metrics.Token)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() with no metrics token error = %v", err)
+	}
+
+	short := cfg
+	short.Server.Metrics.Token = "abc123"
+	if err := config.Validate(short); err == nil || !strings.Contains(err.Error(), "server metrics token must be at least 16 characters") {
+		t.Fatalf("Validate() with a short token error = %v, want a refusal", err)
+	}
+
+	strong := cfg
+	strong.Server.Metrics.Token = "0123456789abcdef0123456789abcdef"
+	if err := config.Validate(strong); err != nil {
+		t.Fatalf("Validate() with a strong token error = %v", err)
+	}
+	// The guard exists to keep the credential out of console output and logs.
+	data, err := strong.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "0123456789abcdef") {
+		t.Fatalf("RedactedJSON() leaked the metrics token: %s", data)
+	}
+
+	t.Setenv("TUNNELMESH_SERVER_METRICS_TOKEN", "env-token-value-long-enough")
+	fromEnv, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment token error = %v", err)
+	}
+	if fromEnv.Server.Metrics.Token != "env-token-value-long-enough" {
+		t.Fatalf("token = %q, want the environment value", fromEnv.Server.Metrics.Token)
 	}
 }

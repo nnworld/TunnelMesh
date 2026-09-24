@@ -134,6 +134,10 @@ type ServerConfig struct {
 	TCPBridge          TCPBridgeConfig          `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
 	TCPBridgeEnabled   bool                     `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
 	Relay              RelayConfig              `mapstructure:"relay" json:"relay" yaml:"relay"`
+	HTTP               ServerHTTPConfig         `mapstructure:"http" json:"http" yaml:"http"`
+	Agents             ServerAgentConfig        `mapstructure:"agents" json:"agents" yaml:"agents"`
+	Audit              ServerAuditConfig        `mapstructure:"audit" json:"audit" yaml:"audit"`
+	Metrics            ServerMetricsConfig      `mapstructure:"metrics" json:"metrics" yaml:"metrics"`
 	Stream             ServerStreamConfig       `mapstructure:"stream" json:"stream" yaml:"stream"`
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
@@ -228,8 +232,105 @@ type WebSSHConfig struct {
 	MaxMessageBytes       int           `mapstructure:"max_message_bytes" json:"max_message_bytes" yaml:"max_message_bytes"`
 }
 
+// ServerAgentConfig groups the per-Agent policy the Server applies to accepted
+// Agent connections. It is a block rather than another flat server.* key because
+// Agent-facing policy is expected to grow in one place instead of across the
+// address fields, which describe where the node listens.
+// DefaultAgentMaxConnectionsPerAgent is the per-Agent connection ceiling the
+// Server applies when server.agents.max_connections_per_agent is unset. It equals
+// the maximum agent.connections.max may hold, so enforcing the default cannot
+// refuse an Agent that was configured to the documented Agent ceiling.
+const DefaultAgentMaxConnectionsPerAgent = 64
+
+type ServerAgentConfig struct {
+	// MaxConnectionsPerAgent is how many physical Agent WebSockets one Agent
+	// identity may hold on this Server node. It must stay at or above
+	// agent.connections.max, otherwise the Agent is told to open a pool the Server
+	// then refuses; the Agent retries instead of losing the existing connections.
+	MaxConnectionsPerAgent int `mapstructure:"max_connections_per_agent" json:"max_connections_per_agent" yaml:"max_connections_per_agent"`
+}
+
+// ServerMetricsConfig guards the Prometheus endpoint.
+type ServerMetricsConfig struct {
+	// Token is the bearer credential a scraper must present to read /metrics. Empty
+	// means the endpoint answers unauthenticated requests, which is what a Server
+	// behind a reverse proxy that already restricts /metrics wants. A set token is
+	// never serialized into config output.
+	Token string `mapstructure:"token" json:"-" yaml:"-"`
+}
+
+// MinimumMetricsTokenLength is the shortest accepted bearer token. Below it a public
+// listener can be searched faster than the operator can notice, which would make the
+// guard look stronger than it is.
+const MinimumMetricsTokenLength = 16
+
+// ServerAuditConfig is the retention policy for the management audit trail.
+type ServerAuditConfig struct {
+	// RetentionDays is how long audit rows are kept. Zero, the default, keeps them
+	// forever: an audit log is evidence, and silently dropping it because a key was
+	// missing from a file is the kind of loss nobody notices until an incident needs
+	// it. Deleting history must be an explicit, positive decision.
+	RetentionDays int `mapstructure:"retention_days" json:"retention_days" yaml:"retention_days"`
+}
+
+// DefaultHTTP* are the floors the management listener always applies. They exist
+// as named constants because a hand-built RuntimeConfig (tests, embedders) leaves
+// ServerHTTPConfig zeroed, and a zeroed block must not mean "no protection".
+const (
+	DefaultHTTPReadHeaderTimeout = 10 * time.Second
+	DefaultHTTPIdleTimeout       = 120 * time.Second
+	DefaultHTTPMaxHeaderBytes    = 1 << 20
+	DefaultHTTPBodyTimeout       = 30 * time.Second
+)
+
+// ServerHTTPConfig bounds the management-plane HTTP listener. The console, /api/v1
+// and the Agent/Client WebSocket upgrades share this one port, which is why none
+// of these limits may become a connection-wide ReadTimeout or WriteTimeout: a
+// hijacked upgrade has to stay open for hours, while a slow-loris request must die
+// in seconds.
+type ServerHTTPConfig struct {
+	// ReadHeaderTimeout bounds receiving request headers.
+	ReadHeaderTimeout time.Duration `mapstructure:"read_header_timeout" json:"read_header_timeout" yaml:"read_header_timeout"`
+	// IdleTimeout closes a keep-alive connection that stays quiet this long. An
+	// in-flight request is never interrupted.
+	IdleTimeout time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	// MaxHeaderBytes bounds one request header block.
+	MaxHeaderBytes int `mapstructure:"max_header_bytes" json:"max_header_bytes" yaml:"max_header_bytes"`
+	// BodyTimeout bounds reading one management API request body. It is applied per
+	// request on the /api/ path, so a stalled client cannot hold a handler forever.
+	BodyTimeout time.Duration `mapstructure:"body_timeout" json:"body_timeout" yaml:"body_timeout"`
+	// MaxConcurrentConnections sheds new connections above this many open
+	// connections. Zero, the default, accepts every connection and keeps the
+	// historical behaviour; capacity normally belongs to the reverse proxy, so this
+	// is the knob for a Server that is exposed directly.
+	MaxConcurrentConnections int `mapstructure:"max_connections" json:"max_connections" yaml:"max_connections"`
+}
+
+// WithSafeDefaults fills every non-positive duration and byte limit with the
+// built-in floor, so upgrading cannot weaken the listener by omitting the block.
+func (c ServerHTTPConfig) WithSafeDefaults() ServerHTTPConfig {
+	if c.ReadHeaderTimeout <= 0 {
+		c.ReadHeaderTimeout = DefaultHTTPReadHeaderTimeout
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = DefaultHTTPIdleTimeout
+	}
+	if c.MaxHeaderBytes <= 0 {
+		c.MaxHeaderBytes = DefaultHTTPMaxHeaderBytes
+	}
+	if c.BodyTimeout <= 0 {
+		c.BodyTimeout = DefaultHTTPBodyTimeout
+	}
+	return c
+}
+
 type ServerStreamConfig struct {
-	MaxConcurrentOpens    int `mapstructure:"max_concurrent_opens" json:"max_concurrent_opens" yaml:"max_concurrent_opens"`
+	MaxConcurrentOpens int `mapstructure:"max_concurrent_opens" json:"max_concurrent_opens" yaml:"max_concurrent_opens"`
+	// MaxActivePerAgent is the node-local ceiling on live streams toward one
+	// Agent. Unlike max_concurrent_opens it is a level, not a processing width,
+	// so it bounds the resource a single Client can pin onto an Agent. Zero means
+	// unlimited.
+	MaxActivePerAgent     int `mapstructure:"max_active_per_agent" json:"max_active_per_agent" yaml:"max_active_per_agent"`
 	MaxPendingOpens       int `mapstructure:"max_pending_opens" json:"max_pending_opens" yaml:"max_pending_opens"`
 	InitialWindow         int `mapstructure:"initial_window" json:"initial_window" yaml:"initial_window"`
 	WindowUpdateThreshold int `mapstructure:"window_update_threshold" json:"window_update_threshold" yaml:"window_update_threshold"`
@@ -292,7 +393,10 @@ type AgentConfig struct {
 }
 
 type AgentStreamConfig struct {
-	MaxConcurrentDials int           `mapstructure:"max_concurrent_dials" json:"max_concurrent_dials" yaml:"max_concurrent_dials"`
+	MaxConcurrentDials int `mapstructure:"max_concurrent_dials" json:"max_concurrent_dials" yaml:"max_concurrent_dials"`
+	// MaxActive is this Agent's own ceiling on simultaneously live streams, the
+	// defence in depth behind the Server's per-agent cap. Zero means unlimited.
+	MaxActive          int           `mapstructure:"max_active" json:"max_active" yaml:"max_active"`
 	MaxPendingDials    int           `mapstructure:"max_pending_dials" json:"max_pending_dials" yaml:"max_pending_dials"`
 	ConnectTimeout     time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
 	OpenTimeout        time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
@@ -550,7 +654,16 @@ func setDefaults(v *viper.Viper) {
 		"server.relay.cert":                                  "",
 		"server.relay.key":                                   "",
 		"server.relay.server_name":                           "",
+		"server.agents.max_connections_per_agent":            DefaultAgentMaxConnectionsPerAgent,
+		"server.audit.retention_days":                        0,
+		"server.metrics.token":                               "",
+		"server.http.read_header_timeout":                    DefaultHTTPReadHeaderTimeout,
+		"server.http.idle_timeout":                           DefaultHTTPIdleTimeout,
+		"server.http.max_header_bytes":                       DefaultHTTPMaxHeaderBytes,
+		"server.http.body_timeout":                           DefaultHTTPBodyTimeout,
+		"server.http.max_connections":                        0,
 		"server.stream.max_concurrent_opens":                 256,
+		"server.stream.max_active_per_agent":                 1024,
 		"server.stream.max_pending_opens":                    1024,
 		"server.stream.initial_window":                       262144,
 		"server.stream.window_update_threshold":              131072,
@@ -610,6 +723,7 @@ func setDefaults(v *viper.Viper) {
 		"agent.connections.evaluation_interval":              10 * time.Second,
 		"agent.connections.cooldown":                         30 * time.Second,
 		"agent.streams.max_concurrent_dials":                 32,
+		"agent.streams.max_active":                           1024,
 		"agent.streams.max_pending_dials":                    128,
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
@@ -655,6 +769,12 @@ func bindEnvironment(v *viper.Viper) {
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
 		"server.authorization_cache.enabled",
+		"server.stream.max_active_per_agent", "agent.streams.max_active",
+		"server.http.read_header_timeout", "server.http.idle_timeout", "server.http.max_header_bytes",
+		"server.http.body_timeout", "server.http.max_connections",
+		"server.agents.max_connections_per_agent",
+		"server.audit.retention_days",
+		"server.metrics.token",
 		"server.webssh.enabled", "server.webssh.ticket_ttl", "server.webssh.session_ttl", "server.webssh.max_active_sessions_per_user", "server.webssh.open_timeout", "server.webssh.idle_timeout", "server.webssh.max_message_bytes",
 		"server.proxy_entry.enabled", "server.proxy_entry.listen", "server.proxy_entry.trusted_proxies", "server.proxy_entry.domain_suffix",
 		"server.proxy_entry.route_header", "server.proxy_entry.client_ip_header", "server.proxy_entry.client_port_header",
@@ -676,6 +796,10 @@ func bindEnvironment(v *viper.Viper) {
 func Validate(cfg Config) error {
 	var problems []string
 	problems = append(problems, validateServerStream(cfg.Server.Stream)...)
+	problems = append(problems, validateServerHTTP(cfg.Server.HTTP)...)
+	problems = append(problems, validateServerAgents(cfg.Server.Agents)...)
+	problems = append(problems, validateServerAudit(cfg.Server.Audit)...)
+	problems = append(problems, validateServerMetrics(cfg.Server.Metrics)...)
 	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
 	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
 	problems = append(problems, validateProxyEntry(cfg.Server.ProxyEntry)...)
@@ -757,10 +881,72 @@ func validateDownloads(cfg DownloadsConfig) []string {
 	return nil
 }
 
+// validateServerAgents bounds the per-Agent policy. Zero means "use the default
+// ceiling" rather than "no limit", matching the handler, and the ceiling is
+// deliberately not cross-checked against agent.connections.max at load time: those
+// two settings live on different hosts and are applied in no guaranteed order, so a
+// startup refusal would break deployments that are consistent at runtime.
+func validateServerAgents(cfg ServerAgentConfig) []string {
+	var problems []string
+	if cfg.MaxConnectionsPerAgent < 0 {
+		problems = append(problems, "server agents max connections per agent must not be negative")
+	}
+	return problems
+}
+
+// validateServerMetrics accepts an unset token and otherwise requires one that is
+// long enough to survive a brute force attempt against a public listener.
+func validateServerMetrics(cfg ServerMetricsConfig) []string {
+	token := strings.TrimSpace(cfg.Token)
+	if token == "" {
+		return nil
+	}
+	if len(token) < MinimumMetricsTokenLength {
+		return []string{fmt.Sprintf("server metrics token must be at least %d characters", MinimumMetricsTokenLength)}
+	}
+	return nil
+}
+
+// validateServerAudit only rejects a negative window. Zero is a meaningful value -
+// keep everything - so it must stay valid, while a negative number would hand the
+// sweeper a future cutoff and delete the whole trail.
+func validateServerAudit(cfg ServerAuditConfig) []string {
+	if cfg.RetentionDays < 0 {
+		return []string{"server audit retention days must not be negative"}
+	}
+	return nil
+}
+
+// validateServerHTTP rejects only values that would weaken the listener. Zero is
+// deliberately valid: it means "use the built-in floor", so omitting server.http
+// entirely can never disable the protection an operator expects by default.
+func validateServerHTTP(cfg ServerHTTPConfig) []string {
+	var problems []string
+	if cfg.ReadHeaderTimeout < 0 {
+		problems = append(problems, "server http read header timeout must not be negative")
+	}
+	if cfg.IdleTimeout < 0 {
+		problems = append(problems, "server http idle timeout must not be negative")
+	}
+	if cfg.MaxHeaderBytes < 0 {
+		problems = append(problems, "server http max header bytes must not be negative")
+	}
+	if cfg.BodyTimeout < 0 {
+		problems = append(problems, "server http body timeout must not be negative")
+	}
+	if cfg.MaxConcurrentConnections < 0 {
+		problems = append(problems, "server http max connections must not be negative")
+	}
+	return problems
+}
+
 func validateServerStream(cfg ServerStreamConfig) []string {
 	var problems []string
 	if cfg.MaxConcurrentOpens <= 0 {
 		problems = append(problems, "server stream max concurrent opens must be positive")
+	}
+	if cfg.MaxActivePerAgent < 0 {
+		problems = append(problems, "server stream max active per agent must not be negative")
 	}
 	if cfg.MaxPendingOpens <= 0 {
 		problems = append(problems, "server stream max pending opens must be positive")
@@ -948,6 +1134,9 @@ func validateAuthorizationCache(cfg AuthorizationCacheConfig) []string {
 
 func validateAgentStreams(cfg AgentStreamConfig) []string {
 	var problems []string
+	if cfg.MaxActive < 0 {
+		problems = append(problems, "agent streams max active must not be negative")
+	}
 	if cfg.MaxConcurrentDials <= 0 {
 		problems = append(problems, "agent stream max concurrent dials must be positive")
 	}
@@ -1029,6 +1218,15 @@ func validateClientTunnels(tunnels []TunnelConfig) []string {
 			}
 			if tunnel.TargetPort < 1 || tunnel.TargetPort > 65535 {
 				problems = append(problems, label+" target_port must be between 1 and 65535")
+			}
+			// These three protocols carry no credentials of their own, so a
+			// non-loopback bind publishes the internal target to whoever can
+			// reach this host. socks5 and http-proxy already gate on
+			// allow_remote; the guard has to cover the raw forwarders too,
+			// otherwise the documented default is the only thing protecting a
+			// tunnel that someone deliberately moved off loopback.
+			if host, _, err := net.SplitHostPort(tunnel.ListenAddr); err == nil && !isLoopbackListenHost(host) && !tunnel.AllowRemote {
+				problems = append(problems, fmt.Sprintf("%s non-loopback %s tunnel requires allow_remote", label, protocol))
 			}
 		case "socks5":
 			if strings.TrimSpace(tunnel.ListenAddr) == "" {
@@ -1644,6 +1842,7 @@ func (c Config) RedactedJSON() ([]byte, error) {
 	copy.TLS.KeyFile = redact(copy.TLS.KeyFile)
 	copy.Server.Relay.Key = redact(copy.Server.Relay.Key)
 	copy.Server.Relay.NodeToken = redact(copy.Server.Relay.NodeToken)
+	copy.Server.Metrics.Token = redact(copy.Server.Metrics.Token)
 	return json.MarshalIndent(copy, "", "  ")
 }
 
