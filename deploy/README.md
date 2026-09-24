@@ -18,11 +18,12 @@
 | `install/oneclick/winsw-checksums.txt` | WinSW 校验和登记表；未登记的版本拒绝自动下载 | [Windows Service 安装](../docs/deployment/windows-service.md) |
 | `install/oneclick/testdata/` | 函数级 bash 测试套件、渲染驱动与 `curl`/`systemctl`/`launchctl`/`loginctl`/`plutil` 桩；不进发布归档 | [测试与验证](../docs/development/testing.md) |
 | `openresty/tunnelmesh_proxy_entry.lua`、`openresty/tunnelmesh-proxy.conf.example`、`openresty/Dockerfile.proxy-connect` | tp-* HTTP 代理入口的 OpenResty 搬运层、server 块模板与补丁内核镜像 | [OpenResty 代理入口部署](../docs/deployment/openresty-proxy-entry.md) |
+| `mysql56/utf8mb4.cnf` | 本地 `mysql56` Compose profile 的 5.6 服务端配置：复现生产的 `utf8mb4_general_ci`，不放宽 `innodb_large_prefix`。一次性测试库，非部署产物 | [测试与验证](../docs/development/testing.md)、[Docker 部署](../docs/deployment/docker.md) |
 | `prometheus/prometheus.yml.example` | Prometheus 抓取起点配置（单节点与集群两种形态） | [可观测性](../docs/operations/observability.md) |
 | `prometheus/recording-rules.yaml`、`alert-rules.yaml` | 录制规则与告警规则 | 同上 |
 | `grafana/dashboards/tunnelmesh.json` | 唯一 Dashboard，内部按 Overview / Agent / Network / Cluster / Security / HTTP Proxy Entry 六个 Row 组织 | 同上 |
 | `grafana/provisioning/dashboards.yml`、`datasources.yml` | Grafana 自动装载配置 | 同上 |
-| `grafana/dashboard_schema_test.go`、`install/install_templates_test.go`、`openresty/openresty_artifacts_test.go` | 产物一致性测试，随 `go test ./deploy/...` 执行 | [测试与验证](../docs/development/testing.md) |
+| `grafana/dashboard_schema_test.go`、`install/install_templates_test.go`、`mysql56/mysql56_service_test.go`、`openresty/openresty_artifacts_test.go` | 产物一致性测试，随 `go test ./deploy/...` 执行 | [测试与验证](../docs/development/testing.md) |
 
 ## 模板约定
 

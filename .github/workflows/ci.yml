@@ -39,6 +39,22 @@ jobs:
           TUNNELMESH_AGENT_TOKEN=ci-placeholder
           TUNNELMESH_CLIENT_TOKEN=ci-placeholder
           docker compose -f docker-compose.local.yml --profile agent --profile client config
+      # The cluster file must keep interpolating with only the three variables
+      # the documented bootstrap exports: a `:?` on the opt-in mysql56 profile
+      # would break the cluster flow for everyone, and only `config` proves the
+      # profile is really excluded from the default run.
+      - run: >-
+          MYSQL_PASSWORD=ci-placeholder
+          MYSQL_ROOT_PASSWORD=ci-placeholder
+          TUNNELMESH_STORAGE_MYSQL_DSN='tunnelmesh:ci-placeholder@tcp(mysql:3306)/tunnelmesh?parseTime=true&tls=true'
+          docker compose -f docker-compose.cluster.yml config | tee "${RUNNER_TEMP}/cluster.yml"
+      - run: "! grep -Eq '^  mysql56:' \"${RUNNER_TEMP}/cluster.yml\""
+      - run: >-
+          MYSQL_PASSWORD=ci-placeholder
+          MYSQL_ROOT_PASSWORD=ci-placeholder
+          TUNNELMESH_STORAGE_MYSQL_DSN='tunnelmesh:ci-placeholder@tcp(mysql:3306)/tunnelmesh?parseTime=true&tls=true'
+          docker compose -f docker-compose.cluster.yml --profile mysql56 config
+          | grep -Eq '^  mysql56:'
 
   mysql56:
     # MySQL 5.6 is the lowest server version the project supports; a production

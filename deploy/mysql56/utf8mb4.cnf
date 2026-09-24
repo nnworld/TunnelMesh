@@ -1,0 +1,16 @@
+# MySQL 5.6 server options for the opt-in `mysql56` Compose profile.
+#
+# Why this file exists: the CI `mysql56` job can only start a service container
+# with the image's server defaults, which are latin1 on 5.6, so CI proves SQL
+# syntax and semantics but not the production charset. Production runs
+# utf8mb4_general_ci, and under utf8mb4 an index key costs 4 bytes per character
+# against InnoDB's 767-byte limit on 5.6. This profile closes that gap locally:
+# every indexed column in migrations/ddl.sql is VARBINARY or VARCHAR(191), so
+# the largest key is 764 bytes, no innodb_large_prefix is needed, and tables
+# land in ROW_FORMAT=Compact exactly like the production instances.
+#
+# It is a disposable test database, not a deployment artifact: no TLS, loopback
+# port only, and never holds real data or credentials.
+[mysqld]
+character-set-server = utf8mb4
+collation-server = utf8mb4_general_ci
