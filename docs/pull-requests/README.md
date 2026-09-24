@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 28 份记录，按日期倒序排列。
+共 29 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁](2026-09-24-mysql56-contract-ci-gate.md) | [计划：MySQL 5.6 契约测试 CI 门禁](../superpowers/plans/2026-09-24-mysql56-contract-ci-gate.md) | — |
 | 2026-09-24 | [Migration comment splitter hotfix](2026-09-24-migration-comment-splitter-hotfix.md) | [计划：迁移脚本注释分号解析紧急修复计划](../superpowers/plans/2026-09-24-migration-comment-splitter-hotfix.md) | — |
 | 2026-09-24 | [Client WINDOW_UPDATE 泄漏修复](2026-09-24-client-window-update-leak.md) | [计划：Client WINDOW_UPDATE 泄漏修复](../superpowers/plans/2026-09-24-client-window-update-leak.md) | — |
 | 2026-09-24 | [Client 观测状态模型修复](2026-09-24-client-status-metadata-state.md) | [计划：客户端观测状态模型修复](../superpowers/plans/2026-09-24-client-status-metadata-state.md) | — |

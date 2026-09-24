@@ -49,8 +49,25 @@ cd web && npm run build && cd ..
 
 ## MySQL 与 etcd 相关验证
 
-- Repository contract test 默认跑 SQLite 方言；设置 `TUNNELMESH_TEST_MYSQL_DSN` 后才会对真实
-  MySQL 执行同一套契约测试。
+- CI 的 `mysql56` job 起一个 `mysql:5.6` 服务容器（项目声明的最低支持版本，生产实例为
+  `5.6.51-91.0-log`），用它执行与 SQLite **同一个** contract 函数：
+  `runRepositoryContract`（含 `runClientRepositoryContract`）、`runIdentityRepositoryContract`
+  与 registry 的 `runRegistryContract`。因此 MySQL 方言专属的 SQL 错误（`FOR UPDATE`、
+  `EXISTS` 相关子查询、带守卫的 `DELETE`、767-byte 索引前缀、`connection_epoch` 位宽）
+  不再只能靠生产报错发现。`mysql56` 是 main 的必需状态检查。
+- 本地复跑同一批测试需要一个空库和建表权限，`OpenMySQL` 默认 `auto-init=true`：
+
+```bash
+TUNNELMESH_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true' \
+  go test ./internal/storage ./internal/registry -count=1 -run MySQL
+```
+
+  `multiStatements=true` 是必需的：迁移测试用一次 `ExecContext` 执行整段 DDL，与 auto-init
+  路径一致。`docker-compose.cluster.yml` 的 `mysql:8.4` 是开发环境默认，**不能**替代 5.6
+  下限验证：8.x 会放行 5.6 拒绝的语法。
+- 已知边界：CI 服务容器使用服务端默认 charset（latin1），生产是 `utf8mb4_general_ci`。
+  差异只会让 CI 比生产更宽松（键长度、字符串折叠），不会反向漏判；所有被索引列都是
+  `VARBINARY` 或 `VARCHAR(191)`，两种 charset 下均满足 767-byte 前缀限制。
 - etcd 注册发现当前只保留实现与文档接口，真实集成测试属于 deferred 项，见
   [项目完整性清单](../operations/completeness-checklist.md)。
 

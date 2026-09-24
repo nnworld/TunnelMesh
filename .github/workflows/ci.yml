@@ -39,3 +39,42 @@ jobs:
           TUNNELMESH_AGENT_TOKEN=ci-placeholder
           TUNNELMESH_CLIENT_TOKEN=ci-placeholder
           docker compose -f docker-compose.local.yml --profile agent --profile client config
+
+  mysql56:
+    # MySQL 5.6 is the lowest server version the project supports; a production
+    # fleet still runs 5.6.51. The MySQL-backed contract tests are gated behind
+    # TUNNELMESH_TEST_MYSQL_DSN and were never run in CI, which is how a 32-bit
+    # connection_epoch column and JSON "null" capabilities reached a real server
+    # unnoticed. This job runs the same contract assertions against the floor
+    # version so driver-specific SQL cannot ship unverified.
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:5.6
+        env:
+          MYSQL_DATABASE: tunnelmesh_test
+          MYSQL_USER: tunnelmesh
+          MYSQL_PASSWORD: tunnelmesh
+          MYSQL_ROOT_PASSWORD: ci-root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci-root"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # multiStatements is required because the migration tests execute a whole
+      # DDL script in one ExecContext, exactly like the auto-init path.
+      TUNNELMESH_TEST_MYSQL_DSN: tunnelmesh:tunnelmesh@tcp(127.0.0.1:3306)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run MySQL 5.6 repository and registry contracts
+        # -p 1 is required, not a tuning knob: both packages open the same
+        # schema_meta in one database and auto-init inserts its single row, so
+        # running the packages in parallel loses a race on INSERT id=1.
+        run: go test -p 1 ./internal/storage ./internal/registry -count=1 -run MySQL

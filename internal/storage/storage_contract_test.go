@@ -59,6 +59,10 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	}
 
 	runServiceTokenRepositoryContract(t, db)
+	// The Client observability SQL is dialect-sensitive (EXISTS subqueries,
+	// INSTR, guarded DELETEs, aggregates), so it runs on whichever driver the
+	// contract was started with instead of only on the SQLite unit tests.
+	runClientRepositoryContract(t, db)
 
 	agent := Agent{ID: "agent-1", Name: "edge", OwnerUserID: user.ID, Capabilities: `{"tcp":true}`}
 	if err := db.Agents().Create(ctx, agent); err != nil {

@@ -14,7 +14,10 @@
 - [x] tp-* 托管 HTTP 代理入口（OpenResty 搬运层 + Server 策略内核 + 管理后台）
 - [ ] 完整 capability-gated protocol v2、flow control、UDP association 和正式 relay protobuf
 - [ ] 配置 etcd 的真实集成测试（当前仅保留实现与文档接口）
-- [ ] 配置 `TUNNELMESH_TEST_MYSQL_DSN` 后执行真实 MySQL contract
+- [x] 真实 MySQL contract 进入 CI：`mysql56` job 起 `mysql:5.6` 服务容器，执行与 SQLite 同一套
+      repository/registry 契约并作为 main 的必需检查
+- [ ] MySQL charset 端到端验证（CI 为服务端默认 latin1，生产为 `utf8mb4_general_ci`）与
+      `mysql:8.4` 开发环境的版本矩阵
 - [ ] 生产环境容量压测、故障注入和跨平台发布产物
 
 未完成项必须保持显式 deferred，不得在发布说明中宣称已支持。
