@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -490,5 +491,25 @@ func TestSessionFlowControlBulkWriteIsDeliveredIntact(t *testing.T) {
 	<-drained
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("delivered %d bytes that differ from the payload", len(got))
+	}
+}
+
+// `client.stream.inbound_buffer_bytes` must reach both per-stream queues, which
+// is the only place the Client bounds what the Server may send it.
+func TestClientInboundBufferComesFromConfiguration(t *testing.T) {
+	transport := &receiveTransport{sent: make(chan protocol.Frame, 1), recv: make(chan protocol.Frame, 1), done: make(chan struct{})}
+	session := NewSession(transport)
+	defer session.Close()
+	if err := session.SetInboundBufferBytes(protocol.MaxStreamFrame); !errors.Is(err, ErrInboundBufferTooSmall) {
+		t.Fatalf("a one-frame queue cannot hold the advertised credit: err=%v", err)
+	}
+	if err := session.SetInboundBufferBytes(131072); err != nil {
+		t.Fatal(err)
+	}
+	if got := newFrameStream(session, 7).readQueue.Capacity(); got != 131072 {
+		t.Fatalf("byte stream queue capacity = %d, want the configured 131072", got)
+	}
+	if got := newFrameDatagramStream(session, 8).readQueue.Capacity(); got != 131072 {
+		t.Fatalf("datagram stream queue capacity = %d, want the configured 131072", got)
 	}
 }

@@ -73,6 +73,8 @@ tunnelmesh-client forward udp \
   --target-port 53
 ```
 
+每个本地源地址对应一条隧道流，默认最多 1024 条 association；达到上限时淘汰最久未使用的条目，若全部在同一时刻被使用则丢弃新报文并记录，避免本机任意进程把 Agent 拨号池耗尽。需要更大规模时在 `client.tunnels` 或进程参数中提高该上限前先确认 Agent 的并发能力。
+
 公网入口不直接监听 UDP；需要公网 UDP 时，应在目标网络内放置 UDP 网关，再通过 TCP/HTTP 或其他受支持入口接入。
 
 ## 6. TCP 和 UDP 同时转发

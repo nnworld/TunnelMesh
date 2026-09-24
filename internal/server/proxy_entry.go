@@ -411,7 +411,7 @@ func (p *ProxyEntry) handleAbsoluteForm(w http.ResponseWriter, r *http.Request, 
 		RouteDomain: routeName, AgentID: route.AgentID, ClientIP: clientIP.String(), Target: target,
 		DurationMs: elapsed.Milliseconds(), Status: resp.StatusCode,
 	})
-	copyResponse(w, resp)
+	_ = copyResponse(r.Context(), w, resp)
 	slog.InfoContext(r.Context(), "proxy_request_forwarded",
 		"route", routeName, "agent_id", route.AgentID, "target", target, "client_ip", clientIP.String(),
 		"method", r.Method, "status", resp.StatusCode, "duration_ms", elapsed.Milliseconds())

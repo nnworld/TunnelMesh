@@ -286,6 +286,8 @@ server:
     max_entries: 100000
 ```
 
+`initial_window` 与 `window_update_threshold` 是 Agent 数据面的真实额度：前者既是 `OPEN_STREAM` 通告给 Agent 的 credit，也是 Server 为每条流预留的接收缓冲上限；后者是回补 `WINDOW_UPDATE` 的累计阈值。二者必须满足 `initial_window - window_update_threshold >= max_frame_payload`，否则发送方在剩余窗口不足一帧时无处可去，配置校验会直接拒绝。`max_frame_payload` 只有 `32768` 一个合法值，因为帧编解码没有协商其它 DATA 尺寸。对端通告的窗口仍会被夹紧，详见 [WebSocket 代理协议模块](../protocol/proxy-modules.md)。
+
 `authorization_cache` 使用数据库中的共享授权修订号失效。SQLite 正向缓存默认 5 秒；MySQL 集群默认 5 分钟，并通过 2 秒修订号轮询保证权限变更尽快生效。轮询失败超过 `max_stale_on_poll_error` 后缓存 fail-closed，新请求会回源数据库。所有 Token、用户、Agent 和策略变更必须与修订号更新处于同一数据库事务。
 
 本节点创建、轮换或撤销 service token 时会立即通知本地缓存，因此本节点新流通常无需等待轮询周期。其它节点、直接数据库写入和旧版本节点仍依赖 revision 轮询。`/ready` 中的 `authorization_cache` 组件表示修订号源是否健康；轮询失败会让该组件变为 unhealthy，并在超过容忍时间后停止使用正向缓存。需要逐请求回源时可将 `authorization_cache.enabled` 设为 `false`，该配置只影响缓存，不会降低认证和授权检查强度。
@@ -301,6 +303,8 @@ agent:
     open_timeout: 8s
     inbound_buffer_bytes: 262144
 ```
+
+`inbound_buffer_bytes` 决定每条流最多缓冲多少 Server→Agent 字节，最小值是两个整帧（65536），低于该值会让正常的背压变成 `RESET`。
 
 Client 默认等待严格打开结果并限制入站缓冲：
 

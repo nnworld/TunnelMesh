@@ -6,7 +6,7 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 30 份记录，按日期倒序排列。
+共 31 份记录，按日期倒序排列。
 
 ## 记录清单
 
@@ -15,6 +15,7 @@
 | 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁](2026-09-24-mysql56-contract-ci-gate.md) | [计划：MySQL 5.6 契约测试 CI 门禁](../superpowers/plans/2026-09-24-mysql56-contract-ci-gate.md) | — |
 | 2026-09-24 | [MySQL 5.6 本地复现 profile](2026-09-24-mysql56-compose-profile.md) | [计划：MySQL 5.6 本地复现 profile](../superpowers/plans/2026-09-24-mysql56-compose-profile.md) | — |
 | 2026-09-24 | [Migration comment splitter hotfix](2026-09-24-migration-comment-splitter-hotfix.md) | [计划：迁移脚本注释分号解析紧急修复计划](../superpowers/plans/2026-09-24-migration-comment-splitter-hotfix.md) | — |
+| 2026-09-24 | [Agent / Server / Client 数据面流控与阻塞隔离加固](2026-09-24-dataplane-flow-control-hardening.md) | [计划：Agent / Server / Client 数据面流控与阻塞隔离加固](../superpowers/plans/2026-09-24-dataplane-flow-control-hardening.md) | [ADR：数据面窗口与 credit 不变量](../architecture/adr/0002-dataplane-window-credit-invariants.md) |
 | 2026-09-24 | [Client WINDOW_UPDATE 泄漏修复](2026-09-24-client-window-update-leak.md) | [计划：Client WINDOW_UPDATE 泄漏修复](../superpowers/plans/2026-09-24-client-window-update-leak.md) | — |
 | 2026-09-24 | [Client 观测状态模型修复](2026-09-24-client-status-metadata-state.md) | [计划：客户端观测状态模型修复](../superpowers/plans/2026-09-24-client-status-metadata-state.md) | — |
 | 2026-09-24 | [Client receive-window credit timing fix](2026-09-24-client-receive-window-credit.md) | [计划：Client receive-window credit timing fix p…](../superpowers/plans/2026-09-24-client-receive-window-credit.md) | — |

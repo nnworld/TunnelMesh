@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -29,6 +30,9 @@ type WebSocketRunOptions struct {
 	Metrics        *observability.Metrics
 	Metadata       *ClientMetadataOptions
 	ConnectionSlot int
+	// InboundBufferBytes overrides the per-stream buffer both directions use.
+	// Zero keeps the compiled-in default.
+	InboundBufferBytes int
 }
 
 func RunWebSocket(ctx context.Context, serverURL, token string, onReady func(*Session) error) error {
@@ -78,6 +82,11 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 				}
 			}
 			session := NewSessionWithOpenModeAndMetadata(transport, openMode, collector)
+			if options.InboundBufferBytes > 0 {
+				if err := session.SetInboundBufferBytes(options.InboundBufferBytes); err != nil {
+					slog.Warn("client_inbound_buffer_rejected", "configured_bytes", options.InboundBufferBytes, "error", err)
+				}
+			}
 			session.Metrics = options.Metrics
 			session.Start()
 			if onReady != nil {

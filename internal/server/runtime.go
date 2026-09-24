@@ -129,7 +129,12 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	}
 	cfg.ServerNodeID = runtimeConfig.NodeID
 	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
-	localAgentRelay := NewAgentRelayTransport(agentSessions)
+	// `server.stream.*` decides the credit this Server grants Agents, so a
+	// deployment that tunes it changes the data plane instead of a comment.
+	localAgentRelay := NewAgentRelayTransport(agentSessions, AgentRelayWindowConfig{
+		AdvertisedWindow: uint32(runtimeConfig.Stream.InitialWindow),
+		UpdateThreshold:  uint32(runtimeConfig.Stream.WindowUpdateThreshold),
+	})
 	serverNodeID := runtimeConfig.NodeID
 	if strings.TrimSpace(serverNodeID) == "" {
 		serverNodeID = "local"

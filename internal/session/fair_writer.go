@@ -148,6 +148,10 @@ func (w *FairFrameWriter) EnqueueData(streamID uint32, frame protocol.Frame) err
 	}
 	frame.StreamID = streamID
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrStreamQueueFull
+	}
 	stream, exists := w.streams[streamID]
 	created := false
 	if !exists {
@@ -159,11 +163,13 @@ func (w *FairFrameWriter) EnqueueData(streamID uint32, frame protocol.Frame) err
 		w.cursor = len(w.order) - 1
 		created = true
 	}
-	w.mu.Unlock()
-
+	// The push happens under w.mu because nextDataLocked retires idle queues in
+	// the same lock domain. Without it, a producer could hold a pointer to a
+	// queue that was just closed and observe a spurious ErrStreamQueueFull that
+	// the caller treats as a fatal stream error.
 	if !stream.queue.TryPush(frame) {
 		if created {
-			w.removeStream(streamID, stream)
+			w.removeStreamLocked(streamID, stream)
 		}
 		return ErrStreamQueueFull
 	}
@@ -171,8 +177,27 @@ func (w *FairFrameWriter) EnqueueData(streamID uint32, frame protocol.Frame) err
 	return nil
 }
 
+// StreamQueueCount reports how many per-stream send queues the writer currently
+// holds. Idle queues are retired as they drain, so this stays bounded by the
+// number of streams with bytes still waiting, not by the streams ever opened.
+func (w *FairFrameWriter) StreamQueueCount() int {
+	if w == nil {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.streams)
+}
+
 func (w *FairFrameWriter) removeStream(streamID uint32, stream *fairStreamQueue) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.removeStreamLocked(streamID, stream)
+}
+
+// removeStreamLocked detaches one stream from both the lookup map and the
+// round-robin list. Callers must hold w.mu.
+func (w *FairFrameWriter) removeStreamLocked(streamID uint32, stream *fairStreamQueue) {
 	if current, ok := w.streams[streamID]; ok && current == stream {
 		delete(w.streams, streamID)
 		for i, id := range w.order {
@@ -185,7 +210,6 @@ func (w *FairFrameWriter) removeStream(streamID uint32, stream *fairStreamQueue)
 			}
 		}
 	}
-	w.mu.Unlock()
 	stream.queue.Close()
 }
 
@@ -273,6 +297,12 @@ func (w *FairFrameWriter) next(ctx context.Context) (controlItem, bool) {
 }
 
 func (w *FairFrameWriter) nextDataLocked() (protocol.Frame, bool) {
+	// Queues found empty during this pass are retired once the pass ends, so the
+	// round-robin list keeps its shape while it is being walked. Wire stream IDs
+	// are monotonic and never reused, so without this the map and the scan grow
+	// for the whole life of the connection and every send costs O(streams ever
+	// opened) while holding w.mu.
+	var idle []uint32
 	for range w.order {
 		index := w.cursor % len(w.order)
 		streamID := w.order[index]
@@ -283,10 +313,26 @@ func (w *FairFrameWriter) nextDataLocked() (protocol.Frame, bool) {
 		}
 		if frame, ok := stream.queue.TryPop(); ok {
 			w.waitSamples.Record(stream.queue.LastWait())
+			w.retireIdleLocked(idle)
 			return frame, true
 		}
+		idle = append(idle, streamID)
 	}
+	w.retireIdleLocked(idle)
 	return protocol.Frame{}, false
+}
+
+// retireIdleLocked drops queues that are still empty when the sweep runs. A
+// queue is only closed after its last byte left, so no frame can be reordered or
+// lost: the next EnqueueData recreates it under the same lock.
+func (w *FairFrameWriter) retireIdleLocked(ids []uint32) {
+	for _, id := range ids {
+		stream, ok := w.streams[id]
+		if !ok || stream.queue.Len() > 0 {
+			continue
+		}
+		w.removeStreamLocked(id, stream)
+	}
 }
 
 func (w *FairFrameWriter) WriterQueueWaitP95() time.Duration {

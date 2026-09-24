@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -152,3 +153,34 @@ func (nopNetConn) RemoteAddr() net.Addr             { return nil }
 func (nopNetConn) SetDeadline(time.Time) error      { return nil }
 func (nopNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+// failingBody reads a little, then breaks like an upstream connection that died
+// mid-response.
+type failingBody struct {
+	remaining int
+	err       error
+}
+
+func (b *failingBody) Read(p []byte) (int, error) {
+	if b.remaining > 0 {
+		n := min(b.remaining, len(p))
+		copy(p[:n], "partial"[b.remaining-n:])
+		b.remaining -= n
+		return n, nil
+	}
+	return 0, b.err
+}
+
+func TestCopyResponseReportsShortBody(t *testing.T) {
+	breakErr := errors.New("upstream body broke mid-flight")
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Length": []string{"11"}},
+		Body:          io.NopCloser(&failingBody{remaining: 7, err: breakErr}),
+		ContentLength: 11,
+	}
+	recorder := httptest.NewRecorder()
+	if err := copyResponse(context.Background(), recorder, resp); !errors.Is(err, breakErr) {
+		t.Fatalf("copyResponse error = %v, want %v", err, breakErr)
+	}
+}

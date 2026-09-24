@@ -1563,3 +1563,352 @@ func TestSessionWriterQueueCoversAdvertisedCredit(t *testing.T) {
 		t.Fatalf("session writer queue = %d bytes, want at least the %d-byte credit the Server advertises", streamQueueBytes, protocol.DefaultServerReceiveWindow)
 	}
 }
+
+type stalledWriteConn struct {
+	reads     chan dispatcherReadResult
+	writes    chan []byte
+	unblock   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newStalledWriteConn() *stalledWriteConn {
+	return &stalledWriteConn{
+		reads: make(chan dispatcherReadResult, 4), writes: make(chan []byte, 16),
+		unblock: make(chan struct{}), closed: make(chan struct{}),
+	}
+}
+
+func (c *stalledWriteConn) Read(p []byte) (int, error) {
+	select {
+	case result := <-c.reads:
+		if result.err != nil {
+			return 0, result.err
+		}
+		return copy(p, result.payload), nil
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (c *stalledWriteConn) Write(p []byte) (int, error) {
+	select {
+	case <-c.unblock:
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+	select {
+	case c.writes <- append([]byte(nil), p...):
+		return len(p), nil
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (c *stalledWriteConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func openAgentStream(t *testing.T, d *StreamDispatcher, id uint32, port int) {
+	t.Helper()
+	payload, err := protocol.EncodeStreamOpenPayload(protocol.StreamOpenPayload{Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: id, Payload: payload}); err != nil {
+		t.Fatalf("open stream %d: %v", id, err)
+	}
+	waitStreamInstalled(t, d, id)
+}
+
+func handleWithin(t *testing.T, d *StreamDispatcher, frame protocol.Frame, context string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- d.Handle(frame) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%s: Handle error=%v", context, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s: Handle did not return; the Agent receive loop is blocked on one stream", context)
+	}
+}
+
+func TestAgentInboundWriteReturnsBeforeTargetConsumes(t *testing.T) {
+	stalled := newStalledWriteConn()
+	ready := newDirectionalDispatcherConn()
+	d := NewStreamDispatcherWithSender(Dialer{}, func(_ context.Context, _ string, _ string, port int) (io.ReadWriteCloser, error) {
+		if port == 1234 {
+			return stalled, nil
+		}
+		return ready, nil
+	}, func(protocol.Frame) error { return nil })
+	defer d.Close()
+
+	openAgentStream(t, d, 41, 1234)
+	openAgentStream(t, d, 42, 5678)
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 41, Payload: []byte("first")}, "DATA to stalled stream")
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 41, Payload: []byte("second")}, "second DATA to stalled stream")
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 42, Payload: []byte("other")}, "DATA to healthy stream")
+
+	close(stalled.unblock)
+	for _, want := range []string{"first", "second"} {
+		select {
+		case got := <-stalled.writes:
+			if string(got) != want {
+				t.Fatalf("stalled target wrote %q, want %q", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %q to reach the stalled target", want)
+		}
+	}
+	select {
+	case got := <-ready.writes:
+		if string(got) != "other" {
+			t.Fatalf("healthy target wrote %q, want other", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy stream never received its bytes")
+	}
+}
+
+func TestAgentInboundWindowAbuseResetsOnlyOffendingStream(t *testing.T) {
+	stalled := newStalledWriteConn()
+	defer stalled.Close()
+	ready := newDirectionalDispatcherConn()
+	sent := make(chan protocol.Frame, 32)
+	d := NewStreamDispatcherWithSender(Dialer{}, func(_ context.Context, _ string, _ string, port int) (io.ReadWriteCloser, error) {
+		if port == 1234 {
+			return stalled, nil
+		}
+		return ready, nil
+	}, func(frame protocol.Frame) error { sent <- frame; return nil })
+	defer d.Close()
+
+	openAgentStream(t, d, 43, 1234)
+	openAgentStream(t, d, 44, 5678)
+	// Never release the stalled target, so no inbound credit is ever returned and
+	// the peer keeps pushing far past the advertised window.
+	chunk := make([]byte, protocol.MaxStreamFrame)
+	for i := range chunk {
+		chunk[i] = 'x'
+	}
+	var reset protocol.Frame
+	for attempt := 0; attempt < 64; attempt++ {
+		handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 43, Payload: chunk}, "flood DATA")
+		select {
+		case frame := <-sent:
+			if frame.Type == protocol.FrameReset && frame.StreamID == 43 {
+				reset = frame
+			}
+		default:
+		}
+		if reset.Type == protocol.FrameReset {
+			break
+		}
+	}
+	if reset.Type != protocol.FrameReset {
+		t.Fatal("window abuse did not reset the offending stream")
+	}
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 44, Payload: []byte("still usable")}, "DATA after resetting one stream")
+	select {
+	case got := <-ready.writes:
+		if string(got) != "still usable" {
+			t.Fatalf("surviving stream wrote %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("one abusive stream took the whole dispatcher down")
+	}
+}
+
+func TestAgentStreamResetUnblocksTargetWritePump(t *testing.T) {
+	stalled := newStalledWriteConn()
+	d := NewStreamDispatcherWithSender(Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return stalled, nil }, func(protocol.Frame) error { return nil })
+	defer d.Close()
+
+	openAgentStream(t, d, 45, 1234)
+	d.mu.Lock()
+	entry := d.streams[45]
+	d.mu.Unlock()
+	if entry == nil {
+		t.Fatal("stream 45 is not installed")
+	}
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 45, Payload: []byte("queued")}, "DATA before RESET")
+	handleWithin(t, d, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: 45}, "RESET")
+	select {
+	case <-entry.pumpDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RESET did not stop the per-stream target writer")
+	}
+	closeDone := make(chan struct{})
+	go func() { _ = d.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close is waiting on a target writer that should already be gone")
+	}
+}
+
+type recordingTargetConn struct {
+	mu     sync.Mutex
+	writes bytes.Buffer
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newRecordingTargetConn() *recordingTargetConn {
+	return &recordingTargetConn{closed: make(chan struct{})}
+}
+
+func (c *recordingTargetConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (c *recordingTargetConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes.Write(p)
+}
+
+func (c *recordingTargetConn) written() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes.String()
+}
+
+func (c *recordingTargetConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestAgentCreditsEarlyDataReceivedWhileDialing(t *testing.T) {
+	dial := newControlledDialFunc()
+	target := newRecordingTargetConn()
+	// Hold the dial open until every early byte is queued, so the test always
+	// exercises the dial-pending buffer rather than racing with the dial.
+	proceed := make(chan struct{})
+	started := dial.stage(9000, func(context.Context, protocol.StreamOpenPayload) (io.ReadWriteCloser, error) {
+		<-proceed
+		return target, nil
+	})
+	sent := make(chan protocol.Frame, 64)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error { sent <- frame; return nil },
+		DialExecutorConfig{MaxConcurrent: 1, MaxPending: 4, ConnectTimeout: 5 * time.Second, OpenTimeout: 10 * time.Second}, dial.dial)
+	defer dispatcher.Close()
+
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 51, Window: protocol.DefaultServerReceiveWindow, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial did not start")
+	}
+	chunk := bytes.Repeat([]byte("z"), 25600)
+	const total = 8 * 25600
+	for i := 0; i < 8; i++ {
+		if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 51, Payload: chunk}); err != nil {
+			t.Fatalf("early DATA %d: %v", i, err)
+		}
+	}
+	close(proceed)
+	waitStreamInstalled(t, dispatcher, 51)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(target.written()) < total && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := len(target.written()); got != total {
+		t.Fatalf("target received %d of %d early bytes", got, total)
+	}
+	// The point of the test: bytes that landed before the dial finished must
+	// return credit like any other inbound byte, or the Server's send window is
+	// silently smaller and a bulk upload deadlocks once it is exhausted.
+	var credited uint32
+	for time.Now().Before(deadline) && credited < defaultAgentWindowUpdateThreshold {
+		select {
+		case frame := <-sent:
+			if frame.Type == protocol.FrameWindowUpdate && frame.StreamID == 51 {
+				credited += frame.Window
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if credited < defaultAgentWindowUpdateThreshold {
+		t.Fatalf("early DATA returned %d credit, want at least %d", credited, defaultAgentWindowUpdateThreshold)
+	}
+}
+
+func TestAgentPendingBufferOverflowResetsStream(t *testing.T) {
+	dial := newControlledDialFunc()
+	// No staged result: the dial stays parked until the stream is cancelled, so
+	// every DATA below really lands in the dial-pending buffer instead of racing
+	// the per-stream pump that drains an installed stream.
+	started := dial.stage(9001, nil)
+	sent := make(chan protocol.Frame, 64)
+	dispatcher := NewStreamDispatcherWithConfig(Dialer{}, nil, func(frame protocol.Frame) error { sent <- frame; return nil },
+		DialExecutorConfig{MaxConcurrent: 1, MaxPending: 4, ConnectTimeout: 5 * time.Second, OpenTimeout: 10 * time.Second}, dial.dial)
+	defer dispatcher.Close()
+
+	payload, err := protocol.EncodeStreamOpenPayload(StreamOpenPayload{Protocol: "tcp", TargetHost: "host", TargetPort: 9001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenStream, StreamID: 52, Window: protocol.DefaultServerReceiveWindow, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial did not start")
+	}
+	chunk := bytes.Repeat([]byte("q"), protocol.MaxStreamFrame)
+	for i := 0; i < defaultInboundQueueBytes/protocol.MaxStreamFrame+2; i++ {
+		if err := dispatcher.Handle(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 52, Payload: chunk}); err != nil {
+			t.Fatalf("DATA %d while dialing: %v", i, err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case frame := <-sent:
+			if frame.Type == protocol.FrameReset && frame.StreamID == 52 {
+				waitStreamFailure(t, dispatcher, 52)
+				return
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatal("an overflowing dial-pending buffer did not reset its own stream")
+}
+
+// `agent.streams.inbound_buffer_bytes` has to size the per-stream queue, or the
+// documented knob is decoration and a deployment cannot trade memory for burst.
+func TestAgentInboundBufferComesFromConfiguration(t *testing.T) {
+	target := newRecordingTargetConn()
+	d := NewStreamDispatcherWithSender(Dialer{}, func(context.Context, string, string, int) (io.ReadWriteCloser, error) { return target, nil }, func(protocol.Frame) error { return nil })
+	defer d.Close()
+	if err := d.SetInboundBufferBytes(protocol.MaxStreamFrame); !errors.Is(err, ErrInboundBufferTooSmall) {
+		t.Fatalf("a one-frame queue is smaller than the credit this Agent grants: err=%v", err)
+	}
+	if err := d.SetInboundBufferBytes(2 * protocol.MaxStreamFrame); err != nil {
+		t.Fatal(err)
+	}
+	openAgentStream(t, d, 61, 1234)
+	d.mu.Lock()
+	entry := d.streams[61]
+	d.mu.Unlock()
+	if entry == nil {
+		t.Fatal("stream was never installed")
+	}
+	if got := entry.inbound.Capacity(); got != 2*protocol.MaxStreamFrame {
+		t.Fatalf("inbound queue capacity = %d, want the configured %d", got, 2*protocol.MaxStreamFrame)
+	}
+}

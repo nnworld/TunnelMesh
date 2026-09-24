@@ -16,6 +16,7 @@
 | 编号 | 标题 | 状态 | 关联记录 |
 | --- | --- | --- | --- |
 | 0001 | [Separate scoped service credentials from management sessions](0001-scoped-service-tokens.md) | Accepted | — |
+| 0002 | [数据面窗口与 credit 不变量](0002-dataplane-window-credit-invariants.md) | Accepted | [计划：Client receive-window credit timing fix p…](../../superpowers/plans/2026-09-24-client-receive-window-credit.md)<br>[计划：Client WINDOW_UPDATE 泄漏修复](../../superpowers/plans/2026-09-24-client-window-update-leak.md)<br>[计划：Agent / Server / Client 数据面流控与阻塞隔离加固](../../superpowers/plans/2026-09-24-dataplane-flow-control-hardening.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md)<br>[PR：Client WINDOW_UPDATE 泄漏修复](../../pull-requests/2026-09-24-client-window-update-leak.md)<br>[PR：Agent / Server / Client 数据面流控与阻塞隔离加固](../../pull-requests/2026-09-24-dataplane-flow-control-hardening.md) |
 
 ## 新增 ADR 的步骤
 
