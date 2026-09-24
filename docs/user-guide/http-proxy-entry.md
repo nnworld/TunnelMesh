@@ -167,7 +167,7 @@ curl -x https://tp-demo.tm.example.com --proxy-user 'u:p' http://example.com/
 ## 限制
 
 - **不支持 SOCKS5**。需要 SOCKS5 请用 `tunnelmesh-client forward socks5`。
-- **tp-* 入口不承载 UDP**。该入口只处理 HTTP/HTTPS/WebSocket 的 CONNECT 与绝对形式请求；UDP 只能通过 `forward udp` 从用户侧发起到 Agent 内网，或等待内嵌 VPN 网关交付（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
+- **tp-* 入口不承载 UDP**。该入口只处理 HTTP/HTTPS/WebSocket 的 CONNECT 与绝对形式请求；UDP 只能通过 `forward udp` 从用户侧发起到 Agent 内网，或改用内嵌 VPN 网关（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，仅 `-tags vpn` 构建提供）。
 - **一条路由只有一个出口 Agent**，没有负载与故障转移；Agent 离线时该路由直接 502。
 - Basic 认证是**路由级共享账号**，没有 per-user 配额，也无法区分是哪个人在用；需要区分请为不同
   人群建不同路由。

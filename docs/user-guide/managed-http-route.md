@@ -68,7 +68,7 @@ client 本地端口映射没有独立的 `hostHeader`、`targetScheme` 或 `tlsS
 <agent-id>-<ip-encoding>-<port>.apps.example.com
 ```
 
-其中 IP 和端口使用明文编码，便于人工配置和排查；`127.0.0.1` 表示 Agent 所在主机上的本机服务。DNS Host 不区分大小写，因此动态域名中的 Agent ID 会与在线 Agent 做大小写不敏感匹配；如果存在多个仅大小写不同的 Agent ID，Server 会拒绝该动态请求，避免路由到错误 Agent。不要把 Token 或其他敏感信息放进域名。动态 wildcard 只适用于服务端支持的 HTTP/HTTPS/WebSocket 入口；VPN 网关的公网 UDP 端口是独立入口，不参与动态域名解析（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
+其中 IP 和端口使用明文编码，便于人工配置和排查；`127.0.0.1` 表示 Agent 所在主机上的本机服务。DNS Host 不区分大小写，因此动态域名中的 Agent ID 会与在线 Agent 做大小写不敏感匹配；如果存在多个仅大小写不同的 Agent ID，Server 会拒绝该动态请求，避免路由到错误 Agent。不要把 Token 或其他敏感信息放进域名。动态 wildcard 只适用于服务端支持的 HTTP/HTTPS/WebSocket 入口；VPN 网关的公网 UDP 端口是独立入口，不参与动态域名解析（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，仅 `-tags vpn` 构建提供）。
 
 动态泛域名当前只支持 IPv4 目标和明文 HTTP 上游，不支持 `hostHeader`、`targetScheme=https` 或 `tlsServerName`。如需这些能力，请创建显式托管路由。
 

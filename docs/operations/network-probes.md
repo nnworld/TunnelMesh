@@ -71,4 +71,4 @@ GET  /api/v1/agents/{agentId}/probes
 5. 将探针延迟与同一 Row 的 Stream stage latency p95 对比：探针延迟升高但 stream authorization/open 阶段稳定时，优先排查 Agent 到目标服务的网络；authorization/open 阶段同步升高时，优先排查 Server 存储或 Agent 拨号队列。
 5. 进入 Agent 主机，从 Agent 网络命名空间执行 `nc -vz host port`、`curl --connect-timeout 3` 或 UDP 专用测试，确认问题是在 Server→Agent 通道还是 Agent→目标服务。
 
-UDP 探针从 Agent 所在网络发起，并受 capability、Agent Policy、目标地址校验和超时限制；探针路径不经 VPN 网关的公网 UDP 端点（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。当前默认 executor 未配置时会返回 `unsupported`，不会伪造成功结果。
+UDP 探针从 Agent 所在网络发起，并受 capability、Agent Policy、目标地址校验和超时限制；探针路径不经 VPN 网关的公网 UDP 端点（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，仅 `-tags vpn` 构建提供）。当前默认 executor 未配置时会返回 `unsupported`，不会伪造成功结果。

@@ -190,7 +190,7 @@ nc -vzu 10.0.0.53 53
 2. **签发时集群能否核实**：管理 API 可能落在任意 Server 节点，而能力只记录在 Agent 当前连接的那个节点的会话里。落在别的节点时签发仍会成功，但审计详情里的 `icmpCapability` 是 `unverified` 而不是 `verified`。
 3. **节点开关**：`server.vpn.icmp_enabled` 为 `false` 时签发一律返回 409 `vpn_agent_capability_missing`，与 Agent 状态无关。
 
-网关数据面本身仍在分阶段实施中，因此当前版本即使三项都满足也还 ping 不通，详见 `server-admin.md` 的 VPN 章节。
+三项都满足后还剩两个 Server 侧前提：二进制必须是 `-tags vpn` 构建，且 `server.vpn.enabled: true`。缺该 tag 的进程会在启动时直接拒绝而不是静默不工作，官方发行包与镜像的构建矩阵尚不含它，所以用发行版部署时这里仍然 ping 不通，排查顺序见 [VPN 网关部署](../deployment/vpn-gateway.md)。
 
 ## 9. 安全建议
 

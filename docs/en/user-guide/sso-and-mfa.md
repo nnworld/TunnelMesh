@@ -568,7 +568,7 @@ changed, never the secret value.
 
 These are deliberately not implemented, so do not design a workflow around them: P2P NAT traversal and
 arbitrary remote command execution. ICMP echo and an embedded WireGuard VPN gateway are a separate
-approved feature ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), in progress); they are also out of scope for this release and do not
+approved feature ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), built only with `-tags vpn`); they are also out of scope for this release and do not
 interact with identity. SSH support stays limited to the existing
 stdio/WebSocket proxy path and is not extended into a general command-execution API. WebAuthn/passkeys,
 SMS and email OTP, SCIM user sync, and SAML are also not implemented; OIDC is the only federation

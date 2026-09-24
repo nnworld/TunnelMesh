@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 39 份记录，按日期倒序排列。
+共 40 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-09-24 | [阶段 6 第二轮合并 main 与未合并部分审查](2026-09-24-vpn-phase6-second-main-merge-review.md) | [计划：VPN 网关 阶段 6：Server 数据面（WireGuard + netsta…](../superpowers/plans/2026-09-23-vpn-phase6-server-data-plane.md) | — |
 | 2026-09-24 | [一键安装函数级套件不再挂在交互提示上](2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | [计划：一键安装函数级套件交互挂死修复](../superpowers/plans/2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | — |
 | 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁](2026-09-24-mysql56-contract-ci-gate.md) | [计划：MySQL 5.6 契约测试 CI 门禁](../superpowers/plans/2026-09-24-mysql56-contract-ci-gate.md) | — |
 | 2026-09-24 | [MySQL 5.6 本地复现 profile](2026-09-24-mysql56-compose-profile.md) | [计划：MySQL 5.6 本地复现 profile](../superpowers/plans/2026-09-24-mysql56-compose-profile.md) | — |

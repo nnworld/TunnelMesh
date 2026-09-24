@@ -9,6 +9,10 @@ VPN 工作在 IP 层，TCP、UDP、ICMP echo 都能走，代价是必须导入�
 部署侧的放行、密钥注入与 IP 池规划见 [VPN 网关部署](../deployment/vpn-gateway.md)；
 运维侧的容量、指标与故障处理见 [VPN 网关运维](../operations/vpn.md)。
 
+> **前提：Server 必须是 `-tags vpn` 构建，且 `server.vpn.enabled: true`。** 数据面在 `//go:build vpn` 后面，
+> 官方发行包与镜像的构建矩阵尚不含该 tag；不带它的 Server 会在启动时直接拒绝而不是静默不工作。
+> 后台能签发配置不等于隧道能连通，构建变体与放行见 [VPN 网关部署](../deployment/vpn-gateway.md)。
+
 ## 拿到配置文件
 
 配置文件由管理员签发，**私钥只显示一次**，服务端以 AES-256-GCM 密封保存，之后只能由管理员显式 reveal。

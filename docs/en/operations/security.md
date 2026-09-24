@@ -9,7 +9,7 @@ This guide summarizes TunnelMesh's transport, token, identity, policy, RBAC, and
 - Allow only TLS 1.2 or newer.
 - Restrict `security.allowed_hosts` to the production hostname.
 - When WebSSH or SFTP is enabled, restrict `security.allowed_origins` to the exact admin-console origin.
-- Public ingress is HTTP/HTTPS/WSS. The approved VPN gateway ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), in progress) will add exactly one public UDP port that bypasses the reverse proxy; until it ships, the Server exposes no public UDP. Allow that port separately in security groups and host firewalls when it lands.
+- Public ingress is HTTP/HTTPS/WSS. The VPN gateway ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), built only with `-tags vpn`) adds exactly one public UDP port that bypasses the reverse proxy. Default builds, including the release binaries and images, carry no public UDP listener, so that port exists only in a `-tags vpn` deployment; allow it separately in security groups and host firewalls there.
 
 ## Scoped Agent and Client tokens
 

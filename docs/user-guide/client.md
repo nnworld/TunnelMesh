@@ -45,7 +45,7 @@ tunnelmesh-client --config tunnelmesh.yaml status
 | `proxy tcp` | TCP | stdin/stdout ↔ Agent 内网服务 | 用于 SSH `ProxyCommand` 和 websocat |
 | `tunnel status/stop` | - | 本地隧道管理 | 查看或停止配置的隧道 |
 
-Client 的 UDP 能力是 `forward udp`：由用户侧发起、经 Server 到达 Agent 内网。Server 另有独立的 WireGuard VPN 网关入口（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中），不经 Client。
+Client 的 UDP 能力是 `forward udp`：由用户侧发起、经 Server 到达 Agent 内网。Server 另有独立的 WireGuard VPN 网关入口（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，仅 `-tags vpn` 构建提供），不经 Client。
 
 ## 4. TCP 转发
 
@@ -75,7 +75,7 @@ tunnelmesh-client forward udp \
 
 每个本地源地址对应一条隧道流，默认最多 1024 条 association；达到上限时淘汰最久未使用的条目，若全部在同一时刻被使用则丢弃新报文并记录，避免本机任意进程把 Agent 拨号池耗尽。需要更大规模时在 `client.tunnels` 或进程参数中提高该上限前先确认 Agent 的并发能力。
 
-`forward udp` 的监听端口在用户本机，公网侧没有与之对应的 UDP 监听；需要让公网用户访问内网 UDP 服务时，可在目标网络内放置 UDP 网关，再通过 TCP/HTTP 等受支持入口接入，或等待内嵌 VPN 网关交付（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，实施中）。
+`forward udp` 的监听端口在用户本机，公网侧没有与之对应的 UDP 监听；需要让公网用户访问内网 UDP 服务时，可在目标网络内放置 UDP 网关，再通过 TCP/HTTP 等受支持入口接入，或改用内嵌 VPN 网关（[ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)，仅 `-tags vpn` 构建提供）。
 
 ## 6. TCP 和 UDP 同时转发
 

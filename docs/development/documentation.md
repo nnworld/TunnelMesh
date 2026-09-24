@@ -67,7 +67,7 @@ python3 scripts/gen_doc_index.py
 
 - 不重写结论、不删除失败尝试、不追改验证结果。
 - 需要修正时新增记录，或在计划正文标注“补记计划”并只记录已验证事实（AGENTS.md 紧急修复条款）。
-- 唯一允许的历史文件改动是**链接维护**：目标文档移动或改名时更新路径，不改动其余正文。
+- 允许的历史文件改动只有两类：**链接维护**（目标文档移动或改名时更新路径，不改动其余正文）和**标识脱敏**（把真实内网域名、主机名、机器名换成 RFC 2606 示例域）。脱敏只替换标识符，结论、时间线与验证结果必须原样保留。
 - 文件改名前必须评估历史记录的引用面：`rg -l '<old-name>.md' docs/` 命中历史记录时，优先考虑
   保留原名，避免为了命名美观而大面积改写历史文件。
 
@@ -77,6 +77,10 @@ python3 scripts/gen_doc_index.py
 - `docs/en/` 与 `docs/community/` 面向英文读者和发布传播，可以使用英文；遇到语义冲突时以中文深度文档为准。
 - 文档与示例中不得出现密码、Token、私钥、生产 DSN、完整凭据或未脱敏日志。示例一律使用
   `tunnel.example.com`、`<token from the console>` 这类占位符。
+- 真实内网域名、内部主机名与开发者机器名同样属于内部信息，测试夹具、示例配置、i18n 文案和
+  时点记录里都不得出现（历史上回归过两次：`91a030d` 清理后又被合并带回）。替换沿用固定映射：
+  动态后缀用 `apps.example.com`，托管路由 `tm-*` 用 `tm-*.tm.example.com`，控制台用 `example.com`；
+  新增文档前先 `rg '<internal-domain>'` 确认没有把真实域名带回来，且不复述被清理的字符串。
 - 涉及公网入口的示例必须使用真实存在的路径（`/ws/agent`、`/ws/client`、`/ws/tcp`、
   `/ws/webssh/<session-id>`、`/api/v1`、`/health/live`、`/health/ready`、`/metrics`）；
   路径以 `internal/server/web.go` 和 `internal/server/health.go` 为准。

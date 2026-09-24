@@ -395,7 +395,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
 - Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
 - Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes. Identity metric labels are a closed enumeration that excludes usernames, client IPs, provider ids, and device tokens.
-- Deliberately not implemented: P2P NAT traversal and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through an embedded WireGuard gateway is approved by [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) and in progress; L2 frames are never forwarded.
+- Deliberately not implemented: P2P NAT traversal and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through the embedded WireGuard gateway is implemented in [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) `-tags vpn` builds and off by default; the release binaries and images do not carry that tag yet, and L2 frames are never forwarded.
 
 ## Repository layout
 

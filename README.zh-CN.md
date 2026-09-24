@@ -376,7 +376,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata 只来自 allowlist 中的文件或环境变量；名称命中敏感模式时清空值并标记 `redacted=true`。
 - 每个目标地址在 Agent 侧再次校验 SSRF、回环、私网、链路本地、CIDR 和端口策略。
 - 日志、指标、审计和普通 traceroute 输出不包含 secret、密码、私钥、完整 `Authorization` header 或会话字节；身份认证指标的标签是封闭枚举，不含用户名、客户端 IP、provider id 或设备 token。
-- 明确不实现：P2P NAT traversal 和任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路。ICMP echo 经内嵌 WireGuard 网关（[ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)）已批准、实施中；不转发 L2 以太网帧。
+- 明确不实现：P2P NAT traversal 和任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路。ICMP echo 经内嵌 WireGuard 网关已在 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) 的 `-tags vpn` 构建中实现，默认关闭；发行二进制与镜像尚不含该 tag，且不转发 L2 以太网帧。
 
 ## 仓库结构
 
