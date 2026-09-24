@@ -92,4 +92,5 @@
 ## 集成状态
 
 - 分支：`codex/mysql56-contract-ci-gate`。
-- 必需检查：`build-test`、`packaging`、`mysql56`（合并前登记）。
+- 检查：`build-test`、`packaging`、`mysql56` 在第 3 轮全部通过；`mysql56` 已登记为 main 的必需状态检查。
+  远端 PR：https://github.com/nnworld/TunnelMesh/pull/27
