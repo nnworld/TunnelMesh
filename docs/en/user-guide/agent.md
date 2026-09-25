@@ -66,7 +66,7 @@ Rules:
 
 By default, an Agent uses one WebSocket connection. After the Server supports connection pooling, you can raise `agent.connections.max`, which is accepted in the range 1-512.
 
-The Agent pool size and the Server's per-Agent ceiling (`server.agents.max_connections_per_agent`, default 64) are two settings on two machines and are never reconciled automatically: once the pool exceeds the Server ceiling, the extra connections are refused and back off while established ones keep working. Raise both together and confirm the enforced value with `tunnelmesh_agent_connection_capacity`.
+The Agent pool size and the Server's per-Agent ceiling (`server.agents.max_connections_per_agent`, default 64) are two settings on two machines and are never reconciled automatically: once the pool exceeds the Server ceiling, the extra connections are refused and back off while established ones keep working. Raise both together and confirm the enforced value with `tunnelmesh_agent_connection_capacity`. On every metadata ack the Agent compares the ceiling the Server reports against its own pool and logs one WARN per distinct value: `agent connection pool exceeds the server ceiling` (fields `configured_max`, `server_max`), so the mismatch is greppable on the Agent host instead of only visible as connections that keep getting refused.
 
 Pool scaling considers healthy connections, active streams, pending dials, and latency signals. Existing streams stay on their current connection. A stable `instance_id` distinguishes multiple physical Agent processes that share one logical Agent ID.
 

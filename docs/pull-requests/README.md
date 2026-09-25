@@ -6,13 +6,14 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 43 份记录，按日期倒序排列。
+共 44 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
 | 2026-09-25 | [Review P1–P3 加固与客户端观测页排序](2026-09-25-review-p1-p3-hardening.md) | [计划：实施计划：Review P1–P3 加固与客户端观测页排序](../superpowers/plans/2026-09-24-review-p1-p3-hardening.md) | — |
+| 2026-09-25 | [容量类拒绝的 error_class 与 Agent 侧上限错配告警](2026-09-25-capacity-error-class-and-pool-warning.md) | — | — |
 | 2026-09-25 | [Agent 连接池上限抬到 512 与「0」语义定版](2026-09-25-agent-pool-ceiling-512.md) | [计划：实施计划：Agent 连接池上限抬到 512 与 0 语义定版](../superpowers/plans/2026-09-25-agent-pool-ceiling-512.md) | — |
 | 2026-09-24 | [阶段 6 第二轮合并 main 与未合并部分审查](2026-09-24-vpn-phase6-second-main-merge-review.md) | [计划：VPN 网关 阶段 6：Server 数据面（WireGuard + netsta…](../superpowers/plans/2026-09-23-vpn-phase6-server-data-plane.md) | — |
 | 2026-09-24 | [VPN 英文镜像补齐与 `multiStatements` 遗留说法清理](2026-09-24-vpn-en-mirror-and-ci-dsn-hygiene.md) | — | — |

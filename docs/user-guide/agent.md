@@ -75,7 +75,7 @@ agent:
     cooldown: 30s
 ```
 
-`max` 的可配置区间是 1–512，超过会被 `check-config` 拒绝（这个上界用来抓 "5120" 这类笔误，不是测出来的性能墙）。Agent 愿意开多少条，和 Server 愿意接受多少条，是两台机器上的两个配置，不会自动对齐：把 `max` 抬到超过 Server 的 `server.agents.max_connections_per_agent`（默认 64）之后，超出的连接会被拒并退避重连，既有连接不受影响。因此调池子时两侧一起改，并用 `tunnelmesh_agent_connection_capacity` 核对 Server 真正在强制的值。
+`max` 的可配置区间是 1–512，超过会被 `check-config` 拒绝（这个上界用来抓 "5120" 这类笔误，不是测出来的性能墙）。Agent 每次收到 Server 的 metadata ack 都会核对回传的上限，发现它低于自己配置的 `max` 时输出一条 WARN `agent connection pool exceeds the server ceiling`（同一上限值只说一次，不刷屏），排查时 `journalctl -u tunnelmesh-agent | grep 'server ceiling'` 就能看到该改哪一侧。Agent 愿意开多少条，和 Server 愿意接受多少条，是两台机器上的两个配置，不会自动对齐：把 `max` 抬到超过 Server 的 `server.agents.max_connections_per_agent`（默认 64）之后，超出的连接会被拒并退避重连，既有连接不受影响。因此调池子时两侧一起改，并用 `tunnelmesh_agent_connection_capacity` 核对 Server 真正在强制的值。
 
 同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；本节点没有健康连接时会回退到远端 Server 节点，已建立的流固定在原连接上，不会在线迁移。
 

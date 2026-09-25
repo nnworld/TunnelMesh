@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
@@ -48,6 +49,7 @@ func RunConnectionPool(ctx context.Context, options WebSocketPoolOptions) error 
 					handler := &connectionPoolHandler{
 						controller: controller, connectionID: connectionID,
 						session: session, inner: inner,
+						agentID: options.AgentID, configuredMax: options.Max,
 					}
 					if dispatcher, ok := inner.(*StreamDispatcher); ok {
 						handler.dispatcher = dispatcher
@@ -68,12 +70,21 @@ type connectionPoolHandler struct {
 	dispatcher   *StreamDispatcher
 	inner        SessionFrameHandler
 	supported    bool
+	// agentID and configuredMax exist only to interpret the Server's ack: the pool
+	// size is a local wish, the acked ceiling is the remote fact, and the gap between
+	// them is otherwise visible only as a connection that keeps getting refused.
+	agentID       string
+	configuredMax int
+	// ceilingWarned dedupes per distinct ceiling, because metadata acks repeat on
+	// every report and this is a configuration finding, not a runtime event.
+	ceilingWarned int
 }
 
 func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
 	if frame.Type == protocol.FrameAgentMetadataAck {
 		if ack, err := protocol.DecodeAgentMetadataAckPayload(frame.Payload); err == nil {
 			h.supported = ack.ConnectionPoolSupported
+			h.checkServerCeiling(ack.MaxConnectionsPerAgent)
 			if h.dispatcher != nil {
 				strictOpen := false
 				icmpEcho := false
@@ -95,6 +106,22 @@ func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
 		return nil
 	}
 	return h.inner.Handle(frame)
+}
+
+// checkServerCeiling warns once per distinct ceiling when the Server enforces fewer
+// connections than the pool is configured to open. The two settings live on different
+// hosts and are deliberately not cross-checked at startup, so this runtime ack is the
+// only place where the mismatch can be named. A zero ceiling means an older Server that
+// omits the field, which is not the same as "no connections allowed" and stays silent.
+func (h *connectionPoolHandler) checkServerCeiling(serverMax int) {
+	if serverMax <= 0 || h.configuredMax <= serverMax || h.ceilingWarned == serverMax {
+		return
+	}
+	h.ceilingWarned = serverMax
+	slog.Warn("agent connection pool exceeds the server ceiling",
+		"agent_id", h.agentID, "connection_id", h.connectionID,
+		"configured_max", h.configuredMax, "server_max", serverMax,
+		"hint", "raise server.agents.max_connections_per_agent or lower agent.connections.max")
 }
 
 func (h *connectionPoolHandler) Close() error {
