@@ -236,15 +236,25 @@ type WebSSHConfig struct {
 // Agent connections. It is a block rather than another flat server.* key because
 // Agent-facing policy is expected to grow in one place instead of across the
 // address fields, which describe where the node listens.
+// AgentConnectionsCeiling is the largest agent.connections.max a configuration may
+// request. It is a documented ceiling rather than a proven engineering limit: a
+// bigger pool costs one WebSocket plus its per-connection buffers on both sides, so
+// the bound exists to catch typos (a "5120" pool), not to protect a measured wall.
+const AgentConnectionsCeiling = 512
+
 // DefaultAgentMaxConnectionsPerAgent is the per-Agent connection ceiling the
-// Server applies when server.agents.max_connections_per_agent is unset. It equals
-// the maximum agent.connections.max may hold, so enforcing the default cannot
-// refuse an Agent that was configured to the documented Agent ceiling.
+// Server applies when server.agents.max_connections_per_agent is unset (0 means
+// "use this default", see ServerAgentConfig). It stays below AgentConnectionsCeiling
+// on purpose: the default must protect a shared node, and an Agent that genuinely
+// wants a bigger pool raises both sides explicitly.
 const DefaultAgentMaxConnectionsPerAgent = 64
 
 type ServerAgentConfig struct {
 	// MaxConnectionsPerAgent is how many physical Agent WebSockets one Agent
-	// identity may hold on this Server node. It must stay at or above
+	// identity may hold on this Server node. Zero selects
+	// DefaultAgentMaxConnectionsPerAgent rather than meaning "unlimited": the Server
+	// needs a finite number to ack, to publish as a capacity gauge, and to bound one
+	// identity's share of the session map. It must stay at or above
 	// agent.connections.max, otherwise the Agent is told to open a pool the Server
 	// then refuses; the Agent retries instead of losing the existing connections.
 	MaxConnectionsPerAgent int `mapstructure:"max_connections_per_agent" json:"max_connections_per_agent" yaml:"max_connections_per_agent"`
@@ -882,10 +892,11 @@ func validateDownloads(cfg DownloadsConfig) []string {
 }
 
 // validateServerAgents bounds the per-Agent policy. Zero means "use the default
-// ceiling" rather than "no limit", matching the handler, and the ceiling is
-// deliberately not cross-checked against agent.connections.max at load time: those
-// two settings live on different hosts and are applied in no guaranteed order, so a
-// startup refusal would break deployments that are consistent at runtime.
+// ceiling" rather than "no limit" (ServerAgentConfig explains why this key is the
+// exception to the "0 means unlimited" convention), and the ceiling is deliberately
+// not cross-checked against agent.connections.max at load time: those two settings
+// live on different hosts and are applied in no guaranteed order, so a startup
+// refusal would break deployments that are consistent at runtime.
 func validateServerAgents(cfg ServerAgentConfig) []string {
 	var problems []string
 	if cfg.MaxConnectionsPerAgent < 0 {
@@ -1345,12 +1356,12 @@ func validateAgentConnections(c AgentConnectionConfig) []string {
 	if c.Min < 1 {
 		problems = append(problems, "agent connections min must be at least 1")
 	}
-	if c.Max < c.Min || c.Max > 64 {
+	if c.Max < c.Min || c.Max > AgentConnectionsCeiling {
 		if c.Max < c.Min {
 			problems = append(problems, "agent connections max must be greater than or equal to min")
 		}
-		if c.Max > 64 {
-			problems = append(problems, "agent connections max must be at most 64")
+		if c.Max > AgentConnectionsCeiling {
+			problems = append(problems, fmt.Sprintf("agent connections max must be at most %d", AgentConnectionsCeiling))
 		}
 	}
 	if c.LowWatermark > c.HighWatermark {

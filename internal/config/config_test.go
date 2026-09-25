@@ -131,7 +131,9 @@ func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 	}{
 		{name: "min below one", edit: func(c *config.AgentConnectionConfig) { c.Min = 0 }, want: "agent connections min must be at least 1"},
 		{name: "max below min", edit: func(c *config.AgentConnectionConfig) { c.Min, c.Max = 2, 1 }, want: "agent connections max must be greater than or equal to min"},
-		{name: "max above limit", edit: func(c *config.AgentConnectionConfig) { c.Max = 65 }, want: "agent connections max must be at most 64"},
+		{name: "former ceiling is legal now", edit: func(c *config.AgentConnectionConfig) { c.Max = 64 }},
+		{name: "ceiling inclusive", edit: func(c *config.AgentConnectionConfig) { c.Max = 512 }},
+		{name: "max above limit", edit: func(c *config.AgentConnectionConfig) { c.Max = 513 }, want: "agent connections max must be at most 512"},
 		{name: "low above high", edit: func(c *config.AgentConnectionConfig) { c.Max, c.LowWatermark = 8, 17 }, want: "agent connections low watermark must be less than or equal to high watermark"},
 		{name: "invalid evaluation interval", edit: func(c *config.AgentConnectionConfig) { c.EvaluationInterval = 0 }, want: "agent connections evaluation interval must be positive"},
 		{name: "invalid cooldown", edit: func(c *config.AgentConnectionConfig) { c.Cooldown = 0 }, want: "agent connections cooldown must be positive"},
@@ -141,6 +143,16 @@ func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 			cfg := base
 			tc.edit(&cfg.Agent.Connections)
 			err := config.Validate(cfg)
+			// An empty want means the pool size itself must be accepted: a ceiling
+			// change is only correct in both directions if the passing case is
+			// asserted too. The fixture leaves unrelated sections unset on purpose,
+			// so only the connection rules are under test here.
+			if tc.want == "" {
+				if err != nil && strings.Contains(err.Error(), "agent connections") {
+					t.Fatalf("Validate() error = %v, want this Agent pool accepted", err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
 			}
