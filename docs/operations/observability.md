@@ -135,6 +135,12 @@ increase(tunnelmesh_connections_total{component="server",mode="http",result="rej
 的 `mode="http"` 只覆盖管理监听器，Agent 与 Client 的 WebSocket 仍分别使用 `mode="agent"` 与
 `mode="client"`。
 
+`error_class="capacity"` 是所有准入拒绝的统一类别（`internal/observability/events.go`
+`NormalizeErrorClass` 匹配 `capacity` 与 `queue full`）：单 Agent 连接超限、单 Agent 活跃流超限、
+Agent 本地 dial 队列满都归到它，过去它们落在 `internal`，等于把「运维该抬上限」和「有 bug」混在
+一个标签里。同一个类别也用于 `tunnelmesh_agent_connection_errors_total`。注意 `rejected` 与
+`capacity` 是两回事：前者是结果、后者是原因，HTTP 准入丢弃同时带这两个标签。
+
 校验：
 
 ```bash

@@ -96,6 +96,12 @@ func NormalizeErrorClass(err error) string {
 		return "authorization"
 	case strings.Contains(message, "policy"):
 		return "policy"
+	// Admission refusals come before backpressure: both mean "we stopped you", but an
+	// operator raising a ceiling and an operator chasing a stalled writer are doing
+	// different things. Mapped here rather than per call site so every component that
+	// reports a capacity refusal shares one label.
+	case strings.Contains(message, "capacity"), strings.Contains(message, "queue full"):
+		return "capacity"
 	case strings.Contains(message, "backpressure"), strings.Contains(message, "buffer full"):
 		return "backpressure"
 	case strings.Contains(message, "reset"), strings.Contains(message, "broken pipe"):
