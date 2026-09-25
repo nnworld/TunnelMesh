@@ -72,15 +72,15 @@ server:
 | `server.http.max_header_bytes` | `1048576` | 单个请求头块字节上限，超出直接断开 | 否 |
 | `server.http.body_timeout` | `30s` | **只作用于 `/api/v1`** 的单个请求体读取预算，按请求设置读截止并在响应结束后清除 | 否 |
 | `server.http.max_connections` | `0` | 管理监听器同时保有的连接数上限，`0` 表示不限制；超限的新连接立即关闭而不排队 | 否 |
-| `server.agents.max_connections_per_agent` | `64` | 单个 Agent 身份在本节点可保有的物理 WebSocket 数，达到上限后新连接被拒绝（`session: agent connection capacity reached`），既有连接不受影响 | 否 |
+| `server.agents.max_connections_per_agent` | `64` | 单个 Agent 身份在本节点可保有的物理 WebSocket 数，达到上限后新连接被拒绝（`session: agent connection capacity reached`），既有连接不受影响。`0` 表示「取默认 64」而不是「不限」，见下 | 否 |
 | `server.metrics.token` | 空 | `/metrics` 的 Bearer 凭据。空值表示匿名可抓取（与历史行为一致）；设置后必须不少于 16 字符 | 否 |
 | `server.audit.retention_days` | `0` | 审计日志保留天数。`0` 表示永久保留；只有正数才会启动清理任务 | 否 |
 
 - **为什么没有 `read_timeout`/`write_timeout`**：这两个是连接级预算，会把所有长连接（WebSocket、WebSSH、大文件下载）一起切断，因此代码里刻意不设置。等价能力由上表的"请求头预算 + 每请求体预算 + 空闲预算"组合提供。
-- **`0` 的两种含义不要混淆**：`server.http.max_connections=0` 是"不限制"；`server.http` 其余四项与 `server.agents.max_connections_per_agent` 的 `0` 或负数是"用内置安全默认值"（负数会在 `check-config` 阶段被拒绝）。写配置时不要靠 `0` 去关闭某个超时——需要放宽就填一个大值。
+- **`0` 的规则**：容量与保留类键的 `0` 统一表示"关掉这条限制"——`server.http.max_connections=0` 不限连接数、`server.audit.retention_days=0` 永久保留、`server.stream.max_active_per_agent=0` 与 `agent.streams.max_active=0` 不限活跃流。两类例外：`server.http` 的四个时间/字节预算与 `server.agents.max_connections_per_agent` 的 `0` 表示"用内置安全默认值"（负数一律在 `check-config` 阶段被拒绝）。原因很简单：超时预算为 0 会导致功能不可用，Agent 连接上限必须是一个有限数才能回 ACK、才能作为水位暴露；而"不限"对它们来说不是合法诉求。写配置时不要靠 `0` 去关闭某条超时——需要放宽就填一个大值。
 - **`body_timeout` 不覆盖 WebSocket 路径**：`/ws/agent`、`/ws/client`、`/ws/webssh/`、`/ws/tcp` 不经过 `/api/v1` 包装器。已认证的 Agent/Client WebSocket 另有空闲读预算（三个 30s 心跳周期，见 `internal/server/runtime.go` 的 `websocketIdleReadTimeout`），半开连接会在那里被发现，而不是靠 HTTP 超时。
 - **与反向代理的取值关系**：`server.http.idle_timeout` 必须 **不小于** Nginx upstream 的 `keepalive_timeout`，否则 Nginx 会复用一条 Server 已关闭的连接并回 502；`server.http.max_connections` 只在 Server 直接暴露公网（没有 Nginx 或 `location /` 直连）时才需要设成与进程容量匹配的正数，Nginx 在前时容量由 `limit_conn` 决定，保持 `0` 即可。完整取值依据见 [Nginx 推荐配置](../deployment/nginx.md#限流与容量取值)。
-- **`max_connections_per_agent` 与 Agent 侧的关系**：`agent.connections.max`（上限 64）是 Agent 自己愿意开的连接数，本键是 Server 愿意接受的数量，两者不自动对齐；把 Server 侧调小会让超出的连接被拒并退避重连，不会踢掉既有连接。
+- **`max_connections_per_agent` 与 Agent 侧的关系**：`agent.connections.max`（允许 1–512）是 Agent 自己愿意开的连接数，本键是 Server 愿意接受的数量，两者**不自动对齐**，也不会启动期交叉校验——它们在不同主机上、生效顺序不保证。把 Server 侧调小只会让超出的连接被拒并退避重连，不会踢掉既有连接。**抬升 Agent 池的配方**：`agent.connections.max: 256` 时把 `server.agents.max_connections_per_agent` 设成不小于 256，否则 Agent 会一直撞到 `agent connection capacity reached`。本键没有上界校验，因为它按 **Agent 身份** 计数，而一个身份可以由多个物理进程共享（`instance_id` 区分）：取值要按「同身份进程数 × 每进程 `connections.max`」估算，可以高于 Agent 侧的 512 上限。两侧水位都可以观察：`tunnelmesh_agent_connection_capacity` 是 Server 实际强制的上限，Dashboard 的 Agent 连接列显示实际持有可能比它小。
 - **`metrics.token` 与网络白名单二选一即可**：`/metrics` 输出含指标名与标签值，能反推内部拓扑。若已经由反向代理按来源网段放行，就不必再配 token；若 Server 直接暴露，应用层凭据比依赖运维改 nginx 更可靠。健康探针 `/health/live`、`/health/ready` 永远不需要该 token，凭据不会被用来让 LB 误判节点死亡。抓取侧配置见 [`deploy/prometheus/prometheus.yml.example`](../../deploy/prometheus/prometheus.yml.example)。
 - **审计保留是显式决策**：审计日志是证据，`retention_days` 默认 `0` 让升级不会删掉任何历史。启用后由后台每小时执行一次分批删除（单事务 1000 行），首次清理历史大表不会长时间锁表；集群每个节点各跑各的，语句本身幂等，因此不需要分布式锁。删除记录只输出条数与耗时，不含行标识。
 
@@ -392,7 +392,7 @@ agent:
     cooldown: 30s
 ```
 
-`max` 大于 1 前必须完成所有入口 Server 的滚动升级。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
+`max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
 ## Stream 延迟与授权缓存
 

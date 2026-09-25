@@ -75,6 +75,8 @@ agent:
     cooldown: 30s
 ```
 
+`max` 的可配置区间是 1–512，超过会被 `check-config` 拒绝（这个上界用来抓 "5120" 这类笔误，不是测出来的性能墙）。Agent 愿意开多少条，和 Server 愿意接受多少条，是两台机器上的两个配置，不会自动对齐：把 `max` 抬到超过 Server 的 `server.agents.max_connections_per_agent`（默认 64）之后，超出的连接会被拒并退避重连，既有连接不受影响。因此调池子时两侧一起改，并用 `tunnelmesh_agent_connection_capacity` 核对 Server 真正在强制的值。
+
 同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；本节点没有健康连接时会回退到远端 Server 节点，已建立的流固定在原连接上，不会在线迁移。
 
 连接池会持续采样 pending dial、open P95、TTFB P95、writer queue wait P95、活跃流数和 RTT。信号连续两次超过默认阈值且 Server 确认支持连接池时才会扩容；这些信号不包含目标地址、Token 或凭据。`instance_id` 用于区分多个物理 Agent 进程；未配置时进程会生成并持久化一个稳定值，Linux 打包部署默认保存到 `/var/lib/tunnelmesh-agent/agent-instance-id`。运维细节见[逻辑 Agent 连接池运维指南](../operations/connection-pool.md)。
