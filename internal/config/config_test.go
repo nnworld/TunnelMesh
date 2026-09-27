@@ -131,7 +131,9 @@ func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 	}{
 		{name: "min below one", edit: func(c *config.AgentConnectionConfig) { c.Min = 0 }, want: "agent connections min must be at least 1"},
 		{name: "max below min", edit: func(c *config.AgentConnectionConfig) { c.Min, c.Max = 2, 1 }, want: "agent connections max must be greater than or equal to min"},
-		{name: "max above limit", edit: func(c *config.AgentConnectionConfig) { c.Max = 65 }, want: "agent connections max must be at most 64"},
+		{name: "former ceiling is legal now", edit: func(c *config.AgentConnectionConfig) { c.Max = 64 }},
+		{name: "ceiling inclusive", edit: func(c *config.AgentConnectionConfig) { c.Max = 512 }},
+		{name: "max above limit", edit: func(c *config.AgentConnectionConfig) { c.Max = 513 }, want: "agent connections max must be at most 512"},
 		{name: "low above high", edit: func(c *config.AgentConnectionConfig) { c.Max, c.LowWatermark = 8, 17 }, want: "agent connections low watermark must be less than or equal to high watermark"},
 		{name: "invalid evaluation interval", edit: func(c *config.AgentConnectionConfig) { c.EvaluationInterval = 0 }, want: "agent connections evaluation interval must be positive"},
 		{name: "invalid cooldown", edit: func(c *config.AgentConnectionConfig) { c.Cooldown = 0 }, want: "agent connections cooldown must be positive"},
@@ -141,6 +143,16 @@ func TestLoadAgentConnectionPoolDefaultsAndValidation(t *testing.T) {
 			cfg := base
 			tc.edit(&cfg.Agent.Connections)
 			err := config.Validate(cfg)
+			// An empty want means the pool size itself must be accepted: a ceiling
+			// change is only correct in both directions if the passing case is
+			// asserted too. The fixture leaves unrelated sections unset on purpose,
+			// so only the connection rules are under test here.
+			if tc.want == "" {
+				if err != nil && strings.Contains(err.Error(), "agent connections") {
+					t.Fatalf("Validate() error = %v, want this Agent pool accepted", err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
 			}
@@ -154,7 +166,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantServerStream := config.ServerStreamConfig{
-		MaxConcurrentOpens: 256, MaxPendingOpens: 1024,
+		MaxConcurrentOpens: 256, MaxActivePerAgent: 1024, MaxPendingOpens: 1024,
 		InitialWindow: 262144, WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
 	}
 	if cfg.Server.Stream != wantServerStream {
@@ -169,8 +181,9 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 		t.Fatalf("Server.AuthorizationCache = %+v, want %+v", cfg.Server.AuthorizationCache, wantAuthCache)
 	}
 	wantAgentStreams := config.AgentStreamConfig{
-		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		MaxConcurrentDials: 32, MaxActive: 1024, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
 	if cfg.Agent.Streams != wantAgentStreams {
 		t.Fatalf("Agent.Streams = %+v, want %+v", cfg.Agent.Streams, wantAgentStreams)
@@ -190,7 +203,7 @@ func TestLoadStreamLatencyDefaults(t *testing.T) {
 
 func applyStreamLatencyDefaults(cfg *config.Config) {
 	cfg.Server.Stream = config.ServerStreamConfig{
-		MaxConcurrentOpens: 256, MaxPendingOpens: 1024, InitialWindow: 262144,
+		MaxConcurrentOpens: 256, MaxActivePerAgent: 1024, MaxPendingOpens: 1024, InitialWindow: 262144,
 		WindowUpdateThreshold: 131072, MaxFramePayload: 32768,
 	}
 	cfg.Server.AuthorizationCache = config.AuthorizationCacheConfig{
@@ -199,13 +212,82 @@ func applyStreamLatencyDefaults(cfg *config.Config) {
 		MaxStaleOnPollError: 5 * time.Second, MaxEntries: 100000,
 	}
 	cfg.Agent.Streams = config.AgentStreamConfig{
-		MaxConcurrentDials: 32, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
+		MaxConcurrentDials: 32, MaxActive: 1024, MaxPendingDials: 128, ConnectTimeout: 5 * time.Second,
 		OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144,
+		ICMPBindAddress: "0.0.0.0", ICMPTimeout: 5 * time.Second, ICMPMaxConcurrent: 64,
 	}
 	cfg.Client.Stream = config.ClientStreamConfig{OpenTimeout: 8 * time.Second, InboundBufferBytes: 262144}
 	cfg.Client.RemoteValidation = config.RemoteValidationConfig{
 		PositiveTTL: 15 * time.Second, NegativeTTL: 2 * time.Second,
 		Timeout: 3 * time.Second, MaxEntries: 10000,
+	}
+}
+
+func TestLoadAgentICMPStreamDefaultsAndValidation(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	streams := cfg.Agent.Streams
+	if streams.ICMPEnabled {
+		t.Error("ICMPEnabled default = true, want false so an upgrade never opens a ping socket by itself")
+	}
+	if streams.ICMPBindAddress != "0.0.0.0" {
+		t.Errorf("ICMPBindAddress default = %q, want 0.0.0.0", streams.ICMPBindAddress)
+	}
+	if streams.ICMPTimeout != 5*time.Second {
+		t.Errorf("ICMPTimeout default = %s, want 5s", streams.ICMPTimeout)
+	}
+	if streams.ICMPMaxConcurrent != 64 {
+		t.Errorf("ICMPMaxConcurrent default = %d, want 64", streams.ICMPMaxConcurrent)
+	}
+
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_ENABLED", "true")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_BIND_ADDRESS", "127.0.0.1")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_TIMEOUT", "2s")
+	t.Setenv("TUNNELMESH_AGENT_STREAMS_ICMP_MAX_CONCURRENT", "8")
+	overridden, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment set error = %v", err)
+	}
+	got := overridden.Agent.Streams
+	if !got.ICMPEnabled || got.ICMPBindAddress != "127.0.0.1" || got.ICMPTimeout != 2*time.Second || got.ICMPMaxConcurrent != 8 {
+		t.Fatalf("Agent.Streams icmp = %+v, want the four environment overrides applied", got)
+	}
+	if err := config.Validate(overridden); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "agent icmp timeout", edit: func(c *config.Config) { c.Agent.Streams.ICMPTimeout = 0 }, want: "agent stream icmp timeout must be positive while icmp is enabled"},
+		{name: "agent icmp concurrency", edit: func(c *config.Config) { c.Agent.Streams.ICMPMaxConcurrent = -1 }, want: "agent stream icmp max concurrent must be positive while icmp is enabled"},
+		{name: "agent icmp bind address", edit: func(c *config.Config) { c.Agent.Streams.ICMPBindAddress = "agent.example.com" }, want: "agent stream icmp bind address must be an ip address while icmp is enabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			broken := overridden
+			tc.edit(&broken)
+			err := config.Validate(broken)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	// A disabled engine is never validated: the agent does not open the socket,
+	// so refusing to start over an unset address would be a self-inflicted
+	// outage for every deployment that does not use ICMP.
+	disabled := overridden
+	disabled.Agent.Streams.ICMPEnabled = false
+	disabled.Agent.Streams.ICMPTimeout = 0
+	disabled.Agent.Streams.ICMPMaxConcurrent = 0
+	disabled.Agent.Streams.ICMPBindAddress = ""
+	if err := config.Validate(disabled); err != nil {
+		t.Fatalf("Validate() with icmp disabled error = %v, want nil", err)
 	}
 }
 
@@ -483,6 +565,21 @@ func TestValidateRejectsInvalidSOCKS5TunnelConfiguration(t *testing.T) {
 			name: "invalid auth mode",
 			yaml: "client:\n  tunnels:\n    - protocol: socks5\n      listen: 127.0.0.1:10866\n      agent_id: agent-a\n      auth_mode: token\n",
 			want: "socks5 auth mode must be none or password",
+		},
+		{
+			name: "remote tcp listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: tcp\n      listen: 0.0.0.0:10867\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 5432\n",
+			want: "non-loopback tcp tunnel requires allow_remote",
+		},
+		{
+			name: "remote udp listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: udp\n      listen: 0.0.0.0:10868\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 5432\n",
+			want: "non-loopback udp tunnel requires allow_remote",
+		},
+		{
+			name: "remote http listener without explicit permission",
+			yaml: "client:\n  tunnels:\n    - protocol: http\n      listen: 0.0.0.0:10869\n      agent_id: agent-a\n      target_host: 10.0.0.10\n      target_port: 8080\n",
+			want: "non-loopback http tunnel requires allow_remote",
 		},
 		{
 			name: "remote listener without explicit permission",
@@ -1222,5 +1319,429 @@ func TestValidateProxyEntryAllowsWildcardTrustedProxies(t *testing.T) {
 	ipv6WildcardTrust.Server.ProxyEntry.TrustedProxies = []string{"::/0"}
 	if err := config.Validate(ipv6WildcardTrust); err != nil {
 		t.Fatalf("valid IPv6 wildcard trusted proxy config rejected: %v", err)
+	}
+}
+
+// vpnDocumentedExample is the server.vpn block from the embedded VPN gateway
+// design spec §8, verbatim. Loading it in a test is what keeps the documentation
+// and the loader honest: if a key is renamed here and not in the spec, or the
+// spec advertises a key the loader ignores, this test fails.
+const vpnDocumentedExample = `mode: local
+server:
+  vpn:
+    enabled: true
+    listen: "0.0.0.0:51820"
+    endpoint_host: "gw-1.mesh.example.com"
+    ip_pool: "10.64.0.0/16"
+    node_subnet_size: 24
+    mtu: 1420
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+`
+
+func loadVPNFile(t *testing.T, body string) config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vpn.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	return cfg
+}
+
+func TestVPNDefaults(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	vpn := cfg.Server.VPN
+	if vpn.Enabled {
+		t.Fatal("server.vpn must default to disabled so an upgrade changes nothing")
+	}
+	if vpn.Listen != "0.0.0.0:51820" {
+		t.Errorf("listen default = %q", vpn.Listen)
+	}
+	if vpn.EndpointHost != "gw-1.mesh.example.com" {
+		t.Errorf("endpoint_host default = %q", vpn.EndpointHost)
+	}
+	if vpn.IPPool != "10.64.0.0/16" {
+		t.Errorf("ip_pool default = %q", vpn.IPPool)
+	}
+	if vpn.NodeSubnetSize != 24 {
+		t.Errorf("node_subnet_size default = %d", vpn.NodeSubnetSize)
+	}
+	if vpn.MTU != 1420 {
+		t.Errorf("mtu default = %d", vpn.MTU)
+	}
+	if vpn.MaxPeers != 0 || vpn.MaxFlowsTotal != 0 || vpn.PacketRatePerPeer != 0 {
+		t.Errorf("the zero-means-unlimited defaults changed: max_peers=%d max_flows_total=%d packet_rate_per_peer=%d",
+			vpn.MaxPeers, vpn.MaxFlowsTotal, vpn.PacketRatePerPeer)
+	}
+	if vpn.MaxFlowsPerPeer != 128 {
+		t.Errorf("max_flows_per_peer default = %d", vpn.MaxFlowsPerPeer)
+	}
+	if vpn.ConnectTimeout != 10*time.Second || vpn.IdleTimeout != 120*time.Second || vpn.ShutdownTimeout != 15*time.Second {
+		t.Errorf("timeout defaults changed: %s %s %s", vpn.ConnectTimeout, vpn.IdleTimeout, vpn.ShutdownTimeout)
+	}
+	if !vpn.ICMPEnabled {
+		t.Error("icmp_enabled must default to true so the capability is governed by agent negotiation, not by a silent default")
+	}
+	if vpn.ICMPTimeout != 5*time.Second || vpn.ICMPMaxConcurrent != 64 {
+		t.Errorf("icmp defaults changed: %s %d", vpn.ICMPTimeout, vpn.ICMPMaxConcurrent)
+	}
+	// The defaults must themselves be a valid configuration. A shipped default
+	// that fails Validate would make every operator's first "enabled: true" an
+	// exercise in guessing which key is wrong.
+	enabled := cfg
+	enabled.Server.VPN.Enabled = true
+	if err := config.Validate(enabled); err != nil {
+		t.Fatalf("the documented defaults must validate once enabled: %v", err)
+	}
+}
+
+func TestValidateVPNAcceptsTheDocumentedExample(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	if !cfg.Server.VPN.Enabled {
+		t.Fatal("the documented example enables the gateway")
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the documented example must validate: %v", err)
+	}
+}
+
+// TestValidateVPNSkipsEverythingWhenDisabled is the upgrade safety property. A
+// deployment that never touches server.vpn must keep loading even if the keys it
+// inherited from an example file are nonsense.
+func TestValidateVPNSkipsEverythingWhenDisabled(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	cfg.Server.VPN.Enabled = false
+	cfg.Server.VPN.Listen = "not-a-listen-address"
+	cfg.Server.VPN.EndpointHost = ""
+	cfg.Server.VPN.IPPool = "10.64.0.0/33"
+	cfg.Server.VPN.NodeSubnetSize = 99
+	cfg.Server.VPN.MTU = 1
+	cfg.Server.VPN.MaxPeers = -5
+	cfg.Server.VPN.ICMPTimeout = 0
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("a disabled gateway must contribute no problems: %v", err)
+	}
+}
+
+func TestValidateVPNRejectsBadValues(t *testing.T) {
+	base := func() config.Config {
+		cfg := loadVPNFile(t, vpnDocumentedExample)
+		if err := config.Validate(cfg); err != nil {
+			t.Fatalf("baseline must validate: %v", err)
+		}
+		return cfg
+	}
+	cases := map[string]func(*config.Config){
+		"listen without a port":   func(c *config.Config) { c.Server.VPN.Listen = "0.0.0.0" },
+		"empty listen":            func(c *config.Config) { c.Server.VPN.Listen = "" },
+		"empty endpoint host":     func(c *config.Config) { c.Server.VPN.EndpointHost = "" },
+		"endpoint host with port": func(c *config.Config) { c.Server.VPN.EndpointHost = "gw-1.mesh.example.com:51820" },
+		"endpoint host invalid":   func(c *config.Config) { c.Server.VPN.EndpointHost = "not a host" },
+		"empty ip pool":           func(c *config.Config) { c.Server.VPN.IPPool = "" },
+		"ip pool not a cidr":      func(c *config.Config) { c.Server.VPN.IPPool = "10.64.0.0" },
+		"ip pool bad prefix":      func(c *config.Config) { c.Server.VPN.IPPool = "10.64.0.0/33" },
+		"ip pool ipv6":            func(c *config.Config) { c.Server.VPN.IPPool = "fd00::/64" },
+		"ip pool link local":      func(c *config.Config) { c.Server.VPN.IPPool = "169.254.0.0/16" },
+		"ip pool multicast":       func(c *config.Config) { c.Server.VPN.IPPool = "224.0.0.0/4" },
+		// One typo turning a /8 into 65536 subnets is a startup memory
+		// exhaustion vector, so the count cap must surface at load time.
+		"ip pool too many subnets": func(c *config.Config) {
+			c.Server.VPN.IPPool = "10.0.0.0/8"
+			c.Server.VPN.NodeSubnetSize = 24
+		},
+		"subnet size equal to pool":   func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 16 },
+		"subnet size wider than pool": func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 8 },
+		"subnet size above /30":       func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 31 },
+		"subnet size zero":            func(c *config.Config) { c.Server.VPN.NodeSubnetSize = 0 },
+		"mtu zero":                    func(c *config.Config) { c.Server.VPN.MTU = 0 },
+		"mtu below the floor":         func(c *config.Config) { c.Server.VPN.MTU = 575 },
+		"mtu above the ceiling":       func(c *config.Config) { c.Server.VPN.MTU = 1501 },
+		"negative max peers":          func(c *config.Config) { c.Server.VPN.MaxPeers = -1 },
+		"negative flows per peer":     func(c *config.Config) { c.Server.VPN.MaxFlowsPerPeer = -1 },
+		"negative flows total":        func(c *config.Config) { c.Server.VPN.MaxFlowsTotal = -1 },
+		"negative packet rate":        func(c *config.Config) { c.Server.VPN.PacketRatePerPeer = -1 },
+		"zero connect timeout":        func(c *config.Config) { c.Server.VPN.ConnectTimeout = 0 },
+		"negative connect timeout":    func(c *config.Config) { c.Server.VPN.ConnectTimeout = -time.Second },
+		"zero idle timeout":           func(c *config.Config) { c.Server.VPN.IdleTimeout = 0 },
+		"negative shutdown timeout":   func(c *config.Config) { c.Server.VPN.ShutdownTimeout = -time.Second },
+		"icmp timeout zero":           func(c *config.Config) { c.Server.VPN.ICMPTimeout = 0 },
+		"icmp concurrency zero":       func(c *config.Config) { c.Server.VPN.ICMPMaxConcurrent = 0 },
+		"icmp concurrency negative":   func(c *config.Config) { c.Server.VPN.ICMPMaxConcurrent = -1 },
+	}
+	for name, mutate := range cases {
+		cfg := base()
+		mutate(&cfg)
+		if err := config.Validate(cfg); err == nil {
+			t.Errorf("%s: Validate accepted an invalid server.vpn section", name)
+		}
+	}
+}
+
+// TestValidateVPNICMPDisabledSkipsICMPBounds keeps a peer that never asked for
+// ping working even with placeholder icmp timings, so turning the capability off
+// cannot itself break startup.
+func TestValidateVPNICMPDisabledSkipsICMPBounds(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.ICMPEnabled = false
+	cfg.Server.VPN.ICMPTimeout = 0
+	cfg.Server.VPN.ICMPMaxConcurrent = 0
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("icmp bounds must not apply while icmp is disabled: %v", err)
+	}
+}
+
+func TestValidateVPNAcceptsTheLegalBoundaries(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.MTU = 576
+	cfg.Server.VPN.ShutdownTimeout = 0
+	cfg.Server.VPN.MaxPeers = 1
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the lower boundaries must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.MTU = 1500
+	cfg.Server.VPN.IPPool = "10.64.0.0/24"
+	cfg.Server.VPN.NodeSubnetSize = 30
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the narrowest legal pool must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "100.64.0.0/16"
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("carrier-grade NAT space must be accepted: %v", err)
+	}
+
+	cfg = loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "10.0.0.0/8"
+	cfg.Server.VPN.NodeSubnetSize = 20
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("exactly the subnet count cap must be accepted: %v", err)
+	}
+}
+
+func TestVPNEnvironmentOverridesFileAndCLIOverridesEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vpn.yaml")
+	if err := os.WriteFile(path, []byte(vpnDocumentedExample), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("TUNNELMESH_SERVER_VPN_IP_POOL", "10.99.0.0/16")
+	t.Setenv("TUNNELMESH_SERVER_VPN_MTU", "1300")
+	t.Setenv("TUNNELMESH_SERVER_VPN_NODE_SUBNET_SIZE", "25")
+
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{
+		ConfigFile: path,
+		CLI: map[string]any{
+			"server.vpn.mtu": 1380,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Server.VPN.IPPool; got != "10.99.0.0/16" {
+		t.Errorf("environment did not override the file ip_pool: %q", got)
+	}
+	if got := cfg.Server.VPN.NodeSubnetSize; got != 25 {
+		t.Errorf("environment did not override node_subnet_size: %d", got)
+	}
+	if got := cfg.Server.VPN.MTU; got != 1380 {
+		t.Errorf("CLI did not override the environment mtu: %d", got)
+	}
+	// Untouched keys still come from the file.
+	if got := cfg.Server.VPN.EndpointHost; got != "gw-1.mesh.example.com" {
+		t.Errorf("the file value for endpoint_host was lost: %q", got)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("the overridden configuration must still validate: %v", err)
+	}
+}
+
+// TestVPNLoadFailsOnAnUnusablePool is the fast-fail requirement. An operator
+// must learn that ip_pool is unusable at startup, with a message naming the key,
+// rather than at the first peer issuance.
+func TestVPNLoadFailsOnAnUnusablePool(t *testing.T) {
+	cfg := loadVPNFile(t, vpnDocumentedExample)
+	cfg.Server.VPN.IPPool = "10.64.0.0/33"
+	err := config.Validate(cfg)
+	if err == nil {
+		t.Fatal("an unusable ip_pool must fail validation")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "vpn") {
+		t.Errorf("the error must name the vpn section, got %q", message)
+	}
+	if !strings.Contains(message, "ip_pool") {
+		t.Errorf("the error must name the offending key, got %q", message)
+	}
+}
+
+// TestValidateServerHTTPBoundsRejectsNegatives pins that an operator cannot turn a
+// bound off with a negative number: zero means "built-in safe default", so a
+// negative value is a typo that must fail fast at startup.
+func TestValidateServerHTTPBoundsRejectsNegatives(t *testing.T) {
+	base, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		edit func(*config.Config)
+		want string
+	}{
+		{name: "read header timeout", edit: func(c *config.Config) { c.Server.HTTP.ReadHeaderTimeout = -time.Second }, want: "server http read header timeout must not be negative"},
+		{name: "idle timeout", edit: func(c *config.Config) { c.Server.HTTP.IdleTimeout = -time.Second }, want: "server http idle timeout must not be negative"},
+		{name: "max header bytes", edit: func(c *config.Config) { c.Server.HTTP.MaxHeaderBytes = -1 }, want: "server http max header bytes must not be negative"},
+		{name: "body timeout", edit: func(c *config.Config) { c.Server.HTTP.BodyTimeout = -time.Second }, want: "server http body timeout must not be negative"},
+		{name: "max connections", edit: func(c *config.Config) { c.Server.HTTP.MaxConcurrentConnections = -5 }, want: "server http max connections must not be negative"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// Zero connection shedding is the documented default and must validate, so an
+	// upgrade cannot start refusing connections.
+	cfg := base
+	cfg.Server.HTTP = config.ServerHTTPConfig{}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() with the zero HTTP block error = %v, want no error", err)
+	}
+}
+
+// TestServerHTTPDefaultsMatchSafeFloors keeps the viper defaults and the
+// WithSafeDefaults floors in sync, which is what lets a hand-built RuntimeConfig be
+// as protected as a loaded configuration file.
+func TestServerHTTPDefaultsMatchSafeFloors(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.HTTP.MaxConcurrentConnections != 0 {
+		t.Fatalf("MaxConcurrentConnections = %d, want 0 so upgrading changes nothing", cfg.Server.HTTP.MaxConcurrentConnections)
+	}
+	if got, want := cfg.Server.HTTP, (config.ServerHTTPConfig{}).WithSafeDefaults(); got != want {
+		t.Fatalf("loaded HTTP block = %+v, want the safe defaults %+v", got, want)
+	}
+}
+
+// TestServerHTTPEnvironmentOverrides proves the new keys follow the same
+// TUNNELMESH_ prefix rule as every other setting.
+func TestServerHTTPEnvironmentOverrides(t *testing.T) {
+	t.Setenv("TUNNELMESH_SERVER_HTTP_IDLE_TIMEOUT", "45s")
+	t.Setenv("TUNNELMESH_SERVER_HTTP_MAX_CONNECTIONS", "64")
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.HTTP.IdleTimeout != 45*time.Second {
+		t.Fatalf("IdleTimeout = %v, want 45s", cfg.Server.HTTP.IdleTimeout)
+	}
+	if cfg.Server.HTTP.MaxConcurrentConnections != 64 {
+		t.Fatalf("MaxConcurrentConnections = %d, want 64", cfg.Server.HTTP.MaxConcurrentConnections)
+	}
+}
+
+// TestServerAgentConnectionCapacityDefaults pins that the advertised and enforced
+// per-Agent connection ceiling come from one key, and that dropping the block keeps
+// the number the protocol has always advertised.
+func TestServerAgentConnectionCapacityDefaults(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Agents.MaxConnectionsPerAgent != config.DefaultAgentMaxConnectionsPerAgent {
+		t.Fatalf("MaxConnectionsPerAgent = %d, want the default %d", cfg.Server.Agents.MaxConnectionsPerAgent, config.DefaultAgentMaxConnectionsPerAgent)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	// Zero is the "apply the default" value, so a hand-built Config cannot be
+	// rejected for omitting the block, and only a negative number is a typo.
+	zero := cfg
+	zero.Server.Agents.MaxConnectionsPerAgent = 0
+	if err := config.Validate(zero); err != nil {
+		t.Fatalf("Validate() with a zero ceiling error = %v, want the default ceiling", err)
+	}
+	negative := cfg
+	negative.Server.Agents.MaxConnectionsPerAgent = -1
+	if err := config.Validate(negative); err == nil || !strings.Contains(err.Error(), "server agents max connections per agent must not be negative") {
+		t.Fatalf("Validate() with a negative ceiling error = %v, want a refusal", err)
+	}
+	t.Setenv("TUNNELMESH_SERVER_AGENTS_MAX_CONNECTIONS_PER_AGENT", "8")
+	fromEnv, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment override error = %v", err)
+	}
+	if fromEnv.Server.Agents.MaxConnectionsPerAgent != 8 {
+		t.Fatalf("MaxConnectionsPerAgent = %d, want the environment value 8", fromEnv.Server.Agents.MaxConnectionsPerAgent)
+	}
+}
+
+// TestServerMetricsTokenPolicy covers the three states an operator can choose: no
+// token (endpoint open as before), a strong token, and a token too short to be worth
+// brute-forcing across a public listener.
+func TestServerMetricsTokenPolicy(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Metrics.Token != "" {
+		t.Fatalf("default token = %q, want empty so /metrics keeps its current behaviour", cfg.Server.Metrics.Token)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() with no metrics token error = %v", err)
+	}
+
+	short := cfg
+	short.Server.Metrics.Token = "abc123"
+	if err := config.Validate(short); err == nil || !strings.Contains(err.Error(), "server metrics token must be at least 16 characters") {
+		t.Fatalf("Validate() with a short token error = %v, want a refusal", err)
+	}
+
+	strong := cfg
+	strong.Server.Metrics.Token = "0123456789abcdef0123456789abcdef"
+	if err := config.Validate(strong); err != nil {
+		t.Fatalf("Validate() with a strong token error = %v", err)
+	}
+	// The guard exists to keep the credential out of console output and logs.
+	data, err := strong.RedactedJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "0123456789abcdef") {
+		t.Fatalf("RedactedJSON() leaked the metrics token: %s", data)
+	}
+
+	t.Setenv("TUNNELMESH_SERVER_METRICS_TOKEN", "env-token-value-long-enough")
+	fromEnv, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() with the environment token error = %v", err)
+	}
+	if fromEnv.Server.Metrics.Token != "env-token-value-long-enough" {
+		t.Fatalf("token = %q, want the environment value", fromEnv.Server.Metrics.Token)
 	}
 }

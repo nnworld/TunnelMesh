@@ -30,7 +30,7 @@ Dashboard 用于查看当前权限范围内的 Agent、在线租约、活动隧�
 
 管理员可在“子账号”中创建、启用、禁用、重置密码、逻辑删除和恢复普通账号。创建/重置返回的临时密码只显示一次，响应使用 `Cache-Control: no-store`，不要写入工单、日志或浏览器存储。删除只设置 `deleted_at` 和禁用状态，Agent、路由、隧道、Token 与审计记录都会保留；恢复会清空 `deleted_at`。已删除用户名不能复用，管理员账号不能被这些接口操作。
 
-当前 Schema 版本为 v14。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
+当前 Schema 版本为 v16。启用 `auto_init` 时会按 `schema_meta.version` 顺序执行 `migrations/incremental/` 中对应驱动的增量脚本；发布前先备份数据库并确认 DDL 权限，升级步骤、锁表影响与回滚注意事项见 [Schema 升级与回滚](../operations/schema-upgrades.md)。
 
 ## 单点登录、两步验证与受信任设备
 
@@ -86,11 +86,13 @@ Clients 页面用于查看当前用户权限范围内的客户端实例、metada
 
 因此一个在线但 metadata 已过期的客户端会同时显示 `online` 与 `metadata 已过期`；一个早已断开的记录会显示 `offline`，不会再被标成“已过期”。
 
+列表默认排序是最近心跳倒序，服务端使用 `ORDER BY last_seen_at DESC, id DESC`，因此刚断开的实例仍排在最前，便于优先处理。排序键刻意不用 `updated_at`：后台把实例标记为 stale 或过期时会单独抬升 `updated_at`，按它排序会把“刚被清扫器碰过”的行排成假活跃。`id` 只是同一心跳时刻的稳定 tiebreaker。游标由最后一条记录的 `last_seen_at` 与 `id` 共同编码，因此翻页期间即使有新心跳上报也不会重复读取同一行；代价是一条记录在两次翻页之间新上报了心跳时，会出现在后面的页而不是当前页。
+
 表格上方的统计卡片来自服务端对整个筛选结果集的聚合（`GET /api/v1/clients` 响应的 `summary`），不是当前游标页的逐行累加，所以翻页或筛选后仍与全量一致。
 
 未上报 metadata 的实例记录是按物理连接生成的，连接关闭时随即删除；后台清扫任务还会回收没有活跃租约且已过期的同类残留记录。已上报过 `CLIENT_HELLO` 的记录代表真实安装身份，永远不会被自动删除。
 
-连接列表展示每条物理 WebSocket 的 connection ID、connection epoch、所属 Server 节点、Token、活跃流、健康分、获取时间、最后心跳和租约到期时间。关闭连接必须携带列表中的 connection epoch；本地连接直接关闭，远端连接通过已认证的 Server-node relay 控制通道转发。请求只影响这一条物理连接，客户端连接池可能自动重连。
+连接列表展示每条物理 WebSocket 的 connection ID、connection epoch、所属 Server 节点、Token、活跃流、健康分、获取时间、最后心跳和租约到期时间。“活跃流”是该物理连接上仍未结束的转发流数量，由所属 Server 节点的内存计数随心跳（默认 30 秒）写入租约，因此它是快照而不是实时值：列表按 `last_seen_at` 倒序时，刚断开的连接排最前，其活跃流仍是最后一次上报的数字。租约一旦过期，这一行只作为历史记录保留，后台显示 `—` 而不再显示计数，实例与统计卡片也只累加未过期租约的活跃流。关闭连接必须携带列表中的 connection epoch；本地连接直接关闭，远端连接通过已认证的 Server-node relay 控制通道转发。请求只影响这一条物理连接，客户端连接池可能自动重连。
 
 关闭返回 `409` 表示 epoch 已过期，应刷新列表后使用新值；返回 `503` 表示目标 Server 节点不可达，durable lease 会保留，不要手工删除数据库记录；连接已经不存在时返回幂等成功。
 
@@ -108,7 +110,7 @@ Routes 页面支持将某个域名/路径绑定到 Agent 的目标主机和端�
 <agent-id>-<ip-encoding>-<port>.apps.example.com
 ```
 
-IP 和端口使用明文编码，便于排查；公网 Server 仍只暴露 80/443，不提供公网 UDP。
+IP 和端口使用明文编码，便于排查；动态域名复用 Server 既有的 80/443 入口，不需要为每个 Agent 新开端口。
 
 ## Tunnel 状态
 
@@ -123,6 +125,8 @@ Agent 详情页的“逻辑 Agent 状态”按连接池健康状态推导：至�
 状态派生规则为 `deleted`、`disabled`、`online`、`offline`：逻辑删除优先，其次为禁用；启用且心跳租约未过期为 online，启用但租约已过期为 offline。Server 会在完成节点身份初始化后自动注册，并每 30 秒心跳一次，租约有效期 90 秒。
 
 启用/禁用、逻辑删除和恢复都是管理员操作，会写入审计日志。删除只设置 `deleted_at` 并禁用节点，记录可恢复；恢复会清空 `deleted_at` 并重新启用。节点被禁用或删除后，即使持有有效 fleet token 和 mTLS 证书，relay 认证也会拒绝。
+
+页面顶部的“VPN 网关状态”区块来自 `GET /api/v1/vpn-nodes`，与节点表格是两个独立事实源：表格来自注册租约，区块来自网关运行时。刷新会同时拉取且互不等待，因此一次 501 不会把节点清单一起清空。提供网关的节点会显示子网、已分配与可分配地址、peer 数、ICMP 能力、监听地址和公网 Endpoint；本版该接口返回 501 `vpn_not_implemented`，区块显示“本版未提供网关运行时状态”而不是“已分配 0”，也不弹全局错误提示。没有节点提供网关时显示“当前没有节点提供 VPN 网关”，返回字段缺失时逐项显示 `—`。
 
 `node.id` 缺失时，Server `run` 会自动生成并回写 YAML。systemd 会在非特权服务前以 root 执行 `init-node-id`，因此 `/etc/tunnelmesh` 可以保持只读。每个节点仍必须使用独立 mTLS 证书，证书 SAN 与最终 `node.id` 精确一致。
 
@@ -208,9 +212,33 @@ ZMODEM 协议栈完全在浏览器内运行（`zmodem.js`），Server 只转发�
 
 Server 进程启动时会把本节点遗留的 `active` 会话统一关闭（原因记为 `node_restarted`），避免异常退出后残留会话长期占用活动会话配额；关闭数量通过 `webssh_stale_sessions_closed` 日志输出。集群模式下如果某个节点被永久下线且不再重启，其残留会话仍由 `session_ttl` 到期回收。
 
+## VPN 网关 peer 管理
+
+左侧菜单的“VPN 网关”（`/vpn`）用于给原生 WireGuard 客户端签发 peer：分配一个 VPN 地址、限定可达网段与端口，出口仍由 Agent 承担。页面不按管理员门禁，普通用户只看自己签发的 peer，管理员看全部；可见范围由服务端在分页查询内过滤，前端不再维护第二套角色判断。列表使用 cursor 分页，支持按名称或备注搜索，并按“启用中 / 已停用 / 已吊销”筛选。
+
+**管理面在本版本可用，数据面取决于构建变体。** peer 可以签发、编辑、轮换、吊销并被审计；隧道能否真正建立，取决于 Server 是否为 `-tags vpn` 构建且 `server.vpn.enabled: true`。官方发行包与镜像的构建矩阵**尚不含**该 tag，用发行版部署时导入配置后仍连不通，而后台页面不会提示这一点——它只负责签发，不探测构建变体。部署前先按 [VPN 网关部署](../deployment/vpn-gateway.md) 确认变体。签发表单与服务端校验逐字对齐：名称 1–255 个字符且不含控制字符；授权网段是逗号分隔的 IPv4 CIDR，裸 IP 会被归一为 `/32`（服务端用 `net.ParseCIDR` 解析，不接受无前缀写法），留空表示没有可达目标；授权端口是逗号分隔的 1–65535 整数，留空表示不限；到期时间留空表示永不到期，填写时必须晚于当前时间；并发流与包速率上限填 0 表示不限。前端校验只省一次往返，不是信任边界，服务端会再校验一次。
+
+编辑只提交改动过的字段。集合按集合比较（服务端把 `allowed_ips` 排序后规范化存储），因此只改书写顺序不算策略变更、不会进审计；被清空的端口列表仍会提交，因为“不限端口”本身是有意义的值。“允许 ICMP echo”由出口 Agent 的真实能力决定，不再一律拒绝：Agent 必须在线且已协商 `stream_icmp_echo.v1`（`agent.streams.icmp_enabled: true` 且主机放开了 `net.ipv4.ping_group_range`），否则签发返回 409 `vpn_agent_capability_missing`。节点级 `server.vpn.icmp_enabled` 是上限，关闭时连 Agent 都不会被询问。
+
+集群里有一个已知限制：**能力只记录在 Agent 当前连接的那个节点的会话里**，连接租约不携带能力。管理 API 请求落在别的节点时无法核实，此时签发**仍然成功**，但审计详情里的 `icmpCapability` 是 `unverified` 而不是 `verified`。之所以放行而不是拒绝，是因为“查不到就拒”会让签发随请求落点随机失败，用户看到的是偶发 409、重试也不稳定，比“签发成功、运行时由数据面按 `icmp_unsupported` 拒绝并计数”更难排查。需要确定性判定时，把签发请求固定发往持有该 Agent 连接的节点即可。
+
+审计里的 `icmpCapability` 只记录“当时能否核实”，不记录状态本身：事后要区分的是“Agent 坏了”还是“这个 peer 签发时没人能核实”，而不是当时那一次探测的返回值。
+
+轮换与吊销都是终态操作，会要求二次确认：轮换后旧配置立即失效（IP 不变），必须重新下发；吊销不删除记录，公钥与地址不会被复用，也无法恢复。签发、编辑、轮换、吊销与 reveal 全部写审计日志，审计只记录 peer ID 与动作，不含任何密钥材料。
+
+“使用说明”抽屉给出客户端配置的获取方式与导入步骤。私钥是一次性的：必须输入 `REVEAL` 并勾选风险确认后才会请求 `POST /api/v1/vpn-peers/{peerId}/config:reveal`，返回的 wg-quick 配置只显示一次，只存在于当前页面内存中，关闭抽屉即清除，不写 `localStorage`/`sessionStorage`，也不进 Pinia 持久层。reveal 能不能成功取决于**本节点有没有网关身份**：`-tags vpn` 构建、`server.vpn.enabled: true`、且 `TUNNELMESH_VPN_NODE_PRIVATE_KEY` 可用。三者缺一，请求返回 409 `vpn_node_disabled`，抽屉把这条事实渲染成说明（info 色）而不是“操作失败”——没有可纠正的动作时不该穿校验失败的红色，否则操作员会去找一个不存在的表单错误。之所以拒绝而不是渲染，是因为节点没有身份时 `[Peer] PublicKey` 会是空的，用户导入即失败且报错不指向服务端配置。签发还要求 Server 配置 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`，缺失时返回 503 `credential_secret_unavailable`，不会降级为明文存储。
+
+活跃流是**独立的抽屉**，不放在“使用说明”里：使用说明是离线也成立的文档，活跃流是可能失败的实时读取，两者混在一起会让一次失败的读取看起来像一条写错的说明。抽屉打开时总是重新读取而不是复用上次快照——它被用来判断“这个 peer 现在还连着吗”，一张不知道陈旧了多久的表会把这个问题答错。表格列出协议、目标、端口、开始时间与双向字节数；字节按网关计数的原值打印，不换算成 KiB，因为运维拿它和 `tunnelmesh_bytes_total` 对账时不能被后台四舍五入。
+
+流列表来自服务该 peer 的网关内存，是**此刻的快照而不是历史**：流一关闭、被回收或被吊销就离开列表，什么都不持久化，也不带 cursor（单 peer 的流集受 `server.vpn.max_flows_per_peer` 约束，分两页读会描述两个不同时刻）。集群里请求落到别的节点时返回 501 `vpn_not_implemented`，此时抽屉显示一条 info 提示而**不是空表格**——空表格会读作“该 peer 空闲”，那是一个错误的答复；501 也不是操作员能纠正的失败，所以同样不走红色。真正的读取失败（非 501）才走可重试的错误态。
+
+IP 池概览来自 `GET /api/v1/vpn-nodes`，读的是本节点：`allocated` 与 `capacity` 取自子网租约与 peer 表，不是从前缀推算的（推算出来的容量是签发方未必能兑现的承诺，子网第一个地址是保留的、租约也可能丢失）。读不到时水位保持未知、不弹 toast，不会显示成“已分配 0”。该接口在两种构建里都可用，无网关的节点报告 `enabled: false` 并省略计数器，后台渲染成 em dash。页面按服务端稳定码分类报错，每个码有专属文案（如 `vpn_ip_pool_exhausted`、`vpn_capacity_exhausted`、`vpn_peer_conflict`、`vpn_agent_capability_missing`），不会退化成一句“操作失败，请重试”。
+
 ## 审计日志
 
 Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel/远程服务器/WebSSH 会话操作、metadata 读取和 SSH/TCP proxy 上下文。列表按事件时间倒序显示，同一时间使用审计 ID 倒序作为稳定排序；分页继续沿用 cursor。表格上方可按时间范围、操作者、动作、资源类型和资源 ID 做服务端筛选，点击“查询”后从第一页加载，点击“重置”清空条件并恢复默认列表。列表显示时间、操作者、动作、资源类型和资源 ID；点击“详情”可查看该事件的结构化 JSON 详情。路由创建、更新和删除会记录 Agent、域名、路径、目标地址、端口和状态。日志不记录 metadata 明文、SSH 私钥、SSH 密码、Token 明文、终端字节或 SFTP 文件内容。
+
+审计行默认永久保留：`server.audit.retention_days` 默认 `0`，Server 不会自动删除任何审计历史。只有把它显式配置为正数，Server 才启动保留期清理器，每小时一轮、每轮按最多 1000 行的小批量删除早于保留期的事件，日志只输出删除条数与耗时，不输出行标识。集群里每个节点各自跑一份清理器是安全的（同一批 `DELETE` 以时间为边界，重复执行只删 0 行），不需要分布式锁。删除是不可逆的合规决策：开启前请确认监管留存要求与备份恢复方式，历史很长时第一次清扫的耗时会明显可见。
 
 ## 角色与权限
 
@@ -239,6 +267,8 @@ Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`serve
 ## 配置与排障建议
 
 优先级为命令行参数 > 环境变量 > 配置文件 > 默认值。上线前执行 `check-config`，确认本地 SQLite 或集群 MySQL、注册中心、80/443 地址和 TLS 配置正确。出现 401/403 时检查 token 与角色；出现 404 时检查 Agent ID、路由 Host/path 和 wildcard DNS；出现 stale 时检查 Agent WebSocket、租约和系统时间。
+
+`GET /metrics` 默认不需要认证，因此只能面向内网或 Prometheus 暴露；需要再加一道门时配置 `server.metrics.token`（仅通过环境变量注入，至少 16 字符），此后缺少或不匹配 `Authorization: Bearer <token>` 的请求返回 `401`，而 `/health/live` 与 `/health/ready` 不受影响，后台与列表接口也不会回显该值。管理入口的请求头、空闲 keep-alive、请求体与并发连接上限同样有默认保守的边界，取值关系见 [配置参考](../operations/configuration.md) 的“管理入口的超时、上限与保留策略”。
 
 ### Token secret reveal
 

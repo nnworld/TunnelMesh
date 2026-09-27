@@ -16,7 +16,7 @@ Managed routes whose upstream paths begin with `/api/` returned TunnelMesh's own
 {"code":404,"msg":"Not Found","data":{"error":"not found"}}
 ```
 
-Reported against a live route, where `https://tm-6000d.claw.qihoo.net/skills` worked but `https://tm-6000d.claw.qihoo.net/api/skill/claw/cate` did not.
+Reported against a live route, where `https://tm-6000d.tm.example.com/skills` worked but `https://tm-6000d.tm.example.com/api/skill/claw/cate` did not.
 
 `NewWebHandlerWithManagedRoutes` decided **path first, Host second**: `/api/`, `/health/`, `/metrics`, `/ws/agent`, `/ws/client`, `/ws/webssh/` and then any remaining `/ws/` prefix were all matched before the Host-based managed-route dispatcher was ever consulted. The management API answers every path that does not start with `/api/v1/` with a 404 envelope (`internal/server/api.go:316`), so an upstream's `/api/*` never reached the Agent. The same root cause broke upstream `/ws/*` endpoints (a bare 404, which also breaks `protocol: websocket` routes) and upstream `/health/*` and `/metrics`.
 
@@ -62,7 +62,7 @@ One operational caveat is documented rather than enforced: pointing an explicit-
 
 New tests:
 
-- `TestManagedNamespaceHostServesEveryPath` (red first): `/api/skill/claw/cate`, `/api/v1/tokens`, `/ws/chat`, `/ws/agent`, `/ws/client`, `/health/live`, `/metrics`, `/skills` on `tm-6000d.claw.qihoo.net` must all be served upstream. Before the fix: `/api/skill/claw/cate on a managed-route host was served by "api", want the upstream route`.
+- `TestManagedNamespaceHostServesEveryPath` (red first): `/api/skill/claw/cate`, `/api/v1/tokens`, `/ws/chat`, `/ws/agent`, `/ws/client`, `/health/live`, `/metrics`, `/skills` on `tm-6000d.tm.example.com` must all be served upstream. Before the fix: `/api/skill/claw/cate on a managed-route host was served by "api", want the upstream route`.
 - `TestExplicitDomainRouteServesUpstreamAPIAndWSPaths` (red first): `/api/v1/repos`, `/ws/git`, `/health`, `/readyz` on `git.example.com`. Before the fix: `served by "api"`.
 - `TestControlPlaneEndpointsReservedOnExplicitDomainRoute`: the four reserved endpoints stay on the control plane and the dispatcher is never called for them.
 - `TestControlPlaneHostKeepsReservedPathOrder`: an unmatched Host keeps `/api/` -> API, `/health/` and `/metrics` -> health, `/ws/agent` and `/ws/client` -> their handlers, `/ws/webssh/tick` -> broker, unknown `/ws/unknown` -> 404, `/some/spa/route` -> SPA fallback.

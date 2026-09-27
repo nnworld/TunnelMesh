@@ -20,7 +20,7 @@ import (
 const (
 	DriverSQLite  = "sqlite"
 	DriverMySQL   = "mysql"
-	SchemaVersion = 15
+	SchemaVersion = 16
 )
 
 var ErrSchemaVersionMismatch = errors.New("schema version mismatch")
@@ -56,6 +56,8 @@ type DB struct {
 	userDevices            UserDeviceRepository
 	authChallenges         AuthChallengeRepository
 	authLoginAttempts      AuthLoginAttemptRepository
+	vpnPeers               VPNPeerRepository
+	vpnIPLeases            VPNIPLeaseRepository
 	metrics                *observability.Metrics
 }
 
@@ -314,6 +316,8 @@ func newDB(db *sql.DB, driver string) *DB {
 		userDevices:            NewUserDeviceRepository(db),
 		authChallenges:         NewAuthChallengeRepository(db),
 		authLoginAttempts:      NewAuthLoginAttemptRepository(db),
+		vpnPeers:               NewVPNPeerRepository(db),
+		vpnIPLeases:            NewVPNIPLeaseRepositoryWithDriver(db, driver),
 	}
 }
 
@@ -400,6 +404,11 @@ func initializeSchema(ctx context.Context, db *sql.DB, driver string) error {
 			script = migrations.V14ToV15SQLite
 			if driver == DriverMySQL {
 				script = migrations.V14ToV15MySQL
+			}
+		case 15:
+			script = migrations.V15ToV16SQLite
+			if driver == DriverMySQL {
+				script = migrations.V15ToV16MySQL
 			}
 		default:
 			return fmt.Errorf("%w: database has version %d, application requires version %d; missing adjacent migration v%04d_to_v%04d", ErrSchemaVersionMismatch, version, SchemaVersion, version, version+1)
@@ -533,7 +542,7 @@ func checkSchema(ctx context.Context, db *sql.DB, driver string) error {
 }
 
 func requireSchemaTables(ctx context.Context, db *sql.DB, driver string) error {
-	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts"} {
+	for _, table := range []string{"schema_meta", "authorization_revision", "users", "agents", "agent_instance_metadata", "service_tokens", "agent_runtime_stats", "agent_probe_results", "agent_connection_leases", "client_instance_metadata", "client_connection_leases", "auth_settings", "oidc_providers", "user_identities", "user_mfa", "user_recovery_codes", "user_devices", "auth_challenges", "auth_login_attempts", "vpn_peers", "vpn_ip_leases"} {
 		var found string
 		var err error
 		if driver == DriverMySQL {
@@ -647,6 +656,13 @@ func (d *DB) RemoteServers() RemoteServerRepository {
 func (d *DB) WebSSHSessions() WebSSHSessionRepository {
 	return d.webSSHSessions
 }
+
+// VPNPeers exposes the WireGuard peer records the embedded VPN gateway hands
+// out to users.
+func (d *DB) VPNPeers() VPNPeerRepository { return d.vpnPeers }
+
+// VPNIPLeases exposes the per-node claim on the VPN address pool.
+func (d *DB) VPNIPLeases() VPNIPLeaseRepository { return d.vpnIPLeases }
 
 // AuthSettings exposes the runtime authentication policy singleton.
 func (d *DB) AuthSettings() AuthSettingsRepository { return d.authSettings }

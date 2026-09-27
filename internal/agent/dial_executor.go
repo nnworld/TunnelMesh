@@ -98,9 +98,21 @@ func (c *DialExecutorConfig) normalize() {
 	}
 }
 
-func AgentStreamCapabilities(streams AgentStreamConfig) []string {
-	_ = streams
-	return []string{protocol.CapabilityStreamOpenResult}
+// AgentStreamCapabilities reports what this agent process can actually serve.
+//
+// icmpReady is a separate fact from streams.ICMPEnabled because the
+// configuration is a wish and the engine is the outcome: a host whose
+// net.ipv4.ping_group_range excludes the process gid cannot open the socket no
+// matter what the file says. Advertising a capability the agent cannot honour
+// would make the server sign ICMP peers and send echoes that answer
+// "unsupported stream protocol", which is a failure the operator cannot see
+// from either side of the negotiation.
+func AgentStreamCapabilities(streams AgentStreamConfig, icmpReady bool) []string {
+	capabilities := []string{protocol.CapabilityStreamOpenResult}
+	if streams.ICMPEnabled && icmpReady {
+		capabilities = append(capabilities, protocol.CapabilityStreamICMPEcho)
+	}
+	return capabilities
 }
 
 func (e *DialExecutor) Submit(ctx context.Context, request DialRequest) error {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	streamsession "github.com/tunnelmesh/tunnelmesh/internal/session"
 )
@@ -24,6 +25,11 @@ var (
 	ErrServerGeneration          = errors.New("session: stale server connection generation")
 	ErrServerGenerationExhausted = errors.New("session: server connection generation exhausted")
 	ErrAmbiguousAgentID          = errors.New("session: ambiguous agent id")
+	// ErrAgentConnectionCapacity refuses a new physical connection from an Agent that
+	// already holds every slot this node allows it. It is a refusal, not a kick: the
+	// existing connections stay up, so an Agent that over-provisioned its pool keeps
+	// serving while its next dial backs off and retries.
+	ErrAgentConnectionCapacity = errors.New("session: agent connection capacity reached")
 )
 
 // MetadataCallback applies server-side allowlist/policy checks. Returning
@@ -54,11 +60,14 @@ type AgentSessionConfig struct {
 	SupportedCapabilities []string
 	ServerNodeID          string
 	QueueSize             int
-	MetadataTTL           time.Duration
-	HeartbeatCallback     func(context.Context, *AgentSession) error
-	Authenticate          func(context.Context, AgentRegistration) error
-	MetadataCallback      MetadataCallback
-	MetadataService       *AgentMetadataService
+	// MaxConnectionsPerAgent is how many physical Agent WebSockets one Agent
+	// identity may hold on this node. Zero selects DefaultAgentMaxConnectionsPerAgent.
+	MaxConnectionsPerAgent int
+	MetadataTTL            time.Duration
+	HeartbeatCallback      func(context.Context, *AgentSession) error
+	Authenticate           func(context.Context, AgentRegistration) error
+	MetadataCallback       MetadataCallback
+	MetadataService        *AgentMetadataService
 }
 
 type AgentSession struct {
@@ -81,8 +90,11 @@ type AgentSession struct {
 	metadataCallback   MetadataCallback
 	metadataService    *AgentMetadataService
 	metadataTTL        time.Duration
-	writer             *streamsession.FairFrameWriter
-	closing            bool
+	// maxConnectionsPerAgent is the ceiling that admitted this session, mirrored from
+	// the manager so the metadata ACK can report it without reaching back.
+	maxConnectionsPerAgent int
+	writer                 *streamsession.FairFrameWriter
+	closing                bool
 }
 
 func (s *AgentSession) Supports(capability string) bool {
@@ -125,6 +137,9 @@ func NewAgentSessionManager(cfg AgentSessionConfig) *AgentSessionManager {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 64
 	}
+	if cfg.MaxConnectionsPerAgent <= 0 {
+		cfg.MaxConnectionsPerAgent = config.DefaultAgentMaxConnectionsPerAgent
+	}
 	if cfg.MetadataTTL <= 0 {
 		cfg.MetadataTTL = 5 * time.Minute
 	}
@@ -136,6 +151,17 @@ func NewAgentSessionManager(cfg AgentSessionConfig) *AgentSessionManager {
 		cfg:                cfg,
 	}
 }
+
+// MaxConnectionsPerAgent reports the enforced per-Agent connection ceiling. The
+// metrics gauge and the AgentMetadataAck both read it, so the number advertised can
+// never drift from the number applied.
+func (m *AgentSessionManager) MaxConnectionsPerAgent() int {
+	if m == nil {
+		return config.DefaultAgentMaxConnectionsPerAgent
+	}
+	return m.cfg.MaxConnectionsPerAgent
+}
+
 func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistration, tr FrameTransport) (*AgentSession, error) {
 	if m == nil || tr == nil || strings.TrimSpace(req.AgentID) == "" || strings.TrimSpace(req.NodeID) == "" || req.Epoch <= 0 {
 		return nil, ErrAuthentication
@@ -174,7 +200,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
 		ControlQueueSize: m.cfg.QueueSize, StreamQueueBytes: 262144, QuantumBytes: 32768,
 	})
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), writer: writer}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, maxConnectionsPerAgent: m.cfg.MaxConnectionsPerAgent, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), writer: writer}
 	m.mu.Lock()
 	agentSessions := m.sessions[req.AgentID]
 	if agentSessions == nil {
@@ -186,6 +212,15 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 		m.mu.Unlock()
 		_ = s.Close()
 		return nil, ErrEpoch
+	}
+	// Capacity is per Agent identity, so one leaked credential cannot occupy every
+	// slot on the node. A replacement of a connection this Agent already holds is
+	// not growth and must never be refused, or fencing would deadlock a restarting
+	// Agent behind its own stale registration.
+	if _, replacing := agentSessions[connectionID]; !replacing && len(agentSessions) >= m.cfg.MaxConnectionsPerAgent {
+		m.mu.Unlock()
+		_ = s.Close()
+		return nil, fmt.Errorf("%w: agent %q holds %d connections on this node", ErrAgentConnectionCapacity, req.AgentID, len(agentSessions))
 	}
 	if m.nextServerGeneration == math.MaxUint64 {
 		m.mu.Unlock()
@@ -222,7 +257,7 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 	}
 	ack := protocol.AgentMetadataAckPayload{
 		AgentID: s.AgentID, Epoch: s.Epoch, Revision: payload.Revision,
-		ConnectionPoolSupported: true, MaxConnectionsPerAgent: 64,
+		ConnectionPoolSupported: true, MaxConnectionsPerAgent: s.maxConnectionsPerAgent,
 		Capabilities: s.Capabilities,
 	}
 	digest := metadataDigest(payload)

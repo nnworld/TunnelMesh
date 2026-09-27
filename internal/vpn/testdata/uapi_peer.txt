@@ -1,0 +1,4 @@
+public_key=de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f
+replace_allowed_ips=true
+allowed_ip=10.64.5.7/32
+

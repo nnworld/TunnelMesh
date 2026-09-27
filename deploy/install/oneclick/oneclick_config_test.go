@@ -20,9 +20,7 @@ func renderYAML(t *testing.T, role string, args ...string) string {
 	if err != nil {
 		t.Skipf("bash not available: %v", err)
 	}
-	cmd := exec.Command(bash, filepath.Join("testdata", "render_yaml.sh"), role)
-	cmd.Args = append(cmd.Args, args...)
-	cmd.Env = append(os.Environ(),
+	env := append(os.Environ(),
 		"TM_ONECLICK_LIB=tunnelmesh-install-common.sh",
 		"TM_ONECLICK_ALLOW_STDIN=1",
 		// token 只能来自环境变量；渲染 YAML 时不需要，但 config.Load 的
@@ -30,12 +28,15 @@ func renderYAML(t *testing.T, role string, args ...string) string {
 		"TUNNELMESH_AGENT_TOKEN=test-agent-token",
 		"TUNNELMESH_CLIENT_TOKEN=test-client-token",
 	)
-	out, err := cmd.Output()
+	// 渲染脚本靠 tm_ans_set 预置全部答案，本不该提问；走 runBash 同样是为了给意外的
+	// 交互提示一个有上限、可定位的失败，而不是挂死到包级超时。
+	out, errBuf, err := runBash(t, bash, env, nil, bashTimeout,
+		filepath.Join("testdata", "render_yaml.sh"), append([]string{role}, args...)...)
 	if err != nil {
-		t.Fatalf("render %s yaml: %v", role, err)
+		t.Fatalf("render %s yaml: %v\nstderr:\n%s", role, err, errBuf)
 	}
 	path := filepath.Join(t.TempDir(), role+".yaml")
-	if err := os.WriteFile(path, out, 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
 		t.Fatalf("write yaml: %v", err)
 	}
 	return path

@@ -3,6 +3,14 @@
 # 只测纯函数与可注入依赖的函数，不联网、不注册服务。
 set -uo pipefail
 
+# 本套件没有人在另一头回答问题，因此必须自己切断交互通道，不能指望运行环境恰好没有终端。
+# 共享库的 tm_read_line 在 TM_TTY 为空时回落到 stdin：只要调用方给的 stdin 是「打开着但
+# 永远没有数据」的通道——交互终端、带 PTY 的 go test、CI 里挂着的管道——read 就永久阻塞，
+# 整个 go test 要等到包级 10m 超时才失败，堆栈还指不出是哪个脚本。这里把 stdin 接到
+# /dev/null，任何意外走到 read 的调用都立刻拿到 EOF 并回落默认值。
+# 需要具体输入的断言自己用 `printf ... |` 覆盖，不受这行影响。
+exec </dev/null
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ROOT 指向仓库根，用于定位 deploy/systemd-user/ 等模板（testdata 在 deploy/install/oneclick 下）。
 ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -44,7 +52,19 @@ assert_eq "exit-codes" "0 2 3 4 5 6 7 8" \
   "$TM_EXIT_OK $TM_EXIT_USAGE $TM_EXIT_PREFLIGHT $TM_EXIT_DOWNLOAD $TM_EXIT_CHECKSUM $TM_EXIT_CONFIG $TM_EXIT_SERVICE $TM_EXIT_UNINSTALL"
 assert_eq "default-mode" "user" "$TM_DEFAULT_INSTALL_MODE"
 tm_tty_init
-assert_contains "tty/value" "/dev/tty " "${TM_TTY} "
+# tm_tty_init 的取值是二值的：能打开 /dev/tty 就是 /dev/tty，否则必须是空串让调用方回落
+# stdin，不允许出现第三种值。原来写成 assert_contains "tty/value" "/dev/tty " "${TM_TTY} "，
+# 空串（needle 只剩一个空格）和任意子串都会通过，等于没有断言。
+case "$TM_TTY" in
+  /dev/tty | "") printf 'ok   %s\n' "tty/value" ;;
+  *)
+    printf 'FAIL %s\n  expected: /dev/tty 或空串\n  actual:   %s\n' "tty/value" "$TM_TTY"
+    FAILURES=$((FAILURES + 1))
+    ;;
+esac
+# 断言完 tm_tty_init 的契约就立刻解除武装：后面 tm_validate_listen 之类的调用会走到
+# tm_ask_choice，在有控制终端的环境里那是一次真实的 /dev/tty 读取，会把套件挂死。
+TM_TTY=""
 tm_entry_init "bash" "main"
 assert_eq "entry/bash-c-empty" "" "$TM_ONECLICK_ENTRY"
 tm_entry_init "$HERE/fixtures/fake-entry.sh" "$HERE/fixtures/fake-entry.sh"
@@ -141,6 +161,11 @@ assert_eq "ask/choice-invalid-then-valid" "udp" "$(printf 'quic\nudp\n' | TM_YES
 
 # 没有输入通道时必须失败，不能静默取默认值
 assert_exit_sh 3 "ask/no-channel-dies" "TM_YES=0 TM_TTY= TM_ONECLICK_ALLOW_STDIN= </dev/null tm_require_input_channel"
+# 交互通道断开后，没有预置答案的 tm_ask_choice 必须立刻拿到 EOF 并回落默认值，而不是去读
+# 调用方的 stdin 或 /dev/tty。这条断言是「套件不会挂死」的可执行证据：谁把 TM_TTY 重新武装
+# 起来或去掉上面的 exec </dev/null，它就会卡住并被 go test 侧的 60s 上限点名。
+assert_eq "ask/hermetic-channel-falls-back" "password" \
+  "$(tm_ask_choice_stdio auth_mode "认证方式（socks5 只支持 none|password）" "password" password none)"
 
 # URL 与隧道规格校验
 assert_exit_sh 0 "url/ok-agent" "tm_validate_ws_url wss://tunnel.example.com/ws/agent /ws/agent"
@@ -361,6 +386,11 @@ TM_TUNNEL_SPECS=(); TM_TUNNEL_AUTH=()
 assert_eq "svc/inject-user" "systemd-user" "$(TM_ONECLICK_SERVICE_MANAGER=systemd-user tm_detect_service_manager_stdout)"
 assert_eq "svc/inject-none" "none" "$(TM_ONECLICK_SERVICE_MANAGER=none tm_detect_service_manager_stdout)"
 assert_eq "svc/inject-no-service" "none" "$(TM_ONECLICK_SERVICE_MANAGER= TM_NO_SERVICE=1 tm_detect_service_manager_stdout)"
+
+# 收尾复核：整个套件跑完都没有重新武装交互通道。中途再调用 tm_tty_init 会让后面的 tm_ask*
+# 去读真实终端，在没有人的环境里就是永久阻塞；stdin 也必须仍然是 /dev/null 而不是终端。
+assert_eq "tty/hermetic-at-exit" "" "$TM_TTY"
+assert_eq "tty/stdin-is-not-a-terminal" "no" "$([[ -t 0 ]] && echo yes || echo no)"
 
 printf '\n%s: %d failure(s)\n' "$0" "$FAILURES"
 [[ "$FAILURES" -eq 0 ]]

@@ -9,3 +9,7 @@ These guides are concise English entry points. The Chinese documentation remains
 - [Server administration](user-guide/server-admin.md)
 - [SSO and MFA](user-guide/sso-and-mfa.md)
 
+The embedded VPN gateway has no English page yet; its authoritative guides are Chinese:
+[peer setup](../user-guide/vpn.md), [deployment](../deployment/vpn-gateway.md),
+[operations](../operations/vpn.md).
+

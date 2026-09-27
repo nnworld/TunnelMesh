@@ -2,7 +2,6 @@ package oneclick
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"os"
 	"os/exec"
@@ -230,14 +229,13 @@ func runInstaller(t *testing.T, bash string, env []string, args ...string) runRe
 
 func runRoleInstaller(t *testing.T, bash string, env []string, role string, args ...string) runResult {
 	t.Helper()
-	cmd := exec.Command(bash, append([]string{"install-" + role + ".sh"}, args...)...)
-	cmd.Env = env
-	var out, errBuf bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errBuf
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("%s installer failed: %v\nstdout:\n%s\nstderr:\n%s", role, err, out.String(), errBuf.String())
+	// 安装脚本总是带 --yes 跑，本不该提问；走 runBash 是为了万一有人引入一条交互提示，
+	// 失败信息会点名是哪个脚本卡住，而不是让 go test 挂到包级超时。
+	out, errBuf, err := runBash(t, bash, env, nil, bashTimeout, "install-"+role+".sh", args...)
+	if err != nil {
+		t.Fatalf("%s installer failed: %v\nstdout:\n%s\nstderr:\n%s", role, err, out, errBuf)
 	}
-	return runResult{stdout: out.String(), stderr: errBuf.String()}
+	return runResult{stdout: out, stderr: errBuf}
 }
 
 func absLib(t *testing.T) string {

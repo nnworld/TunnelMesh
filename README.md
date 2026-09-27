@@ -12,7 +12,7 @@
 
 Put an Agent inside a private network, expose managed HTTP routes or local forwards, and operate everything
 from a built-in admin console with RBAC, scoped service tokens, Agent policy, audit logs, and observability.
-Public ingress is HTTP/HTTPS/WSS only — the Server never listens for public UDP.
+Public ingress is HTTP/HTTPS/WSS, plus one public UDP port when the embedded WireGuard VPN gateway is enabled ([ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)); its data plane ships in `-tags vpn` builds.
 
 [Docs site](https://nnworld.github.io/TunnelMesh/) ·
 [Quick start](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
@@ -69,7 +69,7 @@ self-hosted control plane and explicit access policy rather than only a point-to
 
 | Binary | Runs on | Responsibility | Guide |
 | --- | --- | --- | --- |
-| `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay | [Server admin](docs/user-guide/server-admin.md) |
+| `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay, optional WireGuard VPN endpoint on one public UDP port (`-tags vpn`) | [Server admin](docs/user-guide/server-admin.md), [VPN gateway](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | Private network or target host | Outbound TLS WebSocket to the Server, dials internal TCP/UDP/HTTP targets, reports allowlisted metadata | [Agent](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | User workstation | Local forwards (TCP/UDP/HTTP/SOCKS5/HTTP proxy), route publishing, stdio TCP proxy for SSH | [Client](docs/user-guide/client.md) |
 
@@ -395,7 +395,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
 - Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
 - Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes. Identity metric labels are a closed enumeration that excludes usernames, client IPs, provider ids, and device tokens.
-- Deliberately not implemented: ICMP, TUN/L2 VPN, P2P NAT traversal, and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path.
+- Deliberately not implemented: P2P NAT traversal and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through the embedded WireGuard gateway is implemented in [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) `-tags vpn` builds and off by default; the release binaries and images do not carry that tag yet, and L2 frames are never forwarded.
 
 ## Repository layout
 

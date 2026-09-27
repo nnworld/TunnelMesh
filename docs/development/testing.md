@@ -60,14 +60,16 @@ cd web && npm run build && cd ..
 
 ```bash
 docker compose -f docker-compose.cluster.yml --profile mysql56 up -d mysql56
-TUNNELMESH_TEST_MYSQL_DSN='tunnelmesh:tunnelmesh@tcp(127.0.0.1:3307)/tunnelmesh_test?parseTime=true&tls=false&multiStatements=true' \
+TUNNELMESH_TEST_MYSQL_DSN='tunnelmesh:tunnelmesh@tcp(127.0.0.1:3307)/tunnelmesh_test?parseTime=true&tls=false' \
   go test -p 1 ./internal/storage ./internal/registry -count=1 -run MySQL
 ```
 
   - `OpenMySQL` 默认 `auto-init=true`，所以需要**空库**和建表权限；要重来一遍就
     `docker compose -f docker-compose.cluster.yml --profile mysql56 down -v mysql56`。
-  - `multiStatements=true` 是必需的：迁移测试用一次 `ExecContext` 执行整段 DDL，与 auto-init
-    路径一致。
+  - **不需要** `multiStatements`：整段 DDL 与增量脚本一律由 `applySchemaStatements` 拆成单语句逐条
+    执行，测试与 auto-init 走同一条路径。该参数在 `4fc8213`/`e8b7c0d` 之前确实是必需的（当时把整段
+    DDL 交给一次 `ExecContext`）；`TestMySQLGatedTestsNeverExecWholeDDLScripts` 负责拦住它的回归，
+    所以不要为了「保险」把它加回 DSN——那只会让下一份文档继续宣称一个不存在的前提。
   - `-p 1` 是正确性要求，不是调优：两个包对同一个库各自 auto-init，并行会抢
     `schema_meta(id=1)` 这一行并报 `Error 1062`。
   - 口令用 `MYSQL56_TEST_PASSWORD` / `MYSQL56_ROOT_PASSWORD` 覆盖默认占位值即可；这两者只服务
@@ -96,6 +98,28 @@ go test ./deploy/... -count=1
 | `deploy/grafana/dashboard_schema_test.go` | 唯一 Dashboard 的 JSON 结构、Row 划分与 datasource 变量 |
 | `deploy/install/install_templates_test.go` | 每个角色只有一份模板来源，安装脚本引用共享模板且替换全部占位符 |
 | `deploy/openresty/openresty_artifacts_test.go` | Lua/conf/Dockerfile 与 `server.proxy_entry.*` 默认值一致、可信头齐全、tp-* server 块不开 http2、版本 pin 与 `configure → patch → make` 构建顺序、Lua 不含策略逻辑 |
+| `deploy/install/oneclick/oneclick_scripts_test.go` | 一键安装脚本的严格模式、无硬编码秘密、与 `scripts/install.sh` 共享同一份 Release 契约，以及 `testdata/run_tests.sh` 的函数级套件 |
+| `deploy/install/oneclick/oneclick_config_test.go` | 脚本渲染出的 YAML 能被真实的 `config.Load` 解析，且不含秘密 |
+| `deploy/install/oneclick/oneclick_e2e_test.go` | `--archive --yes` 走完安装/升级/卸载（`TM_ONECLICK_E2E=1` 门控） |
+
+### 测试驱动的 shell 脚本必须是非交互的
+
+`deploy/install/oneclick/tunnelmesh-install-common.sh` 的 `tm_ask*` 是给真人用的：`tm_tty_init`
+探测到控制终端就把 `TM_TTY` 设成 `/dev/tty`，否则回落到 stdin。测试里没有人会回答，因此凡是
+`source` 这个共享库并可能走到 `tm_ask*` 的测试驱动脚本，都必须自己切断交互通道，做法见
+`deploy/install/oneclick/testdata/run_tests.sh` 开头：
+
+- `exec </dev/null`：任何意外走到 `read` 的调用立刻拿到 EOF 并回落默认值，而不是阻塞；
+- 需要具体输入的断言用 `printf '...\n' | tm_ask_*_stdio ...` 在子 shell 里覆盖 stdin；
+- 调用过 `tm_tty_init` 之后立刻 `TM_TTY=""`，并在套件收尾用 `tty/hermetic-at-exit` 复核没有被
+  重新武装；
+- 走安装/渲染路径时预置答案（`tm_ans_set`）或传 `--yes`。
+
+Go 侧有第二道防线：`runBash` 用 `exec.CommandContext` 给每个脚本一个硬上限（函数级套件 60s，
+安装/渲染 3m），并设置 `cmd.WaitDelay` 让被杀脚本的子 shell 不再拖住 `Wait`。真出现交互提示时
+失败信息会点名是哪个脚本卡住，而不是让 `go test` 挂到包级 10m 超时只留一份 goroutine dump。
+`TestShellFunctionSuiteNeverReadsTheCallersStdin` 用一条永不写入也永不关闭的管道复现「stdin
+打开着但没有数据」的环境，因此无论本机有没有控制终端都能稳定判定这个不变量。
 
 以下校验依赖平台工具，CI 与本机不一定具备，改动对应产物后需要在目标平台补跑：
 

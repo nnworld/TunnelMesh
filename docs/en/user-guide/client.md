@@ -24,7 +24,7 @@ Supported local forward types:
 - `socks5`
 - `http-proxy`
 
-UDP forwarding preserves datagram boundaries and source associations.
+UDP forwarding preserves datagram boundaries and source associations. It starts on the user's machine, and the Server carries it to the Agent - there is no public UDP listener behind it. The Server has a separate WireGuard VPN gateway ingress ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md), built only with `-tags vpn`) that does not go through the Client; see the [VPN gateway guide](../../user-guide/vpn.md).
 
 ## SOCKS5 and HTTP proxy modes
 
@@ -90,4 +90,10 @@ client:
 ```
 
 This is useful for workstations that need several local mappings at once.
+
+## Non-loopback listeners and process exit
+
+A `tcp`, `udp`, or `http` entry whose `listen` address is not loopback requires `allow_remote: true` (`--allow-remote` for the single-command form); validation and startup both refuse it otherwise, because those three tunnel types have no local credential check, so binding a non-loopback address publishes the target unauthenticated on that segment. `socks5` and `http-proxy` additionally require a `password` or `basic` auth entry.
+
+When any local listener's accept or read loop fails permanently - exhausted descriptors, a destroyed listening socket - `run` and single-command `forward` exit immediately with a non-zero status and write the error to stderr. A port that still looks healthy while serving nothing is the hardest failure to notice from outside, so letting systemd or Docker restart the process beats staying "online" on a broken listener. `Close` and an ordinary configured stop are not failures and never trigger an exit.
 

@@ -75,6 +75,8 @@ agent:
     cooldown: 30s
 ```
 
+`max` 的可配置区间是 1–512，超过会被 `check-config` 拒绝（这个上界用来抓 "5120" 这类笔误，不是测出来的性能墙）。Agent 每次收到 Server 的 metadata ack 都会核对回传的上限，发现它低于自己配置的 `max` 时输出一条 WARN `agent connection pool exceeds the server ceiling`（同一上限值只说一次，不刷屏），排查时 `journalctl -u tunnelmesh-agent | grep 'server ceiling'` 就能看到该改哪一侧。Agent 愿意开多少条，和 Server 愿意接受多少条，是两台机器上的两个配置，不会自动对齐：把 `max` 抬到超过 Server 的 `server.agents.max_connections_per_agent`（默认 64）之后，超出的连接会被拒并退避重连，既有连接不受影响。因此调池子时两侧一起改，并用 `tunnelmesh_agent_connection_capacity` 核对 Server 真正在强制的值。
+
 同一个 Agent ID 的多个连接会出现在管理后台 Agent 详情中。新流量按健康度、活跃流数和本地优先策略选择连接；本节点没有健康连接时会回退到远端 Server 节点，已建立的流固定在原连接上，不会在线迁移。
 
 连接池会持续采样 pending dial、open P95、TTFB P95、writer queue wait P95、活跃流数和 RTT。信号连续两次超过默认阈值且 Server 确认支持连接池时才会扩容；这些信号不包含目标地址、Token 或凭据。`instance_id` 用于区分多个物理 Agent 进程；未配置时进程会生成并持久化一个稳定值，Linux 打包部署默认保存到 `/var/lib/tunnelmesh-agent/agent-instance-id`。运维细节见[逻辑 Agent 连接池运维指南](../operations/connection-pool.md)。
@@ -87,8 +89,9 @@ Agent 负责从所在网络连接目标服务：
 - UDP：连接内网 UDP 服务并保持 datagram 边界和源地址 association。
 - HTTP：连接内网 HTTP 服务，支持请求转发和 WebSocket Upgrade。
 - TCP-over-WebSocket：为 SSH 等原始 TCP 协议提供 binary WebSocket 字节桥。
+- ICMP echo（可选）：为 VPN 网关的 `ping` 代答一个 echo。默认关闭，需要 `agent.streams.icmp_enabled: true` 且主机放开了 `net.ipv4.ping_group_range`，见第 6 节。只放开 echo，不做 traceroute，也不放开其它 ICMP 类型。
 
-Agent 不负责公开监听公网端口；公网入口由 Server 的 80/443 处理。目标主机、目标端口、CIDR 和端口白名单由 Server policy 约束。
+Agent 不负责公开监听公网端口；公网入口由 Server 的 80/443 处理。目标主机、目标端口、CIDR 和端口白名单由 Server policy 约束。ICMP echo 的目标同样受 policy 约束，并且必须是字面 IP 地址：Agent 不自行解析主机名，链路本地段（含云 metadata 的 `169.254.169.254`）、组播和未指定地址一律拒绝。
 
 ## 5. 受控 metadata 上报
 
@@ -125,6 +128,16 @@ Agent 主机必须满足：
 3. 系统时间准确，能够校验 Server 证书。
 4. 能从 Agent 网络访问被代理的目标地址和端口。
 5. 防火墙允许 Agent 到 Server 的出站连接以及到目标服务的内网连接。
+6. 仅在使用 VPN 网关的 ICMP echo 时：主机放开非特权 ping socket 的 gid 范围。
+
+第 6 条是一次性主机设置，不做的话 `icmp_enabled: true` 也不会有任何效果：
+
+```bash
+sysctl -w net.ipv4.ping_group_range='0 2147483647'
+echo 'net.ipv4.ping_group_range = 0 2147483647' > /etc/sysctl.d/99-tunnelmesh-icmp.conf
+```
+
+范围可以收窄到只包含 Agent 运行用户的 gid。socket 打不开时 Agent **不会退出**，只在 stderr 记一条 Error 并继续服务其余隧道，同时不通告 `stream_icmp_echo.v1`——于是 Server 会拒签 ICMP peer，问题恰好暴露在运维会去看的地方。
 
 生产环境使用 `wss://`，不要关闭证书校验或把 Server 证书私钥放在 Agent 主机上。
 
@@ -170,6 +183,16 @@ nc -vzu 10.0.0.53 53
 ```
 
 如果本机可达但 TunnelMesh 仍被拒绝，检查 Server policy 的 target host、target port、CIDR 和协议配置。
+
+### VPN peer 能签发但 ping 不通
+
+按顺序检查三件事：
+
+1. **Agent 是否通告了能力**：`agent.streams.icmp_enabled` 是否为 `true`，以及 Agent 启动时 stderr 有没有 `agent icmp echo is unavailable` 这条 Error。有这条说明 ping socket 没打开，按第 6 节设置 `net.ipv4.ping_group_range`。
+2. **签发时集群能否核实**：管理 API 可能落在任意 Server 节点，而能力只记录在 Agent 当前连接的那个节点的会话里。落在别的节点时签发仍会成功，但审计详情里的 `icmpCapability` 是 `unverified` 而不是 `verified`。
+3. **节点开关**：`server.vpn.icmp_enabled` 为 `false` 时签发一律返回 409 `vpn_agent_capability_missing`，与 Agent 状态无关。
+
+三项都满足后还剩两个 Server 侧前提：二进制必须是 `-tags vpn` 构建，且 `server.vpn.enabled: true`。缺该 tag 的进程会在启动时直接拒绝而不是静默不工作，官方发行包与镜像的构建矩阵尚不含它，所以用发行版部署时这里仍然 ping 不通，排查顺序见 [VPN 网关部署](../deployment/vpn-gateway.md)。
 
 ## 9. 安全建议
 

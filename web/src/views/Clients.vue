@@ -135,7 +135,11 @@
             <el-table-column prop="tokenId" :label="t('clients.token')" min-width="150" />
             <el-table-column prop="serverNodeId" :label="t('clients.serverNode')" min-width="150" />
             <el-table-column prop="connectionEpoch" :label="t('clients.connectionEpoch')" width="110" />
-            <el-table-column prop="activeStreams" :label="t('clients.activeStreams')" width="100" />
+            <el-table-column :label="t('clients.activeStreams')" width="100">
+              <!-- A lapsed lease keeps the counter it last wrote for history, but a
+                   number under "active streams" is a claim about right now. -->
+              <template #default="{ row }">{{ leaseLive(row) ? row.activeStreams : '—' }}</template>
+            </el-table-column>
             <el-table-column prop="healthScore" :label="t('clients.healthScore')" width="100" />
             <el-table-column :label="t('clients.acquiredAt')" width="180"><template #default="{ row }">{{ formatDate(row.acquiredAt) }}</template></el-table-column>
             <el-table-column :label="t('clients.lastHeartbeatAt')" width="180"><template #default="{ row }">{{ formatDate(row.lastHeartbeatAt) }}</template></el-table-column>

@@ -45,6 +45,58 @@ tls:
 
 `server.tcp_bridge_enabled` 是 `server.tcp_bridge.enabled` 的扁平兼容写法，只在配置文件中生效；命令行、环境变量或 `Set` 覆盖中任一处出现规范键或扁平键时，扁平别名不再二次应用。环境变量两种写法都映射到 `TUNNELMESH_SERVER_TCP_BRIDGE_ENABLED`。
 
+## 管理入口的超时、上限与保留策略
+
+管理监听器用一个端口承载后台页面、`/api/v1`、Agent/Client WebSocket 和 WebSSH。这决定了它的边界不能照搬普通 HTTP 服务：一条已升级的连接要活几个小时，而一个恶意或缓慢的客户端又必须在几秒内被切断。`server.http.*` 就是这个折中——限制"请求头 + 请求体 + keep-alive 空闲"，不限制已建立连接的存活时间。
+
+```yaml
+server:
+  http:
+    read_header_timeout: 10s
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    body_timeout: 30s
+    max_connections: 0
+  agents:
+    max_connections_per_agent: 64
+  metrics:
+    token: ""
+  audit:
+    retention_days: 0
+```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `server.http.read_header_timeout` | `10s` | 读取请求头的预算，slowloris 的第一道防线 | 否 |
+| `server.http.idle_timeout` | `120s` | keep-alive 连接空闲多久后关闭。正在传输的请求不受影响 | 否 |
+| `server.http.max_header_bytes` | `1048576` | 单个请求头块字节上限，超出直接断开 | 否 |
+| `server.http.body_timeout` | `30s` | **只作用于 `/api/v1`** 的单个请求体读取预算，按请求设置读截止并在响应结束后清除 | 否 |
+| `server.http.max_connections` | `0` | 管理监听器同时保有的连接数上限，`0` 表示不限制；超限的新连接立即关闭而不排队 | 否 |
+| `server.agents.max_connections_per_agent` | `64` | 单个 Agent 身份在本节点可保有的物理 WebSocket 数，达到上限后新连接被拒绝（`session: agent connection capacity reached`），既有连接不受影响。`0` 表示「取默认 64」而不是「不限」，见下 | 否 |
+| `server.metrics.token` | 空 | `/metrics` 的 Bearer 凭据。空值表示匿名可抓取（与历史行为一致）；设置后必须不少于 16 字符 | 否 |
+| `server.audit.retention_days` | `0` | 审计日志保留天数。`0` 表示永久保留；只有正数才会启动清理任务 | 否 |
+
+- **为什么没有 `read_timeout`/`write_timeout`**：这两个是连接级预算，会把所有长连接（WebSocket、WebSSH、大文件下载）一起切断，因此代码里刻意不设置。等价能力由上表的"请求头预算 + 每请求体预算 + 空闲预算"组合提供。
+- **`0` 的规则**：容量与保留类键的 `0` 统一表示"关掉这条限制"——`server.http.max_connections=0` 不限连接数、`server.audit.retention_days=0` 永久保留、`server.stream.max_active_per_agent=0` 与 `agent.streams.max_active=0` 不限活跃流。两类例外：`server.http` 的四个时间/字节预算与 `server.agents.max_connections_per_agent` 的 `0` 表示"用内置安全默认值"（负数一律在 `check-config` 阶段被拒绝）。原因很简单：超时预算为 0 会导致功能不可用，Agent 连接上限必须是一个有限数才能回 ACK、才能作为水位暴露；而"不限"对它们来说不是合法诉求。写配置时不要靠 `0` 去关闭某条超时——需要放宽就填一个大值。
+- **`body_timeout` 不覆盖 WebSocket 路径**：`/ws/agent`、`/ws/client`、`/ws/webssh/`、`/ws/tcp` 不经过 `/api/v1` 包装器。已认证的 Agent/Client WebSocket 另有空闲读预算（三个 30s 心跳周期，见 `internal/server/runtime.go` 的 `websocketIdleReadTimeout`），半开连接会在那里被发现，而不是靠 HTTP 超时。
+- **与反向代理的取值关系**：`server.http.idle_timeout` 必须 **不小于** Nginx upstream 的 `keepalive_timeout`，否则 Nginx 会复用一条 Server 已关闭的连接并回 502；`server.http.max_connections` 只在 Server 直接暴露公网（没有 Nginx 或 `location /` 直连）时才需要设成与进程容量匹配的正数，Nginx 在前时容量由 `limit_conn` 决定，保持 `0` 即可。完整取值依据见 [Nginx 推荐配置](../deployment/nginx.md#限流与容量取值)。
+- **`max_connections_per_agent` 与 Agent 侧的关系**：`agent.connections.max`（允许 1–512）是 Agent 自己愿意开的连接数，本键是 Server 愿意接受的数量，两者**不自动对齐**，也不会启动期交叉校验——它们在不同主机上、生效顺序不保证。把 Server 侧调小只会让超出的连接被拒并退避重连，不会踢掉既有连接。**抬升 Agent 池的配方**：`agent.connections.max: 256` 时把 `server.agents.max_connections_per_agent` 设成不小于 256，否则 Agent 会一直撞到 `agent connection capacity reached`。本键没有上界校验，因为它按 **Agent 身份** 计数，而一个身份可以由多个物理进程共享（`instance_id` 区分）：取值要按「同身份进程数 × 每进程 `connections.max`」估算，可以高于 Agent 侧的 512 上限。水位可以观察：`tunnelmesh_agent_connection_capacity` 是 Server 实际强制的上限，Agent 详情页的「连接数」与「活跃连接」是实际持有的数量，两者不相等就说明有连接在被拒。Agent 收到 metadata ack 时若发现回传上限低于自己配置的池子，会打一条**每个不同上限值只说一次**的 WARN：`agent connection pool exceeds the server ceiling`（字段 `configured_max`、`server_max`），这是 Agent 侧唯一能自动发现该错配的地方——启动期刻意不跨主机校验。被拒的连接在指标里是 `tunnelmesh_connections_total{component="server",mode="agent",result="failed",error_class="capacity"}`，并写入审计（action `agent.connection.rejected`）。
+- **`metrics.token` 与网络白名单二选一即可**：`/metrics` 输出含指标名与标签值，能反推内部拓扑。若已经由反向代理按来源网段放行，就不必再配 token；若 Server 直接暴露，应用层凭据比依赖运维改 nginx 更可靠。健康探针 `/health/live`、`/health/ready` 永远不需要该 token，凭据不会被用来让 LB 误判节点死亡。抓取侧配置见 [`deploy/prometheus/prometheus.yml.example`](../../deploy/prometheus/prometheus.yml.example)。
+- **审计保留是显式决策**：审计日志是证据，`retention_days` 默认 `0` 让升级不会删掉任何历史。启用后由后台每小时执行一次分批删除（单事务 1000 行），首次清理历史大表不会长时间锁表；集群每个节点各跑各的，语句本身幂等，因此不需要分布式锁。删除记录只输出条数与耗时，不含行标识。
+
+上述键都是启动期生效，改动需要重启 Server，不参与管理后台热更新。命令行与环境变量等价：
+
+```bash
+export TUNNELMESH_SERVER_HTTP_IDLE_TIMEOUT=120s
+export TUNNELMESH_SERVER_HTTP_MAX_CONNECTIONS=20000
+export TUNNELMESH_SERVER_AGENTS_MAX_CONNECTIONS_PER_AGENT=32
+export TUNNELMESH_SERVER_METRICS_TOKEN="$(openssl rand -hex 32)"
+export TUNNELMESH_SERVER_AUDIT_RETENTION_DAYS=365
+tunnelmesh-server --server.http.body_timeout=30s check-config
+```
+
+`server.metrics.token` 与 `storage.mysql.dsn`、`tls.key_file` 同属敏感项：`config dump` 与 `RedactedJSON` 输出会把它替换成 `[redacted]`，`json/yaml` 序列化直接省略该字段，日志也只记录"是否配置"，不记录值。
+
 ## 本地模式示例
 
 ```yaml
@@ -243,6 +295,86 @@ tunnelmesh-server --server.proxy_entry.enabled=true \
 
 改完先用 `tunnelmesh-server check-config` 校验再重启。路由本身（出口 agent、认证方式、来源 ACL、目标限制）不在这个配置文件里，全部由管理后台的托管路由维护，创建后 5 秒内生效，不需要重启 Server 或改 nginx。
 
+## 内嵌 VPN 网关（WireGuard）
+
+内嵌 VPN 网关让没有安装 `tunnelmesh-client` 的用户直接用系统自带的 WireGuard 客户端接入内网，出口仍由 Agent 承担。决策背景与边界见 [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md)。
+
+**数据面在 `-tags vpn` 构建里。** 不带该 tag 的二进制只有管理面：`server.vpn` 仍会被完整加载与校验，管理 API 可以签发、列出、修改、轮换、吊销并审计 peer，但没有 WireGuard 端点，`config:reveal` 返回 409 `vpn_node_disabled`（节点没有自己的网关身份，渲染出来的 `[Peer] PublicKey` 会是空的，与其下发一个导入即失败的配置文件不如明确拒绝）。带 tag 的二进制在 `enabled: true` 时会真正监听 `listen` 指定的公网 UDP 端口并承载隧道。
+
+两种构建都**不允许**「配了 `enabled: true` 却悄悄不工作」：无 tag 构建在该配置下启动即失败并报 `this binary was built without VPN support; rebuild with -tags vpn`，而不是报告 ready 然后让每个 peer 超时。构建变体、体积实测与放行步骤见 [VPN 网关部署](../deployment/vpn-gateway.md)，容量、租约与 `error_class` 对照见 [VPN 网关运维](vpn.md)。
+
+与 tp-* 代理入口不同，VPN 端点是一个**独立的公网 UDP 端口**：不经反向代理、不参与 HTTP 路由，必须在防火墙或安全组里单独放行，并单独限流与监控。
+
+```yaml
+server:
+  vpn:
+    enabled: false
+    listen: 0.0.0.0:51820
+    endpoint_host: gw-1.mesh.example.com
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    mtu: 1420
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+```
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `server.vpn.enabled` | `false` | 总开关。关闭时进程不创建任何 VPN 资源，行为与旧版本完全一致；管理 API 的写操作返回 409 `vpn_node_disabled`，读操作返回空列表 | 否 |
+| `server.vpn.listen` | `0.0.0.0:51820` | WireGuard 端点的公网 UDP 监听地址，需独立放行 | 否 |
+| `server.vpn.endpoint_host` | `gw-1.mesh.example.com` | 下发给用户的 `Endpoint` 域名，**只写主机名、不带端口**；端口始终取自 `listen`，二者不会互相矛盾 | `enabled=true` 时必填 |
+| `server.vpn.ip_pool` | `10.64.0.0/16` | peer 地址池。必须是 IPv4，且不得落在链路本地、未指定或组播段；可以使用 CGNAT 段（如 `100.64.0.0/16`） | 否 |
+| `server.vpn.node_subnet_size` | `24` | 每个 Server 节点从池里切出的子网前缀。必须严格窄于 `ip_pool` 的前缀且不窄于 `/30`；切出的子网总数上限 4096 | 否 |
+| `server.vpn.mtu` | `1420` | 隧道 MTU，取值 576–1500。1420 = 1500 − WireGuard 的 72 字节开销 | 否 |
+| `server.vpn.max_peers` | `0` | 单节点 peer 上限，触顶时签发返回 503 `vpn_capacity_exhausted`；0 表示不限 | 否 |
+| `server.vpn.max_flows_per_peer` | `128` | 单 peer 并发流上限，超限计入 `capacity_exhausted` | 否 |
+| `server.vpn.max_flows_total` | `0` | 节点并发流总上限；0 表示不限 | 否 |
+| `server.vpn.packet_rate_per_peer` | `0` | 单 peer 每秒包数上限，超限计入 `rate_limited`；0 表示不限 | 否 |
+| `server.vpn.connect_timeout` | `10s` | 开流（经 Agent 建立目标连接）的超时 | 否 |
+| `server.vpn.idle_timeout` | `120s` | 流空闲回收时间 | 否 |
+| `server.vpn.shutdown_timeout` | `15s` | 进程退出时等待在途流排空的上限，可为 0 | 否 |
+| `server.vpn.icmp_enabled` | `true` | 节点级 ICMP echo 总开关，是上限而不是承诺：peer 还要单独开启，且出口 Agent 必须在线并已协商 `stream_icmp_echo.v1`。开关关闭时连探针都不会被询问，签发返回 409 `vpn_agent_capability_missing` | 否 |
+| `server.vpn.icmp_timeout` | `5s` | 单次 echo 应答超时，超时计入 `icmp_timeout` | 否 |
+| `server.vpn.icmp_max_concurrent` | `64` | 节点并发 echo 上限 | 否 |
+
+三个「0 表示不限」的计数（`max_peers`、`max_flows_total`、`packet_rate_per_peer`）沿用 `max_concurrent_tunnels` 的既有约定。`icmp_timeout` 与 `icmp_max_concurrent` 只在 `icmp_enabled=true` 时校验，因此关掉 ICMP 不会因为遗留的占位取值而无法启动。
+
+`ip_pool` 与 `node_subnet_size` 由 `internal/vpn` 的 `ParsePool` 直接校验，加载器和分配器共用同一套规则：「能启动」就等价于「真的能分出地址」，启动时读到的报错与首次签发时读到的报错是同一条。每个子网的第一个可用地址保留给节点自己的 VPN 接口，不会分给 peer，所以 `/24` 子网实际可分配 253 个地址、`/30` 子网只剩 1 个。
+
+节点自身的 WireGuard 私钥**不是配置项**，只从环境变量注入：
+
+```bash
+TUNNELMESH_VPN_NODE_PRIVATE_KEY=<base64 编码的 32 字节私钥>
+```
+
+配置文件会被复制、备份、打进支持包、提交进版本库，而环境变量可以从 Secret Manager 取值且永不落盘，所以私钥只走后者。base64（`wg(8)` 的写法）与 64 字符 hex（多数 keygen 一行命令的写法）都接受。
+
+该变量由数据面消费，读取时机是启动装配：`enabled: true` 而变量缺失或不可用会让进程**启动失败**，原文分别是 `vpn: TUNNELMESH_VPN_NODE_PRIVATE_KEY is not set, so the gateway has no wireguard identity` 与 `vpn: TUNNELMESH_VPN_NODE_PRIVATE_KEY is not a usable wireguard private key`（外层还会包一层 `server runtime: vpn gateway: `）。`enabled: false` 时根本不读它，所以不使用 VPN 的部署不必注入一个用不上的密钥。
+
+管理面不会因为节点私钥缺失而挂掉：`config:reveal` 此时返回 409 `vpn_node_disabled`，操作员仍然能用后台吊销旧密钥签发的 peer。下发给每个 peer 的私钥用既有的 `TUNNELMESH_TOKEN_ENCRYPTION_KEY`（AES-256-GCM）密封，与凭据密文同构；密钥不可用时签发与 reveal 返回 503 `credential_secret_unavailable`，不会降级为明文。两类私钥都不会出现在日志、审计与指标里。
+
+**节点私钥一旦更换，所有已下发配置立即失效**，必须全部重新 reveal 导入。轮换前先评估影响面并准备好重新下发的通道。
+
+命令行与环境变量等价（`TUNNELMESH_SERVER_VPN_*`）：
+
+```bash
+tunnelmesh-server --server.vpn.enabled=true \
+  --server.vpn.listen=0.0.0.0:51820 \
+  --server.vpn.endpoint_host=gw-1.mesh.example.com \
+  --server.vpn.ip_pool=10.64.0.0/16 \
+  --server.vpn.node_subnet_size=24
+```
+
+改完先用 `tunnelmesh-server check-config` 校验再重启。集群里**每个节点必须配置相同的 `ip_pool` 与 `node_subnet_size`**，否则子网租约会互相拒绝；节点通过 `vpn_ip_leases` 各自抢占一个子网，租约由 epoch fencing 保护，失去租约的节点无法继续从该子网分配地址。
+
 ## Agent 连接池
 
 Agent 保持一个 `server_url`，但可以复用同一个逻辑 Agent 身份建立多条物理 WebSocket 连接。默认配置禁用扩容：
@@ -260,7 +392,7 @@ agent:
     cooldown: 30s
 ```
 
-`max` 大于 1 前必须完成所有入口 Server 的滚动升级。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
+`max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
 ## Stream 延迟与授权缓存
 
@@ -272,6 +404,7 @@ Server 默认配置：
 server:
   stream:
     max_concurrent_opens: 256
+    max_active_per_agent: 1024
     max_pending_opens: 1024
     initial_window: 262144
     window_update_threshold: 131072
@@ -286,6 +419,8 @@ server:
     max_entries: 100000
 ```
 
+`max_concurrent_opens` 是**处理宽度**（同时在进行的目标拨号数），`max_active_per_agent` 是**存量水位**（同一个 Agent 此刻保有的活跃流数量）。两者缺一不可：只限并发处理时，一个 Client 可以慢慢打开成千上万条不读的流，把每条流的缓冲与状态永久钉在 Agent 上；`0` 表示不限，负数被 `check-config` 拒绝。超限时 Server 直接回 `open_result` 的 `queue_full`（stage `queue`、可重试），Client 退避后重开，不会把 Agent 拖进拨号队列。
+
 `initial_window` 与 `window_update_threshold` 是 Agent 数据面的真实额度：前者既是 `OPEN_STREAM` 通告给 Agent 的 credit，也是 Server 为每条流预留的接收缓冲上限；后者是回补 `WINDOW_UPDATE` 的累计阈值。二者必须满足 `initial_window - window_update_threshold >= max_frame_payload`，否则发送方在剩余窗口不足一帧时无处可去，配置校验会直接拒绝。`max_frame_payload` 只有 `32768` 一个合法值，因为帧编解码没有协商其它 DATA 尺寸。对端通告的窗口仍会被夹紧，详见 [WebSocket 代理协议模块](../protocol/proxy-modules.md)。
 
 `authorization_cache` 使用数据库中的共享授权修订号失效。SQLite 正向缓存默认 5 秒；MySQL 集群默认 5 分钟，并通过 2 秒修订号轮询保证权限变更尽快生效。轮询失败超过 `max_stale_on_poll_error` 后缓存 fail-closed，新请求会回源数据库。所有 Token、用户、Agent 和策略变更必须与修订号更新处于同一数据库事务。
@@ -298,13 +433,38 @@ Agent 默认使用有界拨号执行器，单个慢目标不会阻塞同一 WebS
 agent:
   streams:
     max_concurrent_dials: 32
+    max_active: 1024
     max_pending_dials: 128
     connect_timeout: 5s
     open_timeout: 8s
     inbound_buffer_bytes: 262144
+    # VPN 网关的 ICMP echo 出口，默认关闭。协议见 protocol/proxy-modules.md。
+    icmp_enabled: false
+    icmp_bind_address: 0.0.0.0
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
 ```
 
-`inbound_buffer_bytes` 决定每条流最多缓冲多少 Server→Agent 字节，最小值是两个整帧（65536），低于该值会让正常的背压变成 `RESET`。
+`inbound_buffer_bytes` 决定每条流最多缓冲多少 Server→Agent 字节，最小值是两个整帧（65536），低于该值会让正常的背压变成 `RESET`。`max_active` 是 Agent 自己的存量水位（纵深防御的第二层，语义与 Server 侧 `server.stream.max_active_per_agent` 相同），超限时 Agent 在创建任何流状态之前直接回 `queue_full`；`0` 表示不限。两侧任一层被单独调整都不会破坏协议：这是一个水位，不是协商参数。
+
+| 键 | 默认值 | 含义 | 是否必填 |
+|---|---|---|---|
+| `agent.streams.icmp_enabled` | `false` | 是否打开非特权 ping socket 并通告 `stream_icmp_echo.v1`。默认关闭，因此升级二进制本身不会在任何主机上开 socket | 否 |
+| `agent.streams.icmp_bind_address` | `0.0.0.0` | ping socket 绑定的**地址**（不是 `host:port`），必须是 IP；仅在 `icmp_enabled=true` 时校验 | 否 |
+| `agent.streams.icmp_timeout` | `5s` | 单次 echo 等待应答的上限，超时回 `timeout` 状态而不是错误 | 否 |
+| `agent.streams.icmp_max_concurrent` | `64` | 该 Agent 进程的并发 echo 预算，超限立即回 `capacity_exhausted`，不排队 | 否 |
+
+`icmp_enabled=true` 还需要主机一次性放开非特权 ping socket 的 gid 范围，否则 socket 打不开、能力不通告，Server 会拒签 ICMP peer：
+
+```bash
+# 立即生效
+sysctl -w net.ipv4.ping_group_range='0 2147483647'
+# 重启后仍生效
+echo 'net.ipv4.ping_group_range = 0 2147483647' > /etc/sysctl.d/99-tunnelmesh-icmp.conf
+sysctl --system
+```
+
+收窄范围（例如只允许 Agent 的运行 gid）也可以，只要包含该进程 gid 即可。Agent 打不开 socket 时**不会退出**：它在 stderr 记一条 Error 并继续服务 TCP/UDP/HTTP 隧道，因为一个可选能力不该把整个 Agent 拉下线。命令行与环境变量等价：`TUNNELMESH_AGENT_STREAMS_ICMP_ENABLED` 等。
 
 Client 默认等待严格打开结果并限制入站缓冲：
 

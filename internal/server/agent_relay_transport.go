@@ -31,6 +31,13 @@ type AgentRelayWindowConfig struct {
 	// returned. The invariant `window - threshold >= one frame` is enforced
 	// rather than trusted, because a pump that waits for credit never times out.
 	UpdateThreshold uint32
+	// MaxActiveStreamsPerAgent is the node-local ceiling on simultaneously open
+	// streams toward one Agent, across all of its connections.
+	// server.stream.max_concurrent_opens only bounds how many opens are being
+	// processed at once, so without a level cap one Client can pin an unbounded
+	// number of live streams - and the Agent-side target connections behind them
+	// - onto one Agent. Zero means unlimited.
+	MaxActiveStreamsPerAgent int
 }
 
 func (c AgentRelayWindowConfig) advertisedWindow() uint32 {
@@ -154,6 +161,11 @@ func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.Stre
 		return nil, errAgentRelayWireIDsExhausted
 	}
 	allocator.next++
+	if t.windows.MaxActiveStreamsPerAgent > 0 &&
+		t.agentStreamCountLocked(agentID) >= t.windows.MaxActiveStreamsPerAgent {
+		t.mu.Unlock()
+		return nil, ErrAgentRelayStreamCapacity
+	}
 	stream := &agentRelayStream{
 		transport: t, agentID: agentID, connectionID: session.ConnectionID,
 		connectionEpoch: session.ConnectionEpoch, serverGeneration: session.serverGeneration,
@@ -390,6 +402,33 @@ func (t *AgentRelayTransport) Close() error {
 		stream.fail(errAgentRelayClosed)
 	}
 	return nil
+}
+
+// ErrAgentRelayStreamCapacity reports that an Agent already holds as many live
+// streams on this node as `server.stream.max_active_per_agent` allows. It maps to
+// the existing retryable queue_full open result, so no wire value is invented and
+// a legacy Client that does not read OPEN_RESULT still sees a closed stream.
+var ErrAgentRelayStreamCapacity = errors.New("agent relay: active stream capacity reached")
+
+// ActiveStreamsForAgent counts every live stream toward one Agent on this node,
+// across all of its connections, which is what the per-agent ceiling bounds.
+func (t *AgentRelayTransport) ActiveStreamsForAgent(agentID string) int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.agentStreamCountLocked(agentID)
+}
+
+func (t *AgentRelayTransport) agentStreamCountLocked(agentID string) int {
+	count := 0
+	for _, stream := range t.streams {
+		if stream.agentID == agentID {
+			count++
+		}
+	}
+	return count
 }
 
 // ActiveStreams returns the number of currently open local streams for one

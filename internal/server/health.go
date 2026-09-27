@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 // ComponentStatus is the bounded readiness state of one runtime dependency.
@@ -21,8 +23,29 @@ type HealthChecker interface {
 	Ready(context.Context) []ComponentStatus
 }
 
-// NewHealthHandler mounts liveness, readiness, and Prometheus endpoints.
-func NewHealthHandler(checker HealthChecker, metrics http.Handler) http.Handler {
+// MetricsPolicy guards the Prometheus endpoint.
+//
+// A registry leaks more than numbers: metric names and label values describe the
+// internal topology, build versions and traffic shape of the deployment, which is
+// more than an unauthenticated internet listener should hand out. The zero value
+// allows every request, so a Server behind a reverse proxy that already restricts
+// /metrics keeps its current behaviour.
+type MetricsPolicy struct {
+	// Token is the bearer credential a scraper must present. It is only ever supplied
+	// through server.metrics.token or TUNNELMESH_SERVER_METRICS_TOKEN, and never
+	// logged or serialized.
+	Token string
+}
+
+// NewHealthHandler mounts liveness, readiness, and Prometheus endpoints. At most one
+// MetricsPolicy is honoured; extra values are ignored rather than merged, so a
+// caller cannot accidentally widen the guard by passing two.
+func NewHealthHandler(checker HealthChecker, metrics http.Handler, metricsPolicy ...MetricsPolicy) http.Handler {
+	var policy MetricsPolicy
+	if len(metricsPolicy) > 0 {
+		policy = metricsPolicy[0]
+	}
+	requiredToken := strings.TrimSpace(policy.Token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -60,6 +83,13 @@ func NewHealthHandler(checker HealthChecker, metrics http.Handler) http.Handler 
 				http.NotFound(w, r)
 				return
 			}
+			// Health probes stay open above this guard: a monitoring credential must
+			// never become a reason the load balancer declares the node dead.
+			if requiredToken != "" && !presentsBearerToken(r, requiredToken) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			metrics.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
@@ -71,4 +101,17 @@ func writeHealthJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// presentsBearerToken reports whether the request carries the expected bearer token.
+//
+// The comparison is constant time so an attacker cannot binary search the token one
+// byte at a time over many scrapes, and only the conventional Authorization form is
+// accepted: a token in a query string would land in access logs.
+func presentsBearerToken(r *http.Request, expected string) bool {
+	presented := bearerToken(r)
+	if presented == "" || expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 }

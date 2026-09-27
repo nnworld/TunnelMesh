@@ -11,8 +11,8 @@
 **带完整控制面的自托管内网穿透平台。**
 
 在内网部署 Agent，通过托管 HTTP 路由或本地端口转发访问内网服务，并在内置管理后台中完成
-RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口只使用 HTTP/HTTPS/WSS，
-Server 不监听公网 UDP。
+RBAC、scoped service token、Agent 策略、审计和可观测性管理。公网入口以 HTTP/HTTPS/WSS 为主；
+启用内嵌 WireGuard VPN 网关后会额外监听一个公网 UDP 端口（[ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md)），其数据面在 `-tags vpn` 构建里。
 
 [文档站](https://nnworld.github.io/TunnelMesh/) ·
 [五分钟快速开始](https://nnworld.github.io/TunnelMesh/user-guide/quickstart.html) ·
@@ -68,7 +68,7 @@ Server 不监听公网 UDP。
 
 | 可执行文件 | 部署位置 | 职责 | 文档 |
 | --- | --- | --- | --- |
-| `tunnelmesh-server` | 公网入口 | 管理 API（`/api/v1`）、内嵌管理后台、HTTP/HTTPS/WSS 入口、路由解析、隧道协调、节点间 relay | [Server 管理后台](docs/user-guide/server-admin.md) |
+| `tunnelmesh-server` | 公网入口 | 管理 API（`/api/v1`）、内嵌管理后台、HTTP/HTTPS/WSS 入口、路由解析、隧道协调、节点间 relay、可选的 WireGuard VPN 端点（一个公网 UDP 端口，需 `-tags vpn` 构建） | [Server 管理后台](docs/user-guide/server-admin.md)、[VPN 网关部署](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | 内网或目标主机 | 主动建立到 Server 的 TLS WebSocket，连接内网 TCP/UDP/HTTP 目标，按 allowlist 上报 metadata | [Agent 使用帮助](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | 用户主机 | 本地转发（TCP/UDP/HTTP/SOCKS5/HTTP 代理）、路由发布、面向 SSH 的 stdio TCP 代理 | [Client 使用帮助](docs/user-guide/client.md) |
 
@@ -376,7 +376,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata 只来自 allowlist 中的文件或环境变量；名称命中敏感模式时清空值并标记 `redacted=true`。
 - 每个目标地址在 Agent 侧再次校验 SSRF、回环、私网、链路本地、CIDR 和端口策略。
 - 日志、指标、审计和普通 traceroute 输出不包含 secret、密码、私钥、完整 `Authorization` header 或会话字节；身份认证指标的标签是封闭枚举，不含用户名、客户端 IP、provider id 或设备 token。
-- 明确不实现：ICMP、TUN/L2 VPN、P2P NAT traversal 和任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路。
+- 明确不实现：P2P NAT traversal 和任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路。ICMP echo 经内嵌 WireGuard 网关已在 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) 的 `-tags vpn` 构建中实现，默认关闭；发行二进制与镜像尚不含该 tag，且不转发 L2 以太网帧。
 
 ## 仓库结构
 

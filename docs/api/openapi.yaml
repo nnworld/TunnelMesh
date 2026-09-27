@@ -844,7 +844,7 @@ paths:
   /api/v1/clients:
     get:
       summary: List Client instances within the caller's ownership scope
-      description: Administrators may filter across owners. Ordinary users are always restricted to their own Clients in the repository query, before cursor pagination.
+      description: Results are ordered by last heartbeat descending, with the instance ID as a deterministic tie-breaker, so the Clients that reported most recently are on the first page. The stale and expiry sweeps update the row timestamp without any Client activity, which is why that timestamp is not the sort key. Administrators may filter across owners. Ordinary users are always restricted to their own Clients in the repository query, before cursor pagination.
       security: [{bearerAuth: []}]
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
@@ -882,7 +882,7 @@ paths:
     parameters: [{name: clientInstanceId, in: path, required: true, schema: {type: string}}]
     get:
       summary: List physical Client WebSocket leases
-      description: Returns durable leases across Server nodes. The list does not expose credentials or client metadata values.
+      description: Returns durable leases across Server nodes, ordered by most recent heartbeat first. The list does not expose credentials or client metadata values.
       security: [{bearerAuth: []}]
       responses:
         '200': {description: Connection leases, content: {application/json: {schema: {$ref: '#/components/schemas/ClientConnectionClusterEnvelope'}}}}
@@ -1356,6 +1356,199 @@ paths:
         '200': {description: Current release metadata, content: {application/json: {schema: {$ref: '#/components/schemas/DownloadInfoEnvelope'}}}}
         '401': {description: Missing or invalid management bearer Token}
         '403': {description: Administrator required}
+  /api/v1/vpn-peers:
+    get:
+      summary: List the VPN peers visible to the caller
+      description: |
+        Management plane only. A regular user sees their own peers and an
+        administrator sees every peer; the owner restriction is applied inside
+        the paginated query, so a peer the caller may not see appears on no page
+        and a page is never truncated to hide one. An unknown `status` narrows to
+        nothing rather than to everything. Issuing a peer does not yet give it
+        connectivity: the gateway data plane is a later phase of the approved
+        rollout recorded in ADR 0002.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: status, in: query, schema: {type: string, enum: [active, disabled, revoked]}}
+        - {name: nodeId, in: query, schema: {type: string}}
+        - {name: agentId, in: query, schema: {type: string}}
+        - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
+      responses:
+        '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerPageEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '503': {description: The peer service is not assembled on this server}
+    post:
+      summary: Issue a VPN peer
+      description: |
+        Allocates one /32 from the subnet the serving node leases, generates an
+        X25519 key pair and seals the private key with AES-256-GCM. The response
+        is a summary and carries no key material; the private key is retrievable
+        only through `config:reveal`. `agentId` must name an enabled egress agent
+        the caller owns, or any agent when the caller is an administrator; a
+        missing, foreign and disabled agent all answer identically so agent
+        identifiers cannot be enumerated. `icmpEnabled` is refused until agents
+        negotiate the capability. Replaying the same `Idempotency-Key` returns
+        the stored response and cannot burn a second address.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerCreateRequest'}}}}
+      responses:
+        '201': {description: Issued, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerCreateEnvelope'}}}}
+        '400': {description: 'Field validation failed (vpn_peer_invalid) or the configured pool is unusable (vpn_ip_pool_invalid)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '409': {description: 'vpn_node_disabled, vpn_agent_capability_missing, vpn_ip_pool_exhausted or vpn_peer_conflict', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: 'vpn_capacity_exhausted, or credential_secret_unavailable when TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured; nothing is stored', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+  /api/v1/vpn-peers/{peerId}:
+    parameters:
+      - {name: peerId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read one VPN peer
+      description: A peer owned by somebody else answers 404 rather than 403, because 403 would confirm the identifier exists and turn this route into an enumeration oracle.
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Peer summary, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: The peer service is not assembled on this server}
+    patch:
+      summary: Update the supplied VPN peer fields
+      description: |
+        Omitted fields keep their stored value, and at least one field is
+        required. `status` accepts `active` and `disabled` only: revocation has
+        its own verb, so the terminal state cannot be reached two ways where one
+        of them would skip the audit entry the other writes. An expired peer may
+        still be renamed and may still have its policy narrowed, because refusing
+        that would leave no way to shorten the lifetime of a peer already past
+        it; only a newly written `expiresAt` has to be in the future.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerPatchRequest'}}}}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerEnvelope'}}}}
+        '400': {description: 'Invalid field, an empty patch, or an attempt to set the terminal state (vpn_peer_invalid)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '409': {description: 'vpn_peer_conflict for a revoked peer, vpn_node_disabled on a node with server.vpn.enabled false', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: The peer service is not assembled on this server}
+    delete:
+      summary: Revoke a VPN peer
+      description: |
+        Terminal. The row is kept for audit and the address is never reused, so a
+        retired /32 cannot later carry somebody else's traffic. A revoked peer
+        stays readable and stops being loaded by the gateway. Revoking twice is
+        idempotent, because "already revoked" is not something a caller can act
+        on and a retry after a lost response must not fail.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: The revoked peer, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '409': {description: 'vpn_node_disabled on a node with server.vpn.enabled false', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: The peer service is not assembled on this server}
+  /api/v1/vpn-peers/{peerId}/rotate:
+    parameters:
+      - {name: peerId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Rotate the peer key pair
+      description: |
+        Replaces the key pair and keeps the address, which is part of the user's
+        own configuration; the old public key stops working immediately. The
+        action is idempotent under `Idempotency-Key`, because a retry that
+        rotated twice would leave the caller holding a configuration that no
+        longer works with no error to explain it. Rotating does not consume
+        another address and does not move the allocation counter.
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      responses:
+        '200': {description: The rotated peer, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerEnvelope'}}}}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '409': {description: 'vpn_peer_conflict for a revoked peer, vpn_node_disabled on a disabled node', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: 'credential_secret_unavailable when TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+  /api/v1/vpn-peers/{peerId}/config:reveal:
+    parameters:
+      - {name: peerId, in: path, required: true, schema: {type: string}}
+    post:
+      summary: Reveal the peer configuration, private key included
+      description: |
+        Audited, `no-store`, and the only response in this API that contains a
+        peer private key. Requires `X-VPN-Config-Reveal-Confirm`, an
+        `Idempotency-Key` and `acknowledgeRisk: true`; visibility is resolved
+        before those preconditions so the route cannot be used to probe
+        identifiers. The key is sealed rather than hashed, so a confirmed reveal
+        may be repeated. The request is deliberately not served from the
+        idempotency store: that store persists response bodies, and this one
+        carries key material. Answers `vpn_node_disabled` while this node has no
+        gateway identity, rather than rendering a file whose `[Peer] PublicKey`
+        is blank and would fail on the user's machine.
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: X-VPN-Config-Reveal-Confirm, in: header, required: true, schema: {type: string}}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/VPNConfigRevealRequest'}}}}
+      responses:
+        '200':
+          description: The rendered wg-quick configuration
+          headers:
+            Cache-Control: {schema: {type: string, const: no-store}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/VPNConfigRevealEnvelope'}}}
+        '400': {description: A confirmation header, the idempotency key or the acknowledgement is missing}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '409': {description: 'vpn_node_disabled when this node has no gateway identity', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: 'credential_secret_unavailable when TUNNELMESH_TOKEN_ENCRYPTION_KEY is not configured', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+  /api/v1/vpn-peers/{peerId}/flows:
+    parameters:
+      - {name: peerId, in: path, required: true, schema: {type: string}}
+    get:
+      summary: List the active flows of one peer
+      description: |
+        Answered from the memory of the gateway that serves the peer, so it is a
+        snapshot of this instant and not a history: a flow leaves the list the
+        moment it is closed, reaped or revoked, and nothing here is persisted.
+        The projection is narrow by construction - no payload, no key material and
+        no agent-side socket detail - and carries no cursor, because one peer's
+        flow set is bounded by server.vpn.max_flows_per_peer and a list read in
+        two requests would describe two different moments.
+        Visibility is resolved before the gateway is asked, so an identifier that
+        does not exist, or that belongs to somebody else, is a 404, and the route
+        cannot be used to probe either fact.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: The flows this node's gateway holds for the peer. An empty list means the peer is served here and is idle.
+          content: {application/json: {schema: {$ref: '#/components/schemas/VPNFlowListEnvelope'}}}
+        '401': {description: Unauthenticated}
+        '404': {description: 'Not found or not visible (vpn_peer_not_found)', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '501': {description: 'This node cannot observe that peer (vpn_not_implemented): it is served by another gateway node, or this server has no running gateway because it was built without the vpn tag or runs with server.vpn disabled. Not an empty list, which would claim the peer is idle.', content: {application/json: {schema: {$ref: '#/components/schemas/VPNErrorEnvelope'}}}}
+        '503': {description: The peer service is not assembled on this server}
+  /api/v1/vpn-nodes:
+    get:
+      summary: Read the VPN gateway status of this node
+      description: |
+        One entry: the node this process is. A fleet-wide view would need a
+        cluster RPC that does not exist, and answering with the nodes this process
+        happens to know would show part of a fleet as if it were the whole fleet.
+        The shape stays a list so that adding the RPC later does not change a
+        contract a console already reads.
+        Available in both builds. A server without the vpn tag, or one with
+        server.vpn disabled, reports enabled false and omits the counters, which a
+        console renders as an em dash. The counters belong to the subnet lease and
+        to the peer table, so they are read from those rather than derived from
+        configuration: a capacity computed from a prefix is a promise the issuer
+        may not be able to keep.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: This node's gateway status
+          content: {application/json: {schema: {$ref: '#/components/schemas/VPNNodeListEnvelope'}}}
+        '401': {description: Unauthenticated}
+        '404': {description: A node sub-resource, which this route does not have}
+        '405': {description: Method not allowed}
+        '500': {description: 'The gateway could not read the counters it reports. The request fails rather than answer with them omitted, because an absent counter reads as unknown and a slow database is not unknown.'}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
@@ -2206,7 +2399,7 @@ components:
         total: {type: integer, minimum: 0}
         online: {type: integer, minimum: 0, description: Clients with at least one unexpired lease}
         activeConnections: {type: integer, minimum: 0, description: Unexpired physical WebSocket leases across the population}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Sum of activeStreams over unexpired leases in the whole filtered population}
         metadataUnavailable: {type: integer, minimum: 0, description: Clients that never accepted CLIENT_HELLO}
         metadataStale: {type: integer, minimum: 0, description: Reported metadata past its TTL, regardless of presence}
     Client:
@@ -2227,7 +2420,7 @@ components:
         status: {type: string, enum: [online, offline], description: Presence only. Derived from unexpired leases, never from metadata state.}
         metadataState: {type: string, enum: [fresh, expired, unavailable], description: fresh and expired require an accepted CLIENT_HELLO; unavailable means the Client never reported metadata and is independent of presence.}
         activeConnections: {type: integer, minimum: 0}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Sum of activeStreams over the unexpired leases of this instance only}
         serverNodeIds: {type: array, items: {type: string}}
         lastSeenAt: {type: string, format: date-time}
         metadata: {type: object, additionalProperties: {type: string}, description: Bounded non-secret annotations reported by the Client}
@@ -2263,7 +2456,7 @@ components:
         ownerUserId: {type: string}
         serverNodeId: {type: string}
         connectionEpoch: {type: integer, format: int64}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Streams the owning Server node still holds open on this connection, written by its heartbeat; an expired lease keeps its final reported value}
         healthScore: {type: integer, format: int64, minimum: 0}
         acquiredAt: {type: string, format: date-time}
         lastHeartbeatAt: {type: string, format: date-time}
@@ -2607,3 +2800,192 @@ components:
         platform: {type: string, enum: [linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64, windows-arm64]}
         archive: {type: string}
         url: {type: string, format: uri}
+    VPNErrorCode:
+      type: string
+      description: |
+        Stable vpn error code, carried in `data.error` of every mapped failure
+        while `msg` carries the human detail. The set is the public contract of
+        the embedded VPN gateway design spec §12.1 and internal/vpn/errors.go; a
+        code is never renamed without a deprecation window, because consoles,
+        metric labels and troubleshooting tables key off these strings.
+        `credential_secret_unavailable` is shared with the credential and
+        identity surfaces on purpose: one root cause, one code.
+      enum: [vpn_peer_invalid, vpn_ip_pool_invalid, vpn_peer_not_found, vpn_peer_conflict, vpn_agent_capability_missing, vpn_ip_pool_exhausted, vpn_node_disabled, vpn_capacity_exhausted, vpn_not_implemented, credential_secret_unavailable]
+    VPNError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: {$ref: '#/components/schemas/VPNErrorCode'}
+    VPNErrorEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNError'}}
+    VPNPeer:
+      type: object
+      additionalProperties: false
+      required: [id, ownerUserId, name, publicKey, vpnIp, nodeId, agentId, allowedIps, allowedPorts, allowPrivateTargets, icmpEnabled, maxConcurrentFlows, packetRateLimit, status, createdAt, updatedAt]
+      description: |
+        One peer as the management plane reports it. The sealed private-key
+        columns are absent from this projection by construction rather than
+        merely omitted from the JSON: ciphertext, nonce, key id and version never
+        reach a response, a browser cache, a proxy log or a console.
+      properties:
+        id: {type: string}
+        ownerUserId: {type: string}
+        name: {type: string, maxLength: 255}
+        description: {type: string, maxLength: 255}
+        publicKey: {type: string, description: Base64 X25519 public key, always 44 characters}
+        vpnIp: {type: string, description: The single /32 this peer holds on the tunnel. It survives a key rotation and is never reused after revocation.}
+        nodeId: {type: string, description: The gateway node that issued and serves this peer}
+        agentId: {type: string, description: The egress agent traffic leaves through}
+        allowedIps: {type: array, items: {type: string}, description: 'Egress destinations as IPv4 CIDRs, in canonical sorted form. Empty denies every destination, the semantics WireGuard itself uses for an absent AllowedIPs.'}
+        allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: 'Empty permits every port, which is the opposite of an empty allowedIps.'}
+        allowPrivateTargets: {type: boolean, description: Whether the peer may reach RFC1918, loopback and link-local targets. Cloud metadata, multicast and non-routable addresses stay denied either way.}
+        icmpEnabled: {type: boolean, description: 'Whether this peer asked for echo. It is a ceiling rather than a promise: the egress agent also has to have negotiated stream_icmp_echo.v1, and the node has to run server.vpn.icmp_enabled.'}
+        maxConcurrentFlows: {type: integer, minimum: 0, description: Zero means unlimited}
+        packetRateLimit: {type: integer, minimum: 0, description: Packets per second; zero means unlimited}
+        expiresAt: {type: string, format: date-time, nullable: true}
+        status: {type: string, enum: [active, disabled, revoked], description: 'revoked is terminal. The row is kept for audit and the peer stops being loaded by the gateway.'}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    VPNPeerEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNPeer'}}
+    VPNPeerPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/VPNPeer'}}
+        nextCursor: {type: string}
+        hasMore: {type: boolean}
+    VPNPeerPageEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNPeerPage'}}
+    VPNPeerCreate:
+      allOf:
+        - {$ref: '#/components/schemas/VPNPeer'}
+        - type: object
+          required: [configRevealPath]
+          properties:
+            configRevealPath: {type: string, description: 'Where the configuration carrying the private key is fetched. A fact about the resource, not a promise of availability: the node still has to hold a gateway identity.'}
+    VPNPeerCreateEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNPeerCreate'}}
+    VPNPeerCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, agentId]
+      description: Unknown fields are rejected rather than ignored, and the body is capped at 1 MiB.
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255, description: Control characters are rejected, so a name cannot inject a second line into a log entry or a rendered configuration.}
+        description: {type: string, maxLength: 255}
+        agentId: {type: string, minLength: 1, description: An enabled egress agent owned by the caller. An administrator may name any agent.}
+        allowedIps: {type: array, items: {type: string}, description: 'IPv4 CIDRs. An element containing a comma is rejected rather than split, so one entry can never silently become two rules.'}
+        allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}, description: Omitted or empty permits every port.}
+        allowPrivateTargets: {type: boolean, default: false}
+        icmpEnabled: {type: boolean, default: false, description: 'Requires server.vpn.icmp_enabled on the node and an egress agent that is connected and has negotiated stream_icmp_echo.v1; otherwise refused with vpn_agent_capability_missing. A cluster node that cannot see the agent connection still issues the peer and records icmpCapability: unverified in the audit entry.'}
+        maxConcurrentFlows: {type: integer, minimum: 0, default: 0}
+        packetRateLimit: {type: integer, minimum: 0, default: 0}
+        expiresAt: {type: string, format: date-time, nullable: true, description: Must be in the future}
+    VPNPeerPatchRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: A partial update. Absent fields keep their stored value; `allowedIps` and `allowedPorts` are set by presence, because an empty array is a value with a meaning of its own.
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        description: {type: string, maxLength: 255}
+        agentId: {type: string, minLength: 1, description: Re-authorised exactly like a create, so a patch cannot move a peer onto somebody else's egress agent.}
+        allowedIps: {type: array, items: {type: string}}
+        allowedPorts: {type: array, items: {type: integer, minimum: 1, maximum: 65535}}
+        allowPrivateTargets: {type: boolean}
+        icmpEnabled: {type: boolean, description: 'Setting true is re-checked against the egress agent capability and refused with vpn_agent_capability_missing when it is missing'}
+        maxConcurrentFlows: {type: integer, minimum: 0}
+        packetRateLimit: {type: integer, minimum: 0}
+        expiresAt: {type: string, format: date-time, nullable: true, description: 'null clears the expiry. An instant must be in the future, which is the one clock rule that does not apply to the rest of a patch.'}
+        status: {type: string, enum: [active, disabled], description: 'revoked is refused here; revocation has its own verb and its own audit action.'}
+    VPNConfigRevealRequest:
+      type: object
+      additionalProperties: false
+      required: [acknowledgeRisk]
+      properties:
+        acknowledgeRisk: {type: boolean, enum: [true], description: 'Must be true. Unknown fields are rejected, so a misspelled acknowledgement cannot pass for a confirmed one.'}
+    VPNConfigReveal:
+      type: object
+      additionalProperties: false
+      required: [id, name, vpnIp, format, config]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        vpnIp: {type: string}
+        format: {type: string, enum: [wg-quick]}
+        config: {type: string, description: 'The complete configuration file, private key included. Served with Cache-Control: no-store, never written to the idempotency store, and never placed in a log line, a metric label or an audit detail.'}
+    VPNConfigRevealEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNConfigReveal'}}
+    VPNFlow:
+      type: object
+      additionalProperties: false
+      required: [id, protocol, target, port, startedAt, bytesSent, bytesReceived]
+      description: |
+        One active flow of one peer, as the gateway holds it in memory. The
+        identifier is unique inside one process lifetime and is not a database id:
+        flows are never persisted, so an identifier that survived a restart would
+        point at nothing.
+      properties:
+        id: {type: string}
+        protocol: {type: string, enum: [tcp, udp, icmp-echo]}
+        target: {type: string, description: The internal address the flow goes to}
+        port: {type: integer, minimum: 0, maximum: 65535, description: 'Zero for icmp-echo, which has no port'}
+        startedAt: {type: string, format: date-time}
+        bytesSent: {type: integer, minimum: 0, description: Tunnel payload the peer sent towards the internal service}
+        bytesReceived: {type: integer, minimum: 0, description: Tunnel payload the internal service sent back}
+    VPNFlowList:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/VPNFlow'}}
+    VPNFlowListEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNFlowList'}}
+    VPNNodeStatus:
+      type: object
+      additionalProperties: false
+      required: [nodeId, enabled, icmpCapable]
+      description: |
+        One gateway node. The counters are absent rather than zero when the node
+        cannot know them - no gateway in this build, or no subnet leased yet -
+        because zero allocated reads as "the pool is empty" while an omitted
+        counter reads as "unknown", which is the fact.
+      properties:
+        nodeId: {type: string}
+        enabled: {type: boolean, description: Whether server.vpn is enabled on that node}
+        listen: {type: string, description: 'The configured UDP endpoint. Absent while the section is disabled, because nothing is bound.'}
+        endpointHost: {type: string, description: The host written into the peer configurations this node issues}
+        subnet: {type: string, description: 'The subnet this node leased. Absent until the first peer is issued, which is when a subnet is claimed.'}
+        allocated: {type: integer, minimum: 0, description: Addresses handed out of that subnet}
+        capacity: {type: integer, minimum: 0, description: 'Addresses the subnet can hold: every address in the prefix except the network address, the broadcast address and the one the node reserves for its own tunnel interface'}
+        peers: {type: integer, minimum: 0, description: 'Peers this node issued that are not revoked. A revoked row keeps its address forever, so it is not part of a count an operator reads as live.'}
+        icmpCapable: {type: boolean, description: 'server.vpn.icmp_enabled on a gateway that is actually serving. A switch alone cannot promise an echo reply.'}
+    VPNNodeList:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/VPNNodeStatus'}}
+    VPNNodeListEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties: {data: {$ref: '#/components/schemas/VPNNodeList'}}

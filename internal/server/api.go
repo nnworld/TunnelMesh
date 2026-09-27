@@ -56,6 +56,24 @@ type API struct {
 	localNodeID         string
 	downloads           config.DownloadsConfig
 	identity            *IdentityServices
+	// vpnPeerService is nil until the runtime installs it with SetVPN, because
+	// assembling it needs the loaded server configuration and this node's
+	// identity, neither of which NewAPI is given. The handlers answer 503 while
+	// it is nil, which distinguishes "not wired" from "no such endpoint".
+	vpnPeerService *VPNPeerService
+	// vpnDataPlane is the running gateway, and it is nil in every binary that is
+	// not built with -tags vpn or on a node with server.vpn disabled. Holding the
+	// interface rather than the concrete type is what keeps the untagged build
+	// from reaching a field only a tagged build has. The endpoints that need a
+	// live data plane answer 501 while it is nil instead of an empty list that
+	// would read as "nothing is happening".
+	vpnDataPlane VPNDataPlane
+	// vpnConfig and vpnNodeID are the node view the gateway status endpoint reports
+	// when no data plane is installed, which is every untagged binary and every node
+	// with server.vpn disabled. SetVPN records them, because that is the only place
+	// the loaded server configuration reaches the API.
+	vpnConfig config.VPNConfig
+	vpnNodeID string
 	// trustedProxyList decides whether X-Forwarded-For is believed. It is empty by
 	// default, which means the direct peer address is always used.
 	trustedProxyList []string
@@ -361,6 +379,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleDashboard(w, r, p, parts[1:])
 	case "traces":
 		a.handleTraces(w, r, p, parts[1:])
+	case "vpn-peers":
+		a.handleVPNPeers(w, r, p, parts[1:])
+	case "vpn-nodes":
+		a.handleVPNNodes(w, r, p, parts[1:])
 	case "ssh-sessions":
 		if len(parts) == 1 {
 			if r.Method == http.MethodGet {

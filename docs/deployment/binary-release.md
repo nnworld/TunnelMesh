@@ -51,7 +51,7 @@ tunnelmesh-vMAJOR.MINOR.PATCH-PLATFORM.ARCHIVE
 - `SHA256SUMS`；
 - `manifest.json`。
 
-`manifest.json` 记录版本、主版本、Commit、UTC 构建时间、Schema 版本、三个二进制、六个平台和资产清单。其中 `schemaVersion` 不是打包脚本自己的常量，而是构建时从 `internal/storage/db.go` 的 `SchemaVersion` 读取，因此永远与二进制内的实际 Schema 版本一致；当前值为 13。
+`manifest.json` 记录版本、主版本、Commit、UTC 构建时间、Schema 版本、三个二进制、六个平台和资产清单。其中 `schemaVersion` 不是打包脚本自己的常量，而是构建时从 `internal/storage/db.go` 的 `SchemaVersion` 读取，因此永远与二进制内的实际 Schema 版本一致；当前值为 15。
 
 在 Release 目录内校验：
 

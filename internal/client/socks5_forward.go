@@ -112,6 +112,17 @@ func (f *SOCKS5Forward) Start(ctx context.Context) error {
 	return nil
 }
 
+// Err reports the accept-loop failure once the listener stops for a reason other
+// than a clean Close. TCPListener already publishes it, so this only forwards.
+func (f *SOCKS5Forward) Err() <-chan error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ln == nil {
+		return nil
+	}
+	return f.ln.Err()
+}
+
 func (f *SOCKS5Forward) Addr() net.Addr {
 	f.mu.Lock()
 	defer f.mu.Unlock()

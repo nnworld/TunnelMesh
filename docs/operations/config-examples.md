@@ -39,6 +39,8 @@ server:
     max_message_bytes: 65536
   stream:
     max_concurrent_opens: 256
+    # 存量水位：同一 Agent 此刻保有的活跃流上限，0 = 不限。
+    max_active_per_agent: 1024
     max_pending_opens: 1024
     initial_window: 262144
     window_update_threshold: 131072
@@ -50,6 +52,62 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
+  # 管理监听器的请求边界：一个端口同时承载后台页面、/api/v1 与已升级的
+  # WebSocket，所以这里只约束请求头、请求体与 keep-alive 空闲，绝不设连接级
+  # read/write 超时。取值依据与和 Nginx 的关系见
+  # configuration.md「管理入口的超时、上限与保留策略」。
+  http:
+    read_header_timeout: 10s
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    body_timeout: 30s
+    # 0 = 不限制。Nginx 在前时容量由 limit_conn 决定；Server 直接暴露公网时
+    # 必须设置与进程容量匹配的正数，超限新连接立即关闭而不排队。
+    max_connections: 0
+  agents:
+    # 单个 Agent 身份在本节点可保有的物理 WebSocket 数量。
+    max_connections_per_agent: 64
+  metrics:
+    # 空 = /metrics 匿名可抓取（与历史行为一致）。二选一：反向代理按来源网段
+    # 放行，或用 TUNNELMESH_SERVER_METRICS_TOKEN 注入不少于 16 字符的 Bearer。
+    # 该字段不会出现在 config dump 输出里。
+    token: ""
+  audit:
+    # 0 = 永久保留。审计日志是证据，删除必须是显式决策；正数才会启动清理器，
+    # 每小时按 1000 行一批删除，避免首次清理历史大表时长时间锁表。
+    retention_days: 0
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 
 security:
   allowed_hosts:
@@ -107,6 +165,62 @@ server:
     endpoint: ""
     # 由 TUNNELMESH_SERVER_RELAY_NODE_TOKEN 注入。
     node_token: ""
+  # 管理监听器的请求边界：一个端口同时承载后台页面、/api/v1 与已升级的
+  # WebSocket，所以这里只约束请求头、请求体与 keep-alive 空闲，绝不设连接级
+  # read/write 超时。取值依据与和 Nginx 的关系见
+  # configuration.md「管理入口的超时、上限与保留策略」。
+  http:
+    read_header_timeout: 10s
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    body_timeout: 30s
+    # 0 = 不限制。Nginx 在前时容量由 limit_conn 决定；Server 直接暴露公网时
+    # 必须设置与进程容量匹配的正数，超限新连接立即关闭而不排队。
+    max_connections: 0
+  agents:
+    # 单个 Agent 身份在本节点可保有的物理 WebSocket 数量。
+    max_connections_per_agent: 64
+  metrics:
+    # 空 = /metrics 匿名可抓取（与历史行为一致）。二选一：反向代理按来源网段
+    # 放行，或用 TUNNELMESH_SERVER_METRICS_TOKEN 注入不少于 16 字符的 Bearer。
+    # 该字段不会出现在 config dump 输出里。
+    token: ""
+  audit:
+    # 0 = 永久保留。审计日志是证据，删除必须是显式决策；正数才会启动清理器，
+    # 每小时按 1000 行一批删除，避免首次清理历史大表时长时间锁表。
+    retention_days: 0
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 ```
 
 ## Server：集群 MySQL mTLS Relay
@@ -179,6 +293,8 @@ server:
   # MySQL 集群可用较长正向缓存；共享 revision 保证权限变更快速失效。
   stream:
     max_concurrent_opens: 256
+    # 存量水位：同一 Agent 此刻保有的活跃流上限，0 = 不限。
+    max_active_per_agent: 1024
     max_pending_opens: 1024
     initial_window: 262144
     window_update_threshold: 131072
@@ -190,6 +306,62 @@ server:
     revision_poll_interval: 2s
     max_stale_on_poll_error: 5s
     max_entries: 100000
+  # 管理监听器的请求边界：一个端口同时承载后台页面、/api/v1 与已升级的
+  # WebSocket，所以这里只约束请求头、请求体与 keep-alive 空闲，绝不设连接级
+  # read/write 超时。取值依据与和 Nginx 的关系见
+  # configuration.md「管理入口的超时、上限与保留策略」。
+  http:
+    read_header_timeout: 10s
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    body_timeout: 30s
+    # 0 = 不限制。Nginx 在前时容量由 limit_conn 决定；Server 直接暴露公网时
+    # 必须设置与进程容量匹配的正数，超限新连接立即关闭而不排队。
+    max_connections: 0
+  agents:
+    # 单个 Agent 身份在本节点可保有的物理 WebSocket 数量。
+    max_connections_per_agent: 64
+  metrics:
+    # 空 = /metrics 匿名可抓取（与历史行为一致）。二选一：反向代理按来源网段
+    # 放行，或用 TUNNELMESH_SERVER_METRICS_TOKEN 注入不少于 16 字符的 Bearer。
+    # 该字段不会出现在 config dump 输出里。
+    token: ""
+  audit:
+    # 0 = 永久保留。审计日志是证据，删除必须是显式决策；正数才会启动清理器，
+    # 每小时按 1000 行一批删除，避免首次清理历史大表时长时间锁表。
+    retention_days: 0
+  # 内嵌 VPN 网关（WireGuard）。数据面在 -tags vpn 构建里：带 tag 且 enabled: true
+  # 时进程真的监听 listen 指定的公网 UDP 端口并承载隧道；不带 tag 时只有管理面
+  # （签发、列出、修改、轮换、吊销、审计），config:reveal 返回 409 vpn_node_disabled。
+  # 不带 tag 却配 enabled: true 会启动失败并提示 rebuild with -tags vpn，不会静默不工作。
+  # 全部键的取值范围见 configuration.md 的「内嵌 VPN 网关」一节，
+  # 放行、密钥注入与 IP 池规划见 deployment/vpn-gateway.md。
+  vpn:
+    enabled: false
+    # 独立的公网 UDP 端口，不经反向代理，需在防火墙单独放行并单独限流。
+    listen: 0.0.0.0:51820
+    # 下发给用户的 Endpoint 主机名，只写主机名不写端口，端口取自 listen。
+    endpoint_host: gw-1.mesh.example.com
+    # 集群里每个节点必须配置相同的 ip_pool 与 node_subnet_size，
+    # 节点各自从池中租约一个 /24 子网（vpn_ip_leases，epoch fencing）。
+    ip_pool: 10.64.0.0/16
+    node_subnet_size: 24
+    # 1500 - WireGuard 的 72 字节开销。
+    mtu: 1420
+    # 下面三个 0 表示不限。
+    max_peers: 0
+    max_flows_per_peer: 128
+    max_flows_total: 0
+    packet_rate_per_peer: 0
+    connect_timeout: 10s
+    idle_timeout: 120s
+    shutdown_timeout: 15s
+    # 节点级上限而非承诺：peer 还需单独开启，且出口 Agent 要协商到该能力，
+    # 否则签发返回 409 vpn_agent_capability_missing。
+    icmp_enabled: true
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
+    # 节点自身的 WireGuard 私钥不是配置项，只由 TUNNELMESH_VPN_NODE_PRIVATE_KEY 注入。
 
 security:
   # 管理 API 和 WebSocket Host 白名单；动态 HTTP 路由由路由表匹配。
@@ -370,10 +542,20 @@ agent:
     max: 1
   streams:
     max_concurrent_dials: 32
+    # Agent 自己的活跃流水位（纵深防御第二层），0 = 不限。
+    max_active: 1024
     max_pending_dials: 128
     connect_timeout: 5s
     open_timeout: 8s
     inbound_buffer_bytes: 262144
+    # VPN 网关的 ICMP echo 出口。开启前主机必须先执行一次：
+    #   sysctl -w net.ipv4.ping_group_range='0 2147483647'
+    # 否则 socket 打不开、能力不通告，Server 会拒签 ICMP peer，
+    # 但 Agent 仍会继续服务 TCP/UDP/HTTP 隧道。
+    icmp_enabled: false
+    icmp_bind_address: 0.0.0.0
+    icmp_timeout: 5s
+    icmp_max_concurrent: 64
   # token 由 TUNNELMESH_AGENT_TOKEN 注入。
   metadata:
     - name: device_id

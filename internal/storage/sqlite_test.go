@@ -829,9 +829,10 @@ func TestSQLiteFreshSchemaMatchesIncrementalIdentityChain(t *testing.T) {
 // connection_epoch on both lease tables. On SQLite the step is structurally
 // inert, because a SQLite INTEGER already stores a signed 64-bit value and the
 // driver cannot alter a column type in place, so what has to hold here is that
-// the chain advances from 14 to 15, that reopening the database is a no-op, and
-// that a lease written with a token above the 32-bit range still round-trips
-// through the epoch-fenced write path afterwards.
+// the adjacent-only chain advances from 14 to the current tip without a missing
+// v0014_to_v0015 step, that reopening the database is a no-op, and that a lease
+// written with a token above the 32-bit range still round-trips through the
+// epoch-fenced write path afterwards.
 func TestSQLiteV14ToV15LeaseEpochMigration(t *testing.T) {
 	dsn := "file:" + filepath.Join(t.TempDir(), "v14-to-v15.sqlite")
 	raw, err := sql.Open("sqlite", dsn)
@@ -843,7 +844,9 @@ func TestSQLiteV14ToV15LeaseEpochMigration(t *testing.T) {
 		t.Fatalf("create base schema: %v", err)
 	}
 	// The full DDL creates schema_meta but leaves it empty, so seed the source
-	// version to exercise exactly one adjacent step.
+	// version to start the chain below the tip. auto-init always migrates to
+	// SchemaVersion, so this exercises v0014_to_v0015 together with every later
+	// adjacent step; a gap in the chain fails with "missing adjacent migration".
 	for _, statement := range []string{
 		`DELETE FROM schema_meta WHERE id=1`,
 		`INSERT INTO schema_meta(id,version) VALUES(1,14)`,
@@ -861,8 +864,8 @@ func TestSQLiteV14ToV15LeaseEpochMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate v14 to v15: %v", err)
 	}
-	if version, err := db.SchemaVersion(context.Background()); err != nil || version != 15 {
-		t.Fatalf("schema version = %d, err = %v, want 15", version, err)
+	if version, err := db.SchemaVersion(context.Background()); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d, err = %v, want %d", version, err, SchemaVersion)
 	}
 
 	// The fencing token the Server actually generates spans the full int64 range.

@@ -61,6 +61,12 @@ func TestNormalizeErrorClassIsBounded(t *testing.T) {
 		{name: "authorization", err: errors.New("permission denied"), want: "authorization"},
 		{name: "reset", err: errors.New("connection reset by peer"), want: "reset"},
 		{name: "target", err: errors.New("connection refused"), want: "target_unavailable"},
+		// Admission refusals are a distinct class: an operator raising a ceiling is a
+		// different answer from an operator chasing a bug, and both were landing in
+		// "internal".
+		{name: "connection capacity", err: errors.New("session: agent connection capacity reached: agent \"a-1\" holds 64 connections on this node"), want: "capacity"},
+		{name: "stream capacity", err: errors.New("agent relay: active stream capacity reached for agent \"a-1\""), want: "capacity"},
+		{name: "dial queue full", err: errors.New("agent: dial queue full"), want: "capacity"},
 		{name: "internal", err: errors.New("a unique user payload 123"), want: "internal"},
 	}
 	for _, tc := range cases {

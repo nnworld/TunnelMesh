@@ -1,7 +1,95 @@
 export default {
   common: { language: '语言', logout: '退出登录', account: '个人设置', loading: '加载中', loadFailed: '数据加载失败', retry: '重试', empty: '暂无数据', save: '保存', yes: '是', no: '否' },
   errors: { usernameInvalid: '用户名只能包含 3-64 位字母、数字、点、下划线或连字符', usernameConflict: '用户名已存在', passwordPolicy: '密码不符合安全策略', currentPassword: '当前密码不正确', adminProtected: '不能对管理员账号执行该操作', accountDeleted: '账号已删除', accountStatus: '账号状态筛选无效', idempotencyConflict: '该请求标识已被其它操作占用，请重新提交', idempotencyInProgress: '同一请求正在处理中，请稍后查看结果', secretStorageUnavailable: '服务端未配置密钥加密主键，无法保存两步验证密钥或提供商凭据', unknown: '操作失败，请重试' },
-  navigation: { dashboard: '概览', agents: '代理节点', clients: '客户端', routes: '托管路由', tunnels: '隧道', tokens: '访问令牌', servers: 'Server 节点', audits: '审计日志', users: '子账号', sso: '单点登录', security: '安全设置', downloads: '发行管理', remoteServers: '远程服务器', credentials: '密钥管理' },
+  navigation: { dashboard: '概览', agents: '代理节点', clients: '客户端', routes: '托管路由', tunnels: '隧道', tokens: '访问令牌', servers: 'Server 节点', audits: '审计日志', users: '子账号', sso: '单点登录', security: '安全设置', downloads: '发行管理', remoteServers: '远程服务器', credentials: '密钥管理', vpn: 'VPN 网关' },
+  vpn: {
+    title: 'VPN 网关',
+    description: '为原生 WireGuard 客户端签发 peer：分配 VPN 地址、限定可访问的网段与端口，出口仍由 Agent 承担。',
+    refresh: '刷新', keyword: '搜索名称或备注', status: '状态', all: '全部', active: '启用中', disabled: '已停用', revoked: '已吊销',
+    name: '名称', vpnIp: 'VPN 地址', agent: '出口 Agent', allowedIps: '授权网段', allowedPorts: '授权端口',
+    icmp: 'ICMP', expiresAt: '到期时间', createdAt: '创建时间', updatedAt: '更新时间', actions: '操作', never: '永不到期',
+    create: '签发 peer', edit: '编辑 peer', cancel: '取消', save: '保存', loadMore: '加载更多', empty: '暂无 VPN peer',
+    loadFailed: 'VPN peer 加载失败', operationFailed: '操作失败，请重试', created: 'peer 已签发', updated: 'peer 已更新',
+    detail: '详情', detailTitle: 'peer 详情', usageOpen: '使用说明', usageTitle: '客户端配置与使用说明', usageClose: '关闭并清除私钥',
+    rotate: '轮换密钥', rotateTitle: '轮换密钥', rotateConfirm: '轮换后旧配置立即失效，用户必须重新下载配置。是否继续？', rotated: '密钥已轮换，请重新下发配置',
+    revoke: '吊销', revokeTitle: '吊销 peer', revokeConfirm: '吊销是终态：该 peer 的公钥与地址不会被复用，且无法恢复。是否继续？', revokedMessage: 'peer 已吊销',
+    poolTitle: 'IP 池概览', poolNode: '节点', poolSubnet: '本节点子网', poolAllocated: '已分配', poolCapacity: '可分配', poolPeers: 'peer 数',
+    poolEnabled: '已启用', poolDisabled: '未启用', poolListen: '监听地址', poolEndpoint: 'Endpoint', poolIcmp: 'ICMP 能力',
+    poolUnavailable: '网关状态读取失败：本节点未启用 VPN 或状态查询出错，IP 池水位暂时未知；可在 Grafana 的 VPN Gateway Row 查看，或稍后重试。',
+    flowsOpen: '活跃流', flowsTitle: 'peer 活跃流', flowsClose: '关闭', flowsRefresh: '刷新',
+    flowsLoadFailed: '活跃流加载失败',
+    flowsEmpty: '当前没有活跃流：peer 未连接，或连接已结束并被空闲回收。',
+    flows: {
+      protocol: '协议', target: '目标', port: '端口', startedAt: '开始时间',
+      bytesSent: '已发送字节', bytesReceived: '已接收字节'
+    },
+    form: {
+      name: '名称', nameHelp: '1-255 个字符，不含控制字符',
+      agent: '出口 Agent', searchAgents: '搜索 Agent',
+      allowedIps: '授权目标网段', allowedIpsHelp: '逗号分隔的 IPv4 CIDR，例如 10.0.0.0/8, 192.168.0.0/16；留空表示没有可达目标；裸 IP 按 /32 处理。',
+      allowedPorts: '授权端口', allowedPortsHelp: '逗号分隔的整数端口，例如 443, 8443；留空表示不限端口；不支持区间语法。',
+      allowPrivateTargets: '允许访问内网目标', allowPrivateTargetsHelp: '默认关闭：私网、回环与链路本地地址会被逐包策略拒绝。',
+      icmpEnabled: '允许 ICMP echo', icmpEnabledHelp: '需要出口 Agent 在线并已协商到该能力（agent.streams.icmp_enabled 与主机 ping_group_range）；否则签发返回 vpn_agent_capability_missing。集群中若请求落在没有该 Agent 连接的节点，签发仍会成功，但审计详情标记 icmpCapability: unverified。',
+      maxConcurrentFlows: '并发流上限', packetRateLimit: '包速率上限（包/秒）', limitHelp: '0 表示不限。',
+      expiresAt: '到期时间', expiresAtHelp: '留空表示永不到期；填写时必须晚于当前时间。',
+      description: '备注',
+      nameInvalid: '请输入 1-255 个字符且不含控制字符的名称',
+      agentRequired: '请选择出口 Agent',
+      cidrInvalid: '网段格式非法：只接受逗号分隔的 IPv4 CIDR',
+      portInvalid: '端口非法：只接受 1-65535 的整数',
+      limitInvalid: '限额必须是大于等于 0 的整数',
+      expiryInvalid: '到期时间必须晚于当前时间',
+      descriptionInvalid: '备注不能超过 255 个字符'
+    },
+    reveal: {
+      title: '客户端配置', show: '显示私钥并生成配置', confirmLabel: '输入 REVEAL 以确认', confirmPlaceholder: 'REVEAL',
+      acknowledge: '我已理解：私钥将一次性显示在当前浏览器内存中', acknowledgeHelp: '离开页面后必须重新 reveal 并再次确认风险。',
+      submit: '生成配置', copy: '复制', copied: '已复制', copyFailed: '复制失败，请手动选中后复制', download: '下载 .conf',
+      warning: '该配置含 peer 私钥，等同密码；请只通过受信任的渠道交给使用者。',
+      oneTime: '私钥只在本次响应中出现，服务端不会再次明文返回；关闭抽屉后立即从内存清除。',
+      failed: '生成配置失败'
+    },
+    usage: {
+      endpoint: 'Endpoint', publicKey: '网关公钥', peerPublicKey: 'peer 公钥', mtu: 'MTU',
+      mtuHelp: '默认 1420 = 1500 减去 WireGuard 的 72 字节封装开销；客户端不需要额外改路由。',
+      clientRoutes: '客户端路由由 AllowedIPs 决定，导入配置后无需手工添加路由；需要全隧道时填 0.0.0.0/0。',
+      platformsTitle: '各平台导入方式',
+      platforms: {
+        windows: 'Windows：安装 WireGuard for Windows，Add Tunnel 里选择 Import tunnel from file 导入下载的 .conf。',
+        macos: 'macOS：安装 WireGuard 图形客户端导入 .conf，或用 brew 安装 wireguard-tools 后执行 sudo wg-quick up ./peer.conf。',
+        ios: 'iOS：App Store 安装 WireGuard，右上角加号选择 Import from file or archive。',
+        android: 'Android：Play Store 安装 WireGuard，右下角加号选择 Import from file or archive。',
+        linux: 'Linux：把文件放到 /etc/wireguard 后执行 sudo wg-quick up tunnelmesh，开机自启用 systemd 的 wg-quick 单元。'
+      },
+      boundariesTitle: '能力边界（以下不支持项不是故障）',
+      boundaries: {
+        sourceAddress: '源地址不保留：内网侧看到的源地址是 Agent 宿主机地址，不是你的 VPN 地址，因此无法在内网按 VPN 用户做 ACL 或日志归因。',
+        icmpOnly: '只支持 ICMP echo：traceroute 的 TTL 超时、目的不可达、需要分片等其它 ICMP 类型不支持（非特权 ping socket 只暴露 echo）。',
+        protocols: '只支持 TCP、UDP 与 ICMP echo 三种 IP 协议：GRE、SCTP、IPsec 嵌套与组播一律丢弃并计数。',
+        fragmentation: '不支持 IP 分片：分片包被丢弃并计数；TCP 在 Server 侧终结、两条腿独立协商 MSS，不存在 PMTUD 黑洞；UDP 数据报超过路径 MTU 时丢弃。',
+        dataPlaneErrors: '数据面没有错误通道：策略拒绝不回传错误码，失败只表现为连不通或 ping 不通。',
+        noL2: '不转发 L2 以太网帧，也没有 P2P NAT 穿透：所有流量都经 Server 网关与出口 Agent。'
+      },
+      troubleshootingTitle: '排障指引',
+      troubleshooting: '连不通时先查服务端指标与审计，而不是客户端日志：数据面拒绝只表现为超时。',
+      metrics: '指标：tunnelmesh_bytes_total 的 component=vpn、direction 与 protocol 标签；tunnelmesh_streams_total 的 protocol、result 与 error_class 标签（丢包记为 result=rejected）；tunnelmesh_registry_lease_total 的 operation=vpn_subnet_renew。',
+      auditEvent: '审计事件：vpn_packet_denied（含 reason 与目标网段）、vpn_peer_issued、vpn_peer_updated、vpn_peer_rotated、vpn_peer_revoked、vpn_peer_config_revealed。',
+      flowsHint: '活跃流在列表行的「活跃流」里查看：只显示本网关当前正在转发的连接，历史流量请查 Grafana 的 VPN Gateway Row。'
+    },
+    errors: {
+      peerInvalid: '字段校验失败，请检查名称、网段、端口与限额',
+      ipPoolInvalid: '服务端 server.vpn.ip_pool 或 node_subnet_size 配置非法，请联系管理员',
+      peerNotFound: 'peer 不存在或你无权查看',
+      peerConflict: 'peer 冲突：名称、地址或公钥已被占用，或该 peer 已吊销',
+      agentCapabilityMissing: '出口 Agent 不在线或未协商到 ICMP 能力，也可能是本节点关闭了 server.vpn.icmp_enabled；请确认后重试，或关闭「允许 ICMP echo」再签发',
+      ipPoolExhausted: '本节点子网地址已分配完，请联系管理员扩大 server.vpn.ip_pool',
+      nodeDisabled: '该节点未启用 VPN（server.vpn.enabled 为 false）或还没有网关身份，因此无法在本节点生成客户端配置；请在启用了 VPN 的节点上操作',
+      secretUnavailable: '服务端未配置 TUNNELMESH_TOKEN_ENCRYPTION_KEY，无法密封或读取私钥',
+      capacityExhausted: '已达到 server.vpn.max_peers 上限，请先吊销闲置 peer 或提高上限',
+      notImplemented: '本节点提供不了这个数据：该 peer 由其它 Server 节点服务，或本网关未运行；请到服务该 peer 的节点上查看',
+      unknown: '操作失败，请重试'
+    }
+  },
   credentials: {
     title: '密钥管理',
     description: '管理远程服务器使用的 SSH 认证方式：公钥（可选保存私钥用于自动认证）或密码。',
@@ -88,8 +176,8 @@ export default {
     nameRequired: '请输入文件名', deleteTitle: '删除文件', deleteConfirm: '即将删除 {name}。该操作不可撤销，是否继续？'
   },
   shell: { console: '网络控制台', collapse: '收起导航', expand: '展开导航' },
-  servers: { title: 'Server 节点管理', description: '查看集群 Server 节点状态、负载与生命周期', refresh: '刷新', selfRegister: 'Server 会在完成节点身份初始化后自动注册；禁用和删除为逻辑操作，可重新恢复。', empty: '暂无 Server 节点', name: '名称', id: '节点 ID', address: 'Relay 地址', epoch: 'Epoch', statusLabel: '状态', activeConnections: '活跃连接', activeStreams: '活跃流', healthScore: '健康分', lastSeen: '最后心跳', leaseExpires: '租约到期', actions: '操作', detail: '详情', detailTitle: 'Server 节点详情', enabled: '是否启用', deletedAt: '删除时间', createdAt: '创建时间', updatedAt: '更新时间', enable: '启用', disable: '禁用', delete: '删除', restore: '恢复', loadMore: '加载更多', enabledMessage: 'Server 节点已启用', disabledMessage: 'Server 节点已禁用', deletedMessage: 'Server 节点已逻辑删除', restoredMessage: 'Server 节点已恢复', deleteTitle: '删除 Server 节点', deleteConfirm: '删除会禁用该节点，但保留记录并允许恢复。是否继续？', operationFailed: '操作失败', status: { online: '在线', offline: '离线', disabled: '已禁用', deleted: '已删除' } },
-  clients: { title: '客户端运行观测', description: '查看客户端实例、metadata 和物理 WebSocket 连接', refresh: '刷新', reset: '重置', query: '查询', owner: 'Owner', token: 'Token', serverNode: 'Server 节点', status: '状态', metadataState: '元数据时效', agent: 'Agent', keyword: '关键词', onlineClients: '在线客户端', activeConnections: '活跃 WS 连接', activeStreams: '活跃流', metadataUnavailable: 'metadata 未上报', metadataStale: 'metadata 已过期', empty: '暂无客户端', instanceId: '客户端实例 ID', version: '版本', platform: '平台', hostname: '主机名', serverNodes: 'Server 节点', lastSeen: '最近心跳', actions: '操作', detail: '详情', detailTitle: '客户端详情', id: '资源 ID', commit: 'Commit', processStartAt: '进程启动时间', tokens: 'Token', agents: 'Agent', metadata: 'Metadata', metadataName: '名称', metadataValue: '值', metadataEmpty: '暂无 metadata', listeners: '本地监听入口', listenersEmpty: '暂无监听入口', protocol: '协议', listenAddress: '监听地址', enabled: '是否启用', connections: 'WS 连接', connectionsEmpty: '暂无连接', connectionsLoadFailed: '连接加载失败', connectionId: '连接 ID', connectionEpoch: '连接 Epoch', healthScore: '健康分', acquiredAt: '获取时间', lastHeartbeatAt: '最后心跳', expiresAt: '租约到期', leaseState: '租约状态', leaseStateLabel: { live: '活跃', expired: '已过期' }, local: '本节点', closeConnection: '关闭连接', closeTitle: '关闭客户端连接', closeConfirm: '关闭只影响这一条物理 WebSocket，客户端连接池可能自动重连。', cancel: '取消', closeFailed: '连接关闭失败', closed: '连接已关闭', remoteNodeUnavailable: '远端 Server 节点不可用，租约已保留，请稍后重试。', staleEpoch: '连接 Epoch 已过期，请刷新后使用新 Epoch。', loadMore: '加载更多', statusLabel: { online: '在线', offline: '离线' }, metadataStateLabel: { fresh: 'metadata 正常', expired: 'metadata 已过期', unavailable: 'metadata 未上报' } },
+  servers: { title: 'Server 节点管理', description: '查看集群 Server 节点状态、负载与生命周期', refresh: '刷新', selfRegister: 'Server 会在完成节点身份初始化后自动注册；禁用和删除为逻辑操作，可重新恢复。', empty: '暂无 Server 节点', name: '名称', id: '节点 ID', address: 'Relay 地址', epoch: 'Epoch', statusLabel: '状态', activeConnections: '活跃连接', activeStreams: '活跃流', healthScore: '健康分', lastSeen: '最后心跳', leaseExpires: '租约到期', actions: '操作', detail: '详情', detailTitle: 'Server 节点详情', enabled: '是否启用', deletedAt: '删除时间', createdAt: '创建时间', updatedAt: '更新时间', enable: '启用', disable: '禁用', delete: '删除', restore: '恢复', loadMore: '加载更多', enabledMessage: 'Server 节点已启用', disabledMessage: 'Server 节点已禁用', deletedMessage: 'Server 节点已逻辑删除', restoredMessage: 'Server 节点已恢复', deleteTitle: '删除 Server 节点', deleteConfirm: '删除会禁用该节点，但保留记录并允许恢复。是否继续？', operationFailed: '操作失败', status: { online: '在线', offline: '离线', disabled: '已禁用', deleted: '已删除' }, vpn: { title: 'VPN 网关状态', description: '网关运行时状态来自 vpn-nodes 接口；提供网关的节点会显示子网、地址分配水位与 ICMP 能力。', node: '节点', listen: '监听地址', endpoint: 'Endpoint', subnet: '子网', allocated: '已分配', capacity: '可分配', peers: 'peer 数', icmp: 'ICMP 能力', enabled: '已启用', disabled: '未启用', empty: '当前没有节点提供 VPN 网关。', unavailable: '网关运行时状态读不到：本节点未提供 VPN 网关，或状态查询失败；子网水位也可以在 Grafana 的 VPN Gateway Row 查看。', loadFailed: '网关状态加载失败' } },
+  clients: { title: '客户端运行观测', description: '查看客户端实例、metadata 和物理 WebSocket 连接；列表按最近心跳倒序，最新上报的客户端在第一页', refresh: '刷新', reset: '重置', query: '查询', owner: 'Owner', token: 'Token', serverNode: 'Server 节点', status: '状态', metadataState: '元数据时效', agent: 'Agent', keyword: '关键词', onlineClients: '在线客户端', activeConnections: '活跃 WS 连接', activeStreams: '活跃流', metadataUnavailable: 'metadata 未上报', metadataStale: 'metadata 已过期', empty: '暂无客户端', instanceId: '客户端实例 ID', version: '版本', platform: '平台', hostname: '主机名', serverNodes: 'Server 节点', lastSeen: '最近心跳', actions: '操作', detail: '详情', detailTitle: '客户端详情', id: '资源 ID', commit: 'Commit', processStartAt: '进程启动时间', tokens: 'Token', agents: 'Agent', metadata: 'Metadata', metadataName: '名称', metadataValue: '值', metadataEmpty: '暂无 metadata', listeners: '本地监听入口', listenersEmpty: '暂无监听入口', protocol: '协议', listenAddress: '监听地址', enabled: '是否启用', connections: 'WS 连接', connectionsEmpty: '暂无连接', connectionsLoadFailed: '连接加载失败', connectionId: '连接 ID', connectionEpoch: '连接 Epoch', healthScore: '健康分', acquiredAt: '获取时间', lastHeartbeatAt: '最后心跳', expiresAt: '租约到期', leaseState: '租约状态', leaseStateLabel: { live: '活跃', expired: '已过期' }, local: '本节点', closeConnection: '关闭连接', closeTitle: '关闭客户端连接', closeConfirm: '关闭只影响这一条物理 WebSocket，客户端连接池可能自动重连。', cancel: '取消', closeFailed: '连接关闭失败', closed: '连接已关闭', remoteNodeUnavailable: '远端 Server 节点不可用，租约已保留，请稍后重试。', staleEpoch: '连接 Epoch 已过期，请刷新后使用新 Epoch。', loadMore: '加载更多', statusLabel: { online: '在线', offline: '离线' }, metadataStateLabel: { fresh: 'metadata 正常', expired: 'metadata 已过期', unavailable: 'metadata 未上报' } },
   downloads: { title: '发行管理', description: '查看当前发行版本并打开 GitHub Release', refresh: '刷新', loadFailed: '发行信息加载失败', empty: '暂无发行信息', currentRelease: '当前发行版本', version: '版本', commit: 'Commit', buildTime: '构建时间', schemaVersion: 'Schema 版本', repository: '仓库', releaseLink: '打开 GitHub Release', checksum: 'SHA256 校验和', manifest: '发行清单', upgradeNote: '升级前请备份数据库，并阅读当前版本的 Schema 升级与回滚说明。' },
   users: { title: '子账号管理', description: '创建和管理普通账号', create: '添加子账号', username: '用户名', status: '状态', active: '有效', disabled: '已禁用', deleted: '已删除', all: '全部', createdAt: '创建时间', actions: '操作', enable: '启用', disable: '禁用', resetPassword: '重置密码', delete: '删除', restore: '恢复', cancel: '取消', temporaryPassword: '一次性临时密码', passwordWarning: '此密码只显示一次，请立即安全保存。', copy: '复制', copied: '已复制', done: '完成', loadFailed: '账号加载失败', operationFailed: '操作失败', created: '账号已创建', restored: '账号已恢复', confirmEnable: '确认启用该账号？', confirmDisable: '禁用后该账号的 Token 将无法继续鉴权，是否继续？', confirmReset: '确认重置该账号密码？旧登录 Token 不会被撤销。', confirmDelete: '删除后账号将被禁用，但关联资源会保留。是否继续？', mfaRequired: '强制两步验证', mfaRequiredUpdated: '两步验证要求已更新', mfaRequiredFailed: '两步验证要求更新失败', resetMFA: '重置 MFA', confirmResetMFA: '重置会清除该账号的两步验证绑定与全部受信任设备，用户下次登录需要重新绑定。是否继续？', mfaReset: '两步验证已重置', mfaResetFailed: '重置两步验证失败' },
   security: {

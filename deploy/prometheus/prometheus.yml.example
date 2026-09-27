@@ -29,6 +29,9 @@ scrape_configs:
   - job_name: tunnelmesh-server
     metrics_path: /metrics
     scheme: http
+    # 单节点默认抓取内网明文入口，因此不需要凭据。若把 Server 直接暴露公网，
+    # 请设置 server.metrics.token 并在此处补上 authorization.credentials_file，
+    # 见下面集群模式的注释。
     static_configs:
       - targets: ["tunnelmesh-server:8080"]
         labels:
@@ -48,8 +51,13 @@ scrape_configs:
   #     ca_file: /etc/prometheus/certs/tunnelmesh-ca.pem
   #     server_name: tunnel.example.com
   #     min_version: TLS12
-  #   # 仅当 /metrics 位于需要认证的管理入口之后才使用；推荐用 Nginx 按来源
-  #   # 网段放行 /metrics，避免把 token 下发到 Prometheus。
+  #   # /metrics 有两种受控方式，二选一即可：
+  #   #   1) 反向代理按来源网段放行（见 docs/deployment/nginx.md 的 location = /metrics），
+  #   #      此时 Server 自身不需要再配 token；
+  #   #   2) Server 直接暴露或需要应用层凭据时，设置 TUNNELMESH_SERVER_METRICS_TOKEN
+  #   #      （等价键 server.metrics.token，至少 16 字符），被抓取方即需携带 Bearer。
+  #   # 选 2 时请用 credentials_file 而不是把 token 写进本文件：prometheus.yml 常常被
+  #   # 提交进配置仓库，而 /metrics 的输出本身也含内部拓扑。
   #   authorization:
   #     type: Bearer
   #     credentials_file: /etc/prometheus/secrets/tunnelmesh-metrics.token

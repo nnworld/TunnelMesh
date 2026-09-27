@@ -8,12 +8,15 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 52 份计划，按日期倒序排列。
+共 62 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-25 | [实施计划：Agent 连接池上限抬到 512 与 0 语义定版](2026-09-25-agent-pool-ceiling-512.md) | — | [PR：Agent 连接池上限抬到 512 与「0」语义定版](../../pull-requests/2026-09-25-agent-pool-ceiling-512.md)<br>[PR：Review P1–P3 加固与客户端观测页排序](../../pull-requests/2026-09-25-review-p1-p3-hardening.md) |
+| 2026-09-24 | [实施计划：Review P1–P3 加固与客户端观测页排序](2026-09-24-review-p1-p3-hardening.md) | — | [PR：Review P1–P3 加固与客户端观测页排序](../../pull-requests/2026-09-25-review-p1-p3-hardening.md) |
+| 2026-09-24 | [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md) | — | [PR：一键安装函数级套件不再挂在交互提示上](../../pull-requests/2026-09-24-oneclick-shell-suite-hermetic-stdin.md) |
 | 2026-09-24 | [MySQL 5.6 契约测试 CI 门禁实施计划](2026-09-24-mysql56-contract-ci-gate.md) | — | [PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
 | 2026-09-24 | [MySQL 5.6 本地复现 profile 实施计划](2026-09-24-mysql56-compose-profile.md) | — | [PR：MySQL 5.6 本地复现 profile](../../pull-requests/2026-09-24-mysql56-compose-profile.md)<br>[PR：MySQL 5.6 契约测试 CI 门禁](../../pull-requests/2026-09-24-mysql56-contract-ci-gate.md) |
 | 2026-09-24 | [迁移脚本注释分号解析紧急修复计划](2026-09-24-migration-comment-splitter-hotfix.md) | — | [PR：Migration comment splitter hotfix](../../pull-requests/2026-09-24-migration-comment-splitter-hotfix.md) |
@@ -22,11 +25,18 @@
 | 2026-09-24 | [客户端观测状态模型修复实施计划](2026-09-24-client-status-metadata-state.md) | — | [PR：Client 观测状态模型修复](../../pull-requests/2026-09-24-client-status-metadata-state.md) |
 | 2026-09-24 | [Client receive-window credit timing fix plan](2026-09-24-client-receive-window-credit.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md) |
 | 2026-09-24 | [Client local-forward delayed response fix plan](2026-09-24-client-forward-delayed-response.md) | — | [PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md)<br>[PR：Client local-forward delayed response](../../pull-requests/2026-09-24-client-forward-delayed-response.md) |
+| 2026-09-23 | [VPN 网关 阶段 7：Agent ICMP echo 与能力协商 Implementation Plan](2026-09-23-vpn-phase7-agent-icmp.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-23 | [VPN 网关 阶段 6：Server 数据面（WireGuard + netstack）Implementation Plan](2026-09-23-vpn-phase6-server-data-plane.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 6：Server 数据面](../../pull-requests/2026-09-23-vpn-phase6-server-data-plane.md)<br>[PR：VPN 网关 阶段 7：Agent ICMP echo 与能力协商](../../pull-requests/2026-09-23-vpn-phase7-agent-icmp.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-23 | [三端一键安装脚本 Implementation Plan](2026-09-23-one-click-install-scripts.md) | [规格：三端一键安装脚本](../specs/2026-09-23-one-click-install-scripts-design.md) | [PR：三端一键安装脚本（server / agent / client）](../../pull-requests/2026-09-23-one-click-install-scripts.md) |
 | 2026-09-23 | [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md) | — | [PR：Admin Remote Servers, WebSSH, and WebSFTP](../../pull-requests/2026-09-12-admin-webssh-sftp.md)<br>[PR：Managed-route large response truncation](../../pull-requests/2026-09-23-managed-route-response-truncation.md) |
 | 2026-09-23 | [托管路由被控制面保留路径遮蔽修复实施计划](2026-09-23-managed-route-reserved-path-shadowing.md) | — | [PR：Managed-route hosts shadowed by control-p…](../../pull-requests/2026-09-23-managed-route-reserved-path-shadowing.md) |
 | 2026-09-23 | [客户端运行观测状态不同步修复实施计划](2026-09-23-client-lease-epoch-observability-sync.md) | — | [PR：Client lease epoch width and observabilit…](../../pull-requests/2026-09-23-client-lease-epoch-observability-sync.md) |
 | 2026-09-23 | [代理节点在线状态与空元数据修复实施计划](2026-09-23-agent-online-status-and-empty-metadata.md) | — | [PR：Agent list connectivity status and empty …](../../pull-requests/2026-09-23-agent-online-status-and-empty-metadata.md) |
+| 2026-09-22 | [VPN 网关 阶段 5：管理后台 Implementation Plan](2026-09-22-vpn-phase5-admin-console.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[PR：VPN 网关 阶段 5：管理后台](../../pull-requests/2026-09-22-vpn-phase5-admin-console.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-21 | [VPN 网关 阶段 4：纯逻辑包与管理 API Implementation Plan](2026-09-21-vpn-phase4-pure-logic-and-api.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 3：Schema v15 存储层](../../pull-requests/2026-09-20-vpn-phase3-schema-v15.md)<br>[PR：VPN 网关 阶段 4：纯逻辑包与管理 API](../../pull-requests/2026-09-21-vpn-phase4-pure-logic-and-api.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-20 | [VPN 网关 阶段 3：Schema v15 与 VPN Repository Implementation Plan](2026-09-20-vpn-phase3-schema-v15.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 3：Schema v15 存储层](../../pull-requests/2026-09-20-vpn-phase3-schema-v15.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-20 | [VPN 网关 阶段 1：约束反转与 ADR 0002 Implementation Plan](2026-09-20-vpn-phase1-constraint-reversal.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 阶段 1：约束反转与 ADR 0002](../../pull-requests/2026-09-20-vpn-phase1-constraint-reversal.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
+| 2026-09-19 | [VPN 网关 Task 0 可行性验证 Implementation Plan](2026-09-19-vpn-task0-feasibility.md) | [规格：内嵌 VPN 网关（WireGuard）](../specs/2026-09-19-embedded-vpn-gateway-design.md) | [PR：VPN 网关 Task 0：设计规格与可行性验证 spike](../../pull-requests/2026-09-19-vpn-task0-feasibility.md) |
 | 2026-09-18 | [SSO, MFA, and device trust implementation plan (Phase A)](2026-09-18-sso-mfa-device-trust-implementation.md) | [规格：Enterprise capability roadmap design](../specs/2026-09-18-enterprise-capability-roadmap-design.md)<br>[规格：SSO, MFA, and device trust design (Phase …](../specs/2026-09-18-sso-mfa-device-trust-design.md) | [PR：Phase A: enterprise identity foundation (…](../../pull-requests/2026-09-18-sso-mfa-device-trust.md) |
 | 2026-09-18 | [P1–P3 growth and product hardening implementation plan](2026-09-18-p1-p3-growth-product-hardening.md) | — | [PR：P1–P3 growth and product hardening](../../pull-requests/2026-09-18-p1-p3-growth-product-hardening.md) |
 | 2026-09-17 | [P0/P1 Growth Acceleration Implementation Plan](2026-09-17-p0-p1-growth-acceleration-implementation.md) | [规格：P0/P1 Growth Acceleration](../specs/2026-09-17-p0-p1-growth-acceleration-design.md) | [PR：P0/P1 growth acceleration](../../pull-requests/2026-09-17-p0-p1-growth-acceleration.md) |
@@ -71,6 +81,7 @@
 
 以下计划按 AGENTS.md 的紧急修复条款先止损、后补记，正文已标注“补记计划”：
 
+- [一键安装函数级套件交互挂死修复实施计划](2026-09-24-oneclick-shell-suite-hermetic-stdin.md)（2026-09-24）
 - [Client WINDOW_UPDATE 泄漏修复实施计划](2026-09-24-client-window-update-leak.md)（2026-09-24）
 - [托管路由大响应体截断修复实施计划](2026-09-23-managed-route-response-truncation.md)（2026-09-23）
 - [ZMODEM 出站写入串行化修复实施计划](2026-09-13-zmodem-write-serialization.md)（2026-09-13）

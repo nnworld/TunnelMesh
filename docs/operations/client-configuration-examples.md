@@ -111,6 +111,23 @@ client:
       auth_url: http://auth.internal/validate
 ```
 
+`tcp`、`udp`、`http` 三种隧道也受非回环监听门禁约束：`listen` 不是回环地址时必须写 `allow_remote: true`，否则配置校验和启动都会直接拒绝，而不是悄悄绑上一个公网可读的入口。
+
+```yaml
+client:
+  tunnels:
+    - name: lan-postgres
+      protocol: tcp
+      listen: 0.0.0.0:15433
+      agent_id: agent-db
+      target_host: db.internal
+      target_port: 5432
+      # 这三种隧道没有 socks5/http-proxy 那样的本地认证（密码或 Basic），
+      # 因此 allow_remote 等价于把目标服务无凭据发布到该网段：
+      # 只应在本机与网段本身已经是可信边界时使用。
+      allow_remote: true
+```
+
 `auth_url` 会收到包含 `protocol`、`agentId`、`targetHost`、`targetPort` 和本地认证凭据的 POST 请求；返回 `2xx` 表示允许，其它状态、超时或网络错误都表示拒绝。该 URL 可以是 HTTP，但必须部署在可信网络中。
 
 如果只想为不同 Agent 提供固定入口，保留 `connections.min: 1`、`max: 1` 即可。例如：

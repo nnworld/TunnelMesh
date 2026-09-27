@@ -21,6 +21,7 @@ The roadmap is a communication tool, not a delivery promise. Priorities can chan
 
 ## Next (planned)
 
+- **Embedded WireGuard VPN gateway.** Users import a console-signed peer configuration into a native VPN client instead of installing `tunnelmesh-client`: the Server holds one public UDP port, assigns a per-peer VPN address, and carries TCP, UDP and ICMP echo to the chosen egress Agent, with target policy enforced per packet on the Server. The data plane runs in-process on a memory TUN over gVisor netstack, so it needs no `/dev/net/tun` and no `CAP_NET_ADMIN`. Design, measured feasibility and the reversed ingress constraint are recorded in [ADR 0002](../architecture/adr/0002-public-ingress-and-embedded-vpn.md); delivery is phased and nothing is released yet.
 - **Policy templates.** Reusable presets for common internal-access scenarios, so a route or Agent policy can be applied from a named template instead of field by field.
 - **Rate limiting and concurrency policy.** Principal- and token-scoped limits with a documented per-node token bucket for soft limits, evaluated inside the same policy layer as templates.
 - **Session observability.** Live console and tunnel sessions with actor, age, and origin, so an operator can see who is connected right now rather than only what the audit log recorded.
@@ -39,7 +40,7 @@ The roadmap is a communication tool, not a delivery promise. Priorities can chan
 
 The identity foundation is deliberately first: rate limiting keys on the principal and token identity that SSO and MFA harden, and webhook delivery must authenticate with the same secret-storage model that already seals OIDC client secrets and TOTP shared secrets.
 
-Explicitly not planned: ICMP, TUN/L2 VPN, P2P NAT traversal, and arbitrary remote command execution. SSH support stays limited to the existing stdio/WebSocket proxy path and is not extended into a general command-execution API.
+Explicitly not planned: P2P NAT traversal and arbitrary remote command execution. L2 Ethernet frames are never forwarded, and the planned VPN gateway carries ICMP echo only -- no other ICMP type. SSH support stays limited to the existing stdio/WebSocket proxy path and is not extended into a general command-execution API.
 
 ## Contribution path
 

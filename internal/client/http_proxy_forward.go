@@ -37,6 +37,7 @@ type HTTPProxyForward struct {
 	validator *RemoteValidator
 	server    *http.Server
 	ln        net.Listener
+	serve     *serveSignal
 	mu        sync.Mutex
 }
 
@@ -68,8 +69,16 @@ func NewHTTPProxyForward(opener StreamOpener, cfg HTTPProxyForwardConfig) (*HTTP
 			return nil, errors.New("client: non-loopback HTTP proxy listener requires basic auth")
 		}
 	}
-	return &HTTPProxyForward{opener: opener, cfg: cfg, validator: newForwardRemoteValidator(cfg.AuthURL, cfg.RemoteValidation)}, nil
+	return &HTTPProxyForward{
+		opener:    opener,
+		cfg:       cfg,
+		validator: newForwardRemoteValidator(cfg.AuthURL, cfg.RemoteValidation),
+		serve:     newServeSignal(),
+	}, nil
 }
+
+// Err reports the serve failure that ended the proxy listener, if any.
+func (f *HTTPProxyForward) Err() <-chan error { return f.serve.Err() }
 
 func (f *HTTPProxyForward) Start(ctx context.Context) error {
 	if ctx == nil {
@@ -87,7 +96,12 @@ func (f *HTTPProxyForward) Start(ctx context.Context) error {
 	f.ln = ln
 	server := &http.Server{Handler: http.HandlerFunc(f.handleProxy)}
 	f.server = server
-	go func() { _ = server.Serve(ln) }()
+	go func() {
+		err := server.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			f.serve.publish(err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		_ = f.Close()
@@ -111,6 +125,8 @@ func (f *HTTPProxyForward) Close() error {
 	ln := f.ln
 	f.server, f.ln = nil, nil
 	f.mu.Unlock()
+	// Closing the listener makes Serve return; that stop is not a failure.
+	f.serve.close()
 	if srv != nil {
 		_ = srv.Close()
 	}

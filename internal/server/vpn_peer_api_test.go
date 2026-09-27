@@ -1,0 +1,1212 @@
+package server
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
+)
+
+// vpnAPINodePublicKey is the RFC 7748 base-point public key used across the vpn
+// tests. It is a published test vector, not a secret.
+const vpnAPINodePublicKey = "3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08="
+
+// vpnAPINodeID is the node the fixture's peer service issues for, and therefore
+// the node the status endpoint reports.
+const vpnAPINodeID = "api-node-1"
+
+// vpnAPIFixture is an authenticated management API with the peer service
+// assembled over the same SQLite database the other API tests use, plus a second
+// non-admin account so ownership can be exercised from the HTTP layer.
+type vpnAPIFixture struct {
+	api        *API
+	handler    http.Handler
+	userToken  string
+	otherToken string
+	adminToken string
+	userAgent  string
+	otherAgent string
+	otherID    string
+}
+
+func newVPNAPIFixture(t *testing.T, mutate func(*VPNServiceConfig)) *vpnAPIFixture {
+	t.Helper()
+	api, admin, user := apiTestServer(t)
+	ctx := context.Background()
+	accounts := auth.NewAuthService(api.DB)
+	other, err := accounts.CreateUser(ctx, "bob", "bob-pass", "user")
+	if err != nil {
+		t.Fatalf("create the second user: %v", err)
+	}
+	for _, agent := range []storage.Agent{
+		{ID: "vpn-agent-alice", Name: "alice egress", OwnerUserID: user.ID, Enabled: true},
+		{ID: "vpn-agent-bob", Name: "bob egress", OwnerUserID: other.ID, Enabled: true},
+	} {
+		if err := api.DB.Agents().Create(ctx, agent); err != nil {
+			t.Fatalf("create agent %s: %v", agent.ID, err)
+		}
+	}
+	// The store is injected rather than read from the environment, so the tests
+	// neither depend on nor disturb TUNNELMESH_TOKEN_ENCRYPTION_KEY.
+	store, err := auth.NewSecretStore(base64.RawStdEncoding.EncodeToString(make([]byte, 32)), "vpn-api-test-key")
+	if err != nil {
+		t.Fatalf("secret store: %v", err)
+	}
+	cfg := VPNServiceConfig{
+		Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+		EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	api.SetVPNPeerService(NewVPNPeerService(VPNPeerServiceDeps{
+		Peers: api.DB.VPNPeers(), Leases: api.DB.VPNIPLeases(),
+		Agents: api.DB.Agents(), Audits: api.DB.Audits(),
+		Secrets: store, Config: cfg, NodeID: vpnAPINodeID, LeaseTTL: time.Minute,
+		NodePublicKey: vpnAPINodePublicKey,
+	}))
+	// The node view is recorded separately because it is what the status endpoint
+	// falls back to when no gateway is installed, which is the state every untagged
+	// test runs in.
+	api.setVPNNodeView(config.VPNConfig{
+		Enabled: cfg.Enabled, Listen: cfg.Listen, EndpointHost: cfg.EndpointHost,
+		IPPool: cfg.IPPool, NodeSubnetSize: cfg.NodeSubnetSize, ICMPEnabled: cfg.ICMPEnabled,
+	}, vpnAPINodeID)
+	return &vpnAPIFixture{
+		api: api, handler: api.Handler(),
+		userToken:  apiToken(t, api, "alice", "alice-pass"),
+		otherToken: apiToken(t, api, "bob", "bob-pass"),
+		adminToken: apiToken(t, api, admin.Username, "admin-pass"),
+		userAgent:  "vpn-agent-alice",
+		otherAgent: "vpn-agent-bob",
+		otherID:    other.ID,
+	}
+}
+
+type vpnAPIEnvelope struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
+
+type vpnPeerPayload struct {
+	ID               string   `json:"id"`
+	OwnerUserID      string   `json:"ownerUserId"`
+	Name             string   `json:"name"`
+	Description      string   `json:"description"`
+	PublicKey        string   `json:"publicKey"`
+	VPNIP            string   `json:"vpnIp"`
+	NodeID           string   `json:"nodeId"`
+	AgentID          string   `json:"agentId"`
+	AllowedIPs       []string `json:"allowedIps"`
+	AllowedPorts     []int    `json:"allowedPorts"`
+	ICMPEnabled      bool     `json:"icmpEnabled"`
+	Status           string   `json:"status"`
+	ConfigRevealPath string   `json:"configRevealPath"`
+	PrivateKey       string   `json:"privateKey"`
+	Ciphertext       string   `json:"privateKeyCiphertext"`
+	Nonce            string   `json:"privateKeyNonce"`
+	KeyID            string   `json:"privateKeyKeyId"`
+}
+
+type vpnPagePayload struct {
+	Items      []vpnPeerPayload `json:"items"`
+	NextCursor string           `json:"nextCursor"`
+	HasMore    bool             `json:"hasMore"`
+}
+
+// vpnFlowPayload and vpnNodePayload decode the two live-state responses. The
+// counters are pointers because the server omits them when it cannot know them,
+// and a test that decoded them as ints would read a missing counter as zero - the
+// exact confusion the projection was shaped to prevent.
+type vpnFlowPayload struct {
+	ID            string    `json:"id"`
+	Protocol      string    `json:"protocol"`
+	Target        string    `json:"target"`
+	Port          int       `json:"port"`
+	StartedAt     time.Time `json:"startedAt"`
+	BytesSent     int64     `json:"bytesSent"`
+	BytesReceived int64     `json:"bytesReceived"`
+}
+
+type vpnFlowListPayload struct {
+	Items []vpnFlowPayload `json:"items"`
+}
+
+type vpnNodePayload struct {
+	NodeID       string `json:"nodeId"`
+	Enabled      bool   `json:"enabled"`
+	Listen       string `json:"listen"`
+	EndpointHost string `json:"endpointHost"`
+	Subnet       string `json:"subnet"`
+	Allocated    *int   `json:"allocated"`
+	Capacity     *int   `json:"capacity"`
+	Peers        *int   `json:"peers"`
+	ICMPCapable  bool   `json:"icmpCapable"`
+}
+
+type vpnNodeListPayload struct {
+	Items []vpnNodePayload `json:"items"`
+}
+
+type vpnRevealPayload struct {
+	ID     string `json:"id"`
+	VPNIP  string `json:"vpnIp"`
+	Format string `json:"format"`
+	Config string `json:"config"`
+}
+
+func vpnDecodeEnvelope(t *testing.T, r *httptest.ResponseRecorder) vpnAPIEnvelope {
+	t.Helper()
+	var envelope vpnAPIEnvelope
+	if err := json.Unmarshal(r.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode the envelope: %v (%s)", err, r.Body.String())
+	}
+	return envelope
+}
+
+// vpnDataError reads data.error, which carries the stable code for a mapped vpn
+// failure and prose for a transport-level one.
+func vpnDataError(t *testing.T, r *httptest.ResponseRecorder) string {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decode the error payload: %v (%s)", err, envelope.Data)
+	}
+	return payload.Error
+}
+
+func vpnAssertError(t *testing.T, r *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if r.Code != status {
+		t.Fatalf("status = %d, want %d (%s)", r.Code, status, r.Body.String())
+	}
+	if got := vpnDataError(t, r); got != code {
+		t.Fatalf("data.error = %q, want %q (%s)", got, code, r.Body.String())
+	}
+}
+
+func vpnDecodePeer(t *testing.T, r *httptest.ResponseRecorder) vpnPeerPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var peer vpnPeerPayload
+	if err := json.Unmarshal(envelope.Data, &peer); err != nil {
+		t.Fatalf("decode the peer: %v (%s)", err, envelope.Data)
+	}
+	return peer
+}
+
+func vpnDecodePage(t *testing.T, r *httptest.ResponseRecorder) vpnPagePayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var page vpnPagePayload
+	if err := json.Unmarshal(envelope.Data, &page); err != nil {
+		t.Fatalf("decode the page: %v (%s)", err, envelope.Data)
+	}
+	return page
+}
+
+func vpnDecodeReveal(t *testing.T, r *httptest.ResponseRecorder) vpnRevealPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var revealed vpnRevealPayload
+	if err := json.Unmarshal(envelope.Data, &revealed); err != nil {
+		t.Fatalf("decode the revealed configuration: %v (%s)", err, envelope.Data)
+	}
+	return revealed
+}
+
+func vpnDecodeFlows(t *testing.T, r *httptest.ResponseRecorder) vpnFlowListPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var payload vpnFlowListPayload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decode the flow list: %v (%s)", err, r.Body.String())
+	}
+	return payload
+}
+
+func vpnDecodeNodes(t *testing.T, r *httptest.ResponseRecorder) vpnNodeListPayload {
+	t.Helper()
+	envelope := vpnDecodeEnvelope(t, r)
+	var payload vpnNodeListPayload
+	if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+		t.Fatalf("decode the node list: %v (%s)", err, r.Body.String())
+	}
+	return payload
+}
+
+func vpnPeerBody(agentID, name string) map[string]any {
+	return map[string]any{
+		"name": name, "description": "api test peer", "agentId": agentID,
+		"allowedIps": []string{"10.0.0.0/8"}, "allowedPorts": []int{443},
+		"maxConcurrentFlows": 64,
+	}
+}
+
+func (f *vpnAPIFixture) createPeer(t *testing.T, token, agentID, name string) vpnPeerPayload {
+	t.Helper()
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", token, "", vpnPeerBody(agentID, name))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create %s: status = %d (%s)", name, r.Code, r.Body.String())
+	}
+	return vpnDecodePeer(t, r)
+}
+
+// TestVPNPeerAPIRequiresAuthentication covers every route in the surface. The
+// bearer check runs in ServeHTTP before dispatch, so an unauthenticated caller
+// learns nothing about which vpn paths exist.
+func TestVPNPeerAPIRequiresAuthentication(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "auth-probe")
+	for _, call := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/vpn-peers"},
+		{http.MethodPost, "/api/v1/vpn-peers"},
+		{http.MethodGet, "/api/v1/vpn-peers/" + created.ID},
+		{http.MethodPatch, "/api/v1/vpn-peers/" + created.ID},
+		{http.MethodDelete, "/api/v1/vpn-peers/" + created.ID},
+		{http.MethodPost, "/api/v1/vpn-peers/" + created.ID + "/rotate"},
+		{http.MethodPost, "/api/v1/vpn-peers/" + created.ID + "/config:reveal"},
+		{http.MethodGet, "/api/v1/vpn-peers/" + created.ID + "/flows"},
+		{http.MethodGet, "/api/v1/vpn-nodes"},
+	} {
+		r := apiJSON(t, f.handler, call.method, call.path, "", "", nil)
+		if r.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s: status = %d, want 401", call.method, call.path, r.Code)
+		}
+	}
+}
+
+// TestVPNPeerAPIUnavailableWithoutAssembly pins the failure mode of a server
+// whose runtime never installed the service: 503 rather than a 404 that would
+// read as "this product has no vpn api".
+func TestVPNPeerAPIUnavailableWithoutAssembly(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	token := apiToken(t, api, user.Username, "alice-pass")
+	r := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/vpn-peers", token, "", nil)
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", r.Code, r.Body.String())
+	}
+}
+
+// TestVPNPeerAPISetVPNAssemblesTheService covers the configuration-driven
+// assembly the runtime uses, so a wiring mistake cannot hide behind the
+// hand-assembled fixture every other test installs.
+// TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt drives the real gate: the
+// egress agent holds a live session that negotiated stream_icmp_echo.v1, the node
+// switch is on, and the request is answered with a peer rather than a 409.
+func TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	api := f.api
+
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	if _, err := manager.Register(context.Background(), AgentRegistration{
+		AgentID: f.userAgent, NodeID: "node-a", ConnectionID: "conn-icmp",
+		ConnectionEpoch: 1, Epoch: 1,
+		Capabilities: []string{protocol.CapabilityStreamOpenResult, protocol.CapabilityStreamICMPEcho},
+	}, newFakeTransport()); err != nil {
+		t.Fatalf("register the egress session: %v", err)
+	}
+	api.SetAgentConnections(manager, nil)
+	api.SetClusterAgentConnections(&fixedConnectionRegistry{}, nil, "api-node-1")
+
+	store, err := auth.NewSecretStore(base64.RawStdEncoding.EncodeToString(make([]byte, 32)), "vpn-api-icmp-key")
+	if err != nil {
+		t.Fatalf("secret store: %v", err)
+	}
+	api.SetVPNPeerService(NewVPNPeerService(VPNPeerServiceDeps{
+		Peers: api.DB.VPNPeers(), Leases: api.DB.VPNIPLeases(),
+		Agents: api.DB.Agents(), Audits: api.DB.Audits(),
+		Secrets: store,
+		Config: VPNServiceConfig{
+			Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+			EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+			ICMPEnabled: true,
+		},
+		NodeID:            "api-node-1",
+		LeaseTTL:          time.Minute,
+		NodePublicKey:     vpnAPINodePublicKey,
+		AgentCapabilities: api.vpnAgentCapabilityProbe("api-node-1"),
+	}))
+
+	body := vpnPeerBody(f.userAgent, "wants-icmp")
+	body["icmpEnabled"] = true
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", body)
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", r.Code, r.Body.String())
+	}
+	if created := vpnDecodePeer(t, r); !created.ICMPEnabled {
+		t.Fatalf("created = %+v, want icmpEnabled true", created)
+	}
+}
+
+func TestVPNPeerAPISetVPNAssemblesTheService(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	api.SetVPN(config.VPNConfig{
+		Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+		EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+	}, "node-from-config", vpnAPINodePublicKey)
+	token := apiToken(t, api, user.Username, "alice-pass")
+	r := apiJSON(t, api.Handler(), http.MethodGet, "/api/v1/vpn-peers", token, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", r.Code, r.Body.String())
+	}
+	if page := vpnDecodePage(t, r); len(page.Items) != 0 {
+		t.Fatalf("a fresh node listed %d peers", len(page.Items))
+	}
+}
+
+func TestVPNPeerAPICreateAndRead(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "laptop"))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", r.Code, r.Body.String())
+	}
+	created := vpnDecodePeer(t, r)
+	if created.ID == "" || created.VPNIP == "" || len(created.PublicKey) != 44 {
+		t.Fatalf("created summary = %+v", created)
+	}
+	if created.NodeID != "api-node-1" || created.AgentID != f.userAgent || created.Status != "active" {
+		t.Fatalf("created summary = %+v", created)
+	}
+	if len(created.AllowedIPs) != 1 || created.AllowedIPs[0] != "10.0.0.0/8" {
+		t.Fatalf("allowedIps = %v, want the parsed policy", created.AllowedIPs)
+	}
+	if len(created.AllowedPorts) != 1 || created.AllowedPorts[0] != 443 {
+		t.Fatalf("allowedPorts = %v", created.AllowedPorts)
+	}
+	if created.ConfigRevealPath != "/api/v1/vpn-peers/"+created.ID+"/config:reveal" {
+		t.Fatalf("configRevealPath = %q", created.ConfigRevealPath)
+	}
+	// No summary may carry key material, sealed or not: the ciphertext columns
+	// are internal state and the plaintext exists only in a reveal response.
+	body := r.Body.String()
+	for _, forbidden := range []string{"privateKey", "iphertext", "once", "eyId"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("the create response mentions %q: %s", forbidden, body)
+		}
+	}
+	if created.PrivateKey != "" || created.Ciphertext != "" || created.Nonce != "" || created.KeyID != "" {
+		t.Fatalf("the create response leaked key material: %+v", created)
+	}
+
+	detail := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID, f.userToken, "", nil)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("detail status = %d (%s)", detail.Code, detail.Body.String())
+	}
+	if got := vpnDecodePeer(t, detail); got.ID != created.ID || got.VPNIP != created.VPNIP {
+		t.Fatalf("detail = %+v, want the created peer", got)
+	}
+	// An administrator operates the whole fleet and may read any peer.
+	if r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID, f.adminToken, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("admin detail status = %d (%s)", r.Code, r.Body.String())
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/vpn-peer-missing", f.userToken, "", nil); r.Code != http.StatusNotFound {
+		t.Fatalf("missing peer status = %d", r.Code)
+	}
+}
+
+// TestVPNPeerAPICreateIsIdempotent is the guarantee that a retried POST cannot
+// burn a second address: the replayed response is byte-identical and the node
+// still holds exactly one peer.
+func TestVPNPeerAPICreateIsIdempotent(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	body := vpnPeerBody(f.userAgent, "laptop")
+	first := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "vpn-key-1", body)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", first.Code, first.Body.String())
+	}
+	replay := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "vpn-key-1", body)
+	if replay.Code != http.StatusCreated || replay.Body.String() != first.Body.String() {
+		t.Fatalf("replay = %d/%s, want the identical stored response", replay.Code, replay.Body.String())
+	}
+	page := vpnDecodePage(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers", f.userToken, "", nil))
+	if len(page.Items) != 1 {
+		t.Fatalf("the replay created %d peers, want 1", len(page.Items))
+	}
+	// A key claimed by somebody else is a conflict, not a silent replay.
+	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.otherToken, "vpn-key-1", vpnPeerBody(f.otherAgent, "other")); r.Code != http.StatusConflict {
+		t.Fatalf("a stolen idempotency key returned %d (%s)", r.Code, r.Body.String())
+	}
+}
+
+func TestVPNPeerAPIPatchRotateAndRevoke(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "laptop")
+	path := "/api/v1/vpn-peers/" + created.ID
+
+	patched := apiJSON(t, f.handler, http.MethodPatch, path, f.userToken, "", map[string]any{
+		"name": "renamed", "allowedIps": []string{"192.0.2.0/24"}, "allowedPorts": []int{8443},
+	})
+	if patched.Code != http.StatusOK {
+		t.Fatalf("patch status = %d (%s)", patched.Code, patched.Body.String())
+	}
+	updated := vpnDecodePeer(t, patched)
+	if updated.Name != "renamed" || updated.AllowedIPs[0] != "192.0.2.0/24" || updated.AllowedPorts[0] != 8443 {
+		t.Fatalf("patched peer = %+v", updated)
+	}
+	if updated.VPNIP != created.VPNIP || updated.PublicKey != created.PublicKey {
+		t.Fatal("the patch changed a field it was not given")
+	}
+	// An empty patch is a caller mistake, not a no-op: answering 200 would hide
+	// a console bug that silently sends nothing.
+	if r := apiJSON(t, f.handler, http.MethodPatch, path, f.userToken, "", map[string]any{}); r.Code != http.StatusBadRequest {
+		t.Fatalf("empty patch status = %d (%s)", r.Code, r.Body.String())
+	}
+	// PATCH cannot reach the terminal state; revocation has its own endpoint.
+	r := apiJSON(t, f.handler, http.MethodPatch, path, f.userToken, "", map[string]any{"status": "revoked"})
+	vpnAssertError(t, r, http.StatusBadRequest, "vpn_peer_invalid")
+	if r := apiJSON(t, f.handler, http.MethodPatch, path, f.userToken, "", map[string]any{"status": "disabled"}); r.Code != http.StatusOK {
+		t.Fatalf("disabling through PATCH returned %d (%s)", r.Code, r.Body.String())
+	}
+
+	rotated := apiJSON(t, f.handler, http.MethodPost, path+"/rotate", f.userToken, "vpn-rotate-1", nil)
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d (%s)", rotated.Code, rotated.Body.String())
+	}
+	if got := vpnDecodePeer(t, rotated); got.PublicKey == created.PublicKey || got.VPNIP != created.VPNIP {
+		t.Fatalf("rotated peer = %+v", got)
+	}
+	// A retried rotation must not rotate again: the user has already downloaded
+	// the configuration the first response described.
+	replay := apiJSON(t, f.handler, http.MethodPost, path+"/rotate", f.userToken, "vpn-rotate-1", nil)
+	if replay.Code != http.StatusOK || replay.Body.String() != rotated.Body.String() {
+		t.Fatalf("rotate replay = %d/%s", replay.Code, replay.Body.String())
+	}
+
+	revoked := apiJSON(t, f.handler, http.MethodDelete, path, f.userToken, "", nil)
+	if revoked.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d (%s)", revoked.Code, revoked.Body.String())
+	}
+	if got := vpnDecodePeer(t, revoked); got.Status != "revoked" {
+		t.Fatalf("revoked status = %q", got.Status)
+	}
+	// The row stays readable for audit, and both mutations are now refused.
+	if r := apiJSON(t, f.handler, http.MethodGet, path, f.userToken, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("reading a revoked peer returned %d", r.Code)
+	}
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, path+"/rotate", f.userToken, "", nil), http.StatusConflict, "vpn_peer_conflict")
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPatch, path, f.userToken, "", map[string]any{"name": "x"}), http.StatusConflict, "vpn_peer_conflict")
+	// Revoking twice is not something the caller can act on.
+	if r := apiJSON(t, f.handler, http.MethodDelete, path, f.userToken, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("a second revoke returned %d (%s)", r.Code, r.Body.String())
+	}
+}
+
+// TestVPNPeerAPIPaginationKeepsOwnersApart is D11 verified through HTTP: the
+// owner restriction is applied inside the query, so another user's peer appears
+// on no page, not even a later one.
+func TestVPNPeerAPIPaginationKeepsOwnersApart(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	for i := 0; i < 3; i++ {
+		f.createPeer(t, f.userToken, f.userAgent, "alice-peer")
+		f.createPeer(t, f.otherToken, f.otherAgent, "bob-peer")
+	}
+	cursor := ""
+	seen, pages := 0, 0
+	for {
+		path := "/api/v1/vpn-peers?limit=2"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		r := apiJSON(t, f.handler, http.MethodGet, path, f.userToken, "", nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("page %d status = %d (%s)", pages, r.Code, r.Body.String())
+		}
+		page := vpnDecodePage(t, r)
+		for _, peer := range page.Items {
+			if peer.Name != "alice-peer" {
+				t.Fatalf("page %d leaked %s owned by %s", pages, peer.Name, peer.OwnerUserID)
+			}
+		}
+		seen += len(page.Items)
+		pages++
+		if !page.HasMore || pages > 10 {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if seen != 3 || pages != 2 {
+		t.Fatalf("alice saw %d peers over %d pages, want 3 over 2", seen, pages)
+	}
+	admin := vpnDecodePage(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers?limit=50", f.adminToken, "", nil))
+	if len(admin.Items) != 6 {
+		t.Fatalf("the admin saw %d peers, want 6", len(admin.Items))
+	}
+	// A user may not widen their own view by asking for somebody else's rows:
+	// the owner filter is set from the authenticated principal, never from the
+	// query string.
+	filtered := vpnDecodePage(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers?owner="+f.otherID, f.userToken, "", nil))
+	if len(filtered.Items) != 3 {
+		t.Fatalf("an owner query parameter widened the view to %d peers", len(filtered.Items))
+	}
+}
+
+// TestVPNPeerAPICrossUserAccessIsNotFound asserts the anti-enumeration rule from
+// the HTTP layer: every verb on somebody else's peer answers 404, never 403,
+// because 403 confirms the identifier exists.
+func TestVPNPeerAPICrossUserAccessIsNotFound(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "alice-secret")
+	path := "/api/v1/vpn-peers/" + created.ID
+	for _, call := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodGet, path, nil},
+		{http.MethodPatch, path, map[string]any{"name": "stolen"}},
+		{http.MethodDelete, path, nil},
+		{http.MethodPost, path + "/rotate", nil},
+		{http.MethodPost, path + "/config:reveal", map[string]any{"acknowledgeRisk": true}},
+		{http.MethodGet, path + "/flows", nil},
+	} {
+		r := apiJSONWithHeaders(t, f.handler, call.method, call.path, f.otherToken, map[string]string{
+			"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "cross-user-" + call.method,
+		}, call.body)
+		if r.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status = %d, want 404 (%s)", call.method, call.path, r.Code, r.Body.String())
+			continue
+		}
+		if strings.Contains(strings.ToLower(r.Body.String()), "forbidden") {
+			t.Errorf("%s %s leaked a forbidden response: %s", call.method, call.path, r.Body.String())
+		}
+	}
+	// Attaching a peer to somebody else's egress agent is refused with the same
+	// answer as a missing agent, so agent IDs cannot be enumerated either.
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.otherAgent, "through-others")),
+		http.StatusBadRequest, "vpn_peer_invalid")
+	// An administrator may use any agent, because operating the fleet is the job.
+	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.adminToken, "", vpnPeerBody(f.otherAgent, "admin-peer")); r.Code != http.StatusCreated {
+		t.Fatalf("admin create status = %d (%s)", r.Code, r.Body.String())
+	}
+}
+
+// TestVPNPeerAPIRevealGuardsThePrivateKey walks the three preconditions of the
+// approved reveal pattern and then the property that matters most: the response
+// is never cached and never written into the idempotency store, because that
+// store persists response bodies in the clear.
+func TestVPNPeerAPIRevealGuardsThePrivateKey(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "reveal-me")
+	path := "/api/v1/vpn-peers/" + created.ID + "/config:reveal"
+
+	for name, headers := range map[string]map[string]string{
+		"no confirmation header": {"Idempotency-Key": "vpn-reveal-1"},
+		"no idempotency key":     {"X-VPN-Config-Reveal-Confirm": "yes"},
+	} {
+		r := apiJSONWithHeaders(t, f.handler, http.MethodPost, path, f.userToken, headers, map[string]any{"acknowledgeRisk": true})
+		if r.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 (%s)", name, r.Code, r.Body.String())
+		}
+	}
+	r := apiJSONWithHeaders(t, f.handler, http.MethodPost, path, f.userToken, map[string]string{
+		"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "vpn-reveal-1",
+	}, map[string]any{"acknowledgeRisk": false})
+	if r.Code != http.StatusBadRequest {
+		t.Fatalf("acknowledgeRisk=false returned %d (%s)", r.Code, r.Body.String())
+	}
+	// An unknown field is rejected rather than ignored, so a misspelled
+	// acknowledgement cannot look like a confirmed one.
+	r = apiJSONWithHeaders(t, f.handler, http.MethodPost, path, f.userToken, map[string]string{
+		"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "vpn-reveal-2",
+	}, map[string]any{"acknowledgeRisk": true, "reason": "audit"})
+	if r.Code != http.StatusBadRequest {
+		t.Fatalf("an unknown reveal field returned %d (%s)", r.Code, r.Body.String())
+	}
+
+	ok := apiJSONWithHeaders(t, f.handler, http.MethodPost, path, f.userToken, map[string]string{
+		"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "vpn-reveal-3",
+	}, map[string]any{"acknowledgeRisk": true})
+	if ok.Code != http.StatusOK {
+		t.Fatalf("reveal status = %d (%s)", ok.Code, ok.Body.String())
+	}
+	if got := ok.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	revealed := vpnDecodeReveal(t, ok)
+	if revealed.ID != created.ID || revealed.Format != "wg-quick" {
+		t.Fatalf("reveal payload = %+v", revealed)
+	}
+	for _, want := range []string{"[Interface]", "[Peer]", "PrivateKey = ", "Address = " + created.VPNIP + "/32", "PublicKey = " + vpnAPINodePublicKey} {
+		if !strings.Contains(revealed.Config, want) {
+			t.Errorf("the rendered configuration is missing %q:\n%s", want, revealed.Config)
+		}
+	}
+	// The idempotency store persists response bodies, so a reveal must never go
+	// through it: that would write a private key into the database in the clear.
+	if _, err := f.api.DB.Idempotency().Get(context.Background(), "vpn-reveal-3"); err == nil {
+		t.Fatal("the reveal response was persisted in the idempotency store")
+	}
+	// A second confirmed reveal works and returns the same key, because the key
+	// is sealed rather than hashed: it is recoverable by design.
+	again := apiJSONWithHeaders(t, f.handler, http.MethodPost, path, f.userToken, map[string]string{
+		"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "vpn-reveal-4",
+	}, map[string]any{"acknowledgeRisk": true})
+	if again.Code != http.StatusOK {
+		t.Fatalf("second reveal status = %d (%s)", again.Code, again.Body.String())
+	}
+	if vpnDecodeReveal(t, again).Config != revealed.Config {
+		t.Fatal("two reveals of an unrotated peer returned different configurations")
+	}
+	// The reveal is audited, and the audit trail carries no key material.
+	page, err := f.api.DB.Audits().List(context.Background(), storage.AuditFilter{Action: vpnAuditRevealed}, "", 50)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("found %d reveal audit entries, want 2", len(page.Items))
+	}
+	for _, entry := range page.Items {
+		if entry.ResourceID != created.ID {
+			t.Errorf("the reveal audit entry points at %q", entry.ResourceID)
+		}
+		if strings.Contains(entry.Details, "PrivateKey") {
+			t.Errorf("the reveal audit entry carries key material: %s", entry.Details)
+		}
+	}
+}
+
+// TestVPNPeerAPIWithoutADataPlaneReportsWhatItCannotObserve pins D13's negative
+// half: a node with no running gateway answers 501 for one peer's flows, because a
+// 200 with an empty list would be read as "this peer has no traffic" and hide the
+// fact that nothing here can observe traffic at all.
+//
+// The node status endpoint is deliberately not in that set. It answers 200 in both
+// builds, because the configuration it reports exists whether or not a gateway was
+// built into the binary, and a console that had to special-case 501 for the node
+// page would render "no node serves VPN" for a fleet that simply runs an untagged
+// server.
+func TestVPNPeerAPIWithoutADataPlaneReportsWhatItCannotObserve(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "flows")
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
+		http.StatusNotImplemented, "vpn_not_implemented")
+	// A missing peer is still a 404: the flows route resolves the peer before
+	// reporting what it cannot do, so it cannot be used to probe the build.
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/vpn-peer-missing/flows", f.userToken, "", nil),
+		http.StatusNotFound, "vpn_peer_not_found")
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200 without a data plane", r.Code, r.Body.String())
+	}
+	nodes := vpnDecodeNodes(t, r)
+	if len(nodes.Items) != 1 {
+		t.Fatalf("node status listed %d nodes, want this node only", len(nodes.Items))
+	}
+	node := nodes.Items[0]
+	if node.NodeID != vpnAPINodeID {
+		t.Errorf("nodeId = %q, want %q", node.NodeID, vpnAPINodeID)
+	}
+	if !node.Enabled {
+		t.Error("an enabled server.vpn section was reported as disabled")
+	}
+	if node.Listen != "0.0.0.0:51820" || node.EndpointHost != "gw-1.mesh.example.com" {
+		t.Errorf("listen/endpointHost = %q/%q, want the configured pair", node.Listen, node.EndpointHost)
+	}
+	// No gateway in this build, so nothing can say whether echo would be served.
+	if node.ICMPCapable {
+		t.Error("icmpCapable is true on a node with no data plane")
+	}
+	for name, counter := range map[string]*int{"allocated": node.Allocated, "capacity": node.Capacity, "peers": node.Peers} {
+		if counter != nil {
+			t.Errorf("%s = %d without a data plane, want it omitted so the console renders an em dash", name, *counter)
+		}
+	}
+}
+
+// A disabled node still answers 200, and says so: this is the shape the console
+// renders after the operator takes the stop-loss path of ADR 0002.
+func TestVPNPeerAPIReportsADisabledNode(t *testing.T) {
+	f := newVPNAPIFixture(t, func(c *VPNServiceConfig) { c.Enabled = false })
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	node := vpnDecodeNodes(t, r).Items[0]
+	if node.Enabled {
+		t.Error("a disabled server.vpn section was reported as enabled")
+	}
+	if node.ICMPCapable {
+		t.Error("icmpCapable is true on a disabled node")
+	}
+}
+
+// D13's positive half: a gateway that serves the peer answers 200 with exactly the
+// snapshot it holds, field for field. The projection is narrow on purpose - no
+// payload, no key material, no agent-side socket - and the test asserts the fields
+// that are there rather than only the count, because a byte counter rendered as the
+// flow identifier is the kind of mistake a shape-only assertion passes.
+func TestVPNPeerAPIListsTheActiveFlowsOfAServedPeer(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "flows")
+	started := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	plane := &fakeVPNDataPlane{
+		serves: true,
+		flows: []VPNFlowSnapshot{
+			{ID: "vpnflow-1", Protocol: "tcp", Target: "192.168.1.20", Port: 443, StartedAt: started, BytesSent: 2048, BytesReceived: 4096},
+			{ID: "vpnflow-2", Protocol: "icmp-echo", Target: "192.168.1.21", StartedAt: started.Add(time.Minute), BytesSent: 64, BytesReceived: 64},
+		},
+	}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("flows = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	items := vpnDecodeFlows(t, r).Items
+	if len(items) != 2 {
+		t.Fatalf("flows listed %d items, want 2 (%s)", len(items), r.Body.String())
+	}
+	first := items[0]
+	if first.ID != "vpnflow-1" || first.Protocol != "tcp" || first.Target != "192.168.1.20" || first.Port != 443 {
+		t.Errorf("the first flow decoded as %+v, want the tcp snapshot", first)
+	}
+	if !first.StartedAt.Equal(started) {
+		t.Errorf("startedAt = %s, want %s", first.StartedAt, started)
+	}
+	if first.BytesSent != 2048 || first.BytesReceived != 4096 {
+		t.Errorf("byte counters = %d/%d, want 2048/4096", first.BytesSent, first.BytesReceived)
+	}
+	if second := items[1]; second.Protocol != "icmp-echo" || second.Port != 0 {
+		t.Errorf("the second flow decoded as %+v, want the echo snapshot", second)
+	}
+	if calls, _ := plane.liveState(); len(calls) != 1 || calls[0] != created.ID {
+		t.Errorf("the gateway was asked about %v, want one call for %s", calls, created.ID)
+	}
+}
+
+// A gateway that serves other peers but not this one still answers 501. The peer
+// row exists and is readable, which is exactly why the answer cannot be an empty
+// list: the traffic is on another node.
+func TestVPNPeerAPIReportsFlowsOfAPeerOnAnotherNodeAsNotImplemented(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "remote")
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{serves: false})
+
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
+		http.StatusNotImplemented, "vpn_not_implemented")
+}
+
+// Visibility is resolved before the gateway is asked, so a peer belonging to
+// somebody else is a 404 and not a 501. Answering 501 there would make the status
+// code itself an ownership oracle: two identifiers, two different answers, one of
+// them not yours.
+func TestVPNPeerAPIFlowsOfAnotherUsersPeerAreNotFound(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.otherToken, f.otherAgent, "bobs")
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{serves: true})
+
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/flows", f.userToken, "", nil),
+		http.StatusNotFound, "vpn_peer_not_found")
+}
+
+// The node status is the gateway's own report when one is installed: the counters
+// exist only in its memory and in the repositories it reads, so the API must not
+// invent them from configuration.
+func TestVPNPeerAPIReportsTheGatewayNodeStatus(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	allocated, capacity, peers := 18, 253, 4
+	plane := &fakeVPNDataPlane{status: VPNNodeStatus{
+		NodeID: vpnAPINodeID, Enabled: true, Listen: "0.0.0.0:51820",
+		EndpointHost: "gw-1.mesh.example.com", Subnet: "10.64.5.0/24",
+		Allocated: &allocated, Capacity: &capacity, Peers: &peers, ICMPCapable: true,
+	}}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.adminToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("node status = %d (%s), want 200", r.Code, r.Body.String())
+	}
+	nodes := vpnDecodeNodes(t, r)
+	if len(nodes.Items) != 1 {
+		t.Fatalf("node status listed %d nodes, want this node only", len(nodes.Items))
+	}
+	node := nodes.Items[0]
+	if node.NodeID != vpnAPINodeID || !node.Enabled || node.Subnet != "10.64.5.0/24" {
+		t.Errorf("node decoded as %+v, want the gateway's report", node)
+	}
+	for name, got := range map[string]struct {
+		value *int
+		want  int
+	}{"allocated": {node.Allocated, 18}, "capacity": {node.Capacity, 253}, "peers": {node.Peers, 4}} {
+		if got.value == nil {
+			t.Errorf("%s was omitted, want %d", name, got.want)
+			continue
+		}
+		if *got.value != got.want {
+			t.Errorf("%s = %d, want %d", name, *got.value, got.want)
+		}
+	}
+	if !node.ICMPCapable {
+		t.Error("icmpCapable = false, want the gateway's answer")
+	}
+	if _, calls := plane.liveState(); calls != 1 {
+		t.Errorf("the gateway was asked for its status %d times, want 1", calls)
+	}
+}
+
+// A gateway that cannot read its own counters must fail the request. Reporting the
+// configuration fields with the counters omitted would render as "no subnet
+// leased", which is a different claim from "the database did not answer".
+func TestVPNPeerAPIReportsAFailingGatewayStatus(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	f.api.SetVPNDataPlane(&fakeVPNDataPlane{statusErr: errors.New("vpn: list leased subnets: context deadline exceeded")})
+
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes", f.adminToken, "", nil)
+	if r.Code != http.StatusInternalServerError {
+		t.Fatalf("node status = %d (%s), want 500", r.Code, r.Body.String())
+	}
+}
+
+// The node view is a collection route with no sub-resources, so the two shapes a
+// caller can get wrong are answered apart: an unknown deeper path is a 404 and a
+// known one reached with the wrong verb is a 405.
+func TestVPNPeerAPIRejectsMalformedNodeRequests(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-nodes", f.adminToken, "", nil); r.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST on the node collection returned %d, want 405", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-nodes/api-node-1", f.adminToken, "", nil); r.Code != http.StatusNotFound {
+		t.Errorf("a node sub-resource returned %d, want 404", r.Code)
+	}
+}
+
+func TestVPNPeerAPIDisabledNode(t *testing.T) {
+	f := newVPNAPIFixture(t, func(c *VPNServiceConfig) { c.Enabled = false })
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "nope")),
+		http.StatusConflict, "vpn_node_disabled")
+	// Reads stay available and report nothing, so a console wired up ahead of
+	// the gateway renders an empty table instead of an error page.
+	r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers", f.userToken, "", nil)
+	if r.Code != http.StatusOK {
+		t.Fatalf("list status = %d (%s)", r.Code, r.Body.String())
+	}
+	if page := vpnDecodePage(t, r); len(page.Items) != 0 {
+		t.Fatalf("a disabled node listed %d peers", len(page.Items))
+	}
+}
+
+// TestVPNPeerAPIRejectsMalformedRequests covers the transport-level rules: the
+// method allowlist, unknown sub-resources, unknown body fields, and the two
+// request errors a caller can make that must be answered before anything is
+// allocated.
+func TestVPNPeerAPIRejectsMalformedRequests(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	created := f.createPeer(t, f.userToken, f.userAgent, "malformed")
+	path := "/api/v1/vpn-peers/" + created.ID
+
+	if r := apiJSON(t, f.handler, http.MethodPost, path, f.userToken, "", nil); r.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST on a peer returned %d, want 405", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodPut, path, f.userToken, "", nil); r.Code != http.StatusMethodNotAllowed {
+		t.Errorf("PUT on a peer returned %d, want 405", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, path+"/bogus", f.userToken, "", nil); r.Code != http.StatusNotFound {
+		t.Errorf("an unknown action returned %d, want 404", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, path+"/rotate", f.userToken, "", nil); r.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET on rotate returned %d, want 405", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodGet, "/api/v1/vpn-peers/"+created.ID+"/x/y", f.userToken, "", nil); r.Code != http.StatusNotFound {
+		t.Errorf("a deep path returned %d, want 404", r.Code)
+	}
+	if r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", map[string]any{"name": "x", "bogus": true}); r.Code != http.StatusBadRequest {
+		t.Errorf("an unknown create field returned %d, want 400", r.Code)
+	}
+	// This fixture leaves server.vpn.icmp_enabled false, so the node ceiling
+	// refuses the request before any agent capability is consulted. The capable
+	// path is TestVPNPeerAPIIssuesICMPWhenTheAgentNegotiatedIt.
+	body := vpnPeerBody(f.userAgent, "wants-icmp")
+	body["icmpEnabled"] = true
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", body),
+		http.StatusConflict, "vpn_agent_capability_missing")
+	badCIDR := vpnPeerBody(f.userAgent, "bad-cidr")
+	badCIDR["allowedIps"] = []string{"10.0.0.1"}
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", badCIDR),
+		http.StatusBadRequest, "vpn_peer_invalid")
+	// An unusable pool is an operator fault that the first issue reports, since
+	// nothing at load time can know a peer will ever be requested.
+	store, err := auth.NewSecretStore(base64.RawStdEncoding.EncodeToString(make([]byte, 32)), "vpn-api-test-key")
+	if err != nil {
+		t.Fatalf("secret store: %v", err)
+	}
+	f.api.SetVPNPeerService(NewVPNPeerService(VPNPeerServiceDeps{
+		Peers: f.api.DB.VPNPeers(), Leases: f.api.DB.VPNIPLeases(),
+		Agents: f.api.DB.Agents(), Audits: f.api.DB.Audits(),
+		Secrets: store,
+		Config:  VPNServiceConfig{Enabled: true, IPPool: "10.64.0.0/33", NodeSubnetSize: 24},
+		NodeID:  "api-node-1",
+	}))
+	vpnAssertError(t, apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "no-pool")),
+		http.StatusBadRequest, "vpn_ip_pool_invalid")
+}
+
+// fakeVPNDataPlane stands in for the gateway. It records the peer hot-reload
+// calls the service makes so a test can assert the wiring without a UDP socket,
+// a TUN device or the "vpn" build tag.
+type fakeVPNDataPlane struct {
+	mu       sync.Mutex
+	applied  []storage.VPNPeer
+	removed  []string
+	started  bool
+	closed   bool
+	applyErr error
+	// The live-state answers. Both are configurable because D13 makes them the
+	// whole difference between a 200 and a 501: a gateway that does not serve the
+	// peer has to say so, and a gateway that cannot read its own counters has to
+	// fail rather than report zeros.
+	serves      bool
+	flows       []VPNFlowSnapshot
+	status      VPNNodeStatus
+	statusErr   error
+	flowCalls   []string
+	statusCalls int
+}
+
+func (f *fakeVPNDataPlane) ApplyPeer(peer storage.VPNPeer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.applyErr != nil {
+		return f.applyErr
+	}
+	f.applied = append(f.applied, peer)
+	return nil
+}
+
+func (f *fakeVPNDataPlane) RemovePeer(peerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, peerID)
+	return nil
+}
+
+func (f *fakeVPNDataPlane) Start(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = true
+	return nil
+}
+
+func (f *fakeVPNDataPlane) PeerFlows(peerID string) ([]VPNFlowSnapshot, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flowCalls = append(f.flowCalls, peerID)
+	if !f.serves {
+		return nil, false
+	}
+	return append([]VPNFlowSnapshot(nil), f.flows...), true
+}
+
+func (f *fakeVPNDataPlane) NodeStatus(context.Context) (VPNNodeStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statusCalls++
+	if f.statusErr != nil {
+		return VPNNodeStatus{}, f.statusErr
+	}
+	return f.status, nil
+}
+
+// liveState returns what the gateway answered, so a test can assert the route
+// consulted it at all rather than only that the response looked right.
+func (f *fakeVPNDataPlane) liveState() ([]string, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.flowCalls...), f.statusCalls
+}
+
+func (f *fakeVPNDataPlane) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+func (f *fakeVPNDataPlane) snapshot() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	applied := make([]string, 0, len(f.applied))
+	for _, peer := range f.applied {
+		applied = append(applied, peer.ID)
+	}
+	return applied, append([]string(nil), f.removed...)
+}
+
+// setVPNTestConfig is a server.vpn section that can hand out a working
+// configuration: every field RevealConfig consults is set to a usable value.
+func setVPNTestConfig() config.VPNConfig {
+	return config.VPNConfig{
+		Enabled: true, IPPool: "10.64.0.0/16", NodeSubnetSize: 24,
+		EndpointHost: "gw-1.mesh.example.com", Listen: "0.0.0.0:51820", MTU: 1420,
+	}
+}
+
+func setVPNTestAgent(t *testing.T, api *API, user storage.User, agentID string) {
+	t.Helper()
+	agent := storage.Agent{ID: agentID, Name: agentID + " egress", OwnerUserID: user.ID, Enabled: true}
+	if err := api.DB.Agents().Create(context.Background(), agent); err != nil {
+		t.Fatalf("create agent %s: %v", agentID, err)
+	}
+}
+
+// TestVPNPeerAPISetVPNInjectsTheNodeIdentity pins the production assembly path.
+//
+// SetVPN is what the runtime calls, so the node identity has to arrive through
+// it. Every other test in this file builds the service by hand with an injected
+// NodePublicKey, which is exactly the shape of test that stays green while a real
+// deployment answers 409 vpn_node_disabled on every reveal.
+func TestVPNPeerAPISetVPNInjectsTheNodeIdentity(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	setVPNTestAgent(t, api, user, "setvpn-agent")
+	api.SetVPN(setVPNTestConfig(), "node-setvpn", vpnAPINodePublicKey)
+	token := apiToken(t, api, user.Username, "alice-pass")
+	handler := api.Handler()
+
+	r := apiJSON(t, handler, http.MethodPost, "/api/v1/vpn-peers", token, "", vpnPeerBody("setvpn-agent", "laptop"))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", r.Code, r.Body.String())
+	}
+	created := vpnDecodePeer(t, r)
+	if created.NodeID != "node-setvpn" {
+		t.Fatalf("nodeId = %q, want the identity SetVPN was given", created.NodeID)
+	}
+	revealed := apiJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/config:reveal", token,
+		map[string]string{"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "setvpn-reveal"},
+		map[string]any{"acknowledgeRisk": true})
+	if revealed.Code != http.StatusOK {
+		t.Fatalf("reveal status = %d, want 200 (%s)", revealed.Code, revealed.Body.String())
+	}
+	rendered := vpnDecodeReveal(t, revealed).Config
+	for _, want := range []string{
+		"[Interface]", "[Peer]",
+		"PrivateKey = ", "Address = " + created.VPNIP + "/32", "MTU = 1420",
+		"PublicKey = " + vpnAPINodePublicKey,
+		"Endpoint = gw-1.mesh.example.com:51820",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the rendered configuration is missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+// TestVPNPeerAPISetVPNWithoutANodeIdentityRefusesReveal pins the other half: a
+// node that could not read TUNNELMESH_VPN_NODE_PRIVATE_KEY keeps refusing with
+// the stable code instead of rendering a file whose [Peer] PublicKey is blank,
+// which would fail on the user's machine with no pointer back at the server.
+func TestVPNPeerAPISetVPNWithoutANodeIdentityRefusesReveal(t *testing.T) {
+	api, _, user := apiTestServer(t)
+	setVPNTestAgent(t, api, user, "identityless-agent")
+	api.SetVPN(setVPNTestConfig(), "node-identityless", "")
+	token := apiToken(t, api, user.Username, "alice-pass")
+	handler := api.Handler()
+
+	created := vpnDecodePeer(t, apiJSON(t, handler, http.MethodPost, "/api/v1/vpn-peers", token, "", vpnPeerBody("identityless-agent", "laptop")))
+	vpnAssertError(t, apiJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/config:reveal", token,
+		map[string]string{"X-VPN-Config-Reveal-Confirm": "yes", "Idempotency-Key": "identityless-reveal"},
+		map[string]any{"acknowledgeRisk": true}),
+		http.StatusConflict, "vpn_node_disabled")
+}
+
+// TestSetVPNDataPlaneRegistersThePeerSink pins the hot-reload wiring: installing
+// a data plane makes it the sink the peer service notifies after a committed
+// write, and a peer that stops being active is removed rather than re-applied.
+func TestSetVPNDataPlaneRegistersThePeerSink(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	plane := &fakeVPNDataPlane{}
+	f.api.SetVPNDataPlane(plane)
+
+	created := f.createPeer(t, f.userToken, f.userAgent, "sink-peer")
+	if applied, removed := plane.snapshot(); len(applied) != 1 || applied[0] != created.ID || len(removed) != 0 {
+		t.Fatalf("after issue: applied = %v, removed = %v", applied, removed)
+	}
+	if got := plane.applied[0]; got.PublicKey != created.PublicKey || got.VPNIP != created.VPNIP {
+		t.Errorf("the sink received %+v, which is not the row that was committed", got)
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	rotated := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers/"+created.ID+"/rotate", f.userToken, "", nil)
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("rotate status = %d (%s)", rotated.Code, rotated.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(applied) != 1 || len(removed) != 0 {
+		t.Fatalf("after rotate: applied = %v, removed = %v", applied, removed)
+	}
+	if got := plane.applied[0]; got.PublicKey == created.PublicKey {
+		t.Error("the sink received the pre-rotation public key, so the old identity would keep working")
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	if r := apiJSON(t, f.handler, http.MethodPatch, "/api/v1/vpn-peers/"+created.ID, f.userToken, "", map[string]any{"status": "disabled"}); r.Code != http.StatusOK {
+		t.Fatalf("disable status = %d (%s)", r.Code, r.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(removed) != 1 || removed[0] != created.ID || len(applied) != 0 {
+		t.Fatalf("after disable: applied = %v, removed = %v", applied, removed)
+	}
+
+	plane.mu.Lock()
+	plane.applied, plane.removed = nil, nil
+	plane.mu.Unlock()
+	if r := apiJSON(t, f.handler, http.MethodDelete, "/api/v1/vpn-peers/"+created.ID, f.userToken, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d (%s)", r.Code, r.Body.String())
+	}
+	if applied, removed := plane.snapshot(); len(removed) != 1 || removed[0] != created.ID || len(applied) != 0 {
+		t.Fatalf("after revoke: applied = %v, removed = %v", applied, removed)
+	}
+}
+
+// TestVPNPeerServiceSurvivesAFailingSink pins the direction of authority. The
+// database write has already committed when the sink is called, so a data plane
+// that refuses the update must not turn a successful issue into a failed
+// request: the peer exists, the user has been handed an address and a key, and a
+// 500 would make them retry an operation that worked.
+func TestVPNPeerServiceSurvivesAFailingSink(t *testing.T) {
+	f := newVPNAPIFixture(t, nil)
+	plane := &fakeVPNDataPlane{applyErr: errors.New("uapi socket is gone")}
+	f.api.SetVPNDataPlane(plane)
+
+	r := apiJSON(t, f.handler, http.MethodPost, "/api/v1/vpn-peers", f.userToken, "", vpnPeerBody(f.userAgent, "sink-fails"))
+	if r.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (%s)", r.Code, r.Body.String())
+	}
+	created := vpnDecodePeer(t, r)
+	stored, err := f.api.DB.VPNPeers().Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("the committed row disappeared when the sink failed: %v", err)
+	}
+	if stored.ID != created.ID || stored.Status != storage.VPNPeerStatusActive {
+		t.Fatalf("the committed row is %+v", stored)
+	}
+	// The disagreement is recorded where an operator looks for it rather than
+	// being swallowed, and the record carries no key material.
+	page, err := f.api.DB.Audits().List(context.Background(), storage.AuditFilter{Action: vpnAuditSyncFailed}, "", 50)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ResourceID != created.ID {
+		t.Fatalf("found %d sync-failure audit entries for %s", len(page.Items), created.ID)
+	}
+	if details := page.Items[0].Details; strings.Contains(details, created.PublicKey) || strings.Contains(details, "PrivateKey") {
+		t.Errorf("the sync-failure audit entry carries key material: %s", details)
+	}
+}

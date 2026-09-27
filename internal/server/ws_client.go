@@ -43,9 +43,14 @@ type clientRelayStream struct {
 	protocol         string
 	clientHalfClosed bool
 	relayHalfClosed  bool
-	sendState        *protocol.StreamState
-	windowSignal     chan struct{}
-	flowMu           sync.Mutex
+	// counted says whether this stream still holds one slot of the
+	// connection's active-stream gauge. It is guarded by the session mutex and
+	// cleared by the goroutine that releases the slot, so a stream closed by
+	// two paths at once is accounted for exactly once.
+	counted      bool
+	sendState    *protocol.StreamState
+	windowSignal chan struct{}
+	flowMu       sync.Mutex
 	// inbound holds Client-to-Agent DATA that the pump has not handed over yet.
 	// It is what keeps the shared frame loop off the critical path of a stalled
 	// Agent, so it must stay byte-bounded and be closed with the stream.
@@ -96,17 +101,19 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 	if service != nil {
 		clientObservability = service.observability
 	}
+	releaseStreamCount := func() {
+		if clientObservability != nil {
+			_ = clientObservability.StreamClosed(principal)
+		}
+	}
 	closeStream := func(id uint32) {
 		mu.Lock()
 		stream := streams[id]
-		delete(streams, id)
 		mu.Unlock()
+		// An unknown id holds no slot, so releasing on its behalf would steal a
+		// count from one of the streams that are still live on this connection.
 		if stream != nil {
-			stream.inbound.Close()
-			_ = stream.conn.Close()
-		}
-		if clientObservability != nil {
-			_ = clientObservability.StreamClosed(principal)
+			retireClientStream(id, stream, &mu, streams, releaseStreamCount)
 		}
 	}
 	reset := func(id uint32) error {
@@ -326,16 +333,18 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 						_ = sendOpenResult(id, protocol.OpenResultPayload{Accepted: false, Stage: protocol.OpenResultStageProtocol, Code: protocol.OpenResultCodeInternalError})
 						return
 					}
+					// Claim the gauge slot before the stream becomes visible to
+					// relayToClient, which is allowed to retire it on its very
+					// first read failure. ClientSessionManager is a different
+					// lock, so no session path is re-entered while held.
+					stream.counted = clientObservability != nil && clientObservability.StreamOpened(principal) == nil
 					streams[id] = stream
 					mu.Unlock()
 					if err := sendOpenResult(id, result); err != nil {
 						closeStream(id)
 						return
 					}
-					go relayToClient(ctx, id, stream, writer, &mu, streams)
-					if clientObservability != nil {
-						_ = clientObservability.StreamOpened(principal)
-					}
+					go relayToClient(ctx, id, stream, writer, &mu, streams, releaseStreamCount)
 					if metrics != nil {
 						metrics.ObserveStream(request.Protocol, "accepted", "")
 					}
@@ -359,12 +368,10 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 			}
 			stream := newRelayStream(frame.StreamID, conn, request.Protocol, frame.Window)
 			mu.Lock()
+			stream.counted = clientObservability != nil && clientObservability.StreamOpened(principal) == nil
 			streams[frame.StreamID] = stream
 			mu.Unlock()
-			go relayToClient(ctx, frame.StreamID, stream, writer, &mu, streams)
-			if clientObservability != nil {
-				_ = clientObservability.StreamOpened(principal)
-			}
+			go relayToClient(ctx, frame.StreamID, stream, writer, &mu, streams, releaseStreamCount)
 			if metrics != nil {
 				metrics.ObserveStream(request.Protocol, "accepted", "")
 			}
@@ -472,14 +479,27 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 // of its goroutines: the Agent-side reader and the Client-side upload pump.
 // Closing the inbound queue is what lets a pump blocked in Pop return, so every
 // path that removes a stream from the map must go through here.
-func retireClientStream(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream) {
+//
+// release hands the stream's slot back to the active-stream gauge. Doing it here
+// rather than at each caller is what keeps the count honest: the retirement
+// paths in relayToClient used to leave the gauge incremented for the whole life
+// of the WebSocket, which is exactly the "active streams" number an operator
+// reads climbing without traffic. A stream that never claimed a slot, or one
+// already released by the other close path, is skipped instead of decrementing a
+// count that belongs to a live stream.
+func retireClientStream(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, release func()) {
 	mu.Lock()
 	if streams[id] == stream {
 		delete(streams, id)
 	}
+	counted := stream.counted
+	stream.counted = false
 	mu.Unlock()
 	stream.inbound.Close()
 	_ = stream.conn.Close()
+	if counted && release != nil {
+		release()
+	}
 }
 
 // pumpClientUpload is the single writer for one Client-to-Agent stream. A target
@@ -523,7 +543,7 @@ func pumpClientUpload(id uint32, stream *clientRelayStream, mu *sync.Mutex, stre
 	}
 }
 
-func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, writer *streamsession.FairFrameWriter, mu *sync.Mutex, streams map[uint32]*clientRelayStream) {
+func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, writer *streamsession.FairFrameWriter, mu *sync.Mutex, streams map[uint32]*clientRelayStream, release func()) {
 	bufferSize := 32 << 10
 	if strings.EqualFold(stream.protocol, "udp") {
 		bufferSize = protocol.MaxPayload
@@ -537,7 +557,7 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 				control.Version = protocol.CurrentVersion
 				control.StreamID = id
 				if err := writer.EnqueueControl(control); err != nil {
-					retireClientStream(id, stream, mu, streams)
+					retireClientStream(id, stream, mu, streams, release)
 					return
 				}
 				continue
@@ -556,14 +576,14 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 				return
 			}
 			if err := waitForClientWindow(id, stream, mu, streams, n); err != nil {
-				retireClientStream(id, stream, mu, streams)
+				retireClientStream(id, stream, mu, streams, release)
 				return
 			}
 			if sendErr := writer.EnqueueData(id, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buffer[:n]...)}); sendErr != nil {
 				slog.WarnContext(ctx, "client_stream_queue_full_reset",
 					"protocol", stream.protocol, "stream_id", id,
 					"error_class", observability.NormalizeErrorClass(sendErr))
-				retireClientStream(id, stream, mu, streams)
+				retireClientStream(id, stream, mu, streams, release)
 				// The peer must learn the byte stream ended early. Dropping the
 				// stream silently leaves the Client holding a short body, which
 				// surfaces as a truncated download with nothing in the log to
@@ -585,13 +605,13 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 				return
 			}
 			if !errors.Is(err, io.EOF) {
-				retireClientStream(id, stream, mu, streams)
+				retireClientStream(id, stream, mu, streams, release)
 				_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
 				return
 			}
 			_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: id})
 			if complete {
-				retireClientStream(id, stream, mu, streams)
+				retireClientStream(id, stream, mu, streams, release)
 			}
 			return
 		}

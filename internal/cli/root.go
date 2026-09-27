@@ -165,7 +165,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH, ProxyEntry: cfg.Server.ProxyEntry, TrustedProxies: cfg.Server.TrustedProxies})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, TrustedProxies: cfg.Server.TrustedProxies})
 			if err != nil {
 				return err
 			}
@@ -350,12 +350,22 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			if strings.TrimSpace(nodeID) == "" {
 				nodeID = cfg.Agent.ID
 			}
+			echoer, echoErr := startAgentEchoer(cfg.Agent.Streams)
+			if echoErr != nil {
+				// Non-fatal on purpose. The agent still serves every tunnel it
+				// already had, and the missing capability makes the server refuse
+				// to sign ICMP peers, which is where an operator looks next.
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agent icmp echo is unavailable and will not be advertised: %v\n", echoErr)
+			}
+			if echoer != nil {
+				defer func() { _ = echoer.Close() }()
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
 			return agent.RunConnectionPool(cmd.Context(), agent.WebSocketPoolOptions{
 				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
 				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
-				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams),
+				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
 				Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
 				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
 				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
@@ -378,15 +388,43 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 	}
 }
 
-func NewAgentDispatcherFactory(streams config.AgentStreamConfig) agent.ConnectionSessionFactory {
+// agentEchoOpener is a variable so a test can reproduce the permission failure a
+// real host produces when net.ipv4.ping_group_range excludes the process gid.
+var agentEchoOpener = agent.OpenEchoer
+
+// startAgentEchoer opens the unprivileged ping socket the echo capability needs.
+// It returns a nil engine and a nil error when the configuration leaves ICMP off,
+// so a host without the sysctl is never penalised for a feature it does not use.
+// When the operator did ask for it and the host refused, the error is returned
+// for the caller to report and the engine stays nil, which is what keeps the
+// capability out of the advertisement.
+func startAgentEchoer(streams config.AgentStreamConfig) (*agent.Echoer, error) {
+	if !streams.ICMPEnabled {
+		return nil, nil
+	}
+	echoer, err := agentEchoOpener(agent.EchoerConfig{
+		BindAddress:   streams.ICMPBindAddress,
+		Timeout:       streams.ICMPTimeout,
+		MaxConcurrent: streams.ICMPMaxConcurrent,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return echoer, nil
+}
+
+func NewAgentDispatcherFactory(streams config.AgentStreamConfig, echoer *agent.Echoer) agent.ConnectionSessionFactory {
 	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
-		session.SetCapabilities(agent.AgentStreamCapabilities(streams))
-		dispatcher := agent.NewStreamDispatcherWithConfig(agent.Dialer{}, nil, session.Send, agent.DialExecutorConfig{
+		// Readiness is the engine, not the configuration: a host that refused the
+		// ping socket must not advertise a stream it cannot serve.
+		session.SetCapabilities(agent.AgentStreamCapabilities(streams, echoer != nil))
+		dispatcher := agent.NewStreamDispatcherWithConfig(agent.Dialer{ICMPEcho: echoer}, nil, session.Send, agent.DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,
 			ConnectTimeout: streams.ConnectTimeout,
 			OpenTimeout:    streams.OpenTimeout,
 		}, nil)
+		dispatcher.SetMaxActiveStreams(streams.MaxActive)
 		if err := dispatcher.SetInboundBufferBytes(streams.InboundBufferBytes); err != nil {
 			slog.Warn("agent inbound buffer rejected", "configured_bytes", streams.InboundBufferBytes, "error", err)
 		}
@@ -461,6 +499,8 @@ func clientForwardCommand(opts *rootOptions, proto string) *cobra.Command {
 	cmd := &cobra.Command{Use: proto, Short: "local " + proto + " forward"}
 	var listen, targetHost, agentID string
 	var targetPort int
+	var allowRemote bool
+	cmd.Flags().BoolVar(&allowRemote, "allow-remote", false, "allow a non-loopback listener to serve an unauthenticated tunnel")
 	cmd.Flags().StringVar(&listen, "listen", "127.0.0.1:0", "local listen address")
 	cmd.Flags().StringVar(&targetHost, "target-host", "", "target host on the Agent network")
 	cmd.Flags().IntVar(&targetPort, "target-port", 0, "target port on the Agent network")
@@ -480,51 +520,64 @@ func clientForwardCommand(opts *rootOptions, proto string) *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "loaded %d configured tunnel(s)\n", len(cfg.Client.Tunnels))
 		}
 		var active io.Closer
+		var serveErrs <-chan error
 		defer func() {
 			if active != nil {
 				_ = active.Close()
 			}
 		}()
-		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+		// A listener that goes deaf must end the command, not just the session: the
+		// reconnect loop would otherwise rebind nothing and report a healthy client.
+		runCtx, cancelRun := context.WithCancel(cmd.Context())
+		defer cancelRun()
+		watcher := newForwardServeWatcher(1)
+		err = runClientWebSocket(runCtx, cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
 			if active != nil {
 				_ = active.Close()
 				active = nil
+				serveErrs = nil
 			}
 			opener := client.NewSessionOpener(session)
 			switch proto {
 			case "tcp":
-				forward, err := client.NewTCPForward(opener, client.TCPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				forward, err := client.NewTCPForward(opener, client.TCPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort, AllowRemote: allowRemote})
 				if err != nil {
 					return err
 				}
-				if err := forward.Start(cmd.Context()); err != nil {
+				if err := forward.Start(runCtx); err != nil {
 					return err
 				}
+				serveErrs = forward.Err()
 				active = forward
 			case "udp":
-				forward, err := client.NewUDPForward(opener, client.UDPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				forward, err := client.NewUDPForward(opener, client.UDPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort, AllowRemote: allowRemote})
 				if err != nil {
 					return err
 				}
-				if err := forward.Start(cmd.Context()); err != nil {
+				if err := forward.Start(runCtx); err != nil {
 					return err
 				}
+				serveErrs = forward.Err()
 				active = forward
 			case "http":
-				forward, err := client.NewHTTPForward(opener, client.HTTPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort})
+				forward, err := client.NewHTTPForward(opener, client.HTTPForwardConfig{ListenAddr: listen, AgentID: agentID, TargetHost: targetHost, TargetPort: targetPort, AllowRemote: allowRemote})
 				if err != nil {
 					return err
 				}
-				if err := forward.Start(cmd.Context()); err != nil {
+				if err := forward.Start(runCtx); err != nil {
 					return err
 				}
+				serveErrs = forward.Err()
 				active = forward
 			default:
 				return fmt.Errorf("unsupported forward protocol %q", proto)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s forward %s -> %s:%d via %s\n", proto, listen, targetHost, targetPort, agentID)
+			description := fmt.Sprintf("%s forward %s -> %s:%d via %s", proto, listen, targetHost, targetPort, agentID)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), description)
+			watcher.watch(runCtx, description, cancelRun, serveErrs)
 			return nil
 		})
+		return forwardServeResult(watcher, err)
 	}
 	return cmd
 }
@@ -563,15 +616,22 @@ func clientSOCKS5ForwardCommand(opts *rootOptions) *cobra.Command {
 			}
 		}
 		var active io.Closer
+		var serveErrs <-chan error
 		defer func() {
 			if active != nil {
 				_ = active.Close()
 			}
 		}()
-		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+		// A listener that goes deaf must end the command, not just the session: the
+		// reconnect loop would otherwise rebind nothing and report a healthy client.
+		runCtx, cancelRun := context.WithCancel(cmd.Context())
+		defer cancelRun()
+		watcher := newForwardServeWatcher(1)
+		err = runClientWebSocket(runCtx, cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
 			if active != nil {
 				_ = active.Close()
 				active = nil
+				serveErrs = nil
 			}
 			forward, err := client.NewSOCKS5Forward(client.NewSessionOpener(session), client.SOCKS5ForwardConfig{
 				ListenAddr:  listen,
@@ -592,17 +652,21 @@ func clientSOCKS5ForwardCommand(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := forward.Start(cmd.Context()); err != nil {
+			if err := forward.Start(runCtx); err != nil {
 				return err
 			}
 			active = forward
+			serveErrs = forward.Err()
 			addr := listen
 			if forward.Addr() != nil {
 				addr = forward.Addr().String()
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "socks5 forward %s -> agent %s auth %s\n", addr, agentID, authMode)
+			description := fmt.Sprintf("socks5 forward %s -> agent %s auth %s", addr, agentID, authMode)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), description)
+			watcher.watch(runCtx, description, cancelRun, serveErrs)
 			return nil
 		})
+		return forwardServeResult(watcher, err)
 	}
 	return cmd
 }
@@ -641,15 +705,22 @@ func clientHTTPProxyForwardCommand(opts *rootOptions) *cobra.Command {
 			}
 		}
 		var active io.Closer
+		var serveErrs <-chan error
 		defer func() {
 			if active != nil {
 				_ = active.Close()
 			}
 		}()
-		return runClientWebSocket(cmd.Context(), cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
+		// A listener that goes deaf must end the command, not just the session: the
+		// reconnect loop would otherwise rebind nothing and report a healthy client.
+		runCtx, cancelRun := context.WithCancel(cmd.Context())
+		defer cancelRun()
+		watcher := newForwardServeWatcher(1)
+		err = runClientWebSocket(runCtx, cfg.Client.ServerURL, cfg.Client.Token, func(session *client.Session) error {
 			if active != nil {
 				_ = active.Close()
 				active = nil
+				serveErrs = nil
 			}
 			forward, err := client.NewHTTPProxyForward(client.NewSessionOpener(session), client.HTTPProxyForwardConfig{
 				ListenAddr:  listen,
@@ -670,17 +741,21 @@ func clientHTTPProxyForwardCommand(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := forward.Start(cmd.Context()); err != nil {
+			if err := forward.Start(runCtx); err != nil {
 				return err
 			}
 			active = forward
+			serveErrs = forward.Err()
 			addr := listen
 			if forward.Addr() != nil {
 				addr = forward.Addr().String()
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "http-proxy forward %s -> agent %s auth %s\n", addr, agentID, authMode)
+			description := fmt.Sprintf("http-proxy forward %s -> agent %s auth %s", addr, agentID, authMode)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), description)
+			watcher.watch(runCtx, description, cancelRun, serveErrs)
 			return nil
 		})
+		return forwardServeResult(watcher, err)
 	}
 	return cmd
 }

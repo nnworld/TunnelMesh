@@ -207,6 +207,42 @@ func runClientRepositoryContract(t *testing.T, db *DB) {
 		"contract-client-handshake", "contract-client-lapsed", "contract-client-neighbour",
 		"contract-client-online", "contract-client-stale", "contract-client-unreported",
 	}, ","))
+
+	// The drawer lists one Client's physical leases, so the row with the newest
+	// heartbeat must come first: three connections that all report at a different
+	// second used to arrive in connection-id order, which put a lease that has
+	// not been seen for minutes next to the "active streams" column.
+	leaseFixtures := []struct {
+		connectionID string
+		heartbeat    time.Time
+	}{
+		{connectionID: "contract-lease-mid", heartbeat: now.Add(-30 * time.Second)},
+		{connectionID: "contract-lease-old", heartbeat: now.Add(-90 * time.Second)},
+		{connectionID: "contract-lease-new", heartbeat: now},
+	}
+	for index, fixture := range leaseFixtures {
+		putContractClientLease(t, db, fixture.connectionID, staleID, int64(index+1), epoch+int64(index), live, fixture.heartbeat)
+	}
+	if leases, err := db.ClientConnections().ListByInstance(ctx, staleID); err != nil {
+		t.Fatalf("list leases by heartbeat order: %v", err)
+	} else if got := strings.Join(leaseConnectionIDs(leases), ","); got != "contract-lease-new,contract-lease-mid,contract-lease-old" {
+		t.Fatalf("lease order = %q, want newest heartbeat first", got)
+	}
+	for index, fixture := range leaseFixtures {
+		if err := db.ClientConnections().Release(ctx, fixture.connectionID, epoch+int64(index)); err != nil {
+			t.Fatalf("release contract lease %s: %v", fixture.connectionID, err)
+		}
+	}
+}
+
+// leaseConnectionIDs projects the connection order a listing returned, so an
+// ORDER BY regression reads as a permutation instead of a field-by-field diff.
+func leaseConnectionIDs(leases []ClientConnectionLease) []string {
+	ids := make([]string, 0, len(leases))
+	for _, lease := range leases {
+		ids = append(ids, lease.ConnectionID)
+	}
+	return ids
 }
 
 // putContractClientInstance stores one Client metadata row with an explicit

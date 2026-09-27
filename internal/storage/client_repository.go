@@ -98,18 +98,25 @@ func (r *clientInstanceRepo) Get(ctx context.Context, id string) (ClientInstance
 	return scanClientInstance(r.db.QueryRowContext(ctx, `SELECT `+clientInstanceColumns+` FROM client_instance_metadata WHERE id=?`, id))
 }
 
+// List walks client instances newest-heartbeat first.
+//
+// The key is last_seen_at, not updated_at: the stale and expiry sweeps bump updated_at
+// without any client activity, so ordering by it would put clients that stopped
+// reporting at the top of the page an operator opens to find live ones. The id
+// tiebreak keeps the walk stable when two heartbeats land in the same instant, which
+// is what lets cursor pagination neither repeat nor skip a row.
 func (r *clientInstanceRepo) List(ctx context.Context, filter ClientInstanceFilter, cursor string, limit int) (Page[ClientInstance], error) {
 	cursor, limit = pageArgs(cursor, limit)
 	conditions, args := clientInstanceConditions(filter, time.Now().UTC())
-	if updated, id, ok := decodeCompositeCursor(cursor); ok {
-		conditions = append(conditions, `(updated_at>? OR (updated_at=? AND id>?))`)
-		args = append(args, updated, updated, id)
+	if seen, id, ok := decodeCompositeCursor(cursor); ok {
+		conditions = append(conditions, `(last_seen_at<? OR (last_seen_at=? AND id<?))`)
+		args = append(args, seen, seen, id)
 	}
 	query := `SELECT ` + clientInstanceColumns + ` FROM client_instance_metadata`
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY updated_at,id LIMIT ?`
+	query += ` ORDER BY last_seen_at DESC,id DESC LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -131,7 +138,7 @@ func (r *clientInstanceRepo) List(ctx context.Context, filter ClientInstanceFilt
 		page.Items = page.Items[:limit]
 		page.HasMore = true
 		last := page.Items[len(page.Items)-1]
-		page.NextCursor = encodeCursor(tm(last.UpdatedAt) + "\x00" + last.ID)
+		page.NextCursor = encodeCursor(tm(last.LastSeenAt) + "\x00" + last.ID)
 	}
 	return page, nil
 }
@@ -363,7 +370,11 @@ func (r *clientConnectionRepo) ListByInstances(ctx context.Context, clientInstan
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT `+clientConnectionColumns+` FROM client_connection_leases WHERE client_instance_id IN (`+strings.Join(placeholders, `,`)+`) ORDER BY client_instance_id,connection_id`, args...)
+	// Grouped by instance so one batch serves every row of the list page, and
+	// newest heartbeat first inside an instance because the drawer renders these
+	// rows as the Client's live connections: an idle lease from hours ago must
+	// not sit above the one carrying traffic now.
+	rows, err := r.db.QueryContext(ctx, `SELECT `+clientConnectionColumns+` FROM client_connection_leases WHERE client_instance_id IN (`+strings.Join(placeholders, `,`)+`) ORDER BY client_instance_id,updated_at DESC,connection_id`, args...)
 	if err != nil {
 		return nil, err
 	}

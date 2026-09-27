@@ -64,9 +64,27 @@ Rules:
 
 ## Connection pool behavior
 
-By default, an Agent uses one WebSocket connection. After the Server supports connection pooling, you can raise `agent.connections.max`.
+By default, an Agent uses one WebSocket connection. After the Server supports connection pooling, you can raise `agent.connections.max`, which is accepted in the range 1-512.
+
+The Agent pool size and the Server's per-Agent ceiling (`server.agents.max_connections_per_agent`, default 64) are two settings on two machines and are never reconciled automatically: once the pool exceeds the Server ceiling, the extra connections are refused and back off while established ones keep working. Raise both together and confirm the enforced value with `tunnelmesh_agent_connection_capacity`. On every metadata ack the Agent compares the ceiling the Server reports against its own pool and logs one WARN per distinct value: `agent connection pool exceeds the server ceiling` (fields `configured_max`, `server_max`), so the mismatch is greppable on the Agent host instead of only visible as connections that keep getting refused.
 
 Pool scaling considers healthy connections, active streams, pending dials, and latency signals. Existing streams stay on their current connection. A stable `instance_id` distinguishes multiple physical Agent processes that share one logical Agent ID.
+
+## ICMP echo for the VPN gateway
+
+The Agent answers a single ICMP echo on behalf of a VPN peer. The capability is off by default and takes two things on that host:
+
+```yaml
+agent:
+  streams:
+    icmp_enabled: true
+```
+
+- `net.ipv4.ping_group_range` must include the group the Agent runs as. Without it the Agent cannot open an unprivileged ping socket and logs `agent icmp echo is unavailable` on stderr at start.
+- Only echo is handled. Every other ICMP type is dropped and counted by the gateway policy chain, and the Agent never constructs one.
+- Echo targets pass the same Agent policy, CIDR, and port checks as TCP and UDP targets.
+
+When a peer that should answer a `ping` does not, check in this order: the Agent's `icmp_enabled` and that startup error line; whether the issuing request could verify the capability (`icmpCapability: unverified` in the audit detail is a cluster placement fact, not an Agent failure); and the node ceiling `server.vpn.icmp_enabled`. Then check the Server side, which is where this usually ends: the binary must be a `-tags vpn` build and `server.vpn.enabled` must be `true`. A Server without the tag refuses to start rather than failing silently, and the release binaries and images do not carry the tag yet.
 
 ## Service deployment
 

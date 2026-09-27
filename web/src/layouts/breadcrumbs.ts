@@ -12,6 +12,7 @@ export function breadcrumbsFor(path: string): Breadcrumb[] {
     : path === '/agents' ? 'agents.title'
     : path === '/clients' ? 'clients.title'
     : path === '/routes' ? 'routes.title'
+    : path === '/vpn' ? 'vpn.title'
     : path === '/tunnels' ? 'tunnels.title'
     : path === '/tokens' ? 'tokens.title'
     : path === '/servers' ? 'servers.title'

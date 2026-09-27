@@ -16,7 +16,7 @@ Agents initiate outbound TLS WebSocket connections to the Server. Clients connec
 
 ## TLS/WSS and reverse-proxy requirements
 
-Public ingress supports only HTTP, HTTPS, and WebSocket over TLS/WSS. Public UDP is not exposed by the Server.
+Public ingress is HTTP, HTTPS, and WebSocket over TLS/WSS. The embedded WireGuard VPN gateway adds exactly one public UDP port and is compiled only in `-tags vpn` builds ([ADR 0002](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md)); the release binaries and images do not carry that tag yet, so a default deployment of this release has no public UDP. The port never goes through the reverse proxy described below.
 
 For a typical deployment:
 

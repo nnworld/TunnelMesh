@@ -52,7 +52,7 @@ This plan turns the repository preparation into a focused three-day launch. It i
 
 **280-character post:**
 
-> TunnelMesh: self-hosted HTTP/TCP/UDP tunneling with an admin console, scoped tokens, Agent policy, RBAC, audit logs, and WebSSH/SFTP. Public ingress is HTTP/HTTPS/WSS only. Built with Go and Vue. https://github.com/nnworld/TunnelMesh
+> TunnelMesh: self-hosted HTTP/TCP/UDP tunneling with an admin console, scoped tokens, Agent policy, RBAC, audit logs, and WebSSH/SFTP. Public ingress is HTTP/HTTPS/WSS. Built with Go and Vue. https://github.com/nnworld/TunnelMesh
 
 **Article summary:**
 

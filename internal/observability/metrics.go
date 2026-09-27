@@ -202,9 +202,16 @@ func label(value string) string {
 
 // NormalizeProtocol keeps peer-controlled protocol values within a finite
 // Prometheus label set. Unknown extensions remain observable as "unknown".
+//
+// "icmp-echo" is in the set because it is a stream protocol rather than an IP
+// protocol number: the VPN gateway relays ICMP echo through an agent stream that
+// carries this name, and labelling it "icmp" would split one protocol across two
+// series. A bare "icmp" stays unknown on purpose - nothing in the system relays
+// ICMP other than echo, so a caller claiming it is describing a protocol that
+// does not exist.
 func NormalizeProtocol(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "tcp", "udp", "http", "websocket":
+	case "tcp", "udp", "http", "websocket", "icmp-echo":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
 		return "unknown"

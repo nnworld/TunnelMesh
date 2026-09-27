@@ -228,6 +228,10 @@ func (s *ClientStreamService) open(ctx context.Context, job clientOpenJob) clien
 			code = protocol.OpenResultCodeAgentOffline
 		} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			code = protocol.OpenResultCodeTimeout
+		} else if errors.Is(err, ErrAgentRelayStreamCapacity) {
+			// Same retryable code the queue itself reports, so a Client backs off
+			// and retries instead of treating the Agent as broken.
+			return clientOpenResult{payload: failureResult(protocol.OpenResultStageQueue, protocol.OpenResultCodeQueueFull)}
 		}
 		return clientOpenResult{payload: failureResult(protocol.OpenResultStageRelay, code)}
 	}

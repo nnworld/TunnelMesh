@@ -64,3 +64,81 @@ func TestWebHandlerHealthRoutesPrecedeSPAFallback(t *testing.T) {
 		}
 	}
 }
+
+func stubMetricsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("# HELP tunnelmesh_test_metric\n"))
+	})
+}
+
+// TestHealthHandlerMetricsStaysOpenWithoutAPolicy pins the default: an upgrade that
+// does not set server.metrics.token must not lock its own monitoring out.
+func TestHealthHandlerMetricsStaysOpenWithoutAPolicy(t *testing.T) {
+	for name, policy := range map[string][]MetricsPolicy{
+		"no policy":   nil,
+		"empty token": {{Token: ""}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := NewHealthHandler(fakeHealthChecker{}, stubMetricsHandler(), policy...)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 while no token is configured", w.Code)
+			}
+		})
+	}
+}
+
+// TestHealthHandlerMetricsRequiresBearerToken is the protection itself: the metric
+// names, build info and traffic volumes in a Prometheus endpoint describe internal
+// topology, so a Server exposed directly to the internet needs one switch to stop
+// the whole registry being public.
+func TestHealthHandlerMetricsRequiresBearerToken(t *testing.T) {
+	h := NewHealthHandler(fakeHealthChecker{}, stubMetricsHandler(), MetricsPolicy{Token: "s3cret-token"})
+	cases := []struct {
+		name   string
+		header string
+		want   int
+	}{
+		{name: "missing", want: http.StatusUnauthorized},
+		{name: "wrong scheme", header: "Basic c3NyZXQtdG9rZW4=", want: http.StatusUnauthorized},
+		{name: "wrong token", header: "Bearer wrong-token", want: http.StatusUnauthorized},
+		{name: "prefix of the real token", header: "Bearer s3cret", want: http.StatusUnauthorized},
+		{name: "no separator", header: "Bears3cret-token", want: http.StatusUnauthorized},
+		{name: "correct", header: "Bearer s3cret-token", want: http.StatusOK},
+		{name: "case-insensitive scheme", header: "bearer s3cret-token", want: http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			if tc.header != "" {
+				r.Header.Set("Authorization", tc.header)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			if tc.want != http.StatusOK {
+				if strings.Contains(w.Body.String(), "tunnelmesh_test_metric") {
+					t.Fatal("a rejected scrape must not return metric output")
+				}
+				if got := w.Header().Get("WWW-Authenticate"); got == "" {
+					t.Fatal("a rejected scrape must advertise the scheme it expects")
+				}
+			}
+			if strings.Contains(w.Body.String(), "s3cret-token") {
+				t.Fatal("the response leaked the configured token")
+			}
+		})
+	}
+	// Liveness and readiness are for the load balancer and must stay open: protecting
+	// metrics cannot be allowed to black-hole health probes.
+	for _, path := range []string{"/health/live", "/health/ready"} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code == http.StatusUnauthorized {
+			t.Fatalf("%s was challenged, want it to stay open", path)
+		}
+	}
+}

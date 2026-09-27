@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
+	"github.com/tunnelmesh/tunnelmesh/internal/vpn"
 	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
@@ -133,10 +134,15 @@ type ServerConfig struct {
 	TCPBridge          TCPBridgeConfig          `mapstructure:"tcp_bridge" json:"tcp_bridge" yaml:"tcp_bridge"`
 	TCPBridgeEnabled   bool                     `mapstructure:"tcp_bridge_enabled" json:"tcp_bridge_enabled" yaml:"tcp_bridge_enabled"`
 	Relay              RelayConfig              `mapstructure:"relay" json:"relay" yaml:"relay"`
+	HTTP               ServerHTTPConfig         `mapstructure:"http" json:"http" yaml:"http"`
+	Agents             ServerAgentConfig        `mapstructure:"agents" json:"agents" yaml:"agents"`
+	Audit              ServerAuditConfig        `mapstructure:"audit" json:"audit" yaml:"audit"`
+	Metrics            ServerMetricsConfig      `mapstructure:"metrics" json:"metrics" yaml:"metrics"`
 	Stream             ServerStreamConfig       `mapstructure:"stream" json:"stream" yaml:"stream"`
 	AuthorizationCache AuthorizationCacheConfig `mapstructure:"authorization_cache" json:"authorization_cache" yaml:"authorization_cache"`
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
+	VPN                VPNConfig                `mapstructure:"vpn" json:"vpn" yaml:"vpn"`
 	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
 	// header may be believed when resolving a management-API client IP. It is
 	// empty by default, which means the direct peer address is always used and a
@@ -165,6 +171,57 @@ type ProxyEntryConfig struct {
 	AuthBackoffThreshold int           `mapstructure:"auth_backoff_threshold" json:"auth_backoff_threshold" yaml:"auth_backoff_threshold"`
 }
 
+// VPNConfig configures the embedded WireGuard gateway.
+//
+// The shape mirrors ProxyEntryConfig: one enabled switch, the addresses it
+// binds, and the resource limits that keep a single peer from exhausting the
+// process. It is disabled by default so upgrading a deployment that has never
+// heard of the gateway changes nothing about it.
+//
+// The node's own WireGuard private key is deliberately not a key here. It is
+// injected only through TUNNELMESH_VPN_NODE_PRIVATE_KEY, because a configuration
+// file is copied, backed up, rendered into a support bundle and committed to
+// version control, while an environment variable can be sourced from a secret
+// manager and never written to disk. The key the gateway hands to each peer is
+// sealed with TUNNELMESH_TOKEN_ENCRYPTION_KEY the same way credential secrets
+// are, so neither identity is ever stored in plaintext.
+type VPNConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	// Listen is the public UDP address of the WireGuard endpoint. It is not
+	// proxied and takes no part in HTTP routing, so it must be opened, rate
+	// limited and monitored separately (see ADR 0002).
+	Listen string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	// EndpointHost is the DNS name written into the peer configurations handed
+	// to users. It is a bare host, not a host:port pair: the port always comes
+	// from Listen, so the two cannot disagree.
+	EndpointHost string `mapstructure:"endpoint_host" json:"endpoint_host" yaml:"endpoint_host"`
+	// IPPool is the address space peers are drawn from and NodeSubnetSize is the
+	// prefix each server node carves out of it. Both are validated by
+	// vpn.ParsePool so the loader and the allocator can never disagree about
+	// what is a usable pool.
+	IPPool         string `mapstructure:"ip_pool" json:"ip_pool" yaml:"ip_pool"`
+	NodeSubnetSize int    `mapstructure:"node_subnet_size" json:"node_subnet_size" yaml:"node_subnet_size"`
+	// MTU leaves 72 bytes of headroom under Ethernet for the WireGuard
+	// encapsulation at the default of 1420.
+	MTU int `mapstructure:"mtu" json:"mtu" yaml:"mtu"`
+	// The three zero-means-unlimited counters follow the convention already used
+	// by max_concurrent_tunnels, so a deployment that does not set them inherits
+	// the same "no artificial ceiling" behaviour.
+	MaxPeers          int           `mapstructure:"max_peers" json:"max_peers" yaml:"max_peers"`
+	MaxFlowsPerPeer   int           `mapstructure:"max_flows_per_peer" json:"max_flows_per_peer" yaml:"max_flows_per_peer"`
+	MaxFlowsTotal     int           `mapstructure:"max_flows_total" json:"max_flows_total" yaml:"max_flows_total"`
+	PacketRatePerPeer int           `mapstructure:"packet_rate_per_peer" json:"packet_rate_per_peer" yaml:"packet_rate_per_peer"`
+	ConnectTimeout    time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
+	IdleTimeout       time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	ShutdownTimeout   time.Duration `mapstructure:"shutdown_timeout" json:"shutdown_timeout" yaml:"shutdown_timeout"`
+	// ICMPEnabled turns on echo handling for every peer that also asks for it.
+	// A peer still needs the egress agent to have negotiated the capability, so
+	// this switch is a ceiling rather than a promise.
+	ICMPEnabled       bool          `mapstructure:"icmp_enabled" json:"icmp_enabled" yaml:"icmp_enabled"`
+	ICMPTimeout       time.Duration `mapstructure:"icmp_timeout" json:"icmp_timeout" yaml:"icmp_timeout"`
+	ICMPMaxConcurrent int           `mapstructure:"icmp_max_concurrent" json:"icmp_max_concurrent" yaml:"icmp_max_concurrent"`
+}
+
 type WebSSHConfig struct {
 	Enabled               bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	TicketTTL             time.Duration `mapstructure:"ticket_ttl" json:"ticket_ttl" yaml:"ticket_ttl"`
@@ -175,8 +232,115 @@ type WebSSHConfig struct {
 	MaxMessageBytes       int           `mapstructure:"max_message_bytes" json:"max_message_bytes" yaml:"max_message_bytes"`
 }
 
+// ServerAgentConfig groups the per-Agent policy the Server applies to accepted
+// Agent connections. It is a block rather than another flat server.* key because
+// Agent-facing policy is expected to grow in one place instead of across the
+// address fields, which describe where the node listens.
+// AgentConnectionsCeiling is the largest agent.connections.max a configuration may
+// request. It is a documented ceiling rather than a proven engineering limit: a
+// bigger pool costs one WebSocket plus its per-connection buffers on both sides, so
+// the bound exists to catch typos (a "5120" pool), not to protect a measured wall.
+const AgentConnectionsCeiling = 512
+
+// DefaultAgentMaxConnectionsPerAgent is the per-Agent connection ceiling the
+// Server applies when server.agents.max_connections_per_agent is unset (0 means
+// "use this default", see ServerAgentConfig). It stays below AgentConnectionsCeiling
+// on purpose: the default must protect a shared node, and an Agent that genuinely
+// wants a bigger pool raises both sides explicitly.
+const DefaultAgentMaxConnectionsPerAgent = 64
+
+type ServerAgentConfig struct {
+	// MaxConnectionsPerAgent is how many physical Agent WebSockets one Agent
+	// identity may hold on this Server node. Zero selects
+	// DefaultAgentMaxConnectionsPerAgent rather than meaning "unlimited": the Server
+	// needs a finite number to ack, to publish as a capacity gauge, and to bound one
+	// identity's share of the session map. It must stay at or above
+	// agent.connections.max, otherwise the Agent is told to open a pool the Server
+	// then refuses; the Agent retries instead of losing the existing connections.
+	MaxConnectionsPerAgent int `mapstructure:"max_connections_per_agent" json:"max_connections_per_agent" yaml:"max_connections_per_agent"`
+}
+
+// ServerMetricsConfig guards the Prometheus endpoint.
+type ServerMetricsConfig struct {
+	// Token is the bearer credential a scraper must present to read /metrics. Empty
+	// means the endpoint answers unauthenticated requests, which is what a Server
+	// behind a reverse proxy that already restricts /metrics wants. A set token is
+	// never serialized into config output.
+	Token string `mapstructure:"token" json:"-" yaml:"-"`
+}
+
+// MinimumMetricsTokenLength is the shortest accepted bearer token. Below it a public
+// listener can be searched faster than the operator can notice, which would make the
+// guard look stronger than it is.
+const MinimumMetricsTokenLength = 16
+
+// ServerAuditConfig is the retention policy for the management audit trail.
+type ServerAuditConfig struct {
+	// RetentionDays is how long audit rows are kept. Zero, the default, keeps them
+	// forever: an audit log is evidence, and silently dropping it because a key was
+	// missing from a file is the kind of loss nobody notices until an incident needs
+	// it. Deleting history must be an explicit, positive decision.
+	RetentionDays int `mapstructure:"retention_days" json:"retention_days" yaml:"retention_days"`
+}
+
+// DefaultHTTP* are the floors the management listener always applies. They exist
+// as named constants because a hand-built RuntimeConfig (tests, embedders) leaves
+// ServerHTTPConfig zeroed, and a zeroed block must not mean "no protection".
+const (
+	DefaultHTTPReadHeaderTimeout = 10 * time.Second
+	DefaultHTTPIdleTimeout       = 120 * time.Second
+	DefaultHTTPMaxHeaderBytes    = 1 << 20
+	DefaultHTTPBodyTimeout       = 30 * time.Second
+)
+
+// ServerHTTPConfig bounds the management-plane HTTP listener. The console, /api/v1
+// and the Agent/Client WebSocket upgrades share this one port, which is why none
+// of these limits may become a connection-wide ReadTimeout or WriteTimeout: a
+// hijacked upgrade has to stay open for hours, while a slow-loris request must die
+// in seconds.
+type ServerHTTPConfig struct {
+	// ReadHeaderTimeout bounds receiving request headers.
+	ReadHeaderTimeout time.Duration `mapstructure:"read_header_timeout" json:"read_header_timeout" yaml:"read_header_timeout"`
+	// IdleTimeout closes a keep-alive connection that stays quiet this long. An
+	// in-flight request is never interrupted.
+	IdleTimeout time.Duration `mapstructure:"idle_timeout" json:"idle_timeout" yaml:"idle_timeout"`
+	// MaxHeaderBytes bounds one request header block.
+	MaxHeaderBytes int `mapstructure:"max_header_bytes" json:"max_header_bytes" yaml:"max_header_bytes"`
+	// BodyTimeout bounds reading one management API request body. It is applied per
+	// request on the /api/ path, so a stalled client cannot hold a handler forever.
+	BodyTimeout time.Duration `mapstructure:"body_timeout" json:"body_timeout" yaml:"body_timeout"`
+	// MaxConcurrentConnections sheds new connections above this many open
+	// connections. Zero, the default, accepts every connection and keeps the
+	// historical behaviour; capacity normally belongs to the reverse proxy, so this
+	// is the knob for a Server that is exposed directly.
+	MaxConcurrentConnections int `mapstructure:"max_connections" json:"max_connections" yaml:"max_connections"`
+}
+
+// WithSafeDefaults fills every non-positive duration and byte limit with the
+// built-in floor, so upgrading cannot weaken the listener by omitting the block.
+func (c ServerHTTPConfig) WithSafeDefaults() ServerHTTPConfig {
+	if c.ReadHeaderTimeout <= 0 {
+		c.ReadHeaderTimeout = DefaultHTTPReadHeaderTimeout
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = DefaultHTTPIdleTimeout
+	}
+	if c.MaxHeaderBytes <= 0 {
+		c.MaxHeaderBytes = DefaultHTTPMaxHeaderBytes
+	}
+	if c.BodyTimeout <= 0 {
+		c.BodyTimeout = DefaultHTTPBodyTimeout
+	}
+	return c
+}
+
 type ServerStreamConfig struct {
-	MaxConcurrentOpens    int `mapstructure:"max_concurrent_opens" json:"max_concurrent_opens" yaml:"max_concurrent_opens"`
+	MaxConcurrentOpens int `mapstructure:"max_concurrent_opens" json:"max_concurrent_opens" yaml:"max_concurrent_opens"`
+	// MaxActivePerAgent is the node-local ceiling on live streams toward one
+	// Agent. Unlike max_concurrent_opens it is a level, not a processing width,
+	// so it bounds the resource a single Client can pin onto an Agent. Zero means
+	// unlimited.
+	MaxActivePerAgent     int `mapstructure:"max_active_per_agent" json:"max_active_per_agent" yaml:"max_active_per_agent"`
 	MaxPendingOpens       int `mapstructure:"max_pending_opens" json:"max_pending_opens" yaml:"max_pending_opens"`
 	InitialWindow         int `mapstructure:"initial_window" json:"initial_window" yaml:"initial_window"`
 	WindowUpdateThreshold int `mapstructure:"window_update_threshold" json:"window_update_threshold" yaml:"window_update_threshold"`
@@ -239,11 +403,23 @@ type AgentConfig struct {
 }
 
 type AgentStreamConfig struct {
-	MaxConcurrentDials int           `mapstructure:"max_concurrent_dials" json:"max_concurrent_dials" yaml:"max_concurrent_dials"`
+	MaxConcurrentDials int `mapstructure:"max_concurrent_dials" json:"max_concurrent_dials" yaml:"max_concurrent_dials"`
+	// MaxActive is this Agent's own ceiling on simultaneously live streams, the
+	// defence in depth behind the Server's per-agent cap. Zero means unlimited.
+	MaxActive          int           `mapstructure:"max_active" json:"max_active" yaml:"max_active"`
 	MaxPendingDials    int           `mapstructure:"max_pending_dials" json:"max_pending_dials" yaml:"max_pending_dials"`
 	ConnectTimeout     time.Duration `mapstructure:"connect_timeout" json:"connect_timeout" yaml:"connect_timeout"`
 	OpenTimeout        time.Duration `mapstructure:"open_timeout" json:"open_timeout" yaml:"open_timeout"`
 	InboundBufferBytes int           `mapstructure:"inbound_buffer_bytes" json:"inbound_buffer_bytes" yaml:"inbound_buffer_bytes"`
+	// The ICMP keys mirror server.vpn.icmp_* on purpose: the server sets the
+	// per-peer ceiling and the agent sets the process-wide one, and an operator
+	// reading both blocks should see the same names and the same defaults.
+	// ICMPEnabled stays false by default so an upgrade never opens a ping socket
+	// on a host nobody prepared with net.ipv4.ping_group_range.
+	ICMPEnabled       bool          `mapstructure:"icmp_enabled" json:"icmp_enabled" yaml:"icmp_enabled"`
+	ICMPBindAddress   string        `mapstructure:"icmp_bind_address" json:"icmp_bind_address" yaml:"icmp_bind_address"`
+	ICMPTimeout       time.Duration `mapstructure:"icmp_timeout" json:"icmp_timeout" yaml:"icmp_timeout"`
+	ICMPMaxConcurrent int           `mapstructure:"icmp_max_concurrent" json:"icmp_max_concurrent" yaml:"icmp_max_concurrent"`
 }
 
 type AgentConnectionConfig struct {
@@ -488,7 +664,16 @@ func setDefaults(v *viper.Viper) {
 		"server.relay.cert":                                  "",
 		"server.relay.key":                                   "",
 		"server.relay.server_name":                           "",
+		"server.agents.max_connections_per_agent":            DefaultAgentMaxConnectionsPerAgent,
+		"server.audit.retention_days":                        0,
+		"server.metrics.token":                               "",
+		"server.http.read_header_timeout":                    DefaultHTTPReadHeaderTimeout,
+		"server.http.idle_timeout":                           DefaultHTTPIdleTimeout,
+		"server.http.max_header_bytes":                       DefaultHTTPMaxHeaderBytes,
+		"server.http.body_timeout":                           DefaultHTTPBodyTimeout,
+		"server.http.max_connections":                        0,
 		"server.stream.max_concurrent_opens":                 256,
+		"server.stream.max_active_per_agent":                 1024,
 		"server.stream.max_pending_opens":                    1024,
 		"server.stream.initial_window":                       262144,
 		"server.stream.window_update_threshold":              131072,
@@ -520,6 +705,22 @@ func setDefaults(v *viper.Viper) {
 		"server.proxy_entry.max_concurrent_tunnels":          512,
 		"server.proxy_entry.max_header_bytes":                16384,
 		"server.proxy_entry.auth_backoff_threshold":          5,
+		"server.vpn.enabled":                                 false,
+		"server.vpn.listen":                                  "0.0.0.0:51820",
+		"server.vpn.endpoint_host":                           "gw-1.mesh.example.com",
+		"server.vpn.ip_pool":                                 "10.64.0.0/16",
+		"server.vpn.node_subnet_size":                        24,
+		"server.vpn.mtu":                                     1420,
+		"server.vpn.max_peers":                               0,
+		"server.vpn.max_flows_per_peer":                      128,
+		"server.vpn.max_flows_total":                         0,
+		"server.vpn.packet_rate_per_peer":                    0,
+		"server.vpn.connect_timeout":                         10 * time.Second,
+		"server.vpn.idle_timeout":                            120 * time.Second,
+		"server.vpn.shutdown_timeout":                        15 * time.Second,
+		"server.vpn.icmp_enabled":                            true,
+		"server.vpn.icmp_timeout":                            5 * time.Second,
+		"server.vpn.icmp_max_concurrent":                     64,
 		"security.allowed_hosts":                             []string{},
 		"security.allowed_origins":                           []string{},
 		"security.allow_legacy_connection_tokens":            false,
@@ -532,10 +733,15 @@ func setDefaults(v *viper.Viper) {
 		"agent.connections.evaluation_interval":              10 * time.Second,
 		"agent.connections.cooldown":                         30 * time.Second,
 		"agent.streams.max_concurrent_dials":                 32,
+		"agent.streams.max_active":                           1024,
 		"agent.streams.max_pending_dials":                    128,
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
 		"agent.streams.inbound_buffer_bytes":                 262144,
+		"agent.streams.icmp_enabled":                         false,
+		"agent.streams.icmp_bind_address":                    "0.0.0.0",
+		"agent.streams.icmp_timeout":                         5 * time.Second,
+		"agent.streams.icmp_max_concurrent":                  64,
 		"client.connections.min":                             1,
 		"client.connections.max":                             1,
 		"client.connections.high_watermark":                  16,
@@ -573,11 +779,21 @@ func bindEnvironment(v *viper.Viper) {
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
 		"server.authorization_cache.enabled",
+		"server.stream.max_active_per_agent", "agent.streams.max_active",
+		"server.http.read_header_timeout", "server.http.idle_timeout", "server.http.max_header_bytes",
+		"server.http.body_timeout", "server.http.max_connections",
+		"server.agents.max_connections_per_agent",
+		"server.audit.retention_days",
+		"server.metrics.token",
 		"server.webssh.enabled", "server.webssh.ticket_ttl", "server.webssh.session_ttl", "server.webssh.max_active_sessions_per_user", "server.webssh.open_timeout", "server.webssh.idle_timeout", "server.webssh.max_message_bytes",
 		"server.proxy_entry.enabled", "server.proxy_entry.listen", "server.proxy_entry.trusted_proxies", "server.proxy_entry.domain_suffix",
 		"server.proxy_entry.route_header", "server.proxy_entry.client_ip_header", "server.proxy_entry.client_port_header",
 		"server.proxy_entry.connect_timeout", "server.proxy_entry.idle_timeout", "server.proxy_entry.shutdown_timeout",
 		"server.proxy_entry.max_concurrent_tunnels", "server.proxy_entry.max_header_bytes", "server.proxy_entry.auth_backoff_threshold",
+		"server.vpn.enabled", "server.vpn.listen", "server.vpn.endpoint_host", "server.vpn.ip_pool", "server.vpn.node_subnet_size",
+		"server.vpn.mtu", "server.vpn.max_peers", "server.vpn.max_flows_per_peer", "server.vpn.max_flows_total",
+		"server.vpn.packet_rate_per_peer", "server.vpn.connect_timeout", "server.vpn.idle_timeout", "server.vpn.shutdown_timeout",
+		"server.vpn.icmp_enabled", "server.vpn.icmp_timeout", "server.vpn.icmp_max_concurrent",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
@@ -590,9 +806,14 @@ func bindEnvironment(v *viper.Viper) {
 func Validate(cfg Config) error {
 	var problems []string
 	problems = append(problems, validateServerStream(cfg.Server.Stream)...)
+	problems = append(problems, validateServerHTTP(cfg.Server.HTTP)...)
+	problems = append(problems, validateServerAgents(cfg.Server.Agents)...)
+	problems = append(problems, validateServerAudit(cfg.Server.Audit)...)
+	problems = append(problems, validateServerMetrics(cfg.Server.Metrics)...)
 	problems = append(problems, validateAuthorizationCache(cfg.Server.AuthorizationCache)...)
 	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
 	problems = append(problems, validateProxyEntry(cfg.Server.ProxyEntry)...)
+	problems = append(problems, validateVPN(cfg.Server.VPN)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
@@ -670,10 +891,73 @@ func validateDownloads(cfg DownloadsConfig) []string {
 	return nil
 }
 
+// validateServerAgents bounds the per-Agent policy. Zero means "use the default
+// ceiling" rather than "no limit" (ServerAgentConfig explains why this key is the
+// exception to the "0 means unlimited" convention), and the ceiling is deliberately
+// not cross-checked against agent.connections.max at load time: those two settings
+// live on different hosts and are applied in no guaranteed order, so a startup
+// refusal would break deployments that are consistent at runtime.
+func validateServerAgents(cfg ServerAgentConfig) []string {
+	var problems []string
+	if cfg.MaxConnectionsPerAgent < 0 {
+		problems = append(problems, "server agents max connections per agent must not be negative")
+	}
+	return problems
+}
+
+// validateServerMetrics accepts an unset token and otherwise requires one that is
+// long enough to survive a brute force attempt against a public listener.
+func validateServerMetrics(cfg ServerMetricsConfig) []string {
+	token := strings.TrimSpace(cfg.Token)
+	if token == "" {
+		return nil
+	}
+	if len(token) < MinimumMetricsTokenLength {
+		return []string{fmt.Sprintf("server metrics token must be at least %d characters", MinimumMetricsTokenLength)}
+	}
+	return nil
+}
+
+// validateServerAudit only rejects a negative window. Zero is a meaningful value -
+// keep everything - so it must stay valid, while a negative number would hand the
+// sweeper a future cutoff and delete the whole trail.
+func validateServerAudit(cfg ServerAuditConfig) []string {
+	if cfg.RetentionDays < 0 {
+		return []string{"server audit retention days must not be negative"}
+	}
+	return nil
+}
+
+// validateServerHTTP rejects only values that would weaken the listener. Zero is
+// deliberately valid: it means "use the built-in floor", so omitting server.http
+// entirely can never disable the protection an operator expects by default.
+func validateServerHTTP(cfg ServerHTTPConfig) []string {
+	var problems []string
+	if cfg.ReadHeaderTimeout < 0 {
+		problems = append(problems, "server http read header timeout must not be negative")
+	}
+	if cfg.IdleTimeout < 0 {
+		problems = append(problems, "server http idle timeout must not be negative")
+	}
+	if cfg.MaxHeaderBytes < 0 {
+		problems = append(problems, "server http max header bytes must not be negative")
+	}
+	if cfg.BodyTimeout < 0 {
+		problems = append(problems, "server http body timeout must not be negative")
+	}
+	if cfg.MaxConcurrentConnections < 0 {
+		problems = append(problems, "server http max connections must not be negative")
+	}
+	return problems
+}
+
 func validateServerStream(cfg ServerStreamConfig) []string {
 	var problems []string
 	if cfg.MaxConcurrentOpens <= 0 {
 		problems = append(problems, "server stream max concurrent opens must be positive")
+	}
+	if cfg.MaxActivePerAgent < 0 {
+		problems = append(problems, "server stream max active per agent must not be negative")
 	}
 	if cfg.MaxPendingOpens <= 0 {
 		problems = append(problems, "server stream max pending opens must be positive")
@@ -745,6 +1029,68 @@ func validateProxyEntry(cfg ProxyEntryConfig) []string {
 	return problems
 }
 
+// validateVPN mirrors validateProxyEntry: a disabled gateway contributes no
+// problems, so a deployment that inherited a stale or nonsensical server.vpn
+// block from an example file keeps starting.
+//
+// The address pool is checked by handing it to vpn.ParsePool rather than by
+// re-implementing the rules. That is the whole point of the pure logic package:
+// the loader and the allocator agree by construction, so a pool that loads is a
+// pool that can actually hand out addresses, and the message the operator reads
+// at startup is the same one they would have read on the first issuance.
+// ValidateVPN exposes the server.vpn rules to callers that assemble a
+// configuration without going through Load, which is what the VPN gateway does
+// when an embedder hands it a RuntimeConfig directly. Sharing one implementation
+// is what keeps the loader and the gateway from drifting apart about which
+// sections are usable; a second copy of these rules would eventually disagree.
+func ValidateVPN(cfg VPNConfig) []string { return validateVPN(cfg) }
+
+func validateVPN(cfg VPNConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	var problems []string
+	if _, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen)); err != nil || port == "" {
+		problems = append(problems, "server.vpn.listen must be a host:port value for the public UDP endpoint")
+	}
+	host := strings.TrimSpace(cfg.EndpointHost)
+	if host == "" {
+		problems = append(problems, "server.vpn.endpoint_host is required when the gateway is enabled")
+	} else if !validDNSHost(host) {
+		problems = append(problems, fmt.Sprintf("server.vpn.endpoint_host %q must be a bare DNS host without a port", cfg.EndpointHost))
+	}
+	if _, err := vpn.ParsePool(cfg.IPPool, cfg.NodeSubnetSize); err != nil {
+		problems = append(problems, fmt.Sprintf("server.vpn.ip_pool or server.vpn.node_subnet_size is unusable: %v", err))
+	}
+	if cfg.MTU < vpn.MinTunnelMTU || cfg.MTU > vpn.MaxTunnelMTU {
+		problems = append(problems, fmt.Sprintf("server.vpn.mtu %d must be between %d and %d", cfg.MTU, vpn.MinTunnelMTU, vpn.MaxTunnelMTU))
+	}
+	if cfg.MaxPeers < 0 {
+		problems = append(problems, "server.vpn.max_peers must not be negative (zero means unlimited)")
+	}
+	if cfg.MaxFlowsPerPeer < 0 {
+		problems = append(problems, "server.vpn.max_flows_per_peer must not be negative (zero means unlimited)")
+	}
+	if cfg.MaxFlowsTotal < 0 {
+		problems = append(problems, "server.vpn.max_flows_total must not be negative (zero means unlimited)")
+	}
+	if cfg.PacketRatePerPeer < 0 {
+		problems = append(problems, "server.vpn.packet_rate_per_peer must not be negative (zero means unlimited)")
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.IdleTimeout <= 0 || cfg.ShutdownTimeout < 0 {
+		problems = append(problems, "server.vpn timeouts must be positive (shutdown_timeout may be zero)")
+	}
+	if cfg.ICMPEnabled {
+		if cfg.ICMPTimeout <= 0 {
+			problems = append(problems, "server.vpn.icmp_timeout must be positive while icmp is enabled")
+		}
+		if cfg.ICMPMaxConcurrent <= 0 {
+			problems = append(problems, "server.vpn.icmp_max_concurrent must be positive while icmp is enabled")
+		}
+	}
+	return problems
+}
+
 func validateWebSSH(cfg WebSSHConfig) []string {
 	var problems []string
 	if !cfg.Enabled {
@@ -799,6 +1145,9 @@ func validateAuthorizationCache(cfg AuthorizationCacheConfig) []string {
 
 func validateAgentStreams(cfg AgentStreamConfig) []string {
 	var problems []string
+	if cfg.MaxActive < 0 {
+		problems = append(problems, "agent streams max active must not be negative")
+	}
 	if cfg.MaxConcurrentDials <= 0 {
 		problems = append(problems, "agent stream max concurrent dials must be positive")
 	}
@@ -812,6 +1161,23 @@ func validateAgentStreams(cfg AgentStreamConfig) []string {
 		problems = append(problems, "agent stream open timeout must be positive")
 	}
 	problems = append(problems, validateInboundBuffer("agent stream", cfg.InboundBufferBytes)...)
+	// Validated only while enabled, exactly like server.vpn.icmp_*: a disabled
+	// engine is never opened, so an unset address must not stop the agent from
+	// serving the tunnels it does provide.
+	if cfg.ICMPEnabled {
+		if cfg.ICMPTimeout <= 0 {
+			problems = append(problems, "agent stream icmp timeout must be positive while icmp is enabled")
+		}
+		if cfg.ICMPMaxConcurrent <= 0 {
+			problems = append(problems, "agent stream icmp max concurrent must be positive while icmp is enabled")
+		}
+		// An unprivileged ping socket binds an address, not a host:port, so a
+		// DNS name here would fail at listen time with a message that does not
+		// name this key.
+		if net.ParseIP(strings.TrimSpace(cfg.ICMPBindAddress)) == nil {
+			problems = append(problems, "agent stream icmp bind address must be an ip address while icmp is enabled")
+		}
+	}
 	return problems
 }
 
@@ -863,6 +1229,15 @@ func validateClientTunnels(tunnels []TunnelConfig) []string {
 			}
 			if tunnel.TargetPort < 1 || tunnel.TargetPort > 65535 {
 				problems = append(problems, label+" target_port must be between 1 and 65535")
+			}
+			// These three protocols carry no credentials of their own, so a
+			// non-loopback bind publishes the internal target to whoever can
+			// reach this host. socks5 and http-proxy already gate on
+			// allow_remote; the guard has to cover the raw forwarders too,
+			// otherwise the documented default is the only thing protecting a
+			// tunnel that someone deliberately moved off loopback.
+			if host, _, err := net.SplitHostPort(tunnel.ListenAddr); err == nil && !isLoopbackListenHost(host) && !tunnel.AllowRemote {
+				problems = append(problems, fmt.Sprintf("%s non-loopback %s tunnel requires allow_remote", label, protocol))
 			}
 		case "socks5":
 			if strings.TrimSpace(tunnel.ListenAddr) == "" {
@@ -981,12 +1356,12 @@ func validateAgentConnections(c AgentConnectionConfig) []string {
 	if c.Min < 1 {
 		problems = append(problems, "agent connections min must be at least 1")
 	}
-	if c.Max < c.Min || c.Max > 64 {
+	if c.Max < c.Min || c.Max > AgentConnectionsCeiling {
 		if c.Max < c.Min {
 			problems = append(problems, "agent connections max must be greater than or equal to min")
 		}
-		if c.Max > 64 {
-			problems = append(problems, "agent connections max must be at most 64")
+		if c.Max > AgentConnectionsCeiling {
+			problems = append(problems, fmt.Sprintf("agent connections max must be at most %d", AgentConnectionsCeiling))
 		}
 	}
 	if c.LowWatermark > c.HighWatermark {
@@ -1478,6 +1853,7 @@ func (c Config) RedactedJSON() ([]byte, error) {
 	copy.TLS.KeyFile = redact(copy.TLS.KeyFile)
 	copy.Server.Relay.Key = redact(copy.Server.Relay.Key)
 	copy.Server.Relay.NodeToken = redact(copy.Server.Relay.NodeToken)
+	copy.Server.Metrics.Token = redact(copy.Server.Metrics.Token)
 	return json.MarshalIndent(copy, "", "  ")
 }
 
