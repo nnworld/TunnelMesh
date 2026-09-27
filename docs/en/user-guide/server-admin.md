@@ -113,6 +113,8 @@ Instance records for Clients that never reported metadata are created per physic
 
 Rows are ordered by most recent heartbeat first, using `last_seen_at DESC, id DESC`, so a Client that just dropped stays at the top. `updated_at` is deliberately not the sort key: the stale and expiry sweeps raise it on their own, which would rank "recently touched by a sweeper" above "recently alive".
 
+`activeStreams` on a connection row is the number of forwarded streams that Server node still holds open for that connection, written into the lease by the heartbeat (30 seconds by default). It is a snapshot, not a live read: a lease that just lapsed stays at the top of the list and still carries the last number it reported. Once a lease expires the row is history, so the console renders `—` there instead of a count, and both the instance card and the summary cards add up only unexpired leases.
+
 ## Observability
 
 Expose Prometheus metrics from the Server and monitor:
