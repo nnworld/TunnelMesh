@@ -173,7 +173,7 @@ describe('client connection lease state', () => {
       {
         connectionId: 'conn-expired', clientInstanceId: 'client-instance-1', tokenId: 'token-1',
         ownerUserId: 'owner-1', serverNodeId: 'server-1', connectionEpoch: 2147483647,
-        activeStreams: 0, healthScore: 100, acquiredAt: new Date(now - 600_000).toISOString(),
+        activeStreams: 84, healthScore: 100, acquiredAt: new Date(now - 600_000).toISOString(),
         lastHeartbeatAt: new Date(now - 300_000).toISOString(), expiresAt: new Date(now - 240_000).toISOString(),
         local: true,
       },
@@ -195,6 +195,14 @@ describe('client connection lease state', () => {
       const closeLabels = Array.from(document.body.querySelectorAll('button'))
         .filter(button => button.textContent?.includes(i18n.global.t('clients.closeConnection')))
       expect(closeLabels).toHaveLength(1)
+      // The expired row still carries the counter it last reported, and showing it
+      // as an active-stream number is what made the drawer look like it was
+      // counting clients that had already gone away.
+      const leaseRows = Array.from(document.body.querySelectorAll('.el-table__body tr'))
+      const liveRow = leaseRows.find(row => row.textContent?.includes('conn-live'))
+      const expiredRow = leaseRows.find(row => row.textContent?.includes('conn-expired'))
+      expect(liveRow?.textContent).toContain('2')
+      expect(expiredRow?.textContent).not.toContain('84')
     } finally {
       unmount()
     }
