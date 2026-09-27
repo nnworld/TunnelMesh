@@ -882,7 +882,7 @@ paths:
     parameters: [{name: clientInstanceId, in: path, required: true, schema: {type: string}}]
     get:
       summary: List physical Client WebSocket leases
-      description: Returns durable leases across Server nodes. The list does not expose credentials or client metadata values.
+      description: Returns durable leases across Server nodes, ordered by most recent heartbeat first. The list does not expose credentials or client metadata values.
       security: [{bearerAuth: []}]
       responses:
         '200': {description: Connection leases, content: {application/json: {schema: {$ref: '#/components/schemas/ClientConnectionClusterEnvelope'}}}}
@@ -2399,7 +2399,7 @@ components:
         total: {type: integer, minimum: 0}
         online: {type: integer, minimum: 0, description: Clients with at least one unexpired lease}
         activeConnections: {type: integer, minimum: 0, description: Unexpired physical WebSocket leases across the population}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Sum of activeStreams over unexpired leases in the whole filtered population}
         metadataUnavailable: {type: integer, minimum: 0, description: Clients that never accepted CLIENT_HELLO}
         metadataStale: {type: integer, minimum: 0, description: Reported metadata past its TTL, regardless of presence}
     Client:
@@ -2420,7 +2420,7 @@ components:
         status: {type: string, enum: [online, offline], description: Presence only. Derived from unexpired leases, never from metadata state.}
         metadataState: {type: string, enum: [fresh, expired, unavailable], description: fresh and expired require an accepted CLIENT_HELLO; unavailable means the Client never reported metadata and is independent of presence.}
         activeConnections: {type: integer, minimum: 0}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Sum of activeStreams over the unexpired leases of this instance only}
         serverNodeIds: {type: array, items: {type: string}}
         lastSeenAt: {type: string, format: date-time}
         metadata: {type: object, additionalProperties: {type: string}, description: Bounded non-secret annotations reported by the Client}
@@ -2456,7 +2456,7 @@ components:
         ownerUserId: {type: string}
         serverNodeId: {type: string}
         connectionEpoch: {type: integer, format: int64}
-        activeStreams: {type: integer, minimum: 0}
+        activeStreams: {type: integer, minimum: 0, description: Streams the owning Server node still holds open on this connection, written by its heartbeat; an expired lease keeps its final reported value}
         healthScore: {type: integer, format: int64, minimum: 0}
         acquiredAt: {type: string, format: date-time}
         lastHeartbeatAt: {type: string, format: date-time}

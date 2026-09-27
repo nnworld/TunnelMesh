@@ -370,7 +370,11 @@ func (r *clientConnectionRepo) ListByInstances(ctx context.Context, clientInstan
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT `+clientConnectionColumns+` FROM client_connection_leases WHERE client_instance_id IN (`+strings.Join(placeholders, `,`)+`) ORDER BY client_instance_id,connection_id`, args...)
+	// Grouped by instance so one batch serves every row of the list page, and
+	// newest heartbeat first inside an instance because the drawer renders these
+	// rows as the Client's live connections: an idle lease from hours ago must
+	// not sit above the one carrying traffic now.
+	rows, err := r.db.QueryContext(ctx, `SELECT `+clientConnectionColumns+` FROM client_connection_leases WHERE client_instance_id IN (`+strings.Join(placeholders, `,`)+`) ORDER BY client_instance_id,updated_at DESC,connection_id`, args...)
 	if err != nil {
 		return nil, err
 	}
