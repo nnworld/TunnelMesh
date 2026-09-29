@@ -1024,7 +1024,7 @@ func (r *memoryAgents) Get(_ context.Context, id string) (storage.Agent, error) 
 }
 func (r *memoryAgents) Update(context.Context, storage.Agent) error { return nil }
 func (r *memoryAgents) Delete(context.Context, string) error        { return nil }
-func (r *memoryAgents) List(context.Context, string, int) (storage.Page[storage.Agent], error) {
+func (r *memoryAgents) List(context.Context, storage.AgentListFilter, string, int) (storage.Page[storage.Agent], error) {
 	return storage.Page[storage.Agent]{}, nil
 }
 

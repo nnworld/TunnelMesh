@@ -71,6 +71,7 @@ func runRepositoryContract(t *testing.T, db *DB) {
 	if _, err := db.Agents().Get(ctx, agent.ID); err != nil {
 		t.Fatalf("get agent: %v", err)
 	}
+	runAgentListRepositoryContract(t, db)
 	if err := db.Policies().Create(ctx, AgentPolicy{ID: "policy-1", AgentID: agent.ID, TargetHost: "10.0.0.1", TargetPort: 22, Protocol: "tcp"}); err != nil {
 		t.Fatalf("create policy: %v", err)
 	}

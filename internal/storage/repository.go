@@ -149,12 +149,24 @@ type VPNIPLeaseRepository interface {
 var ErrServiceTokenRevoked = errors.New("service token is already revoked")
 var ErrServiceTokenExpired = errors.New("service token is already expired")
 
+// AgentListFilter narrows a page of agents. The zero value is the whole table,
+// which is what an administrator asks for; both fields are applied in SQL so
+// paging and filtering stay consistent for every page, not only the first one.
+type AgentListFilter struct {
+	// OwnerUserID restricts the page to one owner. Authorization never trusts a
+	// caller-supplied value: the API layer fills it from the principal.
+	OwnerUserID string
+	// Keyword matches a substring of the name or the id, the same shape the
+	// client list uses, so an operator can type either.
+	Keyword string
+}
+
 type AgentRepository interface {
 	Create(context.Context, Agent) error
 	Get(context.Context, string) (Agent, error)
 	Update(context.Context, Agent) error
 	Delete(context.Context, string) error
-	List(context.Context, string, int) (Page[Agent], error)
+	List(context.Context, AgentListFilter, string, int) (Page[Agent], error)
 }
 
 type PolicyStatus string
@@ -1163,15 +1175,33 @@ func (r *agentRepo) Delete(ctx context.Context, id string) error {
 		return checkAffected(res, err)
 	})
 }
-func (r *agentRepo) List(ctx context.Context, cursor string, limit int) (Page[Agent], error) {
+func (r *agentRepo) List(ctx context.Context, filter AgentListFilter, cursor string, limit int) (Page[Agent], error) {
 	cursor, limit = pageArgs(cursor, limit)
 	q := `SELECT id,name,owner_user_id,capabilities,enabled,created_at,updated_at FROM agents`
+	conditions := []string{}
 	args := []any{}
-	if c := decodeCursor(cursor); c != "" {
-		q += ` WHERE id>?`
-		args = append(args, c)
+	if filter.OwnerUserID != "" {
+		conditions = append(conditions, `owner_user_id=?`)
+		args = append(args, filter.OwnerUserID)
 	}
-	q += ` ORDER BY id LIMIT ?`
+	if keyword := boundedAgentFilter(strings.TrimSpace(filter.Keyword)); keyword != "" {
+		conditions = append(conditions, `(INSTR(name, ?)>0 OR INSTR(id, ?)>0)`)
+		args = append(args, keyword, keyword)
+	}
+	// The page key is (created_at, id) rather than id: the console lists newest
+	// registrations first, and ordering one way while paging by another would
+	// repeat or skip rows at every page boundary. created_at is not unique, so
+	// the id tie-break is part of the cursor as well. Both columns are TEXT
+	// holding RFC3339 UTC, so the database compares them in the same order the
+	// console renders them, on either dialect.
+	if created, id, ok := decodeCompositeCursor(cursor); ok {
+		conditions = append(conditions, `(created_at<? OR (created_at=? AND id<?))`)
+		args = append(args, created, created, id)
+	}
+	if len(conditions) > 0 {
+		q += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1196,7 +1226,8 @@ func (r *agentRepo) List(ctx context.Context, cursor string, limit int) (Page[Ag
 	if len(out) > limit {
 		p.Items = out[:limit]
 		p.HasMore = true
-		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
+		last := p.Items[len(p.Items)-1]
+		p.NextCursor = encodeCursor(tm(last.CreatedAt) + "\x00" + last.ID)
 	}
 	return p, nil
 }
