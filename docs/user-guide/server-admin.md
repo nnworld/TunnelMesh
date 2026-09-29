@@ -262,7 +262,9 @@ Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`serve
 
 ## 发行管理
 
-“发行管理”是左侧菜单的最后一项，仅管理员可见。页面展示当前 Server 的版本、Commit、构建时间、Schema 版本和仓库地址，以及 SHA256SUMS 和 manifest 链接，并通过固定入口打开 GitHub Release：<https://github.com/nnworld/TunnelMesh/releases>。页面不再展示各平台下载、压缩包和校验命令。升级前请先备份数据库，并阅读当前版本的 Schema 升级与回滚说明。
+“发行管理”是左侧菜单的最后一项，仅管理员可见。页面展示当前 Server 的版本、Commit、构建时间、Schema 版本和仓库地址，并按平台列出不可变发行包（`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`、`windows/arm64`）：每张卡片给出压缩包名、下载入口和可复制的 SHA256 校验命令，页面底部另有 SHA256SUMS 与 manifest 链接。所有地址都由服务端按 `downloads.github_repository` 与当前构建版本拼接，前端不内置仓库域名，因此镜像仓库或 GitHub Enterprise 部署同样可用。
+
+当运行的是源码构建（版本为 `dev`）时，页面会提示该版本没有对应的 GitHub 发行包，链接仅对按 tag 发布的版本有效——此时压缩包名仍然展示，便于与自行构建的产物对齐。升级前请先备份数据库，并阅读当前版本的 Schema 升级与回滚说明。发行包由 CI 产出，后台只展示下载信息，不代理 GitHub 凭据，也不缓存发行文件。
 
 ## 配置与排障建议
 
