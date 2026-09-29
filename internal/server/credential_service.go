@@ -147,9 +147,9 @@ func (s *CredentialService) Create(ctx context.Context, actor auth.Principal, in
 	if err != nil {
 		return storage.Credential{}, mapCredentialStorageError(err)
 	}
-	s.writeAudit(ctx, actor, "credential.created", created.ID)
+	s.writeAudit(ctx, actor, "credential.created", created.ID, credentialAuditDetails(created))
 	if created.HasSecret() {
-		s.writeAudit(ctx, actor, "credential.secret-set", created.ID)
+		s.writeAudit(ctx, actor, "credential.secret-set", created.ID, credentialAuditDetails(created))
 	}
 	return created, nil
 }
@@ -231,9 +231,11 @@ func (s *CredentialService) Update(ctx context.Context, actor auth.Principal, id
 	}
 	updated, err := s.Get(ctx, actor, id)
 	if err == nil {
-		s.writeAudit(ctx, actor, "credential.updated", id)
+		s.writeAudit(ctx, actor, "credential.updated", id, credentialAuditDetails(updated))
 		if input.Secret != nil && !input.Secret.isEmpty() {
-			s.writeAudit(ctx, actor, "credential.secret-set", id)
+			// The follow-up event says a secret was replaced, which is the fact that
+			// matters; it deliberately carries no new material to name.
+			s.writeAudit(ctx, actor, "credential.secret-set", id, credentialAuditDetails(updated))
 		}
 	}
 	return updated, err
@@ -448,13 +450,14 @@ func mapCredentialStorageError(err error) error {
 }
 
 func (s *CredentialService) Delete(ctx context.Context, actor auth.Principal, id string) error {
-	if _, err := s.Get(ctx, actor, id); err != nil {
+	existing, err := s.Get(ctx, actor, id)
+	if err != nil {
 		return err
 	}
 	if err := s.credentials.Delete(ctx, id, time.Now().UTC()); err != nil {
 		return err
 	}
-	s.writeAudit(ctx, actor, "credential.deleted", id)
+	s.writeAudit(ctx, actor, "credential.deleted", id, credentialAuditDetails(existing))
 	return nil
 }
 
@@ -467,7 +470,7 @@ func (s *CredentialService) Restore(ctx context.Context, actor auth.Principal, i
 	}
 	restored, err := s.Get(ctx, actor, id)
 	if err == nil {
-		s.writeAudit(ctx, actor, "credential.restored", id)
+		s.writeAudit(ctx, actor, "credential.restored", id, credentialAuditDetails(restored))
 	}
 	return restored, err
 }
@@ -511,11 +514,29 @@ func (s *CredentialService) ExtractSSHPublicKey(_ context.Context, _ auth.Princi
 	return ExtractedSSHPublicKey{PublicKey: normalized, Fingerprint: fingerprint}, nil
 }
 
-func (s *CredentialService) writeAudit(ctx context.Context, actor auth.Principal, action, id string) {
+// credentialAuditDetails names the credential that changed. A credential is the one
+// resource in the management surface that stores a secret, so this is the boundary
+// that keeps it out: the fingerprint identifies a public key, hasSecret says whether
+// a secret exists, and no ciphertext, nonce, key id, password or private key is ever
+// copied into an audit event.
+func credentialAuditDetails(credential storage.Credential) map[string]any {
+	details := map[string]any{
+		"name": credential.Name, "type": string(credential.Type),
+		"ownerUserId": credential.OwnerUserID, "enabled": credential.Enabled,
+		"hasSecret": credential.HasSecret(),
+	}
+	auditSet(details, "fingerprint", credential.Fingerprint)
+	return details
+}
+
+func (s *CredentialService) writeAudit(ctx context.Context, actor auth.Principal, action, id string, details map[string]any) {
 	if s == nil || s.audits == nil {
 		return
 	}
-	_ = s.audits.Create(ctx, storage.AuditLog{ActorUserID: actor.UserID, Action: action, ResourceType: "credential", ResourceID: id, Details: "{}"})
+	_ = s.audits.Create(ctx, storage.AuditLog{
+		ActorUserID: actor.UserID, Action: action, ResourceType: "credential",
+		ResourceID: id, Details: auditDetailsJSON(ctx, details),
+	})
 }
 
 // ParseOpenSSHPublicKey validates the untrusted public-key wire format and

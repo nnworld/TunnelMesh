@@ -5,8 +5,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -561,5 +563,49 @@ func TestResolveProxyBasicSecretIgnoresOwnership(t *testing.T) {
 	}
 	if secret, err := (credentialSecretResolver{credentials: nil}).ProxyBasicSecret(ctx, created.ID); err == nil || secret.Username != "" {
 		t.Fatalf("nil-credential resolver = %+v, %v", secret, err)
+	}
+}
+
+// Credential audits must say which credential and of what kind changed, while
+// never carrying the secret itself: the encrypted blob and the plaintext
+// password have no place in an event that is readable in the console.
+func TestCredentialAuditRecordsFactsWithoutSecrets(t *testing.T) {
+	db, service := newCredentialSecretFixture(t)
+	ctx := context.Background()
+	owner := auth.Principal{UserID: "user-audit", Username: "alice", Role: "user"}
+	created, err := service.Create(ctx, owner, CredentialInput{
+		Name: "web-host", Type: storage.CredentialTypePassword,
+		Secret: &CredentialSecret{Password: "s3cr3t-password"}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+	page, err := db.Audits().List(ctx, storage.AuditFilter{Action: "credential.created"}, "", 5)
+	if err != nil || len(page.Items) == 0 {
+		t.Fatalf("credential.created audits = %+v err = %v", page.Items, err)
+	}
+	var details map[string]any
+	if err := json.Unmarshal([]byte(page.Items[0].Details), &details); err != nil {
+		t.Fatalf("credential audit details %q: %v", page.Items[0].Details, err)
+	}
+	if details["name"] != "web-host" || details["type"] != string(storage.CredentialTypePassword) {
+		t.Fatalf("credential audit details = %#v", details)
+	}
+	if hasSecret, ok := details["hasSecret"].(bool); !ok || !hasSecret {
+		t.Fatalf("credential audit hasSecret = %#v", details["hasSecret"])
+	}
+	if details["ownerUserId"] != owner.UserID {
+		t.Fatalf("credential audit owner = %#v", details["ownerUserId"])
+	}
+	for key, value := range details {
+		text := fmt.Sprint(value)
+		if strings.Contains(text, "s3cr3t-password") || strings.Contains(text, created.SecretCiphertext) {
+			t.Fatalf("credential audit leaked secret material under %q", key)
+		}
+	}
+	for _, forbidden := range []string{"secretCiphertext", "secretNonce", "password", "privateKey", "passphrase"} {
+		if _, ok := details[forbidden]; ok {
+			t.Fatalf("credential audit carries %q", forbidden)
+		}
 	}
 }

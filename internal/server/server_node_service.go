@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -175,13 +174,11 @@ func (s *ServerNodeService) writeAudit(ctx context.Context, actor auth.Principal
 	if s.audits == nil {
 		return sql.ErrConnDone
 	}
-	details, err := json.Marshal(map[string]any{"name": node.Name, "enabled": node.Enabled, "address": node.Address})
-	if err != nil {
-		return err
-	}
+	details := map[string]any{"name": node.Name, "enabled": node.Enabled}
+	auditSet(details, "address", node.Address)
 	return s.audits.Create(ctx, storage.AuditLog{
 		ActorUserID: actor.UserID, Action: action, ResourceType: "server_node",
-		ResourceID: node.ID, Details: string(details),
+		ResourceID: node.ID, Details: auditDetailsJSON(ctx, details),
 	})
 }
 

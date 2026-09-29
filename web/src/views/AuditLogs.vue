@@ -45,10 +45,26 @@
           <el-table-column :label="t('audits.time')" width="220">
             <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column prop="actorUserId" :label="t('audits.actor')" min-width="180" />
+          <!-- The stored actor is an identifier; the name is resolved server-side
+               over the rows this reader is already allowed to see. -->
+          <el-table-column :label="t('audits.actor')" min-width="180">
+            <template #default="{ row }">
+              <div class="actor-name">{{ auditActorLabel(row, t('audits.actorSystem')) }}</div>
+              <div v-if="row.actorUserId" class="actor-id">{{ row.actorUserId }}</div>
+            </template>
+          </el-table-column>
           <el-table-column prop="action" :label="t('audits.action')" min-width="180" />
           <el-table-column prop="resourceType" :label="t('audits.resourceType')" min-width="150" />
           <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200" />
+          <!-- What changed, without opening a dialog for every row: the facts an
+               action recorded, summarized, with the whole payload on hover. -->
+          <el-table-column :label="t('audits.summary')" min-width="260">
+            <template #default="{ row }">
+              <span class="audit-summary" :title="auditDetailsTitle(row.details)">
+                {{ auditDetailsSummary(row.details, summaryPairLimit) || t('audits.emptyDetails') }}
+              </span>
+            </template>
+          </el-table-column>
           <el-table-column :label="t('audits.actions')" width="110" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="showAuditDetail(row)">{{ t('audits.detail') }}</el-button>
@@ -61,10 +77,15 @@
     <el-dialog v-model="detailVisible" :title="t('audits.detailTitle')" width="min(680px,94vw)">
       <el-descriptions v-if="detailAudit" :column="1" border>
         <el-descriptions-item :label="t('audits.time')">{{ formatDate(detailAudit.createdAt) }}</el-descriptions-item>
-        <el-descriptions-item :label="t('audits.actor')">{{ detailAudit.actorUserId || '—' }}</el-descriptions-item>
+        <el-descriptions-item :label="t('audits.actor')">
+          {{ auditActorLabel(detailAudit, t('audits.actorSystem')) }}
+          <template v-if="detailAudit.actorUserId"> · {{ detailAudit.actorUserId }}</template>
+        </el-descriptions-item>
         <el-descriptions-item :label="t('audits.action')">{{ detailAudit.action }}</el-descriptions-item>
         <el-descriptions-item :label="t('audits.resourceType')">{{ detailAudit.resourceType }}</el-descriptions-item>
         <el-descriptions-item :label="t('audits.resourceId')">{{ detailAudit.resourceId || '—' }}</el-descriptions-item>
+        <!-- The id that joins this row to the structured logs of the same request. -->
+        <el-descriptions-item :label="t('audits.traceId')">{{ auditTraceId(detailAudit.details) || t('audits.noTrace') }}</el-descriptions-item>
       </el-descriptions>
       <div class="detail-json">
         <pre>{{ formatDetails(detailAudit?.details) }}</pre>
@@ -80,6 +101,10 @@ import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import { listAuditLogs, type AuditLog } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
+import { auditActorLabel, auditDetailsSummary, auditDetailsTitle, auditTraceId } from '../utils/audit'
+
+// How many facts fit on a table row before the line is marked as truncated.
+const summaryPairLimit = 3
 
 const { t } = useI18n()
 const items = ref<AuditLog[]>([])
@@ -164,6 +189,17 @@ onMounted(load)
   display: flex;
   justify-content: flex-end;
   gap: 12px;
+}
+
+.actor-name {
+  font-weight: 600;
+}
+
+.actor-id,
+.audit-summary {
+  color: var(--tm-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .detail-json {

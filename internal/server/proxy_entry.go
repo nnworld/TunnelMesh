@@ -703,20 +703,24 @@ func asProxyEntryError(err error) *proxyentry.Error {
 // no tunnel payload.
 type proxyEntryAuditDetail struct {
 	RouteDomain string `json:"routeDomain"`
-	AgentID     string `json:"agentId,omitempty"`
-	ClientIP    string `json:"clientIp,omitempty"`
-	Target      string `json:"target,omitempty"`
-	BytesUp     int64  `json:"bytesUp,omitempty"`
-	BytesDown   int64  `json:"bytesDown,omitempty"`
-	DurationMs  int64  `json:"durationMs,omitempty"`
-	Status      int    `json:"status,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	// TraceID correlates the tunnel event with the logs of the request that opened
+	// it. It is filled in by audit() so no call site has to remember it.
+	TraceID    string `json:"traceId,omitempty"`
+	AgentID    string `json:"agentId,omitempty"`
+	ClientIP   string `json:"clientIp,omitempty"`
+	Target     string `json:"target,omitempty"`
+	BytesUp    int64  `json:"bytesUp,omitempty"`
+	BytesDown  int64  `json:"bytesDown,omitempty"`
+	DurationMs int64  `json:"durationMs,omitempty"`
+	Status     int    `json:"status,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 func (p *ProxyEntry) audit(ctx context.Context, action string, route proxyentry.Route, detail proxyEntryAuditDetail) {
 	if p == nil || p.audits == nil {
 		return
 	}
+	detail.TraceID = observability.TraceIDFromContext(ctx)
 	encoded, err := json.Marshal(detail)
 	if err != nil {
 		encoded = []byte("{}")

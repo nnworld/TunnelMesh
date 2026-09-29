@@ -16,6 +16,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/proxyentry"
 	"github.com/tunnelmesh/tunnelmesh/internal/routing"
@@ -330,6 +331,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusServiceUnavailable, "api unavailable")
 		return
 	}
+	// Every management request gets a trace, reusing an inbound Traceparent when a
+	// proxy already started one. Audits written while handling the request carry the
+	// same id, and the header is echoed so a console error can be followed into the
+	// structured logs and the other services without opening the database.
+	trace := observability.EnsureTraceContext(r.Header)
+	r = r.WithContext(observability.WithTraceContext(r.Context(), trace))
+	observability.InjectTraceHeaders(r.Context(), w.Header())
+
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	if path == "" {
 		path = "/"
@@ -497,6 +506,7 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 			writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
+		previous := agent
 		if req.Name != "" {
 			agent.Name = strings.TrimSpace(req.Name)
 		}
@@ -511,7 +521,11 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "agent.updated", "agent", agent.ID)
+		details := map[string]any{}
+		auditChange(details, "name", previous.Name, agent.Name)
+		auditChange(details, "capabilities", previous.Capabilities, agent.Capabilities)
+		auditChange(details, "enabled", previous.Enabled, agent.Enabled)
+		a.audit(r.Context(), p, "agent.updated", "agent", agent.ID, details)
 		writeJSON(w, http.StatusOK, publicAgent(agent))
 	case http.MethodDelete:
 		if !isAdmin(p) {
@@ -522,7 +536,9 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "agent.deleted", "agent", id)
+		a.audit(r.Context(), p, "agent.deleted", "agent", id, map[string]any{
+			"name": agent.Name, "ownerUserId": agent.OwnerUserID,
+		})
 		writeJSON(w, http.StatusOK, map[string]string{"id": id})
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -584,7 +600,11 @@ func (a *API) handleAgentProbes(w http.ResponseWriter, r *http.Request, p auth.P
 		}
 		return
 	}
-	a.audit(r.Context(), p, "agent.diagnose", "agent", agentID)
+	// The probe target is recorded, never the probe result: the summary is what an
+	// operator needs to see who reached for which address.
+	a.audit(r.Context(), p, "agent.diagnose", "agent", agentID, map[string]any{
+		"kind": input.Kind, "targetHost": input.Host, "targetPort": input.Port,
+	})
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -622,7 +642,12 @@ func (a *API) handleAgentTrace(w http.ResponseWriter, r *http.Request, p auth.Pr
 		writeStorageError(w, err)
 		return
 	}
-	a.audit(r.Context(), p, "agent.trace", "agent", agentID)
+	// The traceroute has its own identifier, which is how the result is fetched
+	// again; recording it plus the sensitivity flag is what makes a later review of
+	// "who traced this agent, and did they get internal addresses" possible.
+	a.audit(r.Context(), p, "agent.trace", "agent", agentID, map[string]any{
+		"tracerouteId": result.TraceID, "includeSensitive": includeSensitive,
+	})
 	if includeSensitive {
 		w.Header().Set("Cache-Control", "no-store")
 	}
@@ -717,7 +742,8 @@ func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth
 		writeStorageError(w, err)
 		return
 	}
-	if view.Stale && !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("includeStale")), "true") {
+	includeStale := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("includeStale")), "true")
+	if view.Stale && !includeStale {
 		writeAPIError(w, http.StatusNotFound, "metadata not found")
 		return
 	}
@@ -748,7 +774,9 @@ func (a *API) handleAgentMetadata(w http.ResponseWriter, r *http.Request, p auth
 		})
 	}
 	data.Connections = a.agentConnections(agentID)
-	a.audit(r.Context(), p, "agent.metadata.read", "agent_runtime_metadata", agentID)
+	a.audit(r.Context(), p, "agent.metadata.read", "agent_runtime_metadata", agentID, map[string]any{
+		"includeStale": includeStale, "stale": view.Stale, "revision": view.Revision,
+	})
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -812,7 +840,9 @@ func (a *API) createAgent(w http.ResponseWriter, r *http.Request, p auth.Princip
 		if err != nil {
 			return 0, nil, err
 		}
-		a.audit(r.Context(), p, "agent.created", "agent", created.ID)
+		a.audit(r.Context(), p, "agent.created", "agent", created.ID, map[string]any{
+			"name": created.Name, "ownerUserId": created.OwnerUserID, "enabled": created.Enabled,
+		})
 		return http.StatusCreated, publicAgent(created), nil
 	})
 	if err != nil {
@@ -886,7 +916,7 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 				if err != nil {
 					return 0, nil, err
 				}
-				a.audit(r.Context(), p, "policy.created", "agent_policy", created.ID)
+				a.audit(r.Context(), p, "policy.created", "agent_policy", created.ID, policyDetails(agentID, created))
 				return http.StatusCreated, publicPolicy(created), nil
 			})
 			if err != nil {
@@ -927,7 +957,7 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "policy.restored", "agent_policy", policyID)
+		a.audit(r.Context(), p, "policy.restored", "agent_policy", policyID, policyDetails(agentID, restored))
 		writeJSON(w, http.StatusOK, publicPolicy(restored))
 		return
 	}
@@ -948,6 +978,7 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeAPIError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
+		previous := policy
 		req.TargetHost = strings.TrimSpace(req.TargetHost)
 		if req.TargetHost != "" {
 			policy.TargetHost = req.TargetHost
@@ -977,7 +1008,7 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "policy.updated", "agent_policy", policy.ID)
+		a.audit(r.Context(), p, "policy.updated", "agent_policy", policy.ID, policyChangeDetails(agentID, previous, policy))
 		writeJSON(w, http.StatusOK, publicPolicy(policy))
 	case http.MethodDelete:
 		if !isAdmin(p) {
@@ -993,11 +1024,37 @@ func (a *API) handlePolicies(w http.ResponseWriter, r *http.Request, p auth.Prin
 			writeStorageError(w, err)
 			return
 		}
-		a.audit(r.Context(), p, "policy.deleted", "agent_policy", policyID)
+		a.audit(r.Context(), p, "policy.deleted", "agent_policy", policyID, policyDetails(agentID, deleted))
 		writeJSON(w, http.StatusOK, publicPolicy(deleted))
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// policyDetails describes the rule an agent is allowed to reach. It is the shape
+// shared by every policy event so a reader can tell which target was opened, and
+// why a later change mattered.
+func policyDetails(agentID string, policy storage.AgentPolicy) map[string]any {
+	details := map[string]any{
+		"agentId": agentID, "targetHost": policy.TargetHost,
+		"targetPort": policy.TargetPort, "protocol": policy.Protocol,
+	}
+	auditSet(details, "allowedCIDRs", policy.AllowedCIDRs)
+	auditSet(details, "allowedPorts", policy.AllowedPorts)
+	return details
+}
+
+// policyChangeDetails reports the effective rule and marks the fields that this
+// update actually moved, so a narrowing of a policy is visible without diffing two
+// events by hand.
+func policyChangeDetails(agentID string, previous, current storage.AgentPolicy) map[string]any {
+	details := policyDetails(agentID, current)
+	auditChange(details, "targetHost", previous.TargetHost, current.TargetHost)
+	auditChange(details, "targetPort", previous.TargetPort, current.TargetPort)
+	auditChange(details, "protocol", previous.Protocol, current.Protocol)
+	auditChange(details, "allowedCIDRs", previous.AllowedCIDRs, current.AllowedCIDRs)
+	auditChange(details, "allowedPorts", previous.AllowedPorts, current.AllowedPorts)
+	return details
 }
 
 type policyRequest struct {
@@ -1646,9 +1703,10 @@ func (a *API) handleAudits(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeStorageError(w, err)
 		return
 	}
+	actorNames := a.auditActorNames(r.Context(), page.Items)
 	items := make([]any, len(page.Items))
 	for i := range page.Items {
-		items[i] = publicAudit(page.Items[i])
+		items[i] = publicAudit(page.Items[i], actorNames[page.Items[i].ActorUserID])
 	}
 	writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
 }
@@ -1681,10 +1739,16 @@ func auditFilterFromQuery(r *http.Request) (storage.AuditFilter, error) {
 	return filter, nil
 }
 
-func publicAudit(v storage.AuditLog) map[string]any {
+// publicAudit is the single projection of an audit event, shared by the audit list
+// and the overview so the two surfaces can never disagree about an event.
+//
+// actorName is the resolved username of the actor and is empty for a system event
+// or an account that no longer exists; the identifier stays the authority, the
+// name is only a label.
+func publicAudit(v storage.AuditLog, actorName string) map[string]any {
 	return map[string]any{
-		"id": v.ID, "actorUserId": v.ActorUserID, "action": v.Action,
-		"resourceType": v.ResourceType, "resourceId": v.ResourceID,
+		"id": v.ID, "actorUserId": v.ActorUserID, "actorUsername": actorName,
+		"action": v.Action, "resourceType": v.ResourceType, "resourceId": v.ResourceID,
 		"details": json.RawMessage(defaultJSON(v.Details)), "createdAt": v.CreatedAt,
 	}
 }
@@ -1939,10 +2003,63 @@ func defaultJSON(s string) string {
 	}
 	return s
 }
-func (a *API) audit(ctx context.Context, p auth.Principal, action, typ, id string) {
-	if a.service != nil {
-		_ = a.service.CreateAudit(ctx, storage.AuditLog{ActorUserID: p.UserID, Action: action, ResourceType: typ, ResourceID: id, Details: "{}"})
+
+// audit records a management event. details carries the non-secret facts that make
+// the event reconstructable later - what changed and to what - and the request
+// trace id is stamped in so the row can be joined with the logs of the same call.
+// The parameter is mandatory rather than optional so a new call site has to decide
+// what it knows instead of quietly writing an empty object again; nil is the
+// explicit answer for the few actions that genuinely have no facts.
+//
+// Secret material never belongs in details: not passwords, tokens, private keys,
+// complete Authorization headers, nor session bytes.
+func (a *API) audit(ctx context.Context, p auth.Principal, action, typ, id string, details map[string]any) {
+	if a.service == nil {
+		return
 	}
+	_ = a.service.CreateAudit(ctx, storage.AuditLog{
+		ActorUserID: p.UserID, Action: action, ResourceType: typ, ResourceID: id,
+		Details: auditDetailsJSON(ctx, details),
+	})
+}
+
+// auditDetailsJSON encodes audit details, adding the active trace id. An event
+// without facts stays a valid empty JSON object because every reader of the
+// column, including the console, assumes an object rather than null.
+func auditDetailsJSON(ctx context.Context, details map[string]any) string {
+	stamped := observability.StampTrace(ctx, details)
+	if len(stamped) == 0 {
+		return "{}"
+	}
+	encoded, err := json.Marshal(stamped)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+// auditSet records a fact only when it is non-zero, which keeps a details summary
+// readable instead of listing every field an action happened not to carry.
+func auditSet[T comparable](details map[string]any, key string, value T) {
+	var zero T
+	if value == zero {
+		return
+	}
+	details[key] = value
+}
+
+// auditChange records the new value under key, and the previous value under
+// key+"Before", but only when the field actually changed. That keeps "what was it
+// before" answerable for the fields an action really modified, without making an
+// unchanged field look like a modification. Callers that describe the whole
+// resource (a policy rule, for example) write the current facts first, so this
+// stays correct for both conventions.
+func auditChange[T comparable](details map[string]any, key string, before, after T) {
+	if before == after {
+		return
+	}
+	details[key] = after
+	details[key+"Before"] = before
 }
 
 // auditRoute records the non-secret routing facts administrators need while
@@ -1955,13 +2072,9 @@ func (a *API) auditRoute(ctx context.Context, p auth.Principal, action string, r
 		"agentId": route.AgentID, "domain": route.Domain, "pathPrefix": route.PathPrefix,
 		"targetHost": route.TargetHost, "targetPort": route.TargetPort, "status": route.Status,
 	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		encoded = []byte("{}")
-	}
 	_ = a.service.CreateAudit(ctx, storage.AuditLog{
 		ActorUserID: p.UserID, Action: action, ResourceType: "tunnel",
-		ResourceID: route.ID, Details: string(encoded),
+		ResourceID: route.ID, Details: auditDetailsJSON(ctx, details),
 	})
 }
 func writeStorageError(w http.ResponseWriter, err error) {

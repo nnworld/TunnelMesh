@@ -8,12 +8,15 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 63 份计划，按日期倒序排列。
+共 66 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-09-29 | [还原发行管理页各平台下载地址实施计划（补记计划）](2026-09-29-downloads-platform-assets-restore.md) | — | [PR：还原发行管理页各平台下载地址](../../pull-requests/2026-09-29-downloads-platform-assets-restore.md) |
+| 2026-09-29 | [概览“最近事件”补全审计属性实施计划](2026-09-29-dashboard-recent-event-attributes.md) | — | [PR：概览“最近事件”补全审计属性](../../pull-requests/2026-09-29-dashboard-recent-event-attributes.md) |
+| 2026-09-29 | [审计日志信息量增强（Phase P0）实施计划](2026-09-29-audit-log-details-phase-p0.md) | — | [PR：审计日志信息量增强（Phase P0）](../../pull-requests/2026-09-29-audit-log-details-phase-p0.md) |
 | 2026-09-29 | [代理节点列表时间列、翻页、名称筛选与重命名实施计划](2026-09-29-agent-list-created-at-and-rename.md) | — | [PR：代理节点列表时间列、翻页、名称筛选与编辑](../../pull-requests/2026-09-29-agent-list-created-at-and-rename.md) |
 | 2026-09-25 | [实施计划：Agent 连接池上限抬到 512 与 0 语义定版](2026-09-25-agent-pool-ceiling-512.md) | — | [PR：Agent 连接池上限抬到 512 与「0」语义定版](../../pull-requests/2026-09-25-agent-pool-ceiling-512.md)<br>[PR：Review P1–P3 加固与客户端观测页排序](../../pull-requests/2026-09-25-review-p1-p3-hardening.md) |
 | 2026-09-24 | [实施计划：Review P1–P3 加固与客户端观测页排序](2026-09-24-review-p1-p3-hardening.md) | — | [PR：Review P1–P3 加固与客户端观测页排序](../../pull-requests/2026-09-25-review-p1-p3-hardening.md) |

@@ -219,12 +219,13 @@ func (a *API) handleDashboard(w http.ResponseWriter, r *http.Request, principal 
 		writeAPIError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
+	// One projection for both surfaces: the overview and the audit list must not
+	// disagree about what an event carries, and the overview needs the actor and
+	// details to tell two same-named actions apart.
+	actorNames := a.auditActorNames(r.Context(), summary.RecentEvents)
 	recentEvents := make([]any, 0, len(summary.RecentEvents))
 	for _, event := range summary.RecentEvents {
-		recentEvents = append(recentEvents, map[string]any{
-			"id": event.ID, "action": event.Action, "resourceType": event.ResourceType,
-			"resourceId": event.ResourceID, "createdAt": event.CreatedAt,
-		})
+		recentEvents = append(recentEvents, publicAudit(event, actorNames[event.ActorUserID]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agentsTotal": summary.AgentsTotal, "agentsOnline": summary.AgentsOnline,

@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -37,15 +36,11 @@ func writeAgentConnectionAudit(ctx context.Context, audits storage.AuditReposito
 	if failure != nil {
 		details["errorClass"] = observability.NormalizeErrorClass(failure)
 	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		return err
-	}
 	return audits.Create(ctx, storage.AuditLog{
 		ActorUserID:  actorUserID,
 		Action:       action,
 		ResourceType: "agent",
 		ResourceID:   registration.AgentID,
-		Details:      string(encoded),
+		Details:      auditDetailsJSON(ctx, details),
 	})
 }

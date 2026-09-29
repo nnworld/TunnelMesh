@@ -225,6 +225,28 @@ go test ./deploy/... -count=1
   `proxy_auth_backoff`（退避中，不做密码比对）、`credential_secret_unavailable`（secret store 不可用）
   四个之一，不随请求内容变化。
 
+## 管理面 trace 与审计关联
+
+Server 给每个 `/api/v1` 请求一个 W3C trace：请求带了合法的 `Traceparent` 就沿用，没有就现生成一个，
+并把同一个值回显在响应头上。处理该请求时写下的审计事件会在 `details` 里带上 `traceId`，因此一条审计行、
+一行结构化日志和浏览器里的一次报错可以用同一个 ID 串起来，不需要额外的关联表。覆盖面：管理 API 的
+全部写入点（代理节点、策略、路由、令牌、凭据、远程服务器、Server 节点、客户端连接、Agent 连接、WebSSH）
+与身份认证链路（登录成功/失败/限流、MFA、受信任设备、账号创建与停用、OIDC 即时建号），只要上下文里有
+trace 就会被盖章。
+
+边界与代价：
+
+- 后台任务、启动期迁移和保留期清扫器没有请求上下文，它们的审计**不含** `traceId`——这不是丢数据，
+  没有“那一次请求”可关联。审计的聚合器（代理入口拒绝聚合、VPN 拒绝聚合）同样不盖章：一行代表窗口内
+  多次事件，写任何一个 trace 都是错的。
+- 两个低频配置写入点暂未盖章：全局认证策略（`auth.policy.updated`）与 SSO provider 配置变更，它们的
+  `details` 构造器不持有 `context`。为塞一个 trace id 去改这两条链的函数签名属于越界，留待与各自的
+  功能改动一起做。
+- `Traceparent` 是公开格式，不含身份信息；响应头回显不新增敏感面，也不改变鉴权。
+- 排障顺序与[故障排查](troubleshooting.md)一致：先拿控制台报错响应头上的 ID，再按
+  `details.traceId` 反查审计，或反过来从审计行跳到同一请求的日志。
+
+
 ## 告警责任
 
 平台值班负责 Server readiness、scrape 缺失、存储失败和 relay 失败；网络值班负责 heartbeat miss、探针成功率和 RTT；业务负责人负责 Agent 离线、路由拒绝，以及 tp-* 代理入口的

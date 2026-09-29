@@ -151,6 +151,76 @@ func TestDashboardSummaryToleratesActorlessAuditEvents(t *testing.T) {
 	if !strings.Contains(summary.Body.String(), `"action":"proxy_auth_failed"`) {
 		t.Fatalf("summary missing actorless event: %s", summary.Body.String())
 	}
+	// The overview now shows who acted and why, so an actorless system event must
+	// still render as an empty actor rather than dropping the field.
+	var actorless struct {
+		Data struct {
+			RecentEvents []struct {
+				Action      string          `json:"action"`
+				ActorUserID string          `json:"actorUserId"`
+				ResourceID  string          `json:"resourceId"`
+				Details     json.RawMessage `json:"details"`
+			} `json:"recentEvents"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(summary.Body.Bytes(), &actorless); err != nil {
+		t.Fatal(err)
+	}
+	if len(actorless.Data.RecentEvents) != 1 {
+		t.Fatalf("recent events = %d, want 1", len(actorless.Data.RecentEvents))
+	}
+	got := actorless.Data.RecentEvents[0]
+	if got.Action != "proxy_auth_failed" || got.ActorUserID != "" || got.ResourceID != "route-1" {
+		t.Fatalf("actorless event = %+v", got)
+	}
+	if string(got.Details) == "" || string(got.Details) == "null" {
+		t.Fatalf("actorless event lost its details: %s", summary.Body.String())
+	}
+}
+
+// The overview listed only action, resource type and time, which is not enough to
+// tell two `agent.updated` events apart. It now carries the same attributes the
+// audit list exposes, because both are built from the same projection.
+func TestDashboardSummaryCarriesAuditAttributes(t *testing.T) {
+	api, admin, user := apiTestServer(t)
+	ctx := context.Background()
+	if err := api.DB.Audits().Create(ctx, storage.AuditLog{
+		ActorUserID: user.ID, Action: "token.rotated", ResourceType: "service_token",
+		ResourceID: "token-9", Details: `{"keyId":"k1","expiresIn":"720h"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary := apiJSON(t, api, http.MethodGet, "/api/v1/dashboard/summary", apiToken(t, api, admin.Username, "admin-pass"), "", nil)
+	var envelope struct {
+		Data struct {
+			RecentEvents []struct {
+				Action       string          `json:"action"`
+				ActorUserID  string          `json:"actorUserId"`
+				ResourceType string          `json:"resourceType"`
+				ResourceID   string          `json:"resourceId"`
+				Details      json.RawMessage `json:"details"`
+			} `json:"recentEvents"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(summary.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, event := range envelope.Data.RecentEvents {
+		if event.Action != "token.rotated" {
+			continue
+		}
+		found = true
+		if event.ActorUserID != user.ID || event.ResourceType != "service_token" || event.ResourceID != "token-9" {
+			t.Fatalf("event attributes = %+v, want actor %q and resource service_token/token-9", event, user.ID)
+		}
+		if !strings.Contains(string(event.Details), "\"expiresIn\"") {
+			t.Fatalf("event lost its details: %s", event.Details)
+		}
+	}
+	if !found {
+		t.Fatalf("recent events do not include the rotation: %s", summary.Body.String())
+	}
 }
 
 func TestAccountAPIChangesOwnPasswordWithoutRevokingToken(t *testing.T) {

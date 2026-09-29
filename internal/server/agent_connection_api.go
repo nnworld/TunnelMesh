@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -302,12 +301,8 @@ func (a *API) writeAgentConnectionCloseAudit(ctx context.Context, p auth.Princip
 	if failure != nil {
 		details["errorClass"] = observability.NormalizeErrorClass(failure)
 	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		encoded = []byte("{}")
-	}
 	_ = a.service.CreateAudit(ctx, storage.AuditLog{
 		ActorUserID: p.UserID, Action: action, ResourceType: "agent",
-		ResourceID: agentID, Details: string(encoded),
+		ResourceID: agentID, Details: auditDetailsJSON(ctx, details),
 	})
 }

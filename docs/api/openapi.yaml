@@ -11,6 +11,11 @@ info:
     502 egress unavailable, 503 tunnel capacity exhausted or credential secret
     store unavailable, 504 connect timeout - are returned by that entry and never
     by `/api/v1`. See `docs/user-guide/http-proxy-entry.md` for the full table.
+
+    Every `/api/v1` response carries a `Traceparent` header. An inbound one is reused
+    when it is a valid W3C trace parent, otherwise a fresh trace is minted; the same
+    id is stamped into the `traceId` field of any audit event the request writes, so a
+    console error, a log line and an audit row line up without a correlation table.
 servers:
   - url: /
 paths:
@@ -765,8 +770,11 @@ paths:
   /api/v1/dashboard/summary:
     get:
       summary: Read resource counts and recent events within the current principal's scope
+      description: The ten most recent audit events the caller may see, using the same projection as the audit list (actor, action, resource, details, time). An administrator sees every actor; any other principal sees only events they caused, filtered in SQL rather than trimmed after paging.
       security: [{ bearerAuth: [] }]
-      responses: {'200': {description: Dashboard summary}, '401': {description: Unauthenticated}}
+      responses:
+        '200': {description: Dashboard summary, content: {application/json: {schema: {$ref: '#/components/schemas/DashboardSummaryEnvelope'}}}}
+        '401': {description: Unauthenticated}
   /api/v1/agents:
     get:
       summary: List agents the caller may administer
@@ -2592,11 +2600,42 @@ components:
       properties:
         id: {type: string}
         actorUserId: {type: string}
+        actorUsername:
+          type: string
+          description: >-
+            Display name resolved for actorUserId, so a list reads as a person rather
+            than an identifier. Empty for a system event or an account that no longer
+            exists; the identifier remains the authority.
         action: {type: string}
         resourceType: {type: string}
         resourceId: {type: string}
-        details: {type: object, additionalProperties: true, description: Action-specific non-secret facts}
+        details:
+          type: object
+          additionalProperties: true
+          description: >-
+            Action-specific non-secret facts. Update events record the current value
+            and, only for a field that actually changed, the previous value under the
+            same name suffixed with Before - for example name and nameBefore. Events
+            written while serving a management request also carry traceId, the W3C
+            trace id of that request, which joins the row to the structured logs.
+            Secrets, passwords, private keys, token material, Authorization headers
+            and session bytes are never written here.
         createdAt: {type: string, format: date-time}
+    DashboardSummaryEnvelope:
+      allOf:
+        - {$ref: '#/components/schemas/Envelope'}
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [agentsTotal, agentsOnline, activeTunnels, managedRoutes, validServiceTokens, recentEvents]
+              properties:
+                agentsTotal: {type: integer}
+                agentsOnline: {type: integer}
+                activeTunnels: {type: integer}
+                managedRoutes: {type: integer}
+                validServiceTokens: {type: integer}
+                recentEvents: {type: array, maxItems: 10, items: {$ref: '#/components/schemas/AuditLog'}}
     AuditLogPageEnvelope:
       allOf:
         - {$ref: '#/components/schemas/Envelope'}
