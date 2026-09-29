@@ -770,9 +770,12 @@ paths:
   /api/v1/agents:
     get:
       summary: List agents the caller may administer
-      description: Each item carries `enabled`, the administrative switch, and `status`, which is `online` while the agent holds an unexpired connection lease and `offline` otherwise. The two are independent facts, so `enabled` alone never implies connectivity; an agent created in the console lists as `offline` until it first dials in.
+      description: Each item carries `enabled`, the administrative switch, and `status`, which is `online` while the agent holds an unexpired connection lease and `offline` otherwise. The two are independent facts, so `enabled` alone never implies connectivity; an agent created in the console lists as `offline` until it first dials in. Items also carry `createdAt` and `updatedAt`. Rows are ordered by `created_at DESC, id DESC`, so the first page is the most recently registered agents; the cursor is that same pair, which is why `id` stays in the key. `keyword` narrows to agents whose name or id contains the value, applied in SQL before paging, so a match beyond the first page is still reachable. Matching is a substring test, case-sensitive on SQLite and collation-dependent on MySQL.
       security: [{ bearerAuth: [] }]
-      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: keyword, in: query, required: false, schema: {type: string, maxLength: 128}, description: Substring of the agent name or id; longer input is truncated to 128 bytes}
       responses: {'200': {description: Cursor page}}
     post:
       security: [{ bearerAuth: [] }]
@@ -783,7 +786,12 @@ paths:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     get: {security: [{bearerAuth: []}], responses: {'200': {description: Agent}, '404': {description: Not found}}}
     put: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
-    patch: {security: [{bearerAuth: []}], requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/AgentRequest'}}}}, responses: {'200': {description: Updated}}}
+    patch:
+      summary: Update the supplied agent fields
+      description: Administrators only. Omitted fields keep their stored value, so a rename does not have to resend the switch. Setting `enabled` to false rejects new connections to this agent and client tokens that reference it, while sessions already established keep running until the agent reconnects.
+      security: [{bearerAuth: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AgentPatchRequest'}}}}
+      responses: {'200': {description: Updated}, '403': {description: Forbidden}, '404': {description: Not found}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
   /api/v1/agents/{agentId}/metadata:
     parameters:
@@ -2273,6 +2281,7 @@ components:
         - type: object
           properties: {data: {$ref: '#/components/schemas/WebSSHSessionPage'}}
     AgentRequest: {type: object, required: [name], properties: {name: {type: string}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
+    AgentPatchRequest: {type: object, description: The agent fields a PATCH may carry, with no required member so an omitted field keeps its stored value., properties: {name: {type: string, minLength: 1}, capabilities: {type: array, items: {type: string}}, enabled: {type: boolean}}}
     AgentMetadataEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'
