@@ -175,7 +175,7 @@ func (s *apiService) CreateAgent(ctx context.Context, owner string, req agentReq
 	if err := s.agents.Create(ctx, v); err != nil {
 		return storage.Agent{}, err
 	}
-	page, err := s.agents.List(ctx, "", 500)
+	page, err := s.agents.List(ctx, storage.AgentListFilter{OwnerUserID: owner}, "", 500)
 	if err != nil {
 		return storage.Agent{}, err
 	}
@@ -232,7 +232,17 @@ func (s *apiService) GetAgentMetadataView(ctx context.Context, id string) (Agent
 	return s.metadata.GetView(ctx, id)
 }
 func (s *apiService) ListAgents(ctx context.Context, cursor string, limit int) (storage.Page[storage.Agent], error) {
-	return s.agents.List(ctx, cursor, limit)
+	return s.agents.List(ctx, storage.AgentListFilter{}, cursor, limit)
+}
+
+// ListAgentsFiltered pages agents with the owner and keyword constraints in SQL.
+// Filtering after paging would drop matches past the first page, which is why the
+// repository, not the handler, applies them.
+func (s *apiService) ListAgentsFiltered(ctx context.Context, filter storage.AgentListFilter, cursor string, limit int) (storage.Page[storage.Agent], error) {
+	if s == nil || s.agents == nil {
+		return storage.Page[storage.Agent]{}, errors.New("agent repository unavailable")
+	}
+	return s.agents.List(ctx, filter, cursor, limit)
 }
 func (s *apiService) UpdateAgent(ctx context.Context, v storage.Agent) error {
 	return s.agents.Update(ctx, v)
@@ -770,7 +780,8 @@ type agentRequest struct {
 }
 
 func (a *API) listAgents(w http.ResponseWriter, r *http.Request, p auth.Principal) {
-	page, err := a.listAgentsForOwner(r.Context(), p, r.URL.Query().Get("cursor"), queryLimit(r))
+	query := r.URL.Query()
+	page, err := a.listAgentsForOwner(r.Context(), p, query.Get("keyword"), query.Get("cursor"), queryLimit(r))
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -2015,37 +2026,17 @@ func (a *API) findTunnel(ctx context.Context, want storage.Tunnel) (storage.Tunn
 	return found, nil
 }
 
-// listAgentsForOwner walks the underlying cursor until it has a complete page
-// visible to the principal. Filtering after one global page would otherwise
-// make cursor pagination appear to skip or duplicate records for normal users.
-func (a *API) listAgentsForOwner(ctx context.Context, p auth.Principal, cursor string, limit int) (storage.Page[storage.Agent], error) {
-	if isAdmin(p) {
-		return a.service.ListAgents(ctx, cursor, limit)
+// listAgentsForOwner resolves one page of agents the principal may administer.
+// Owner scoping happens in SQL: the previous version paged the whole table 500
+// rows at a time and discarded foreign rows in memory, so a non-admin's page
+// could both miss an agent past the fetched window and report a cursor that
+// repeated rows they could not see.
+func (a *API) listAgentsForOwner(ctx context.Context, p auth.Principal, keyword, cursor string, limit int) (storage.Page[storage.Agent], error) {
+	filter := storage.AgentListFilter{Keyword: keyword}
+	if !isAdmin(p) {
+		filter.OwnerUserID = p.UserID
 	}
-	if limit <= 0 {
-		limit = 50
-	}
-	result := storage.Page[storage.Agent]{}
-	for {
-		page, err := a.service.ListAgents(ctx, cursor, 500)
-		if err != nil {
-			return result, err
-		}
-		for _, v := range page.Items {
-			if v.OwnerUserID == p.UserID {
-				result.Items = append(result.Items, v)
-				if len(result.Items) == limit {
-					result.HasMore = page.HasMore || len(page.Items) > len(result.Items)
-					result.NextCursor = v.ID
-					return result, nil
-				}
-			}
-		}
-		if !page.HasMore || page.NextCursor == "" {
-			return result, nil
-		}
-		cursor = page.NextCursor
-	}
+	return a.service.ListAgentsFiltered(ctx, filter, cursor, limit)
 }
 
 func (a *API) listTunnelsForOwner(ctx context.Context, p auth.Principal, cursor string, limit int) (storage.Page[storage.Tunnel], error) {
