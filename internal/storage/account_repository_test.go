@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -150,4 +151,55 @@ func assertSQLiteTableColumnsContains(t *testing.T, db *sql.DB, table, want stri
 		}
 	}
 	t.Fatalf("table %s does not contain column %s", table, want)
+}
+
+// TestUserBatchRepositoryResolvesExistingAccounts pins the lookup the audit
+// surfaces use to turn actor ids into usernames in one query. Only existing
+// accounts come back, so a deleted actor keeps rendering as an unnamed id
+// instead of failing the whole list.
+func TestUserBatchRepositoryResolvesExistingAccounts(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	batch, ok := db.Users().(UserBatchRepository)
+	if !ok {
+		t.Fatal("user repository does not implement UserBatchRepository")
+	}
+	for _, user := range []User{
+		{ID: "actor-1", Username: "alice", Role: "admin", PasswordHash: "hash"},
+		{ID: "actor-2", Username: "bob", Role: "user", PasswordHash: "hash"},
+	} {
+		if err := db.Users().Create(ctx, user); err != nil {
+			t.Fatalf("create %s: %v", user.ID, err)
+		}
+	}
+
+	found, err := batch.GetByIDs(ctx, []string{"actor-1", "actor-2", "actor-missing", "", "actor-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 2 || found["actor-1"].Username != "alice" || found["actor-2"].Username != "bob" {
+		t.Fatalf("batch lookup = %+v", found)
+	}
+	if _, err := batch.GetByIDs(ctx, nil); err != nil {
+		t.Fatalf("empty batch must not error: %v", err)
+	}
+
+	// An audit page can name more actors than one statement should bind, so the
+	// lookup is chunked. Crossing that bound must resolve every id rather than
+	// quietly returning only the first chunk.
+	bulk := make([]string, 0, userBatchChunkSize+2)
+	for i := range userBatchChunkSize + 2 {
+		id := fmt.Sprintf("bulk-actor-%d", i)
+		if err := db.Users().Create(ctx, User{ID: id, Username: id, Role: "user", PasswordHash: "hash"}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		bulk = append(bulk, id)
+	}
+	resolved, err := batch.GetByIDs(ctx, bulk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != len(bulk) {
+		t.Fatalf("chunked lookup resolved %d of %d accounts", len(resolved), len(bulk))
+	}
 }

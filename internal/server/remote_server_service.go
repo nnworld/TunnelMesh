@@ -76,7 +76,7 @@ func (s *RemoteServerService) Create(ctx context.Context, actor auth.Principal, 
 	if err != nil {
 		return storage.RemoteServer{}, err
 	}
-	s.writeAudit(ctx, actor, "remote_server.created", created.ID)
+	s.writeAudit(ctx, actor, "remote_server.created", created.ID, remoteServerDetails(created))
 	return created, nil
 }
 
@@ -131,19 +131,20 @@ func (s *RemoteServerService) Update(ctx context.Context, actor auth.Principal, 
 	}
 	updated, err := s.Get(ctx, actor, id)
 	if err == nil {
-		s.writeAudit(ctx, actor, "remote_server.updated", id)
+		s.writeAudit(ctx, actor, "remote_server.updated", id, remoteServerDetails(updated))
 	}
 	return updated, err
 }
 
 func (s *RemoteServerService) Delete(ctx context.Context, actor auth.Principal, id string) error {
-	if _, err := s.Get(ctx, actor, id); err != nil {
+	existing, err := s.Get(ctx, actor, id)
+	if err != nil {
 		return err
 	}
 	if err := s.servers.Delete(ctx, id, time.Now().UTC()); err != nil {
 		return err
 	}
-	s.writeAudit(ctx, actor, "remote_server.deleted", id)
+	s.writeAudit(ctx, actor, "remote_server.deleted", id, remoteServerDetails(existing))
 	return nil
 }
 
@@ -156,7 +157,7 @@ func (s *RemoteServerService) Restore(ctx context.Context, actor auth.Principal,
 	}
 	restored, err := s.Get(ctx, actor, id)
 	if err == nil {
-		s.writeAudit(ctx, actor, "remote_server.restored", id)
+		s.writeAudit(ctx, actor, "remote_server.restored", id, remoteServerDetails(restored))
 	}
 	return restored, err
 }
@@ -266,11 +267,27 @@ func (s *RemoteServerService) validateAgentPolicy(ctx context.Context, agentID, 
 	return nil
 }
 
-func (s *RemoteServerService) writeAudit(ctx context.Context, actor auth.Principal, action, id string) {
+// remoteServerDetails records the reachable endpoint an event changed. The login
+// user name is left out on purpose: it is part of the resource, while the agent and
+// credential identifiers are what an operator needs to see which path was edited.
+func remoteServerDetails(server storage.RemoteServer) map[string]any {
+	details := map[string]any{
+		"name": server.Name, "host": server.Host, "port": server.Port,
+		"ownerUserId": server.OwnerUserID, "enabled": server.Enabled,
+	}
+	auditSet(details, "agentId", server.AgentID)
+	auditSet(details, "credentialId", server.CredentialID)
+	return details
+}
+
+func (s *RemoteServerService) writeAudit(ctx context.Context, actor auth.Principal, action, id string, details map[string]any) {
 	if s == nil || s.audits == nil {
 		return
 	}
-	_ = s.audits.Create(ctx, storage.AuditLog{ActorUserID: actor.UserID, Action: action, ResourceType: "remote_server", ResourceID: id, Details: "{}"})
+	_ = s.audits.Create(ctx, storage.AuditLog{
+		ActorUserID: actor.UserID, Action: action, ResourceType: "remote_server",
+		ResourceID: id, Details: auditDetailsJSON(ctx, details),
+	})
 }
 
 func parsePortInt(raw string) (int, error) {

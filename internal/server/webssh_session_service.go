@@ -254,7 +254,7 @@ func (s *WebSSHSessionService) writeCredentialRevealAudit(ctx context.Context, a
 	}
 	_ = s.audits.Create(ctx, storage.AuditLog{
 		ActorUserID: actor.UserID, Action: "credential.revealed", ResourceType: "credential",
-		ResourceID: credentialID, Details: `{"sessionId":"` + sessionID + `"}`,
+		ResourceID: credentialID, Details: auditDetailsJSON(ctx, map[string]any{"sessionId": sessionID}),
 	})
 }
 
@@ -357,7 +357,7 @@ func (s *WebSSHSessionService) writeAudit(ctx context.Context, actor auth.Princi
 	}
 	_ = s.audits.Create(ctx, storage.AuditLog{
 		ActorUserID: actor.UserID, Action: action, ResourceType: "webssh_session",
-		ResourceID: id, Details: `{"result":"` + result + `"}`,
+		ResourceID: id, Details: auditDetailsJSON(ctx, map[string]any{"result": result}),
 	})
 }
 

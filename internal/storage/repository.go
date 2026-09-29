@@ -21,6 +21,17 @@ type UserRepository interface {
 	List(context.Context, string, int) (Page[User], error)
 }
 
+// UserBatchRepository is an optional capability that resolves many accounts in
+// one query. The management API needs it to label the actors of an audit page
+// without issuing one query per row, and keeping it separate avoids widening
+// UserRepository, which authentication fakes implement.
+//
+// The implementation uses portable placeholders and column pruning only, so it
+// is safe on MySQL 5.6 and SQLite without a schema change.
+type UserBatchRepository interface {
+	GetByIDs(context.Context, []string) (map[string]User, error)
+}
+
 type AccountStatus string
 
 const (
@@ -573,6 +584,34 @@ type userRepo struct {
 	lockReads bool
 }
 
+// userBatchChunkSize bounds how many account ids one batched lookup binds.
+const userBatchChunkSize = 200
+
+// userColumns is the single source of truth for the account projection. Every
+// read of the users table lists these columns in this order so scanUser stays
+// correct when a column is added.
+const userColumns = `id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required`
+
+// scanUser decodes one users row produced by a userColumns query. Time columns
+// are stored as text, and deleted_at is nullable, so the conversions are
+// centralised here instead of being repeated per query.
+func scanUser(row rowScanner) (User, error) {
+	var v User
+	var deleted sql.NullString
+	var created, updated string
+	var authSource string
+	var mfaRequired int
+	if err := row.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired); err != nil {
+		return User{}, err
+	}
+	v.AuthSource = normalizeAuthSource(authSource)
+	v.MFARequired = mfaRequired != 0
+	v.DeletedAt = parseTM(deleted)
+	v.CreatedAt = parseTime(created)
+	v.UpdatedAt = parseTime(updated)
+	return v, nil
+}
+
 func (r *userRepo) Create(ctx context.Context, v User) error {
 	v.ID, v.CreatedAt, v.UpdatedAt = stamp(v.ID, v.CreatedAt, v.UpdatedAt, "user")
 	if v.Role == "" {
@@ -585,40 +624,69 @@ func (r *userRepo) Create(ctx context.Context, v User) error {
 	return err
 }
 func (r *userRepo) Get(ctx context.Context, id string) (User, error) {
-	var v User
-	var created, updated string
-	var deleted sql.NullString
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE id=?`
+	query := `SELECT ` + userColumns + ` FROM users WHERE id=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	var authSource string
-	var mfaRequired int
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired)
-	v.AuthSource = normalizeAuthSource(authSource)
-	v.MFARequired = mfaRequired != 0
-	v.DeletedAt = parseTM(deleted)
-	v.CreatedAt = parseTime(created)
-	v.UpdatedAt = parseTime(updated)
-	return v, err
+	return scanUser(r.db.QueryRowContext(ctx, query, id))
+}
+
+// GetByIDs resolves the given accounts in one query. Duplicated and empty ids
+// are dropped, and ids that do not exist are simply absent from the result: a
+// caller labelling historical audit rows must keep working when the account was
+// deleted after the event.
+func (r *userRepo) GetByIDs(ctx context.Context, ids []string) (map[string]User, error) {
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	out := make(map[string]User, len(unique))
+	// A management page can ask for up to 500 rows, so the id list is chunked:
+	// one placeholder per id keeps a single statement inside the bind-parameter
+	// budget every supported driver honours, including older SQLite builds.
+	for start := 0; start < len(unique); start += userBatchChunkSize {
+		end := min(start+userBatchChunkSize, len(unique))
+		chunk := unique[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := r.db.QueryContext(ctx, `SELECT `+userColumns+` FROM users WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			v, err := scanUser(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[v.ID] = v
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	return out, nil
 }
 func (r *userRepo) GetByUsername(ctx context.Context, n string) (User, error) {
-	var v User
-	var created, updated string
-	var deleted sql.NullString
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE username=?`
+	query := `SELECT ` + userColumns + ` FROM users WHERE username=?`
 	if r.lockReads && r.driver == DriverMySQL {
 		query += ` FOR UPDATE`
 	}
-	var authSource string
-	var mfaRequired int
-	err := r.db.QueryRowContext(ctx, query, n).Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired)
-	v.AuthSource = normalizeAuthSource(authSource)
-	v.MFARequired = mfaRequired != 0
-	v.DeletedAt = parseTM(deleted)
-	v.CreatedAt = parseTime(created)
-	v.UpdatedAt = parseTime(updated)
-	return v, err
+	return scanUser(r.db.QueryRowContext(ctx, query, n))
 }
 func (r *userRepo) Update(ctx context.Context, v User) error {
 	if v.UpdatedAt.IsZero() {
@@ -637,7 +705,7 @@ func (r *userRepo) Delete(ctx context.Context, id string) error {
 }
 func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[User], error) {
 	cursor, limit = pageArgs(cursor, limit)
-	q := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users`
+	q := `SELECT ` + userColumns + ` FROM users`
 	args := []any{}
 	if c := decodeCursor(cursor); c != "" {
 		q += ` WHERE id>?`
@@ -652,19 +720,10 @@ func (r *userRepo) List(ctx context.Context, cursor string, limit int) (Page[Use
 	defer rows.Close()
 	var out []User
 	for rows.Next() {
-		var v User
-		var c, u string
-		var deleted sql.NullString
-		var authSource string
-		var mfaRequired int
-		if err := rows.Scan(&v.ID, &v.Username, &v.Role, &v.PasswordHash, &v.Disabled, &deleted, &c, &u, &authSource, &mfaRequired); err != nil {
+		v, err := scanUser(rows)
+		if err != nil {
 			return Page[User]{}, err
 		}
-		v.AuthSource = normalizeAuthSource(authSource)
-		v.MFARequired = mfaRequired != 0
-		v.DeletedAt = parseTM(deleted)
-		v.CreatedAt = parseTime(c)
-		v.UpdatedAt = parseTime(u)
 		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -696,7 +755,7 @@ func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, curso
 		conditions = append(conditions, `id>?`)
 		args = append(args, decoded)
 	}
-	query := `SELECT id,username,role,password_hash,disabled,deleted_at,created_at,updated_at,auth_source,mfa_required FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
+	query := `SELECT ` + userColumns + ` FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY id LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -705,19 +764,10 @@ func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, curso
 	defer rows.Close()
 	page := Page[User]{}
 	for rows.Next() {
-		var user User
-		var deleted sql.NullString
-		var created, updated string
-		var authSource string
-		var mfaRequired int
-		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.PasswordHash, &user.Disabled, &deleted, &created, &updated, &authSource, &mfaRequired); err != nil {
+		user, err := scanUser(rows)
+		if err != nil {
 			return Page[User]{}, err
 		}
-		user.AuthSource = normalizeAuthSource(authSource)
-		user.MFARequired = mfaRequired != 0
-		user.DeletedAt = parseTM(deleted)
-		user.CreatedAt = parseTime(created)
-		user.UpdatedAt = parseTime(updated)
 		page.Items = append(page.Items, user)
 	}
 	if err := rows.Err(); err != nil {

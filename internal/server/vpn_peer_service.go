@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1100,16 +1099,12 @@ func (s *VPNPeerService) audit(ctx context.Context, actor auth.Principal, action
 	if s.audits == nil {
 		return
 	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		encoded = []byte("{}")
-	}
 	_ = s.audits.Create(ctx, storage.AuditLog{
 		ActorUserID:  actor.UserID,
 		Action:       action,
 		ResourceType: vpnPeerResourceType,
 		ResourceID:   peerID,
-		Details:      string(encoded),
+		Details:      auditDetailsJSON(ctx, details),
 	})
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
@@ -823,4 +824,287 @@ func cloneMap(input map[string]any) map[string]any {
 		output[key] = value
 	}
 	return output
+}
+
+// latestAuditDetails decodes the details of the newest audit event for an action.
+// A missing action fails the test, so a lost audit is reported as a lost audit
+// rather than as an empty map.
+func latestAuditDetails(t *testing.T, api *API, action string) map[string]any {
+	t.Helper()
+	page, err := api.DB.Audits().List(context.Background(), storage.AuditFilter{Action: action}, "", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) == 0 {
+		t.Fatalf("no audit event for action %q", action)
+	}
+	var details map[string]any
+	if err := json.Unmarshal([]byte(page.Items[0].Details), &details); err != nil {
+		t.Fatalf("action %q details %q: %v", action, page.Items[0].Details, err)
+	}
+	return details
+}
+
+func mustAuditString(t *testing.T, details map[string]any, key string) string {
+	t.Helper()
+	value, ok := details[key]
+	if !ok {
+		t.Fatalf("details %#v has no key %q", details, key)
+	}
+	text, ok := value.(string)
+	if !ok {
+		t.Fatalf("details[%q] = %#v, want string", key, value)
+	}
+	return text
+}
+
+// An administrator renaming or disabling a node must be reconstructable from the
+// audit alone, which is why the event carries the new value and, only when it
+// changed, the previous one.
+func TestAgentAuditRecordsChangedFacts(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	created := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "audit-agent-create", map[string]any{"name": "before-name"})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create agent = %d: %s", created.Code, created.Body.String())
+	}
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+
+	createDetails := latestAuditDetails(t, api, "agent.created")
+	if got := mustAuditString(t, createDetails, "name"); got != "before-name" {
+		t.Fatalf("agent.created name = %q", got)
+	}
+	if got := mustAuditString(t, createDetails, "ownerUserId"); got != admin.ID {
+		t.Fatalf("agent.created owner = %q, want %q", got, admin.ID)
+	}
+
+	renamed := apiJSON(t, h, http.MethodPatch, "/api/v1/agents/"+agent.Data.ID, token, "", map[string]any{"name": "after-name", "enabled": false})
+	if renamed.Code != http.StatusOK {
+		t.Fatalf("patch agent = %d: %s", renamed.Code, renamed.Body.String())
+	}
+	updateDetails := latestAuditDetails(t, api, "agent.updated")
+	if got := mustAuditString(t, updateDetails, "name"); got != "after-name" {
+		t.Fatalf("agent.updated name = %q", got)
+	}
+	if got := mustAuditString(t, updateDetails, "nameBefore"); got != "before-name" {
+		t.Fatalf("agent.updated nameBefore = %q", got)
+	}
+	if enabled, ok := updateDetails["enabled"].(bool); !ok || enabled {
+		t.Fatalf("agent.updated enabled = %#v, want false", updateDetails["enabled"])
+	}
+	if before, ok := updateDetails["enabledBefore"].(bool); !ok || !before {
+		t.Fatalf("agent.updated enabledBefore = %#v, want true", updateDetails["enabledBefore"])
+	}
+
+	// Flipping only the enable flag must not claim that the name changed.
+	reenabled := apiJSON(t, h, http.MethodPatch, "/api/v1/agents/"+agent.Data.ID, token, "", map[string]any{"enabled": true})
+	if reenabled.Code != http.StatusOK {
+		t.Fatalf("re-enable agent = %d: %s", reenabled.Code, reenabled.Body.String())
+	}
+	second := latestAuditDetails(t, api, "agent.updated")
+	if _, ok := second["nameBefore"]; ok {
+		t.Fatalf("unchanged name recorded as a change: %#v", second)
+	}
+	if _, ok := second["name"]; ok {
+		t.Fatalf("unchanged name recorded: %#v", second)
+	}
+	if enabled, ok := second["enabled"].(bool); !ok || !enabled {
+		t.Fatalf("agent.updated enabled = %#v, want true", second["enabled"])
+	}
+
+	deleted := apiJSON(t, h, http.MethodDelete, "/api/v1/agents/"+agent.Data.ID, token, "", nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete agent = %d: %s", deleted.Code, deleted.Body.String())
+	}
+	deleteDetails := latestAuditDetails(t, api, "agent.deleted")
+	if got := mustAuditString(t, deleteDetails, "name"); got != "after-name" {
+		t.Fatalf("agent.deleted name = %q", got)
+	}
+}
+
+// A policy is the authorization boundary of an agent, so its audit has to say
+// which target and protocol were allowed, not just that something changed.
+func TestPolicyAuditRecordsFacts(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+
+	agentResponse := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "audit-policy-agent", map[string]any{"name": "policy-agent"})
+	var agent struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(agentResponse.Body.Bytes(), &agent); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := "/api/v1/agents/" + agent.Data.ID + "/policies"
+	created := apiJSON(t, h, http.MethodPost, policyPath, token, "audit-policy-create", map[string]any{
+		"targetHost": "10.0.0.8", "targetPort": 8080, "protocol": "tcp",
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create policy = %d: %s", created.Code, created.Body.String())
+	}
+	var policy struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &policy); err != nil {
+		t.Fatal(err)
+	}
+
+	createdDetails := latestAuditDetails(t, api, "policy.created")
+	if got := mustAuditString(t, createdDetails, "agentId"); got != agent.Data.ID {
+		t.Fatalf("policy.created agentId = %q, want %q", got, agent.Data.ID)
+	}
+	if got := mustAuditString(t, createdDetails, "targetHost"); got != "10.0.0.8" {
+		t.Fatalf("policy.created targetHost = %q", got)
+	}
+	if got, ok := createdDetails["targetPort"].(float64); !ok || got != 8080 {
+		t.Fatalf("policy.created targetPort = %#v, want 8080", createdDetails["targetPort"])
+	}
+	if got := mustAuditString(t, createdDetails, "protocol"); got != "tcp" {
+		t.Fatalf("policy.created protocol = %q", got)
+	}
+
+	patched := apiJSON(t, h, http.MethodPatch, policyPath+"/"+policy.Data.ID, token, "", map[string]any{"targetPort": 9090})
+	if patched.Code != http.StatusOK {
+		t.Fatalf("patch policy = %d: %s", patched.Code, patched.Body.String())
+	}
+	patchedDetails := latestAuditDetails(t, api, "policy.updated")
+	if got, ok := patchedDetails["targetPort"].(float64); !ok || got != 9090 {
+		t.Fatalf("policy.updated targetPort = %#v, want 9090", patchedDetails["targetPort"])
+	}
+	if got, ok := patchedDetails["targetPortBefore"].(float64); !ok || got != 8080 {
+		t.Fatalf("policy.updated targetPortBefore = %#v, want 8080", patchedDetails["targetPortBefore"])
+	}
+	if got := mustAuditString(t, patchedDetails, "targetHost"); got != "10.0.0.8" {
+		t.Fatalf("policy.updated targetHost = %q", got)
+	}
+	if _, ok := patchedDetails["targetHostBefore"]; ok {
+		t.Fatalf("policy.updated recorded an unchanged host: %#v", patchedDetails)
+	}
+
+	deleted := apiJSON(t, h, http.MethodDelete, policyPath+"/"+policy.Data.ID, token, "", nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete policy = %d: %s", deleted.Code, deleted.Body.String())
+	}
+	deletedDetails := latestAuditDetails(t, api, "policy.deleted")
+	if got := mustAuditString(t, deletedDetails, "targetHost"); got != "10.0.0.8" {
+		t.Fatalf("policy.deleted targetHost = %q", got)
+	}
+}
+
+// Without a trace id on the audit row there is no way from the console to the
+// structured logs of the same request, so an inbound Traceparent is reused and a
+// missing one is generated and echoed back to the caller.
+func TestManagementAuditCarriesTraceID(t *testing.T) {
+	api, admin, _ := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+	traceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+
+	response := apiJSONWithHeaders(t, h, http.MethodPost, "/api/v1/agents", token, map[string]string{
+		"Idempotency-Key": "audit-traced-create",
+		"Traceparent":     "00-" + traceID + "-00000000000000f0-01",
+	}, map[string]any{"name": "traced-agent"})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create agent = %d: %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Traceparent"); got != "00-"+traceID+"-00000000000000f0-01" {
+		t.Fatalf("response Traceparent = %q", got)
+	}
+	if got := mustAuditString(t, latestAuditDetails(t, api, "agent.created"), observability.AuditTraceKey); got != traceID {
+		t.Fatalf("audit traceId = %q, want %q", got, traceID)
+	}
+
+	untraced := apiJSON(t, h, http.MethodPost, "/api/v1/agents", token, "audit-untraced-create", map[string]any{"name": "untraced-agent"})
+	if untraced.Code != http.StatusCreated {
+		t.Fatalf("create agent without trace = %d: %s", untraced.Code, untraced.Body.String())
+	}
+	generated := mustAuditString(t, latestAuditDetails(t, api, "agent.created"), observability.AuditTraceKey)
+	if len(generated) != 32 || generated == traceID {
+		t.Fatalf("missing Traceparent did not mint a fresh id: %q", generated)
+	}
+}
+
+// The actor column used to be an opaque id. The server resolves the username so
+// both the audit page and the overview label the same person the same way, and a
+// deleted or unknown actor degrades to no name instead of an error.
+func TestAuditListResolvesActorUsernames(t *testing.T) {
+	api, admin, alice := apiTestServer(t)
+	h := api.Handler()
+	token := apiToken(t, api, admin.Username, "admin-pass")
+	ctx := context.Background()
+	if err := api.DB.Audits().Create(ctx, storage.AuditLog{ActorUserID: alice.ID, Action: "agent.updated", ResourceType: "agent", ResourceID: "agent-1", Details: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.DB.Audits().Create(ctx, storage.AuditLog{ActorUserID: "gone-user", Action: "agent.deleted", ResourceType: "agent", ResourceID: "agent-2", Details: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.DB.Audits().Create(ctx, storage.AuditLog{Action: "proxy_auth_failed", ResourceType: "proxy_route", ResourceID: "route-1", Details: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := apiJSON(t, h, http.MethodGet, "/api/v1/audit-logs?limit=50", token, "", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("audit list = %d: %s", response.Code, response.Body.String())
+	}
+	var page struct {
+		Data struct {
+			Items []struct {
+				Action        string `json:"action"`
+				ActorUserID   string `json:"actorUserId"`
+				ActorUsername string `json:"actorUsername"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, item := range page.Data.Items {
+		names[item.Action] = item.ActorUsername
+		if item.Action == "agent.updated" && item.ActorUserID != alice.ID {
+			t.Fatalf("unexpected actor id: %+v", item)
+		}
+	}
+	if names["agent.updated"] != "alice" {
+		t.Fatalf("actor usernames = %+v, want alice for agent.updated", names)
+	}
+	if names["agent.deleted"] != "" {
+		t.Fatalf("unknown actor resolved to %q", names["agent.deleted"])
+	}
+	if names["proxy_auth_failed"] != "" {
+		t.Fatalf("system event resolved to %q", names["proxy_auth_failed"])
+	}
+}
+
+// A throttled or failed login is the event security wants to reconstruct first,
+// and it is written by the identity services rather than the management handlers.
+// Stamping the same trace id there means one id covers the whole request, whoever
+// writes the row.
+func TestLoginAuditCarriesTraceID(t *testing.T) {
+	api, _, alice := apiTestServer(t)
+	h := api.Handler()
+	traceID := "0af7651916cd43dd8448eb211c80319c"
+	response := apiJSONWithHeaders(t, h, http.MethodPost, "/api/v1/auth/login", "", map[string]string{
+		"Traceparent": "00-" + traceID + "-b7ad6b7169203331-01",
+	}, map[string]string{"username": alice.Username, "password": "alice-pass"})
+	if response.Code != http.StatusOK {
+		t.Fatalf("login = %d: %s", response.Code, response.Body.String())
+	}
+	if got := mustAuditString(t, latestAuditDetails(t, api, "auth.login.success"), observability.AuditTraceKey); got != traceID {
+		t.Fatalf("login audit traceId = %q, want %q", got, traceID)
+	}
 }

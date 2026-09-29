@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 var (
@@ -281,7 +281,8 @@ func createAccountAudit(ctx context.Context, audits storage.AuditRepository, act
 		Deleted     bool   `json:"deleted"`
 		MFARequired bool   `json:"mfaRequired"`
 		AuthSource  string `json:"authSource"`
-	}{UserID: user.ID, Username: user.Username, Disabled: user.Disabled, Deleted: user.DeletedAt != nil, MFARequired: user.MFARequired, AuthSource: string(user.AuthSource)})
+		TraceID     string `json:"traceId,omitempty"`
+	}{UserID: user.ID, Username: user.Username, Disabled: user.Disabled, Deleted: user.DeletedAt != nil, MFARequired: user.MFARequired, AuthSource: string(user.AuthSource), TraceID: observability.TraceIDFromContext(ctx)})
 	if err != nil {
 		return err
 	}

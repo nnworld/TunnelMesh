@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 // Login states are the four outcomes the console branches on. They are strings
@@ -409,7 +409,7 @@ func (s *LoginService) audit(ctx context.Context, actorID, action, resourceType,
 	if s.deps.Store == nil {
 		return errors.New("identity store is required")
 	}
-	encoded, err := json.Marshal(details)
+	encoded, err := json.Marshal(observability.StampTrace(ctx, details))
 	if err != nil {
 		return fmt.Errorf("encode audit details: %w", err)
 	}

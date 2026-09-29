@@ -373,13 +373,9 @@ func (a *API) writeClientConnectionCloseAudit(ctx context.Context, p auth.Princi
 	if failure != nil {
 		details["errorClass"] = observability.NormalizeErrorClass(failure)
 	}
-	encoded, err := json.Marshal(details)
-	if err != nil {
-		encoded = []byte("{}")
-	}
 	_ = a.service.CreateAudit(ctx, storage.AuditLog{
 		ActorUserID: p.UserID, Action: "client.connection.close", ResourceType: "client",
-		ResourceID: request.ClientInstanceID, Details: string(encoded),
+		ResourceID: request.ClientInstanceID, Details: auditDetailsJSON(ctx, details),
 	})
 }
 

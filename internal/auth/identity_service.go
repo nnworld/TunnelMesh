@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/auth/oidc"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 	"strings"
 	"time"
-
-	"github.com/tunnelmesh/tunnelmesh/internal/auth/oidc"
-	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 // IdentityView is one linked external identity. The subject is included because
@@ -347,7 +347,7 @@ func auditProvision(ctx context.Context, repos storage.IdentityRepositories, use
 	if result.RoleChange != "" {
 		details["roleChange"] = result.RoleChange
 	}
-	encoded, err := json.Marshal(details)
+	encoded, err := json.Marshal(observability.StampTrace(ctx, details))
 	if err != nil {
 		return err
 	}

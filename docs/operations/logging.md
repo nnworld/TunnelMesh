@@ -39,4 +39,6 @@ tunnelmesh-server --config /etc/tunnelmesh/server.yaml run >>/var/log/tunnelmesh
 
 ## 日志安全
 
-日志中不得出现密码、Bearer Token、私钥、完整 DSN、目标响应体或完整硬件指纹。排障时可以使用 trace ID、Agent ID、路由 ID、错误分类、HTTP 状态和时间范围进行关联。日志级别和 JSON 文件输出尚未提供配置项，若需要集中采集，请在进程管理器或容器层完成。
+日志中不得出现密码、Bearer Token、私钥、完整 DSN、目标响应体或完整硬件指纹。排障时可以使用 trace ID、Agent ID、路由 ID、错误分类、HTTP 状态和时间范围进行关联。
+
+管理面已经把 trace ID 变成可操作的关联键：`/api/v1` 的每个响应都带 `Traceparent`，同一请求写下的审计事件在 `details.traceId` 里是同一个值，因此可以从控制台报错直接跳到审计行（或反向），机制见[可观测性](observability.md)的“管理面 trace 与审计关联”。日志级别和 JSON 文件输出尚未提供配置项，若需要集中采集，请在进程管理器或容器层完成。

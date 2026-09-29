@@ -107,6 +107,8 @@ export type ManagedRoutePage = { items: ManagedRoute[]; nextCursor?: string; has
 export type AuditLog = {
   id: string
   actorUserId?: string
+  /** Username resolved by the server; absent for a system event or a deleted account. */
+  actorUsername?: string
   action: string
   resourceType: string
   resourceId?: string
@@ -139,7 +141,7 @@ export type AuthSource = 'local' | 'oidc' | 'mixed'
 export type UserAccount = { id: string; username: string; role: 'user'; disabled: boolean; authSource?: AuthSource; mfaRequired?: boolean; deletedAt?: string | null; createdAt: string; updatedAt: string }
 export type UserPage = { items: UserAccount[]; nextCursor?: string; hasMore?: boolean }
 export type TemporaryPasswordResult = { user: UserAccount; temporaryPassword: string }
-export type DashboardSummary = { agentsTotal:number; agentsOnline:number; activeTunnels:number; managedRoutes:number; validServiceTokens:number; recentEvents:Array<{id:string;action:string;resourceType:string;resourceId:string;createdAt:string}> }
+export type DashboardSummary = { agentsTotal:number; agentsOnline:number; activeTunnels:number; managedRoutes:number; validServiceTokens:number; recentEvents:AuditLog[] }
 export type ServerNodeStatus = 'online' | 'offline' | 'disabled' | 'deleted'
 export type ServerNode = {
   id: string
