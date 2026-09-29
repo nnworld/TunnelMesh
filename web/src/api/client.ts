@@ -1,6 +1,6 @@
 export type APIResponse<T> = { code: number; msg: string; data: T }
 
-export type Agent = { id: string; name: string; enabled: boolean; status: 'online' | 'offline'; ownerUserId?: string; capabilities?: string[] }
+export type Agent = { id: string; name: string; enabled: boolean; status: 'online' | 'offline'; ownerUserId?: string; capabilities?: string[]; createdAt?: string; updatedAt?: string }
 export type AgentCreateInput = { name: string; enabled: boolean; capabilities?: string[] }
 export type AgentMetadataItem = { name: string; source: 'file' | 'env'; value?: string; redacted: boolean }
 export type AgentMetadataInstance = {
@@ -243,13 +243,15 @@ let token = localStorage.getItem('tunnelmesh_token') || ''
 export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
 export function getToken() { return token }
 
-export function getAgents(params: { cursor?: string; limit?: number } = {}) {
+export function getAgents(params: { cursor?: string; limit?: number; keyword?: string } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.keyword) query.set('keyword', params.keyword)
   return api<{items: Agent[]; nextCursor?: string}>(`/agents${query.size ? `?${query}` : ''}`)
 }
 export function createAgent(input: AgentCreateInput) { return api<Agent>('/agents', { method: 'POST', body: JSON.stringify(input) }) }
+export function updateAgent(id: string, input: Partial<AgentCreateInput>) { return api<Agent>(`/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }) }
 export function listAgentPolicies(agentId: string, params: { cursor?: string; limit?: number; status?: 'active' | 'deleted' | 'all' } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
