@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { CheckResult, TunnelView } from '../api/types'
 import { formatTimeOfDay } from '../format'
@@ -29,6 +29,31 @@ const agentOptions = computed(() =>
     name: agent.name || agent.id,
   })),
 )
+
+// The picker has four different "nothing here" states, and only one of them is allowed to
+// say the token's scope is empty. Collapsing them into one sentence is how a list that was
+// never fetched - or a fetch that failed - reads as an authoritative answer about scope.
+const agentListState = computed(() => {
+  if (routing.agentsLoading) return 'loading' as const
+  if (routing.agentsError) return 'error' as const
+  if (!routing.agentsFetched) return 'idle' as const
+  return routing.agents.length ? ('ready' as const) : ('empty' as const)
+})
+
+const agentStateText = computed(() => {
+  switch (agentListState.value) {
+    case 'loading':
+      return t('routing.tunnels.agent.loading')
+    case 'error':
+      return t('routing.tunnels.agent.failed', { error: routing.agentsError })
+    case 'idle':
+      return t('routing.tunnels.agent.notLoaded')
+    case 'empty':
+      return t('routing.tunnels.agent.empty')
+    default:
+      return t('routing.tunnels.agent.hint')
+  }
+})
 
 function needsTarget(tunnel: TunnelView): boolean {
   // Only the raw forwarders have a fixed internal target; socks5 and http-proxy resolve
@@ -129,11 +154,24 @@ function removeTunnel(index: number) {
   routing.removeTunnel(index)
 }
 
-onMounted(() => {
-  // Fetching the picker up front saves a click, but only when a server is configured:
-  // without one the request would fail and leave a red banner on an empty form.
-  if (routing.serverUrl && routing.tokenPresent) void loadAgents()
-})
+const agentsRequested = ref(false)
+
+watch(
+  () => [routing.serverUrl, routing.tokenPresent] as const,
+  ([serverUrl, tokenPresent]) => {
+    // Fetching the picker up front saves a click, but only once a server and a token are
+    // known: without them the request can only fail and leave a red banner over a form the
+    // operator has not filled in. This is a watcher rather than onMounted because
+    // el-tab-pane renders its content eagerly, so the stored configuration arrives *after*
+    // this view mounts and an onMounted-only check never sees it. The latch keeps it to one
+    // request per window: serverUrl is the live form field, and re-reading the picker on
+    // every keystroke would turn typing an address into a request storm.
+    if (agentsRequested.value || !serverUrl || !tokenPresent) return
+    agentsRequested.value = true
+    void loadAgents()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -256,7 +294,7 @@ onMounted(() => {
                     </span>
                   </el-option>
                   <template #empty>
-                    <p class="tm-hint tm-select-empty">{{ t('routing.tunnels.agent.empty') }}</p>
+                    <p class="tm-hint tm-select-empty" data-test="agent-empty">{{ agentStateText }}</p>
                   </template>
                 </el-select>
               </el-form-item>
@@ -313,7 +351,7 @@ onMounted(() => {
         <el-button size="small" data-test="add-tunnel" @click="addTunnel">
           {{ t('routing.tunnels.add') }}
         </el-button>
-        <p class="tm-hint">{{ t('routing.tunnels.agent.hint') }}</p>
+        <p class="tm-hint" data-test="agent-state">{{ agentStateText }}</p>
       </el-form-item>
     </el-form>
 

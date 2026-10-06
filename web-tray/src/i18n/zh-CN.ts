@@ -149,6 +149,7 @@ export default {
         label: 'Agent',
         placeholder: '请选择 Agent',
         empty: '该 token 作用域内没有可用 Agent。',
+        notLoaded: '尚未拉取 Agent 列表，可点右上角“从服务端拉取 Agent”。',
         load: '从服务端拉取 Agent',
         loading: '正在拉取 Agent…',
         failed: '拉取 Agent 列表失败：{error}',

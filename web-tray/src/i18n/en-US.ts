@@ -149,6 +149,7 @@ export default {
         label: 'Agent',
         placeholder: 'Select an agent',
         empty: 'No agent is available for this token.',
+        notLoaded: 'The agent list has not been loaded yet. Use "Load agents from the server".',
         load: 'Load agents from the server',
         loading: 'Loading agents…',
         failed: 'Loading the agent list failed: {error}',
