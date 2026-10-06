@@ -71,6 +71,7 @@ RBAC、scoped service token、Agent 策略、审计和可观测性管理。公�
 | `tunnelmesh-server` | 公网入口 | 管理 API（`/api/v1`）、内嵌管理后台、HTTP/HTTPS/WSS 入口、路由解析、隧道协调、节点间 relay、可选的 WireGuard VPN 端点（一个公网 UDP 端口，需 `-tags vpn` 构建） | [Server 管理后台](docs/user-guide/server-admin.md)、[VPN 网关部署](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | 内网或目标主机 | 主动建立到 Server 的 TLS WebSocket，连接内网 TCP/UDP/HTTP 目标，按 allowlist 上报 metadata | [Agent 使用帮助](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | 用户主机 | 本地转发（TCP/UDP/HTTP/SOCKS5/HTTP 代理）、路由发布、面向 SSH 的 stdio TCP 代理 | [Client 使用帮助](docs/user-guide/client.md) |
+| `tunnelmesh-client-tray` | macOS 菜单栏 | 与 `tunnelmesh-client run` 等价的隧道，承载在菜单栏应用里，提供图形化设置窗口、Agent 选择与配置检测。共用 `client.yaml`，并按配置派生的锁与命令行互斥（需 `-tags tray` 构建，macOS 13+，由 `release` workflow 的 macOS 作业单独打包成 `.dmg`） | [macOS 系统托盘 Client](docs/user-guide/client-tray.md) |
 
 ## 功能亮点
 
@@ -334,6 +335,8 @@ Chrome 与 `lrzsz`。贡献流程见[贡献指南](CONTRIBUTING.md)。
 | 管理后台 | `make web-build`（`cd web && npm run build`） |
 | 容器镜像 | `make docker-build` |
 | 发行归档 | `make release VERSION=v1.2.3` |
+| macOS 托盘 `.dmg`（需 macOS 主机） | `make tray-web-build && make tray-release VERSION=v1.2.3` |
+| 完整发行含托盘（需 macOS 主机） | `make tray-web-build && make release-with-tray VERSION=v1.2.3` |
 
 提交 PR 前必须完成的验证：
 
@@ -355,8 +358,11 @@ node test/e2e/webssh/run.mjs         # 浏览器端到端测试，见 test/e2e/w
 
 Linux、macOS、Windows（amd64 与 arm64）预编译归档发布在
 [GitHub Releases](https://github.com/nnworld/TunnelMesh/releases)。每个 Release 都包含三个可执行
-文件、各平台服务模板、`SHA256SUMS` 和记录当前 Schema 版本的 `manifest.json`。标签使用不可变的
-`vMAJOR.MINOR.PATCH`，不发布可变的 major/minor 标签。打包细节见[跨平台可执行文件打包](docs/deployment/binary-release.md)。
+文件、各平台服务模板、macOS 托盘客户端的 `.dmg`、覆盖全部资产的 `SHA256SUMS`，以及记录当前
+Schema 版本的 `manifest.json` 与托盘清单 `manifest-tray.json`。标签使用不可变的
+`vMAJOR.MINOR.PATCH`，不发布可变的 major/minor 标签。打包细节见
+[跨平台可执行文件打包](docs/deployment/binary-release.md) 与
+[macOS 托盘客户端打包](docs/deployment/macos-client-tray.md)。
 
 本地构建三个容器镜像：
 

@@ -72,6 +72,7 @@ self-hosted control plane and explicit access policy rather than only a point-to
 | `tunnelmesh-server` | Public edge | Management API (`/api/v1`), embedded admin console, HTTP/HTTPS/WSS ingress, route resolution, tunnel coordination, inter-node relay, optional WireGuard VPN endpoint on one public UDP port (`-tags vpn`) | [Server admin](docs/user-guide/server-admin.md), [VPN gateway](docs/deployment/vpn-gateway.md) |
 | `tunnelmesh-agent` | Private network or target host | Outbound TLS WebSocket to the Server, dials internal TCP/UDP/HTTP targets, reports allowlisted metadata | [Agent](docs/user-guide/agent.md) |
 | `tunnelmesh-client` | User workstation | Local forwards (TCP/UDP/HTTP/SOCKS5/HTTP proxy), route publishing, stdio TCP proxy for SSH | [Client](docs/user-guide/client.md) |
+| `tunnelmesh-client-tray` | macOS menu bar | The same tunnels as `tunnelmesh-client run`, hosted in a menu-bar app with a graphical settings window, agent picker and configuration checks. Shares `client.yaml` and is mutually exclusive with the CLI through a per-configuration lock (`-tags tray`, macOS 13+, packaged as a `.dmg` by the release workflow's macOS job) | [macOS tray client](docs/user-guide/client-tray.md) |
 
 ## Feature highlights
 
@@ -350,6 +351,8 @@ Prerequisites: Go 1.23+, Node.js 22 + npm for `web/`, Docker for image builds, a
 | Admin console | `make web-build` (`cd web && npm run build`) |
 | Container images | `make docker-build` |
 | Release archives | `make release VERSION=v1.2.3` |
+| macOS tray `.dmg` (macOS host) | `make tray-web-build && make tray-release VERSION=v1.2.3` |
+| Full release including the tray (macOS host) | `make tray-web-build && make release-with-tray VERSION=v1.2.3` |
 
 Verification expected before a pull request:
 
@@ -373,9 +376,11 @@ each check, including the `-race` timeout and the embedded-asset verification, i
 
 Prebuilt Linux, macOS, and Windows archives (amd64 and arm64) are published to
 [GitHub Releases](https://github.com/nnworld/TunnelMesh/releases). Every release includes all three
-binaries, platform service templates, `SHA256SUMS`, and a `manifest.json` carrying the current
-Schema version. Tags use immutable `vMAJOR.MINOR.PATCH` versions; mutable major or minor tags are
-not published. Packaging details: [binary release](docs/deployment/binary-release.md).
+binaries, platform service templates, the macOS tray client as a `.dmg`, one `SHA256SUMS` covering
+every asset, and a `manifest.json` carrying the current Schema version plus a `manifest-tray.json`
+for the tray. Tags use immutable `vMAJOR.MINOR.PATCH` versions; mutable major or minor tags are not
+published. Packaging details: [binary release](docs/deployment/binary-release.md) and
+[macOS tray client packaging](docs/deployment/macos-client-tray.md).
 
 Build the three container variants locally with:
 

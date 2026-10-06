@@ -43,6 +43,19 @@ if [[ -f "$ROOT_DIR/web/dist/index.html" ]] && ! diff -qr "$ROOT_DIR/web/dist" "
   exit 1
 fi
 
+# The macOS tray client cannot be built here: it links Cocoa and WebKit through cgo, while
+# this script cross-compiles everything with CGO_ENABLED=0. The release workflow packages
+# it on a macOS runner (scripts/package-macos-tray.sh) and hands the disk images over
+# through TRAY_DIST_DIR. Validating the hand-off *before* the matrix means a missing or
+# corrupt artifact fails in seconds instead of after eighteen cross-compilations.
+TRAY_DIST_DIR="${TRAY_DIST_DIR:-}"
+if [[ -n "$TRAY_DIST_DIR" ]]; then
+  if [[ "$TRAY_DIST_DIR" != /* ]]; then
+    TRAY_DIST_DIR="$ROOT_DIR/$TRAY_DIST_DIR"
+  fi
+  "$ROOT_DIR/scripts/merge-tray-dist.sh" --check "$TRAY_DIST_DIR"
+fi
+
 mkdir -p "$OUTPUT_DIR"
 : > "$OUTPUT_DIR/SHA256SUMS"
 
@@ -137,6 +150,12 @@ for target in "${targets[@]}"; do
   printf '%s  %s\n' "$archive_hash" "$archive" >> "$OUTPUT_DIR/SHA256SUMS"
   rm -rf "$stage"
 done
+
+# Fold the tray disk images in after the matrix, so one release directory and one
+# SHA256SUMS describe every published asset. This never compiles anything.
+if [[ -n "$TRAY_DIST_DIR" ]]; then
+  "$ROOT_DIR/scripts/merge-tray-dist.sh" "$TRAY_DIST_DIR" "$OUTPUT_DIR"
+fi
 
 platform_json="$(IFS=,; printf '%s' "${platforms[*]}")"
 archive_json="$(IFS=,; printf '%s' "${archives[*]}")"

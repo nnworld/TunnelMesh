@@ -6,15 +6,16 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 49 份记录，按日期倒序排列。
+共 50 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-10-05 | [macOS 系统托盘 Client](2026-10-05-client-system-tray-macos.md) | [计划：TunnelMesh Client 系统托盘（macOS）](../superpowers/plans/2026-10-05-client-system-tray-macos.md) | — |
 | 2026-09-29 | [还原发行管理页各平台下载地址](2026-09-29-downloads-platform-assets-restore.md) | [计划：还原发行管理页各平台下载地址实施计划（补记计划）](../superpowers/plans/2026-09-29-downloads-platform-assets-restore.md) | — |
 | 2026-09-29 | [概览“最近事件”补全审计属性](2026-09-29-dashboard-recent-event-attributes.md) | [计划：概览“最近事件”补全审计属性](../superpowers/plans/2026-09-29-dashboard-recent-event-attributes.md) | — |
-| 2026-09-29 | [审计日志信息量增强（Phase P0）](2026-09-29-audit-log-details-phase-p0.md) | [计划：审计日志信息量增强（Phase P0）](../superpowers/plans/2026-09-29-audit-log-details-phase-p0.md)<br>[计划：概览“最近事件”补全审计属性](../superpowers/plans/2026-09-29-dashboard-recent-event-attributes.md) | — |
+| 2026-09-29 | [审计日志信息量增强（Phase P0）](2026-09-29-audit-log-details-phase-p0.md) | [计划：审计日志信息量增强（Phase P0）](../superpowers/plans/2026-09-29-audit-log-details-phase-p0.md)<br>[计划：概览“最近事件”补全审计属性](../superpowers/plans/2026-09-29-dashboard-recent-event-attributes.md)<br>[计划：还原发行管理页各平台下载地址实施计划（补记计划）](../superpowers/plans/2026-09-29-downloads-platform-assets-restore.md) | — |
 | 2026-09-29 | [代理节点列表时间列、翻页、名称筛选与编辑](2026-09-29-agent-list-created-at-and-rename.md) | [计划：代理节点列表时间列、翻页、名称筛选与重命名](../superpowers/plans/2026-09-29-agent-list-created-at-and-rename.md) | — |
 | 2026-09-26 | [Client 活跃流计数与租约排序](2026-09-26-client-active-stream-accounting.md) | — | — |
 | 2026-09-25 | [Review P1–P3 加固与客户端观测页排序](2026-09-25-review-p1-p3-hardening.md) | [计划：实施计划：Review P1–P3 加固与客户端观测页排序](../superpowers/plans/2026-09-24-review-p1-p3-hardening.md) | — |
