@@ -19,7 +19,6 @@ APP_NAME="TunnelMesh Client.app"
 VOLUME_NAME="TunnelMesh Client"
 BUNDLE_ID="com.tunnelmesh.client-tray"
 EXECUTABLE="tunnelmesh-client-tray"
-MIN_MACOS="13.0"
 
 VERSION="${VERSION:-dev}"
 ARCHES="${ARCHES:-arm64 amd64}"
@@ -105,7 +104,9 @@ if [[ "$VERSION" != "dev" && ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-
   echo "VERSION must be vMAJOR.MINOR.PATCH (an optional pre-release suffix is allowed for test builds): $VERSION" >&2
   exit 1
 fi
-for tool in go codesign plutil ditto hdiutil; do
+# otool is not optional: the deployment floor is only real once the built binary has been
+# read back and agreed to it (verify_deployment_target).
+for tool in go codesign plutil ditto hdiutil otool; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "$tool is required" >&2
     exit 1
@@ -113,6 +114,16 @@ for tool in go codesign plutil ditto hdiutil; do
 done
 if [[ ! -f "$INFO_TEMPLATE" ]]; then
   echo "missing Info.plist template: $INFO_TEMPLATE" >&2
+  exit 1
+fi
+
+# The deployment floor belongs to the bundle, so the plist states it once and the build
+# reads it back. It used to be a second literal in this script, which is precisely how the
+# two drifted apart: manifest.json promised macOS 13 while the executable was linked for
+# whatever OS the runner happened to run, and LaunchServices enforces the executable.
+MIN_MACOS="$(plutil -extract LSMinimumSystemVersion raw "$INFO_TEMPLATE")"
+if [[ ! "$MIN_MACOS" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  echo "could not read LSMinimumSystemVersion from $INFO_TEMPLATE (got: ${MIN_MACOS:-empty})" >&2
   exit 1
 fi
 if [[ ! -f "$LAYOUT_SCRIPT" ]]; then
@@ -284,6 +295,25 @@ create_disk_image() {
   rm -rf "$work"
 }
 
+# verify_deployment_target fails the build unless the Mach-O load command agrees with the
+# bundle.
+#
+# Passing the flag is a request; this is the proof. clang records the build host's OS
+# release as LC_BUILD_VERSION minos unless told otherwise, and a macOS 15 runner shipped a
+# .dmg whose app would not open on macOS 14 with "requires macOS 15.0 or later" - a
+# download-level failure no test that only reads this script could ever notice. An empty
+# reading is treated as a mismatch on purpose: a toolchain that stops emitting the load
+# command has to stop the release rather than let the check quietly pass.
+verify_deployment_target() {
+  local binary="$1" recorded
+  recorded="$(otool -l "$binary" | awk '/LC_BUILD_VERSION/ {found = 1} found && /minos/ {print $2; exit}')"
+  if [[ "$recorded" != "$MIN_MACOS" ]]; then
+    echo "$binary records LC_BUILD_VERSION minos ${recorded:-nothing}, expected $MIN_MACOS" >&2
+    return 1
+  fi
+  echo "verified: $binary runs on macOS $MIN_MACOS or later"
+}
+
 platforms=()
 assets=()
 installer_layout="true"
@@ -298,12 +328,23 @@ for arch in $ARCHES; do
   app="$stage/$APP_NAME"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-  echo "building $EXECUTABLE for darwin/$arch"
+  echo "building $EXECUTABLE for darwin/$arch (minimum macOS $MIN_MACOS)"
   # CGO_ENABLED=1 is what pulls in tray_darwin.m; -tags tray is what makes the embed,
   # the native shim and cmd/tunnelmesh-client-tray part of the build at all.
-  (cd "$ROOT_DIR" && CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" \
+  #
+  # The target has to be pinned for both halves of the link. MACOSX_DEPLOYMENT_TARGET
+  # covers the Go-side objects and the clang driver acting as linker; CGO_CFLAGS and
+  # CGO_LDFLAGS cover the .m translation units. Setting only one leaves the other half
+  # recording the host version, which shows up as ld warnings about objects built for a
+  # newer macOS and, on the runner, as an app nobody below the runner can open.
+  (cd "$ROOT_DIR" && \
+    CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" \
+    MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" \
+    CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=$MIN_MACOS" \
+    CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=$MIN_MACOS" \
     go build -tags tray -trimpath -ldflags="$LDFLAGS" \
     -o "$app/Contents/MacOS/$EXECUTABLE" "./cmd/tunnelmesh-client-tray")
+  verify_deployment_target "$app/Contents/MacOS/$EXECUTABLE"
 
   sed "s/__VERSION__/${BUNDLE_VERSION}/g" "$INFO_TEMPLATE" > "$app/Contents/Info.plist"
   if [[ -f "$ICON_SOURCE" ]]; then

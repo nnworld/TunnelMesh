@@ -202,7 +202,9 @@ create/attach/convert 各重试三次，最后一次不再吞掉输出，失败�
 | `LSMinimumSystemVersion` = `13.0` | 低于 13 的系统上登录项在运行时才抛 `Operation not permitted`，而不是安装时被拒 |
 
 `deploy/macos/tray_bundle_test.go` 守卫这些键，同时守卫另外三件事：模板与打包脚本的
-bundle id / 可执行文件名 / 最低系统版本必须一致；打包脚本必须产出 `.dmg`（`hdiutil create`、
+bundle id / 可执行文件名 / 最低系统版本必须一致（脚本里那份只能从 plist 读出来，不许再写第二处
+字面量，且必须既设 `MACOSX_DEPLOYMENT_TARGET`/`-mmacosx-version-min` 又用 `otool` 读回
+`LC_BUILD_VERSION` 校验，见下节）；打包脚本必须产出 `.dmg`（`hdiutil create`、
 `-format UDZO`、`ln -s /Applications`、清单里的 `extension: "dmg"`）且不得再出现 zip 相关参数；
 `scripts/build-release.sh` 里不得出现托盘二进制、`-tags tray`、`CGO_ENABLED=1` 或 `hdiutil`。
 
@@ -216,6 +218,36 @@ bundle id / 可执行文件名 / 最低系统版本必须一致；打包脚本�
 bundle identifier 是 `com.tunnelmesh.client-tray`，沿用 launchd 模板的
 `com.tunnelmesh.<role>` 约定。它不能随意改：`SMAppService` 以 bundle identifier 记录
 登录项，改一次就把所有已装用户的“开机启动”变成孤儿记录。
+
+## 最低系统版本
+
+`LSMinimumSystemVersion` 只是声明，真正决定能不能启动的是 Mach-O 里的
+`LC_BUILD_VERSION.minos`。托盘走 cgo，链接由 clang 完成，而 clang 在没人指定目标版本时按
+**构建主机**的 macOS 版本写 `minos`：CI 的托盘 job 跑在 `macos-15`，于是 v1.3.1 的 `.dmg` 里
+记的是 `minos 15.0`，在 macOS 14.6 上打开直接报“该应用程序要求 macOS 15.0 或更高版本”，
+而同一份包里的 `Info.plist` 和 `manifest.json` 都还写着 13.0 —— 三处互相矛盾，只有二进制说话。
+
+`scripts/package-macos-tray.sh` 因此做两件事：
+
+1. 用 `plutil -extract LSMinimumSystemVersion raw` 从 plist 读出下限，作为唯一来源；编译时同时设
+   `MACOSX_DEPLOYMENT_TARGET` 与 `CGO_CFLAGS`/`CGO_LDFLAGS` 的 `-mmacosx-version-min`。只设一半会
+   留下 `ld: warning: object file ... was built for newer 'macOS' version` 这类警告，另一半仍按宿主
+   记录。
+2. 链接完立刻 `otool -l` 读回 `minos` 并与 plist 比对，不一致就让打包失败。声明和产物对不上时，
+   报错比发一个装不上的包便宜。
+
+runner 之后升到更新的 macOS 也不会再把产物变成“只有同等或更高系统能用”。检查一个已经下载下来的
+映像：
+
+```bash
+hdiutil attach -nobrowse -readonly tunnelmesh-client-tray-<version>-darwin-arm64.dmg
+otool -l "/Volumes/TunnelMesh Client/TunnelMesh Client.app/Contents/MacOS/tunnelmesh-client-tray" \
+  | grep -A4 LC_BUILD_VERSION
+hdiutil detach "/Volumes/TunnelMesh Client"
+```
+
+`minos` 应当是 `13.0`。v1.3.1 的托盘映像记录的是 `15.0`，在 macOS 14 上不可用；修复只保证**之后**
+发行的包正确，已经发出去的 v1.3.1 要重新发版才能替换。
 
 ## 签名与分发
 

@@ -37,6 +37,8 @@
   `NSAppTransportSecurity → NSAllowsLocalNetworking`、`LSMinimumSystemVersion` 三个键缺失都是
   静默故障，由 `macos/tray_bundle_test.go` 守卫；bundle identifier `com.tunnelmesh.client-tray`
   是 `SMAppService` 记录登录项的键，改动会让已装用户的“开机启动”变成孤儿记录。
+  `LSMinimumSystemVersion` 同时是打包时的编译下限：`scripts/package-macos-tray.sh` 只从这份 plist
+  读出它，链接后再用 `otool` 读回 `LC_BUILD_VERSION` 校验，改它等于改发行范围。
 - `windows/tunnelmesh-service.xml` 占位符：`__ROLE__`、`__ROLE_TITLE__`、`__BINARY__`、`__CONFIG__`、
   `__INSTALL_DIR__`、`__ENV_BLOCK__`。`__ENV_BLOCK__` 渲染为若干 `<env name= value= />`（WinSW 没有
   EnvironmentFile 机制），渲染后必须收紧 ACL。
