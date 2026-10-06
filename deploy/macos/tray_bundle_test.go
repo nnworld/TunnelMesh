@@ -2,6 +2,7 @@ package macos
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,10 @@ const (
 	executable = "tunnelmesh-client-tray"
 	minMacOS   = "13.0"
 )
+
+// literalMinimumMacOS matches a second, hand written copy of the deployment floor in the
+// packaging script. The plist is the only place that value may be spelled out.
+var literalMinimumMacOS = regexp.MustCompile(`MIN_MACOS="[0-9]`)
 
 // readOrFail loads a repository artifact.
 func readOrFail(t *testing.T, path string) string {
@@ -141,7 +146,7 @@ func TestPackageScriptMatchesTheTemplate(t *testing.T) {
 		"codesign --verify",
 		bundleID,
 		executable,
-		minMacOS,
+		"LSMinimumSystemVersion",
 		"LICENSE",
 		"NOTICE",
 	} {
@@ -152,6 +157,40 @@ func TestPackageScriptMatchesTheTemplate(t *testing.T) {
 	// The tray can only be built where the frameworks it links exist.
 	if !strings.Contains(script, `uname -s`) || !strings.Contains(script, "Darwin") {
 		t.Errorf("%s must refuse to run off macOS", packageScript)
+	}
+}
+
+// TestPackageScriptPinsTheMachOSDeploymentTarget keeps the shipped binary's minimum macOS
+// equal to the version the bundle declares.
+//
+// A cgo link records the *build host's* OS release as the Mach-O LC_BUILD_VERSION minos,
+// and LaunchServices enforces that number rather than the Info.plist. Packaging on a
+// macOS 15 runner therefore produced an app that a macOS 14 machine refused to open with
+// "requires macOS 15.0 or later", while LSMinimumSystemVersion still said 13.0 and
+// manifest.json still reported 13.0. Two halves close this: tell the toolchain the floor,
+// then prove the artifact obeys it, because a flag that stops being honoured is exactly as
+// invisible as one that was never set.
+func TestPackageScriptPinsTheMachOSDeploymentTarget(t *testing.T) {
+	script := readOrFail(t, packageScript)
+	for _, want := range []string{
+		// The plist is the single source of truth for the floor.
+		`plutil -extract LSMinimumSystemVersion raw "$INFO_TEMPLATE"`,
+		// clang takes the target from the environment for the Go objects and from the
+		// flag for the cgo objects; setting only one leaves ld warnings and, on the
+		// linker side, a minos that still tracks the host.
+		"MACOSX_DEPLOYMENT_TARGET=",
+		"-mmacosx-version-min=",
+		// The build has to fail rather than ship an app that will not launch.
+		"LC_BUILD_VERSION",
+		"minos",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("%s must reference %q", packageScript, want)
+		}
+	}
+	if got := literalMinimumMacOS.FindString(script); got != "" {
+		t.Errorf("%s must derive the minimum macOS version from %s, not repeat it (%s)",
+			packageScript, infoTemplate, got)
 	}
 }
 

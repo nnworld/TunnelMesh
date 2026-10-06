@@ -422,3 +422,59 @@ macOS 作业断言加入 `installerLayout`。三条守卫在实现前均按预�
 
 `internal/server/api.go` 与 `internal/server/client_scoped_api_test.go` 的 gofmt 对齐（上一轮遗留，
 纯空白）。上文“仍待确认与后续”里列的 `.icns` 图标资产一项，本次已交付。
+
+## 补记（2026-10-06）：v1.3.1 的托盘映像装不上 macOS 14
+
+### 现象与根因
+
+合并进 `main` 后发出的 v1.3.1 里，`tunnelmesh-client-tray-v1.3.1-darwin-arm64.dmg` 在
+macOS 14.6 上打开报“应用程序 “TunnelMesh Client” 的这个版本不能与此版本的 macOS 配合使用。
+你使用的是 macOS 14.6。该应用程序要求 macOS 15.0 或更高版本”。
+
+对已发布产物直接取证：
+
+```bash
+hdiutil attach -nobrowse -readonly tunnelmesh-client-tray-v1.3.1-darwin-arm64.dmg
+otool -l "/Volumes/TunnelMesh Client/TunnelMesh Client.app/Contents/MacOS/tunnelmesh-client-tray" \
+  | grep -A4 LC_BUILD_VERSION      # -> minos 15.0, sdk 15.5
+plutil -extract LSMinimumSystemVersion raw \
+  "/Volumes/TunnelMesh Client/TunnelMesh Client.app/Contents/Info.plist"   # -> 13.0
+hdiutil detach "/Volumes/TunnelMesh Client"
+```
+
+`Info.plist` 与 `manifest.json` 都写着 13.0，但 LaunchServices 判定用的是 Mach-O 的
+`LC_BUILD_VERSION.minos`。托盘走 cgo，链接由 clang 完成，clang 在没被指定目标版本时按**构建主机**
+写 `minos`；`.github/workflows/release.yml` 的托盘作业跑在 `macos-15`，于是产物记成 15.0。
+`scripts/package-macos-tray.sh` 里原本有一行 `MIN_MACOS="13.0"`，但它只被写进 `manifest.json`，
+从未参与编译，也没有任何地方核对产物——三处可以同时“看起来正确”，而包根本装不上。
+
+同一发行包里的 `tunnelmesh-v1.3.1-darwin-arm64.tar.gz`（server/agent/client 三个二进制）是 Linux
+交叉编译、`CGO_ENABLED=0` 走 Go 内部链接器，实测 `minos 12.0`，不受影响。
+
+### 变更
+
+- `scripts/package-macos-tray.sh`：删掉脚本里那份 `MIN_MACOS` 字面量，改为
+  `plutil -extract LSMinimumSystemVersion raw "$INFO_TEMPLATE"` 从 plist 读出（单一来源；读出的值
+  不是 `X.Y` 就直接失败）；编译时同时设 `MACOSX_DEPLOYMENT_TARGET` 与 `CGO_CFLAGS`/`CGO_LDFLAGS`
+  的 `-mmacosx-version-min`；新增 `verify_deployment_target`，每个架构链接完立刻 `otool -l` 读回
+  `minos` 并与 plist 比对，不一致就让打包失败；`otool` 进必备工具清单。
+- `deploy/macos/tray_bundle_test.go`：新增 `TestPackageScriptPinsTheMachOSDeploymentTarget`，
+  守卫“从 plist 派生 + 两个编译开关 + 读回校验”，并禁止脚本再出现 `MIN_MACOS="<数字>` 字面量；
+  `TestPackageScriptMatchesTheTemplate` 对脚本的要求从“含 `13.0` 字面量”改为“含
+  `LSMinimumSystemVersion`”，即要求它去读 plist。
+- 文档：`docs/deployment/macos-client-tray.md` 新增“最低系统版本”一节（含如何检查一个已经下载
+  下来的映像）；`docs/user-guide/client-tray.md` 排障表新增该现象；`deploy/README.md` 与
+  `docs/development/testing.md` 同步守卫口径。
+
+### 实测证据（本机 macOS 14.6 / arm64）
+
+- 对照实验说明为什么两个开关都要设：默认构建 `minos 14.0`（等于宿主）；只设
+  `MACOSX_DEPLOYMENT_TARGET=13.0` 得到 `minos 13.0`，但伴随 16 条
+  `ld: warning: object file ... was built for newer 'macOS' version (14.0) than being linked (13.0)`；
+  再加 `CGO_CFLAGS`/`CGO_LDFLAGS` 后 `minos 13.0` 且零警告。
+- 红：新测试在未改脚本时报 5 条 `must reference` 与 1 条字面量重复。
+- 绿：`go test ./deploy/macos/ -count=1` 通过。
+- 端到端：`VERSION=v0.0.0-minosfix ARCHES=arm64 ./scripts/package-macos-tray.sh` 打印
+  `verified: ... runs on macOS 13.0 or later`；挂载产物后 `LC_BUILD_VERSION` 为
+  `minos 13.0` / `sdk 15.0`，`LSMinimumSystemVersion` 为 13.0，`codesign --verify` 通过，
+  映像 4660838 字节。
