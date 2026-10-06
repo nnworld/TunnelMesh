@@ -478,3 +478,50 @@ hdiutil detach "/Volumes/TunnelMesh Client"
   `verified: ... runs on macOS 13.0 or later`；挂载产物后 `LC_BUILD_VERSION` 为
   `minos 13.0` / `sdk 15.0`，`LSMinimumSystemVersion` 为 13.0，`codesign --verify` 通过，
   映像 4660838 字节。
+
+## 补记（2026-10-06）：Agent 下拉为空不是作用域问题，是根本没去拉
+
+### 现象与取证
+
+用户在 v1.3.2（`9b9c9e4`，`minos 13.0`，安装于 `/Applications/TunnelMesh Client.app`）的
+路由配置里选 SOCKS5 隧道，Agent 下拉展开显示“该 token 作用域内没有可用 Agent。”
+
+先用配置里真实存在的 server/token 直接取证（token 不回显）：
+
+```bash
+TOKEN=$(awk '/^[[:space:]]*token:/{gsub(/["'"'"' ]/,"",$2); print $2; exit}' ~/.config/tunnelmesh/client.yaml)
+curl -H "Authorization: Bearer $TOKEN" 'https://tunnelmesh.claw.qihoo.net/api/v1/client/agents?limit=500'
+```
+
+服务端返回 `code 200`、**7 个 Agent（4 个 online）**，`limit=500` 与游标翻页都正常；同一 token 打
+`/api/v1/agents` 返回 401（正确：那是 api_tokens 命名空间）。所以“作用域内没有可用 Agent”是假话。
+
+### 根因
+
+`web-tray/src/App.vue` 在 `onMounted` 里 `await Promise.allSettled([settings.load(), routing.load(), about.load()])`，
+而 Element Plus 的 `el-tab-pane` 默认**立即渲染**（`shouldBeRender = !lazy || loaded || active`），
+四个 tab 的子组件在父组件 `onMounted` 之前就已挂载。于是 `RoutingView` 的
+`onMounted(() => { if (routing.serverUrl && routing.tokenPresent) void loadAgents() })` 永远看到空 store，
+自动拉取一次都不会发生；而下拉的 `#empty` 槽位无条件写着“该 token 作用域内没有可用 Agent。”——
+把“没人问过”说成了“问过且为空”。既有单测全部用 `prepare: () => seed()` 在挂载前灌好 store，
+正好绕开了这个时序，所以 70 个用例全绿也拦不住。
+
+### 变更
+
+- `web-tray/src/views/RoutingView.vue`：自动拉取改为带闩锁的 `watch(() => [routing.serverUrl, routing.tokenPresent], …, { immediate: true })`，
+  配置晚到也能拉一次，且每窗口只一次（`serverUrl` 是实时表单字段，不闩锁就变成打字即请求）；
+  新增 `agentListState` / `agentStateText`，把 未拉取 / 正在拉取 / 拉取失败(带原因) / 确实为空 四种状态
+  分开呈现，下拉 `#empty` 槽位与字段下方 `[data-test="agent-state"]` 共用同一份文案。
+- `web-tray/src/stores/routing.ts`：新增 `agentsFetched`，仅在**成功**返回后置位——它是“能不能说作用域为空”的唯一依据。
+- i18n：`routing.tunnels.agent.notLoaded` 中英各一条。
+- 文档：`docs/user-guide/client-tray.md` 说明自动拉取时机与四种状态怎么读，排障行改为按状态分流；
+  `docs/development/testing.md` 补该覆盖点。
+
+### 测试（先红后绿）
+
+- 红：3 条新用例（`routing tab agent picker`）全部失败——挂载后灌入配置不触发请求、空态文案不分状态。
+- 绿：`npm test -- --run` 20/20（该文件）→ 全量 **73 passed**（原 70）；`npm run build` 通过并镜像到
+  `internal/tray/webdist/dist`。
+- 顺带修正既有用例“loads the agent picker from the server…”的时序假设：自动拉取在飞时按钮是
+  `loading` 态、Element Plus 会禁用它，点击是 no-op，因此显式刷新前先 `flush` 等待首拉结束。
+  这条不是被改坏了，是它原先隐含的“点击必定再发一次”不再成立。
