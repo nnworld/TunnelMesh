@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | Go 单元与集成 | `go test ./... -count=1`、`go test -race ./...`、`go vet ./...` | 协议状态机、流控、Repository 契约（SQLite 与 MySQL 双方言）、迁移、API 授权与分页、跨层集成 |
 | 前端单元 | `cd web && npm test -- --run`、`npm run build` | SSH/SFTP/ZMODEM 客户端逻辑、WebSocket 字节流背压、store、路由、视图交互 |
-| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端 |
+| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端、Agent 选择器（配置在挂载后才到位也要自动拉取一次、每窗口一次、未拉取/失败/确实为空三种空态不得混写） |
 | 浏览器端到端 | `node test/e2e/webssh/run.mjs` | 真实 Chrome + 真实 Server/Agent/SSH 主机，验证凭据自动认证、pty 终端、ZMODEM 双向传输、SFTP 复用与上传逐字节完整性、刷新恢复、浏览器控制台洁净 |
 | OpenResty 端到端 | `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | 真实 OpenResty 容器 + 内部入口替身，验证 CONNECT 搬运、请求头白名单、非 200 响应原样透传、绝对形式改写、客户端断开后隧道回收、日志不含凭据 |
 

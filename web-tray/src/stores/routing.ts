@@ -52,6 +52,10 @@ export const useRoutingStore = defineStore('routing', {
     agents: [] as AgentRef[],
     agentsLoading: false,
     agentsError: '',
+    // Whether the picker was fetched at least once and *succeeded*. Without it the panel
+    // cannot tell "this token has no agents" from "nobody asked yet", and the empty state
+    // would assert the first one either way.
+    agentsFetched: false,
     report: null as ValidationReport | null,
     lastSave: null as RoutingSaveResult | null,
   }),
@@ -113,6 +117,7 @@ export const useRoutingStore = defineStore('routing', {
       this.agentsError = ''
       try {
         this.agents = (await listAgents(this.serverUrl)) ?? []
+        this.agentsFetched = true
       } catch (cause) {
         this.agentsError = describe(cause)
         throw cause

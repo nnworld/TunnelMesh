@@ -71,6 +71,10 @@ describe('routing tab', () => {
   it('loads the agent picker from the server and marks who is online', async () => {
     const tray = installFakeTray({ 'GET /api/agents': fixtures.agents() })
     const { wrapper } = mountView(RoutingView, { prepare: () => seed() })
+    // The mount-time fetch has to settle first: while it is in flight the button renders
+    // as loading, and Element Plus disables a loading button, so clicking it would be a
+    // no-op rather than the explicit refresh this test is about.
+    await flush(6)
     await click(wrapper, '[data-test="load-agents"]')
 
     // One call from the mount-time prefetch (a configured server plus a stored token is
@@ -344,6 +348,74 @@ describe('routing tab proxy authentication', () => {
     useRoutingStore().tunnels[0].protocol = 'tcp'
     await flush(4)
     expect(wrapper.find('[data-test="auth-url-0"]').exists()).toBe(false)
+    tray.restore()
+    wrapper.unmount()
+  })
+})
+
+describe('routing tab agent picker', () => {
+  const agentCalls = (tray: { calls: Array<{ path: string }> }) =>
+    tray.calls.filter((call) => call.path === '/api/agents').length
+
+  // Only the settings store is seeded before mount: adopting it re-applies the stored
+  // language, which would overwrite the locale these assertions are written in.
+  const seedSettings = () => () => useSettingsStore().adopt(fixtures.settings())
+
+  it('loads the list once the stored configuration arrives after mount', async () => {
+    // el-tab-pane renders its content eagerly, so RoutingView mounts before App.vue's
+    // initial load resolves: in the real window the stored configuration always arrives
+    // after onMounted. A fetch scheduled only in onMounted therefore never runs, the
+    // picker stays empty, and the panel blames the token's scope for a request nobody
+    // made.
+    const tray = installFakeTray({ 'GET /api/agents': fixtures.agents() })
+    const { wrapper } = mountView(RoutingView, { locale: 'zh-CN', prepare: seedSettings() })
+    await flush(6)
+    // Nothing is configured yet, so mounting must not fire a request that can only fail.
+    expect(agentCalls(tray)).toBe(0)
+
+    useRoutingStore().adopt(fixtures.routing())
+    await flush(6)
+    expect(agentCalls(tray)).toBe(1)
+    expect(useRoutingStore().agents).toHaveLength(2)
+    expect(wrapper.find('[data-test="agents-notice"]').exists()).toBe(false)
+
+    // One request per window: the trigger has to latch, because serverUrl is the live form
+    // field and re-reading the picker on every keystroke would be a request storm.
+    useRoutingStore().serverUrl = 'wss://other.example.com/ws/client'
+    await flush(6)
+    expect(agentCalls(tray)).toBe(1)
+
+    tray.restore()
+    wrapper.unmount()
+  })
+
+  it('separates a list nobody fetched from a genuinely empty scope', async () => {
+    const tray = installFakeTray({ 'GET /api/agents': [] })
+    const { wrapper } = mountView(RoutingView, { locale: 'zh-CN', prepare: seedSettings() })
+    await flush(6)
+    const state = wrapper.find('[data-test="agent-state"]')
+    expect(state.text()).toContain('尚未拉取')
+    expect(state.text()).not.toContain('没有可用 Agent')
+
+    useRoutingStore().adopt(fixtures.routing())
+    await flush(6)
+    // Only a completed, successful fetch may claim the scope itself is empty.
+    expect(wrapper.find('[data-test="agent-state"]').text()).toContain('该 token 作用域内没有可用 Agent')
+
+    tray.restore()
+    wrapper.unmount()
+  })
+
+  it('shows the fetch failure instead of an empty-scope claim', async () => {
+    const tray = installFakeTray({}, { 'GET /api/agents': { status: 401, msg: 'unauthenticated' } })
+    const { wrapper } = mountView(RoutingView, { locale: 'zh-CN', prepare: seedSettings() })
+    useRoutingStore().adopt(fixtures.routing())
+    await flush(8)
+    const state = wrapper.find('[data-test="agent-state"]')
+    expect(state.text()).toContain('失败')
+    expect(state.text()).not.toContain('该 token 作用域内没有可用 Agent')
+    expect(wrapper.find('[data-test="agents-notice"]').exists()).toBe(false)
+
     tray.restore()
     wrapper.unmount()
   })
