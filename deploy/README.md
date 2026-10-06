@@ -11,6 +11,9 @@
 | `systemd/tunnelmesh-server.service`、`tunnelmesh-agent.service`、`tunnelmesh-client.service` | Linux systemd unit，每角色一份，脚本直接安装不做替换 | [Linux systemd 安装](../docs/deployment/linux-systemd.md) |
 | `systemd-user/tunnelmesh-server.service`、`tunnelmesh-agent.service`、`tunnelmesh-client.service` | Linux systemd **user** 单元模板，每角色一份，路径全部由占位符渲染 | [一键安装脚本](../docs/deployment/oneclick-install.md) |
 | `macos/tunnelmesh.plist` | launchd 用户级服务模板，三角色共用，占位符渲染 | [macOS launchd 安装](../docs/deployment/macos-launchd.md) |
+| `macos/TunnelMeshClient-Info.plist` | macOS 托盘客户端 app bundle 的 Info.plist 模板，由打包脚本渲染；**不是** launchd 服务定义 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md) |
+| `macos/tray-dmg-layout.applescript` | 托盘磁盘映像的安装器布局：驱动 Finder 把挂载窗口摆成图标视图、app 与 `Applications` 别名各就各位。窗口尺寸与图标坐标只在这里定义 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md#产物布局) |
+| `macos/TunnelMeshClient.icns` | 托盘 app 与安装器卷的图标，由 `scripts/generate-tray-icon.sh` 从 `scripts/trayicon` 的几何生成；不要手工编辑，改图标改代码 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md#应用图标) |
 | `windows/tunnelmesh-service.xml` | WinSW 服务模板，三角色共用，占位符渲染 | [Windows Service 安装](../docs/deployment/windows-service.md) |
 | `install/linux-install.sh`、`macos-install.sh`、`windows-install.ps1`、`windows-uninstall.ps1` | 安装与卸载脚本 | 同上三篇 |
 | `install/oneclick/install-{server,agent,client}.sh`、`install-{server,agent,client}.ps1` | 三平台 × 三角色的一键安装入口，只声明参数与角色问答 | [一键安装脚本](../docs/deployment/oneclick-install.md) |
@@ -23,12 +26,17 @@
 | `prometheus/recording-rules.yaml`、`alert-rules.yaml` | 录制规则与告警规则 | 同上 |
 | `grafana/dashboards/tunnelmesh.json` | 唯一 Dashboard，内部按 Overview / Agent / Network / Cluster / Security / HTTP Proxy Entry 六个 Row 组织 | 同上 |
 | `grafana/provisioning/dashboards.yml`、`datasources.yml` | Grafana 自动装载配置 | 同上 |
-| `grafana/dashboard_schema_test.go`、`install/install_templates_test.go`、`mysql56/mysql56_service_test.go`、`openresty/openresty_artifacts_test.go` | 产物一致性测试，随 `go test ./deploy/...` 执行 | [测试与验证](../docs/development/testing.md) |
+| `grafana/dashboard_schema_test.go`、`install/install_templates_test.go`、`macos/tray_bundle_test.go`、`mysql56/mysql56_service_test.go`、`openresty/openresty_artifacts_test.go` | 产物一致性测试，随 `go test ./deploy/...` 执行 | [测试与验证](../docs/development/testing.md) |
 
 ## 模板约定
 
 - `macos/tunnelmesh.plist` 占位符：`__ROLE__`、`__HOME__`、`__BINARY__`、`__CONFIG__`、`__ENVIRONMENT__`。
   `__ENVIRONMENT__` 渲染为 `EnvironmentVariables` dict（无敏感值时渲染为空串），token 因此不必写进 YAML。
+- `macos/TunnelMeshClient-Info.plist` 占位符：只有 `__VERSION__`（渲染 `CFBundleShortVersionString`
+  与 `CFBundleVersion`，打包脚本会去掉 tag 的 `v` 前缀）。`LSUIElement`、
+  `NSAppTransportSecurity → NSAllowsLocalNetworking`、`LSMinimumSystemVersion` 三个键缺失都是
+  静默故障，由 `macos/tray_bundle_test.go` 守卫；bundle identifier `com.tunnelmesh.client-tray`
+  是 `SMAppService` 记录登录项的键，改动会让已装用户的“开机启动”变成孤儿记录。
 - `windows/tunnelmesh-service.xml` 占位符：`__ROLE__`、`__ROLE_TITLE__`、`__BINARY__`、`__CONFIG__`、
   `__INSTALL_DIR__`、`__ENV_BLOCK__`。`__ENV_BLOCK__` 渲染为若干 `<env name= value= />`（WinSW 没有
   EnvironmentFile 机制），渲染后必须收紧 ACL。
@@ -123,6 +131,14 @@ CA 私钥刻意放在 `relay/` 之外：Compose 只挂载 CA 证书和该节点�
 `openresty/` 与 `certs/` 不进归档：`openresty/` 与 `prometheus/`、`grafana/` 同属运维自行挂载或
 自行构建的产物，`certs/` 是本地生成物且包含私钥。调整目录名或文件名前必须
 先更新 `scripts/build-release.sh` 和上述发布文档。
+
+Release 目录里除六个平台归档外，还有两个 macOS 托盘磁盘映像
+（`tunnelmesh-client-tray-<VERSION>-darwin-<arch>.dmg`，内含 `TunnelMesh Client.app`）。它们由
+`scripts/package-macos-tray.sh` 在 macOS runner 上产出、`scripts/merge-tray-dist.sh` 合并进同一
+目录，因此与归档共用一份 `SHA256SUMS`；托盘清单发布为 `manifest-tray.json`，跨平台
+`manifest.json` 的 schema 不变。`macos/TunnelMeshClient-Info.plist` 有双重身份：既随 darwin 归档
+分发给需要自行打包的运维，也是打包脚本渲染 app bundle 的模板。详见
+[macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md)。
 
 ## 校验
 

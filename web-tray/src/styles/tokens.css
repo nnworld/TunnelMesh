@@ -1,0 +1,56 @@
+:root {
+  --tm-bg: #f5f7fa;
+  --tm-surface: #ffffff;
+  --tm-text: #1f2329;
+  --tm-muted: #667085;
+  --tm-border: #d9e2f2;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', Inter, system-ui, sans-serif;
+  color: var(--tm-text);
+  background: var(--tm-bg);
+}
+
+/* Element Plus drives its dark palette from variables scoped to .dark; mirroring the
+   surface tokens here keeps the tray's own chrome consistent with the components. */
+html.dark {
+  --tm-bg: #141414;
+  --tm-surface: #1d1e1f;
+  --tm-text: #e5eaf3;
+  --tm-muted: #a3a6ad;
+  --tm-border: #363637;
+  color-scheme: dark;
+  color: var(--tm-text);
+  background: var(--tm-bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--tm-bg);
+  color: var(--tm-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}

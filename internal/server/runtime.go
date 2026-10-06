@@ -182,6 +182,10 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	managedRoutes := NewManagedRouteHandler(routeTable, &HTTPProxyHandler{Opener: clientTransport})
 	runtime := &ServerRuntime{DB: db, AgentSessions: agentSessions, AgentConnectionLeases: agentConnectionLeases, ClientSessions: clientSessions, ClientConnectionLeases: clientConnectionLeases, ClientObservability: clientObservability, API: NewAPI(db, authService), Auth: authService, Credentials: credentialService, ClientAuthorizer: NewCredentialStreamAuthorizer(credentialService), ClientTransport: clientTransport, LocalAgentRelay: localAgentRelay, managedRoutes: managedRoutes, config: runtimeConfig}
 	runtime.API.SetAgentConnections(agentSessions, localAgentRelay)
+	// The client-scoped API namespace authenticates the same credential the client
+	// WebSocket handshake does, so it reuses this instance instead of building a
+	// second validator with its own background worker.
+	runtime.API.SetClientTokenValidator(credentialService)
 	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
 	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID, vpnNodePublicKey(runtimeConfig.VPN))

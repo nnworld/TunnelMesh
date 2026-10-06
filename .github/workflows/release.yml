@@ -14,8 +14,99 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # Resolved once and shared, so the macOS tray job and the release job cannot disagree
+  # about which version they are building. A tag push and a manual dispatch derive it
+  # differently, and doing that twice is how a release ends up titled v1.2.3 with assets
+  # named v1.2.2. It also fails an invalid version before anything is compiled.
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve and validate release version
+        id: resolve
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release version must match vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # The macOS menu-bar client links Cocoa, WebKit and ServiceManagement through cgo, so it
+  # can only be built on a Mac; the release job below cross-compiles everything else with
+  # CGO_ENABLED=0 and can never produce it. Both darwin architectures are built here from
+  # one arm64 runner, because cgo cross-compilation to amd64 only needs the SDK.
+  macos-tray:
+    needs: version
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-tray/package-lock.json
+      # The settings window is embedded at compile time, so the bundle has to exist before
+      # the Go build. The packaging script refuses to run without it, or with a bundle that
+      # is stale relative to web-tray/dist.
+      - run: cd web-tray && npm ci
+      - run: cd web-tray && npm test -- --run
+      - run: cd web-tray && npm run build
+      - name: Package TunnelMesh Client.app for both darwin architectures
+        run: ./scripts/package-macos-tray.sh
+      - name: Verify the packaged tray
+        run: |
+          set -euo pipefail
+          dir="dist/${VERSION}/macos-tray"
+          # Both architectures are part of the contract: a release with only the runner's
+          # own architecture would leave every Intel Mac without a download.
+          for arch in arm64 amd64; do
+            test -f "${dir}/tunnelmesh-client-tray-${VERSION}-darwin-${arch}.dmg"
+          done
+          (cd "${dir}" && shasum -a 256 -c SHA256SUMS)
+          python3 -m json.tool "${dir}/manifest.json" > /dev/null
+          # The installer layout - an icon view window with the app above one icon
+          # position and the Applications alias above the other - is Finder state, so a
+          # runner without a window server session cannot write it. The image still
+          # installs by drag and the job still succeeds, but whoever cuts the release has
+          # to be able to see that the artifact is a plain folder window instead.
+          python3 - "${dir}/manifest.json" <<'PY'
+          import json, os, sys
+          assets = json.load(open(sys.argv[1]))["assets"]
+          missing = [asset["archive"] for asset in assets if not asset.get("installerLayout")]
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as handle:
+                  handle.write("### macOS disk images\n\n")
+                  handle.write("- %d of %d open as an installer window\n" % (len(assets) - len(missing), len(assets)))
+                  for name in missing:
+                      handle.write("- `%s` has no installer layout\n" % name)
+          for name in missing:
+              print("::warning::%s opens as a plain folder window, not an installer" % name, file=sys.stderr)
+          PY
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: macos-tray
+          path: dist/${{ needs.version.outputs.version }}/macos-tray
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [version, macos-tray]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
@@ -32,20 +123,25 @@ jobs:
       - run: cd web && npm run build
       - run: rsync -a --delete web/dist/ internal/server/web_dist/
       - run: ./scripts/verify-web-embed.sh
-      - name: Resolve and validate release version
-        id: version
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: macos-tray
+          path: tray-dist
+      - name: Build the cross-platform archives and merge the tray disk images
+        run: TRAY_DIST_DIR=tray-dist ./scripts/build-release.sh
+      - name: Verify every published asset
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ github.event.inputs.version }}"
-          else
-            version="${GITHUB_REF_NAME}"
-          fi
-          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "release version must match vMAJOR.MINOR.PATCH" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - run: VERSION="${{ steps.version.outputs.version }}" ./scripts/build-release.sh
-      - run: gh release create "${{ steps.version.outputs.version }}" dist/"${{ steps.version.outputs.version }}"/* --target "${GITHUB_SHA}" --title "${{ steps.version.outputs.version }}" --generate-notes
+          set -euo pipefail
+          dir="dist/${VERSION}"
+          # SHA256SUMS lists bare file names, so the check has to run inside the directory.
+          (cd "${dir}" && sha256sum -c SHA256SUMS)
+          test -f "${dir}/manifest.json"
+          test -f "${dir}/manifest-tray.json"
+          # Six platform archives plus two tray disk images: publishing a partial release
+          # is worse than publishing none, so a missing asset stops the job here.
+          test "$(find "${dir}" -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 2
+          test "$(find "${dir}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+      - name: Create the GitHub release
+        run: gh release create "${VERSION}" dist/"${VERSION}"/* --target "${GITHUB_SHA}" --title "${VERSION}" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

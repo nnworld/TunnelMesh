@@ -126,6 +126,33 @@ func (m *SessionPoolManager) ActiveStreams(agentID string) []int64 {
 	return pool.activeStreams()
 }
 
+// ReadyCount returns how many physical WebSockets for one Agent completed the
+// handshake and registered a session.
+//
+// OpenCount alone cannot answer "is this Agent reachable": slots exist from the
+// moment they are scheduled, including while a reconnect is still being
+// established. A caller reporting connectivity has to look at registered sessions.
+func (m *SessionPoolManager) ReadyCount(agentID string) int {
+	pool := m.pool(agentID)
+	if pool == nil {
+		return 0
+	}
+	return pool.readyCount()
+}
+
+// AgentIDs returns every Agent the manager holds a pool for, sorted so callers that
+// render or diff the list see a stable order.
+func (m *SessionPoolManager) AgentIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := make([]string, 0, len(m.pools))
+	for id := range m.pools {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (m *SessionPoolManager) pool(agentID string) *agentSessionPool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -392,6 +419,12 @@ func (p *agentSessionPool) slotCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.slots)
+}
+
+func (p *agentSessionPool) readyCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.sessions)
 }
 
 func (p *agentSessionPool) activeStreams() []int64 {

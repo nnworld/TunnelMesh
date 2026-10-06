@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS 托盘客户端（TunnelMesh Client.app）的 Info.plist 模板，
+  由 scripts/package-macos-tray.sh 渲染，不是 launchd 服务定义。
+  服务模板见同目录 tunnelmesh.plist。
+
+  占位符：__VERSION__。
+
+  三个键是托盘能跑起来的硬要求，删掉任何一个都会静默坏掉：
+    LSUIElement               菜单栏应用不进 Dock、不抢焦点，与代码里的
+                              NSApplicationActivationPolicyAccessory 一致；
+                              两处都要设，因为登录项由 launchd 拉起时
+                              策略生效早于第一行 Go 代码。
+    NSAllowsLocalNetworking   设置界面由本进程的 127.0.0.1 随机端口提供，
+                              WKWebView 走的是 http；不放行本地网络，
+                              App Transport Security 会直接拦掉首屏，
+                              表现为一个空白窗口而不是一个报错。
+    LSMinimumSystemVersion    开机启动用 SMAppService mainAppService，
+                              macOS 13 才有；低于 13 应当拒绝安装，
+                              而不是让开关在运行时抛 "operation not permitted"。
+
+  不要把 Token、密码或私钥写进本文件；敏感值只存在于
+  ~/.config/tunnelmesh/client.yaml（0600）。
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>TunnelMesh Client</string>
+  <key>CFBundleName</key>
+  <string>TunnelMesh Client</string>
+  <key>CFBundleExecutable</key>
+  <string>tunnelmesh-client-tray</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.tunnelmesh.client-tray</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__VERSION__</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright The TunnelMesh Authors. Licensed under the Apache License 2.0.</string>
+  <key>NSRequiresAquaSystemAppearance</key>
+  <false/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

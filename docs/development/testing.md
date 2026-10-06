@@ -7,6 +7,7 @@
 | --- | --- | --- |
 | Go 单元与集成 | `go test ./... -count=1`、`go test -race ./...`、`go vet ./...` | 协议状态机、流控、Repository 契约（SQLite 与 MySQL 双方言）、迁移、API 授权与分页、跨层集成 |
 | 前端单元 | `cd web && npm test -- --run`、`npm run build` | SSH/SFTP/ZMODEM 客户端逻辑、WebSocket 字节流背压、store、路由、视图交互 |
+| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端 |
 | 浏览器端到端 | `node test/e2e/webssh/run.mjs` | 真实 Chrome + 真实 Server/Agent/SSH 主机，验证凭据自动认证、pty 终端、ZMODEM 双向传输、SFTP 复用与上传逐字节完整性、刷新恢复、浏览器控制台洁净 |
 | OpenResty 端到端 | `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | 真实 OpenResty 容器 + 内部入口替身，验证 CONNECT 搬运、请求头白名单、非 200 响应原样透传、绝对形式改写、客户端断开后隧道回收、日志不含凭据 |
 
@@ -46,6 +47,47 @@ cd web && npm run build && cd ..
 `npm run build` 已内置 `web/dist` → `internal/server/web_dist` 的镜像同步；`verify-web-embed.sh`
 只做一致性校验，不一致时说明同步步骤被绕过。缺失该目录会让 `go build ./cmd/...` 在
 `//go:embed all:web_dist` 处直接失败。
+
+## macOS 托盘的构建隔离与嵌入产物
+
+托盘的设置界面同样走 Go embed，但产物在 `internal/tray/webdist/dist/`，由
+`cd web-tray && npm run build` 通过 `web-tray/scripts/sync-tray-dist.mjs` 镜像同步，与管理后台
+的 `internal/server/web_dist/` 互不影响。
+
+与管理后台不同的地方在于**嵌入被构建标签分成两半**：`embed.go`（`//go:build tray`）持有真正的
+`//go:embed all:dist`，`embed_stub.go`（`//go:build !tray`）提供同名 API 并返回“无产物”。
+原因是 `//go:embed` 的模式匹配不到任何文件时是编译错误，而托盘产物在干净检出里并不存在；
+若不拆开，每次 `go build ./...` 都会要求先装 Node 工具链，包括永远跑不了托盘的 Linux 检出。
+拆开后：
+
+```bash
+go build ./... && go test ./... -count=1        # 无需前端产物，走 stub 半
+cd web-tray && npm test -- --run && npm run build
+CGO_ENABLED=1 go vet -tags tray ./...           # 需要前端产物与 macOS 工具链
+```
+
+无标签时 `webdist.FS()` 必须返回 `nil` 而不是一个空 `fs.FS`：`internal/tray/api.go` 正是用这个
+nil 选择“去跑 npm run build”的占位页面，返回非 nil 的空 FS 会渲染出一个看起来像渲染 bug 的
+空白窗口。`internal/tray/webdist/embed_test.go` 在两种模式下都断言这条契约。
+
+原生代码的隔离由 `scripts/tray_build_tag_test.go` 守卫（已包含在 `go test ./...` 中）：含 cgo
+的文件、import `internal/tray/native` 的文件、`//go:embed` 托盘产物的文件都必须带 `tray` 标签；
+含 `.m`/`.c` 等原生源码的目录里**所有** Go 文件都必须带标签（cgo 要么整包编译这些源文件，
+要么在它们存在却没人 `import "C"` 时直接拒绝该包）；`internal/tray/` 本体禁止 cgo，好让托盘
+逻辑能在 `CGO_ENABLED=0` 的 Linux CI 上跑测试。构建约束用 `go/build/constraint` 求值而不是
+字符串匹配，因此 `tray || linux` 这类“看着带标签、其实仍会编译”的写法同样会被抓到。
+
+托盘无法在 `go test` 里执行原生行为（需要真实 Cocoa run loop），因此分三层兜：
+`deploy/macos/tray_shim_test.go` 把 Objective-C shim 当文本守——必须安装应用主菜单（否则
+WKWebView 收不到任何 ⌘ 编辑快捷键）、必须用 `NSEventMaskKeyDown` 注册 ⌃ 变体的 local monitor
+（传事件类型值时 handler 一次都不触发）、必须同时 `registerDefaults:` 与写本 bundle 持久域
+（自动大写只认后者）；`deploy/macos/tray_bundle_test.go` 守 app bundle 与磁盘映像资产，含
+`.icns` 里 16/128/512/1024 四档表示与卷图标必须落在布局之后。剩下的一半靠实测：这些约束都
+先在 macOS 主机上用合成 `NSEvent` 打给真实 WKWebView 跑出红/绿，再写成守卫，打包后的手工冒烟
+清单见 [macOS 托盘客户端打包](../deployment/macos-client-tray.md#验证)。
+
+图标不是手工资产：`scripts/generate-tray-icon.sh` 从 `scripts/trayicon` 的几何重新生成
+`deploy/macos/TunnelMeshClient.icns`，改图标即改代码，产物可复现。
 
 ## MySQL 与 etcd 相关验证
 
@@ -97,6 +139,7 @@ go test ./deploy/... -count=1
 | --- | --- |
 | `deploy/grafana/dashboard_schema_test.go` | 唯一 Dashboard 的 JSON 结构、Row 划分与 datasource 变量 |
 | `deploy/install/install_templates_test.go` | 每个角色只有一份模板来源，安装脚本引用共享模板且替换全部占位符 |
+| `deploy/macos/tray_bundle_test.go` | 托盘 app bundle 的 Info.plist 三个静默故障键（`LSUIElement`、`NSAllowsLocalNetworking`、`NSRequiresAquaSystemAppearance=false`）与 bundle id / 可执行名 / 最低系统版本；模板与 `scripts/package-macos-tray.sh` 不得漂移；打包脚本必须产出 `.dmg` 且不得再出现 zip 参数；映像必须两段式产出（`-format UDRW` → 挂载 → Finder 布局 → detach → `hdiutil convert -format UDZO`），布局失败时响亮降级并把 `installerLayout` 写进清单；`deploy/macos/tray-dmg-layout.applescript` 必须真的驱动 Finder（`icon view`、`not arranged`、`set position of item`、`close installerWindow`）且不得写死挂载点或卷名；`scripts/build-release.sh` 不得**编译**托盘（不得出现托盘可执行名、`-tags tray`、`CGO_ENABLED=1` 或 `hdiutil`） |
 | `deploy/openresty/openresty_artifacts_test.go` | Lua/conf/Dockerfile 与 `server.proxy_entry.*` 默认值一致、可信头齐全、tp-* server 块不开 http2、版本 pin 与 `configure → patch → make` 构建顺序、Lua 不含策略逻辑 |
 | `deploy/install/oneclick/oneclick_scripts_test.go` | 一键安装脚本的严格模式、无硬编码秘密、与 `scripts/install.sh` 共享同一份 Release 契约，以及 `testdata/run_tests.sh` 的函数级套件 |
 | `deploy/install/oneclick/oneclick_config_test.go` | 脚本渲染出的 YAML 能被真实的 `config.Load` 解析，且不含秘密 |
@@ -137,6 +180,28 @@ systemd-analyze verify deploy/systemd/tunnelmesh-server.service              # L
 Windows 上实际执行一次安装与卸载，并确认渲染出的 `*-service.xml` 中 `arguments`、
 `workingdirectory`、`logpath` 与传入参数一致。产物清单与发布归档布局见
 [deploy/README.md](../../deploy/README.md)。
+
+## 发行链路校验
+
+发行链路跨两种 runner：`scripts/build-release.sh` 在 Linux 上用 `CGO_ENABLED=0` 交叉编译三个
+二进制，`scripts/package-macos-tray.sh` 在 macOS 上打包托盘 `.dmg`，`scripts/merge-tray-dist.sh`
+把后者并进前者的输出目录。这条链路上的错误全是静默的——少一个 macOS 资产、`SHA256SUMS` 不再
+覆盖全部资产、两个作业各自解析出不同版本号——因此有普通 Go 测试守卫，包含在
+`go test ./... -count=1` 里：
+
+| 测试 | 守护的不变量 |
+| --- | --- |
+| `scripts/release_workflow_test.go` | 解析 `.github/workflows/release.yml`：版本号只在 `version` 作业解析一次并被两个构建作业共用；只有 macOS 作业调用打包脚本并校验、汇总 `installerLayout`、上传产物；Linux 的 `release` 作业必须下载该 artifact 并以 `TRAY_DIST_DIR` 交给 `build-release.sh`，且不得自己打包托盘 |
+| `scripts/merge_tray_dist_test.go` | **执行** `scripts/merge-tray-dist.sh`：合并后一条 `sha256sum -c` 覆盖全部资产；托盘清单发布为 `manifest-tray.json` 而不覆盖 `manifest.json`；来源缺 `SHA256SUMS`/`manifest.json`/`.dmg`、映像与校验和不符、或目标已有同名资产时失败且不留半成品；`--check` 只校验不写 |
+| `scripts/tray_build_tag_test.go` | 任何含 cgo、import `internal/tray/native`、`//go:embed` 托盘产物的文件都必须带 `tray` 标签，默认构建不触达 WebKit |
+
+`merge_tray_dist_test.go` 用 fixture 真跑脚本，而不是像其他 shell 守卫那样做字符串匹配：“合并后
+校验和文件仍然可用”这件事证明不了就只能靠人。它只依赖 `bash` 与 `sha256sum`/`shasum` 之一，
+因此 Linux CI 与 macOS 本机都能跑。
+
+打包脚本本身需要真实的 `codesign`、`plutil`、`ditto`、`hdiutil` 与 Go cgo 工具链，不进
+`go test`；产物行为按 [.github/workflows/release-test.md](../../.github/workflows/release-test.md)
+在目标平台手工走一遍。
 
 ## 文档索引校验
 

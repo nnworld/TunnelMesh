@@ -27,30 +27,34 @@ import (
 // storage interfaces so the handler remains usable with SQLite, MySQL, and
 // small in-memory fakes in tests.
 type API struct {
-	DB                  *storage.DB
-	Auth                *auth.AuthService
-	users               storage.UserRepository
-	agents              storage.AgentRepository
-	policies            storage.PolicyRepository
-	tunnels             storage.TunnelRepository
-	audits              storage.AuditRepository
-	idem                storage.IdempotencyRepository
-	dashboard           storage.DashboardRepository
-	routeMu             sync.Mutex
-	service             *apiService
-	tokenService        *TokenService
-	accounts            *auth.AccountService
-	serverNodes         *ServerNodeService
-	traceroute          *TracerouteService
-	probeService        *ProbeService
-	agentSessions       *AgentSessionManager
-	localAgentRelay     *AgentRelayTransport
-	clusterConnections  AgentConnectionLister
-	connectionCloser    AgentConnectionCloseService
-	clientInstances     storage.ClientInstanceRepository
-	clientConnections   storage.ClientConnectionRepository
-	clientCloser        ClientConnectionCloseService
-	credentialService   *CredentialService
+	DB                 *storage.DB
+	Auth               *auth.AuthService
+	users              storage.UserRepository
+	agents             storage.AgentRepository
+	policies           storage.PolicyRepository
+	tunnels            storage.TunnelRepository
+	audits             storage.AuditRepository
+	idem               storage.IdempotencyRepository
+	dashboard          storage.DashboardRepository
+	routeMu            sync.Mutex
+	service            *apiService
+	tokenService       *TokenService
+	accounts           *auth.AccountService
+	serverNodes        *ServerNodeService
+	traceroute         *TracerouteService
+	probeService       *ProbeService
+	agentSessions      *AgentSessionManager
+	localAgentRelay    *AgentRelayTransport
+	clusterConnections AgentConnectionLister
+	connectionCloser   AgentConnectionCloseService
+	clientInstances    storage.ClientInstanceRepository
+	clientConnections  storage.ClientConnectionRepository
+	clientCloser       ClientConnectionCloseService
+	credentialService  *CredentialService
+	// clientTokens authenticates client service tokens for the client-scoped
+	// namespace. It is nil until the runtime installs it, because the management
+	// console credential (api_tokens) cannot validate a tunnel token.
+	clientTokens        ClientTokenValidator
 	remoteServerService *RemoteServerService
 	websshService       *WebSSHSessionService
 	websshCloser        WebSSHConnectionCloseService
@@ -348,6 +352,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a session. Everything else under /auth/ falls through to the authenticated
 	// dispatch below.
 	if a.handlePublicAuth(w, r, path) {
+		return
+	}
+	// A Client calls with a service token, not a console session, so its namespace
+	// is matched and authenticated before the api_tokens bearer check below.
+	if a.handleClientScoped(w, r, path) {
 		return
 	}
 	if !strings.HasPrefix(path, "/api/v1/") {
