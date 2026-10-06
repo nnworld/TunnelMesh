@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -321,23 +320,10 @@ func doctorEndpointCommand(opts *rootOptions, component string) *cobra.Command {
 	})
 }
 
+// serverHealthURL derives the readiness URL from the configured WebSocket URL. The
+// rewrite lives in internal/client so the tray checks the same origin the CLI does.
 func serverHealthURL(serverURL string) (string, error) {
-	parsed, err := url.Parse(serverURL)
-	if err != nil {
-		return "", fmt.Errorf("parse server URL: %w", err)
-	}
-	switch parsed.Scheme {
-	case "ws":
-		parsed.Scheme = "http"
-	case "wss":
-		parsed.Scheme = "https"
-	default:
-		return "", fmt.Errorf("server URL must use ws:// or wss://")
-	}
-	parsed.Path = "/health/ready"
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String(), nil
+	return client.HTTPURLFromWebSocket(serverURL, client.HealthReadyPath)
 }
 
 func agentCommands(opts *rootOptions) []*cobra.Command {
@@ -438,7 +424,9 @@ func clientCommands(opts *rootOptions) []*cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "login requested for %s\n", cfg.Client.ServerURL)
 			return nil
 		}),
-		configCommand(opts, "run", "start the configured client tunnels", runClientTunnels),
+		configCommand(opts, "run", "start the configured client tunnels", func(cmd *cobra.Command, cfg config.Config) error {
+			return runClientTunnels(cmd, cfg, opts.configFile)
+		}),
 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
 			return nil
