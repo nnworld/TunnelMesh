@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { createRoute, getAgentMetadata, listAuditLogs, updateRoute } from '../api/client'
 import router from '../router'
 
@@ -246,5 +246,64 @@ describe('admin routes', () => {
     for (const view of ['Login', 'Dashboard', 'Agents', 'AgentDetail', 'Routes', 'Tunnels', 'AuditLogs', 'Tokens', 'Users', 'AccountSecurity', 'Credentials', 'RemoteServers']) {
       expect(source).toContain(`const ${view} = () => import('./views/${view}.vue')`)
     }
+  })
+})
+
+describe('in-app navigation', () => {
+  // A path that no route declares does not render a 404 page: this router has no catch-all,
+  // so vue-router only logs "No match found for location" and the view silently does not
+  // change. That is how the overview's 查看审计日志 button came to point at /audits while the
+  // real route is /audit-logs, and why a source-level guard is worth more than one test per
+  // button: the failure is invisible to the component that contains it.
+  const declared = router.getRoutes().map((route) => route.path)
+
+  function navigationLiterals(source: string): string[] {
+    const needle = 'router.push('
+    const found: string[] = []
+    for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + needle.length)) {
+      let depth = 1
+      let index = at + needle.length
+      for (; index < source.length && depth > 0; index += 1) {
+        if (source[index] === '(') depth += 1
+        else if (source[index] === ')') depth -= 1
+      }
+      const call = source.slice(at + needle.length, index - 1)
+      for (const match of call.matchAll(/[`'"]\/[^`'"]*[`'"]/g)) found.push(match[0].slice(1, -1))
+    }
+    return found
+  }
+
+  // `${expr}` in a template literal is one path segment, so it can only ever stand for a
+  // declared :param. Matching segment-wise keeps /agents/${id} honest without letting a
+  // wrong static prefix through.
+  function segments(value: string): string[] {
+    return value.replace(/\$\{[^}]*\}/g, '*').split('/').filter(Boolean)
+  }
+
+  function isDeclared(target: string): boolean {
+    const want = segments(target)
+    return declared.some((path) => {
+      const have = segments(path)
+      return have.length === want.length
+        && have.every((segment, position) => segment.startsWith(':') || want[position] === '*' || segment === want[position])
+    })
+  }
+
+  it('only pushes paths the router declares', () => {
+    const checked: string[] = []
+    const offenders: string[] = []
+    for (const dir of ['src/views', 'src/layouts']) {
+      for (const entry of readdirSync(dir).filter((name) => name.endsWith('.vue'))) {
+        const file = `${dir}/${entry}`
+        for (const literal of navigationLiterals(readFileSync(file, 'utf8'))) {
+          checked.push(`${file} ${literal}`)
+          if (!isDeclared(literal)) offenders.push(`${file}: router.push('${literal}')`)
+        }
+      }
+    }
+    // A guard that silently matches nothing is worse than none: this is the assertion that
+    // the scanner still sees the call sites, including the one that regressed.
+    expect(checked.length).toBeGreaterThanOrEqual(7)
+    expect(offenders).toEqual([])
   })
 })

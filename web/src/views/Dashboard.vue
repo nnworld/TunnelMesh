@@ -9,7 +9,9 @@
         <div class="tm-card events">
           <div class="events-head">
             <h3>{{ t('dashboard.recentEvents') }}</h3>
-            <el-button link type="primary" @click="router.push('/audits')">{{ t('dashboard.viewAudits') }}</el-button>
+            <!-- /audit-logs is admin-only and the router guard bounces anyone else back to
+                 this page, so the link is only an exit for accounts that can use it. -->
+            <el-button v-if="auth.isAdmin" link type="primary" @click="router.push('/audit-logs')">{{ t('dashboard.viewAudits') }}</el-button>
           </div>
           <el-empty v-if="!summary.recentEvents.length" :description="t('dashboard.noEvents')" />
           <article v-for="event in summary.recentEvents" :key="event.id" class="event">
@@ -38,9 +40,11 @@ import DataState from '../components/DataState.vue'
 import { getDashboardSummary, type DashboardSummary } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle } from '../utils/audit'
+import { useAuthStore } from '../stores/auth'
 
 const { t } = useI18n()
 const router = useRouter()
+const auth = useAuthStore()
 const loading = ref(true)
 const error = ref(false)
 const summary = ref<DashboardSummary | null>(null)
