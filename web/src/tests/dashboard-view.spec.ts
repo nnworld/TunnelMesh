@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { createPinia } from 'pinia'
 import Dashboard from '../views/Dashboard.vue'
 import { i18n } from '../i18n'
 import { getDashboardSummary, type AuditLog, type DashboardSummary } from '../api/client'
+import { useAuthStore } from '../stores/auth'
 
 const push = vi.fn()
 
@@ -21,10 +23,14 @@ async function flush() {
   await nextTick()
 }
 
-async function mountDashboard() {
+async function mountDashboard(role: 'admin' | 'user' = 'admin') {
   const container = document.createElement('div')
   document.body.appendChild(container)
   const app = createApp(Dashboard)
+  const pinia = createPinia()
+  app.use(pinia)
+  // The audit page is admin-only, so the role decides whether the link may exist at all.
+  useAuthStore(pinia).user = { id: 'user-1', username: 'tester', role }
   app.use(i18n)
   app.mount(container)
   await flush()
@@ -120,7 +126,21 @@ describe('dashboard recent events', () => {
     try {
       buttonByText(container, i18n.global.t('dashboard.viewAudits'))!.click()
       await flush()
-      expect(push).toHaveBeenCalledWith('/audits')
+      expect(push).toHaveBeenCalledWith('/audit-logs')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('does not offer the audit link to accounts the router would bounce', async () => {
+    // /audit-logs carries meta.admin, and beforeEach sends a non-admin back to '/'. A link
+    // that only ever lands you where you already are is worse than no link: it reads as a
+    // broken button, which is exactly how the wrong path looked before.
+    vi.mocked(getDashboardSummary).mockResolvedValue(summary([]))
+    const { container, unmount } = await mountDashboard('user')
+    try {
+      expect(buttonByText(container, i18n.global.t('dashboard.viewAudits'))).toBeUndefined()
+      expect(push).not.toHaveBeenCalled()
     } finally {
       unmount()
     }
