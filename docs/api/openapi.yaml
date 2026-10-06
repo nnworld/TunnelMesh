@@ -923,6 +923,43 @@ paths:
         '409': {description: Connection epoch is stale}
         '500': {description: Connection close failed}
         '503': {description: Owning Server node is unavailable; the lease is preserved}
+  /api/v1/client/agents:
+    get:
+      summary: List the agents this client token may target
+      description: |
+        Client-scoped surface, authenticated with a client service token rather than a
+        console login. The singular `/api/v1/client/` namespace is deliberately separate
+        from the plural, admin-facing `/api/v1/clients/`: the two authenticate with
+        different credentials, and merging them would give a tunnel credential a
+        management view of every client instance in the deployment.
+
+        Only agents the calling token is authorized for are returned. Rows are filtered by
+        token owner in SQL, then by `enabled` and by the token's `scope.agentIds`; an empty
+        scope means unrestricted within the owner. Both filters run while the page is being
+        accumulated rather than after it is truncated, so a page is never silently
+        shortened and the returned cursor always resumes correctly.
+
+        Each item carries `online`, which reflects an unexpired connection lease. An agent
+        listed as offline can still be configured, but a tunnel pointing at it fails to
+        open until that agent dials in - which is exactly what the caller's picker needs to
+        be able to say.
+
+        The response is deliberately minimal. It exposes no capabilities, no reported
+        metadata and no ownership detail, because the only consumer is a picker and every
+        extra field would widen what a leaked tunnel token discloses.
+
+        Every rejection answers the same opaque `401 unauthenticated`: revoked, expired,
+        wrong-type and unknown tokens are indistinguishable from outside, so this endpoint
+        cannot be used as a token oracle.
+      security: [{ clientTokenAuth: [] }]
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Cursor page of the agents in this token's scope, content: {application/json: {schema: {$ref: '#/components/schemas/ClientAgentPageEnvelope'}}}}
+        '401': {description: 'Bearer token missing, revoked, expired, or of a type other than client. The reason is not distinguished.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+        '405': {description: Any method other than GET on this path}
+        '503': {description: 'The Server was started without a client token validator. This is a wiring fault rather than an authentication result, which is why it is not folded into 401.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
   /api/v1/agents/{agentId}/trace:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     post:
@@ -1568,6 +1605,17 @@ paths:
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
+    clientTokenAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A client service token (`client.token` in client.yaml), presented as a bearer
+        token. It is a distinct scheme from `bearerAuth` even though the transport is the
+        same, because the credential is resolved differently: `bearerAuth` answers to
+        `api_tokens` (console logins), while this one answers to `service_tokens` with
+        `type: client`. A console token is rejected here with 401 and a client token is
+        rejected by every `bearerAuth` endpoint, so neither surface can be reached with
+        the other's credential.
   parameters:
     Cursor: {name: cursor, in: query, schema: {type: string}}
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
@@ -2494,6 +2542,28 @@ components:
         connectionId: {type: string}
         connectionEpoch: {type: integer, format: int64}
         closed: {type: boolean}
+    ClientAgent:
+      type: object
+      additionalProperties: false
+      required: [id, name, online]
+      description: One agent as a client token sees it. The closed property set is the contract; adding a field here is an information-disclosure change, not a cosmetic one.
+      properties:
+        id: {type: string, description: 'Agent identifier, the value `client.tunnels[].agent_id` expects'}
+        name: {type: string, description: Display name shown in the picker}
+        online: {type: boolean, description: True while the agent holds an unexpired connection lease}
+    ClientAgentPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ClientAgent'}}
+        nextCursor: {type: string, description: 'Composite `created_at`/`id` key of the last emitted row; empty when this is the last page'}
+        hasMore: {type: boolean, description: 'True when more matching agents may follow, either later in the page that was scanned or in a later one'}
+    ClientAgentPageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/ClientAgentPage'}
     AgentMetadataItem:
       type: object
       required: [name, source, redacted]

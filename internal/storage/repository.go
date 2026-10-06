@@ -1282,6 +1282,18 @@ func (r *agentRepo) List(ctx context.Context, filter AgentListFilter, cursor str
 	return p, nil
 }
 
+// AgentCursor returns the pagination cursor pointing just past agent, in the same
+// composite (created_at, id) form agentRepo.List emits and consumes.
+//
+// A caller that filters rows out of a page has to resume from the last row it
+// actually returned, which means building this cursor itself. Passing a bare agent
+// ID instead does not fail loudly: decodeCursor hands it back unchanged, the
+// composite split finds no separator, and List silently restarts from the first
+// page - repeating rows forever instead of advancing.
+func AgentCursor(agent Agent) string {
+	return encodeCursor(tm(agent.CreatedAt) + "\x00" + agent.ID)
+}
+
 func nullableTime(v *time.Time) any {
 	if v == nil {
 		return nil
