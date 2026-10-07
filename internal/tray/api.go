@@ -39,6 +39,11 @@ const maxRequestBody = 1 << 20
 // force for a port that only exists for the lifetime of one process.
 const secretBytes = 32
 
+// PanelRoute is the URL fragment the menu-bar quick panel is loaded under. The bundle is
+// one application with two roots, so this has to agree with web-tray/src/panelRoute.ts;
+// the guard test in deploy/macos pins the pairing.
+const PanelRoute = "#/panel"
+
 // apiTimeouts keep a stuck renderer from pinning a handler goroutine.
 const (
 	apiReadHeaderTimeout = 10 * time.Second
@@ -163,6 +168,14 @@ func (s *APIServer) Addr() string {
 // it into a cookie for the rest of the session.
 func (s *APIServer) URL() string {
 	return "http://" + s.Addr() + "/?secret=" + url.QueryEscape(s.secret)
+}
+
+// PanelURL is the address of the compact quick panel. It is the same document as the
+// settings window, routed by the URL fragment: one embedded bundle, one origin, one
+// secret, and no second HTTP surface to authorise. The fragment never reaches the server,
+// so the bundle serves index.html for both windows and Vue picks the component.
+func (s *APIServer) PanelURL() string {
+	return s.URL() + PanelRoute
 }
 
 // Start binds the loopback socket and serves in the background.

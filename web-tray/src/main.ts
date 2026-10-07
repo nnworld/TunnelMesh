@@ -1,6 +1,8 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
+import QuickPanelApp from './QuickPanelApp.vue'
+import { isPanelRoute } from './panelRoute'
 import { i18n, applyLanguagePreference } from './i18n'
 import { applyTheme } from './theme'
 // Programmatic components are not resolved by the template compiler, so their styles
@@ -14,4 +16,8 @@ import './styles/tokens.css'
 applyLanguagePreference('system')
 applyTheme('system')
 
-createApp(App).use(createPinia()).use(i18n).mount('#app')
+// One bundle, two windows. The menu-bar shell asks for "#/panel" when the operator turns on
+// the quick panel; a fragment is enough because the server never sees it, so both windows
+// keep one origin, one embedded directory and one launch secret.
+const root = isPanelRoute(window.location.hash) ? QuickPanelApp : App
+createApp(root).use(createPinia()).use(i18n).mount('#app')

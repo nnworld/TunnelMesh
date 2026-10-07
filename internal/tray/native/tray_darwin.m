@@ -24,12 +24,14 @@ extern void TunnelMeshTrayWindowVisibilityChanged(int visible);
 // two files separately, so neither sees the other's declaration.
 typedef struct {
 	const char *url;
+	const char *panelURL;
 	const char *windowTitle;
 	const char *statusTooltip;
 	const char *openMainLabel;
 	const char *openWebsiteLabel;
 	const char *quitLabel;
 	int minimizeToTray;
+	int quickPanel;
 	double widthFraction;
 	double heightFraction;
 } TMTrayConfig;
@@ -45,6 +47,21 @@ enum {
 // validation report side by side, which is the whole point of the interface.
 static const CGFloat TMMinWindowWidth = 720.0;
 static const CGFloat TMMinWindowHeight = 480.0;
+
+// Quick panel size. It is a fixed compact surface rather than a fraction of the screen:
+// the panel answers "is it up, and how much is flowing" in one glance, and a second
+// resizable window would need layout work the settings window already did.
+static const CGFloat TMPanelWidth = 340.0;
+static const CGFloat TMPanelHeight = 420.0;
+
+// Guards the reopen after a transient popover dismisses itself.
+//
+// A transient NSPopover closes on the mouse-down outside it, and that mouse-down is the
+// same event that reaches the status item's action. Without the guard a second click
+// closes the panel and immediately opens it again, which reads as an icon that stopped
+// working: the close and the action land within a millisecond of each other, so a quarter
+// second is what separates "toggle" from "open again".
+static const NSTimeInterval TMPanelReopenGuard = 0.25;
 
 // Runs a block on the main thread. The Go side calls into here from HTTP handler
 // goroutines, and every AppKit mutation has to happen where AppKit lives.
@@ -176,12 +193,21 @@ static void TMInstallControlKeyShortcuts(void) {
 	}];
 }
 
-@interface TMTrayController : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate>
+@interface TMTrayController : NSObject <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, NSPopoverDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) WKWebView *webView;
 @property(nonatomic, copy) NSString *urlString;
 @property(nonatomic, assign) BOOL minimizeToTray;
+// The status menu lives on the controller rather than on NSStatusItem.menu: while a menu
+// is attached, NSStatusBarButton opens it for every click and never sends its action,
+// which would leave the quick panel unreachable.
+@property(nonatomic, strong) NSMenu *statusMenu;
+@property(nonatomic, copy) NSString *panelURLString;
+@property(nonatomic, assign) BOOL quickPanel;
+@property(nonatomic, strong) NSPopover *panelPopover;
+@property(nonatomic, strong) WKWebView *panelWebView;
+@property(nonatomic, assign) NSTimeInterval panelDismissedAt;
 @property(nonatomic, assign) CGFloat widthFraction;
 @property(nonatomic, assign) CGFloat heightFraction;
 @end
@@ -189,6 +215,9 @@ static void TMInstallControlKeyShortcuts(void) {
 // One controller per process, retained for the lifetime of the run loop. ARC would
 // otherwise release it as soon as TMTrayRun's autorelease pool drained.
 static TMTrayController *gController = nil;
+
+// Installed after the controller exists; see TMInstallPanelDismissShortcut below.
+static id gPanelEscapeMonitor = nil;
 
 @implementation TMTrayController
 
@@ -198,7 +227,9 @@ static TMTrayController *gController = nil;
 		return nil;
 	}
 	_urlString = config.url ? [NSString stringWithUTF8String:config.url] : @"";
+	_panelURLString = config.panelURL ? [NSString stringWithUTF8String:config.panelURL] : @"";
 	_minimizeToTray = config.minimizeToTray != 0;
+	_quickPanel = config.quickPanel != 0;
 	_widthFraction = config.widthFraction > 0 ? (CGFloat)config.widthFraction : 0.5;
 	_heightFraction = config.heightFraction > 0 ? (CGFloat)config.heightFraction : 0.5;
 
@@ -217,15 +248,30 @@ static TMTrayController *gController = nil;
 	self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
 	self.statusItem.button.toolTip = tooltip;
 
-	// A template SF Symbol renders correctly in both menu bar appearances. Falling back
-	// to a short title keeps the item usable on a system without the symbol.
-	NSImage *symbol = nil;
-	if (@available(macOS 11.0, *)) {
-		symbol = [NSImage imageWithSystemSymbolName:@"network" accessibilityDescription:tooltip];
+	// The bundle's own glyph first, so the menu bar and Finder show one mark. imageNamed
+	// resolves TunnelMeshMenuBar.png plus its @2x and @3x siblings into one multi-scale
+	// image, which is what keeps the 18pt version crisp on a Retina display instead of
+	// blowing up a single bitmap.
+	//
+	// Marked as a template because that is how the glyph was drawn: the system tints it,
+	// so it follows the menu bar's light and dark appearance the way every status item
+	// does. A coloured copy would read as a sticker on a dark bar.
+	NSImage *mark = [NSImage imageNamed:@"TunnelMeshMenuBar"];
+	if (mark != nil) {
+		mark.template = YES;
+		if (mark.accessibilityDescription == nil) {
+			mark.accessibilityDescription = tooltip;
+		}
 	}
-	if (symbol != nil) {
-		symbol.template = YES;
-		self.statusItem.button.image = symbol;
+	if (mark == nil) {
+		// Running the bare binary from a checkout has no Resources directory, and an SF
+		// Symbol of the same family beats the generic tile.
+		if (@available(macOS 11.0, *)) {
+			mark = [NSImage imageWithSystemSymbolName:@"network" accessibilityDescription:tooltip];
+		}
+	}
+	if (mark != nil) {
+		self.statusItem.button.image = mark;
 		self.statusItem.button.imagePosition = NSImageOnly;
 	} else {
 		self.statusItem.button.title = @"TM";
@@ -237,7 +283,21 @@ static TMTrayController *gController = nil;
 	[menu addItem:[self menuItem:openWebsite action:TMActionOpenWebsite keyEquivalent:@""]];
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self menuItem:quit action:TMActionQuit keyEquivalent:@"q"]];
-	self.statusItem.menu = menu;
+	self.statusMenu = menu;
+
+	// Routing the click here is the only way to get it: the button's default behaviour is
+	// "open the attached menu", and an attached menu never sends an action. Left click now
+	// means the panel when the operator asked for the panel, and the menu stays one right
+	// click (or ⌃-click) away either way.
+	//
+	// On mouse-up, deliberately. The button's own tracking loop (-[NSCell
+	// trackMouse:inRect:ofView:untilMouseUp:]) owns the main thread from mouse-down until
+	// the release, and popping a menu or showing a popover from inside it means the menu's
+	// tracking eats the mouse-up that would end the loop. The main thread then never returns
+	// to the run loop, the icon stops answering, and a queued TMTrayStop is never run.
+	self.statusItem.button.target = self;
+	self.statusItem.button.action = @selector(statusItemClicked:);
+	[self.statusItem.button sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
 }
 
 - (NSMenuItem *)menuItem:(NSString *)title action:(NSInteger)tag keyEquivalent:(NSString *)key {
@@ -264,6 +324,138 @@ static TMTrayController *gController = nil;
 				break;
 		}
 	}
+
+// Routes a click on the menu-bar item.
+//
+// The preference is read at click time rather than decided at start-up: the operator can
+// change it in the general tab while the settings window is open, and the next click on
+// the icon has to honour it. Right click and ⌃-click always mean the menu, so 退出 and
+// 打开官网首页 stay reachable even when the panel is on or the panel content is stuck.
+- (void)statusItemClicked:(id)sender {
+	NSEvent *event = [NSApp currentEvent];
+	BOOL controlDown = (event.modifierFlags & NSEventModifierFlagControl) != 0;
+	BOOL rightClick = event.type == NSEventTypeRightMouseDown || event.type == NSEventTypeRightMouseUp;
+	if (rightClick || controlDown || !self.quickPanel) {
+		[self popUpStatusMenu];
+		return;
+	}
+	NSTimeInterval since = [NSDate timeIntervalSinceReferenceDate] - self.panelDismissedAt;
+	if (self.panelPopover.isShown || since < TMPanelReopenGuard) {
+		[self closeQuickPanel];
+		return;
+	}
+	[self showQuickPanel];
+}
+
+// Shows the status menu under the icon.
+//
+// Popping the menu up by hand is the cost of owning the click. NSZeroPoint is not used:
+// the status button is not flipped on every release, so asking for the bottom edge
+// explicitly is what keeps the menu from covering the icon itself.
+- (void)popUpStatusMenu {
+	NSMenu *menu = self.statusMenu;
+	NSStatusBarButton *button = self.statusItem.button;
+	if (menu == nil || button == nil) {
+		return;
+	}
+	[self closeQuickPanel];
+	[button highlight:YES];
+	[menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSMaxY(button.bounds)) inView:button];
+	[button highlight:NO];
+}
+
+// Builds the panel once and keeps it.
+//
+// Recreating it per click would reload the document every time, which turns a glance at
+// the icon into a visible refresh and re-runs the interface's start-up requests.
+- (void)buildQuickPanel {
+	WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+	configuration.defaultWebpagePreferences.allowsContentJavaScript = YES;
+	WKWebView *panel = [[WKWebView alloc]
+	    initWithFrame:NSMakeRect(0, 0, TMPanelWidth, TMPanelHeight)
+	        configuration:configuration];
+	panel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+	panel.navigationDelegate = self;
+	panel.allowsMagnification = NO;
+
+	NSViewController *host = [[NSViewController alloc] init];
+	host.view = panel;
+	host.preferredContentSize = NSMakeSize(TMPanelWidth, TMPanelHeight);
+
+	NSPopover *popover = [[NSPopover alloc] init];
+	// Transient rather than application-defined: clicking anywhere else, or into the
+	// settings window, has to dismiss the panel without this shell tracking key windows.
+	popover.behavior = NSPopoverBehaviorTransient;
+	popover.animates = YES;
+	popover.contentViewController = host;
+	popover.contentSize = host.preferredContentSize;
+	popover.delegate = self;
+
+	self.panelWebView = panel;
+	self.panelPopover = popover;
+	[self loadPanelURL];
+}
+
+- (void)loadPanelURL {
+	NSURL *url = [NSURL URLWithString:self.panelURLString];
+	if (url == nil || self.panelWebView == nil) {
+		return;
+	}
+	[self.panelWebView loadRequest:[NSURLRequest requestWithURL:url]];
+}
+
+- (void)showQuickPanel {
+	if (self.panelURLString.length == 0) {
+		// Nothing to render. Falling back to the menu beats refusing the click, which
+		// would look like a dead icon.
+		[self popUpStatusMenu];
+		return;
+	}
+	if (self.panelPopover == nil) {
+		[self buildQuickPanel];
+	}
+	// An accessory application is normally not active, and a popover whose window is not
+	// key drops the first click on its buttons.
+	[NSApp activateIgnoringOtherApps:YES];
+	[self.panelPopover showRelativeToRect:self.statusItem.button.bounds
+	                               ofView:self.statusItem.button
+	                        preferredEdge:NSMinYEdge];
+	// The popover's window has to be key. An accessory application normally has no key
+	// window at all, and WKWebView routes the keyboard only to the key window, so without
+	// this the panel looks frozen the moment the operator reaches for Escape. The window
+	// exists only after the popover has been placed, hence the deferred retry.
+	[self makeQuickPanelKeyAfterShowing:self.panelWebView.window];
+}
+
+- (void)makeQuickPanelKeyAfterShowing:(NSWindow *)panelWindow {
+	if (panelWindow != nil) {
+		[panelWindow makeKeyAndOrderFront:nil];
+		return;
+	}
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[self.panelWebView.window makeKeyAndOrderFront:nil];
+	});
+}
+
+- (void)closeQuickPanel {
+	if (self.panelPopover != nil && self.panelPopover.isShown) {
+		[self.panelPopover close];
+	}
+}
+
+- (void)popoverWillClose:(NSNotification *)notification {
+	self.panelDismissedAt = [NSDate timeIntervalSinceReferenceDate];
+}
+
+- (void)setQuickPanel:(BOOL)enabled {
+	TMOnMainSync(^{
+		self.quickPanel = enabled;
+		if (!enabled) {
+			// Turning the setting off must not strand a panel that is already on screen.
+			[self closeQuickPanel];
+		}
+	});
+}
 
 // Installs the application main menu.
 //
@@ -310,6 +502,7 @@ static TMTrayController *gController = nil;
 
 - (void)requestQuit {
 	TunnelMeshTrayMenuAction(TMActionQuit);
+	[self closeQuickPanel];
 	[self hideWindow];
 	// Stopping here as well as in the Go handler keeps 退出 working even if the handler
 	// is not installed yet; [NSApp stop:] is idempotent.
@@ -391,6 +584,9 @@ static TMTrayController *gController = nil;
 
 - (void)showWindow {
 	TMOnMainSync(^{
+		// The panel and the settings window are two renderings of one interface. Leaving
+		// the panel up while the window opens puts the same numbers on screen twice.
+		[self closeQuickPanel];
 		if (self.window == nil) {
 			[self buildWindow:@"TunnelMesh Client"];
 		}
@@ -416,6 +612,12 @@ static TMTrayController *gController = nil;
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
+	if (!sender.isVisible) {
+		// Nothing on screen is being closed. A cancel operation can reach this window
+		// through the responder chain, and honouring it would stop the tunnels with no
+		// window in sight - the worst possible outcome for a keystroke nobody meant.
+		return NO;
+	}
 	// Consulting Go rather than a cached flag means the general tab's switch takes effect
 	// immediately, without the shell having to be told.
 	if (TunnelMeshTrayMinimizeToTray()) {
@@ -450,10 +652,36 @@ static TMTrayController *gController = nil;
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			[self loadSettingsURL];
 		});
+		return;
+	}
+	// The panel reloads on the same terms. NSURLErrorCancelled is skipped because closing
+	// a transient popover mid-load cancels its own navigation, and reloading then would
+	// rebuild a view the operator never asked to see again.
+	if (webView == self.panelWebView && error.code != NSURLErrorCancelled) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+			[self loadPanelURL];
+		});
 	}
 }
 
 @end
+
+// Lets Escape dismiss the quick panel.
+//
+// Scoped to the panel being shown, because the same key cancels dialogs and dropdowns
+// inside the settings window: taking it away there would be a worse surprise than not
+// handling it. A local monitor is the only place that sees the event before the web view's
+// own process does.
+static void TMInstallPanelDismissShortcut(void) {
+	gPanelEscapeMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+	                                                           handler:^NSEvent *(NSEvent *event) {
+		if (event.keyCode == 53 && gController.panelPopover.isShown) {
+			[gController closeQuickPanel];
+			return nil;
+		}
+		return event;
+	}];
+}
 
 void TMTrayRun(TMTrayConfig config) {
 	@autoreleasepool {
@@ -465,12 +693,14 @@ void TMTrayRun(TMTrayConfig config) {
 		[NSApp setDelegate:gController];
 		[gController installMainMenu];
 		TMInstallControlKeyShortcuts();
+		TMInstallPanelDismissShortcut();
 		[NSApp run];
 	}
 }
 
 void TMTrayStop(void) {
 	TMOnMainAsync(^{
+		[gController closeQuickPanel];
 		TMStopApplication();
 	});
 }
@@ -485,6 +715,10 @@ void TMTrayHideWindow(void) {
 
 void TMTraySetMinimizeToTray(int enabled) {
 	[gController setMinimizeToTray:(enabled != 0)];
+}
+
+void TMTraySetQuickPanel(int enabled) {
+	[gController setQuickPanel:(enabled != 0)];
 }
 
 void TMTrayOpenURL(const char *url) {

@@ -40,7 +40,11 @@ export default {
     },
     theme: {
       label: 'Appearance',
-      hint: 'Follow system tracks the macOS light and dark appearance.',
+      hint: {
+        macos: 'Follow system tracks the macOS light and dark appearance.',
+        windows: 'Follow system tracks the Windows light and dark app mode; the window frame always follows the system setting.',
+        other: 'Follow system tracks the operating system light and dark appearance.',
+      },
       system: 'Follow system',
       light: 'Light',
       dark: 'Dark',
@@ -62,20 +66,49 @@ export default {
     },
     launchAtLogin: {
       label: 'Launch at login',
-      hint: 'Registers the app bundle as a macOS login item.',
-      unsupported: 'Login items are not available in this build.',
-      failed: 'macOS refused the login item: {error}',
+      hint: {
+        macos: 'Registers the app bundle as a macOS login item.',
+        windows: 'Writes the per-user registry Run entry, so the client starts when you sign in. No administrator rights needed.',
+        other: 'Starts the client when you sign in.',
+      },
+      unsupported: 'Launch at login is not available in this build.',
+      failed: {
+        macos: 'macOS refused the login item: {error}',
+        windows: 'Windows refused the start-up entry: {error}',
+        other: 'The system refused launch at login: {error}',
+      },
     },
     minimizeToTray: {
-      label: 'Minimize to the menu bar on close',
+      label: 'Minimize to the tray on close',
       hint: 'When off, closing the window quits the client and its tunnels.',
     },
+    quickPanel: {
+      label: 'Quick panel',
+      hint: {
+        macos: 'When on, a left click on the menu-bar item opens the panel; right click (or ⌃-click) still opens the menu. Press Save and the next click on the icon follows it, without a relaunch.',
+        windows: 'When on, a left click on the notification-area icon opens the panel; right click still opens the menu. Press Save and the next click on the icon follows it, without a relaunch.',
+        other: 'When on, clicking the tray icon opens the panel; right click still opens the menu.',
+      },
+      off: 'Off',
+      on: 'On',
+    },
+
     saved: 'Preferences saved.',
     saveFailed: 'Saving the preferences failed: {error}',
+    unsaved: 'Unsaved changes — press Save to apply them.',
+  },
+  panel: {
+    heading: 'Quick panel',
+    tunnels: 'Tunnels',
+    empty: 'No tunnels are configured yet.',
+    openMain: 'Open Dashboard',
+    quit: 'Quit',
+    notRunning: 'The client is stopped.',
+    updated: 'Updated {time}',
   },
   stats: {
     title: 'Statistics',
-    description: 'Live state of the client hosted by the menu bar app.',
+    description: 'Live state of the client hosted by the tray.',
     summary: {
       state: 'State',
       uptime: 'Uptime',
@@ -90,7 +123,13 @@ export default {
       openSlots: 'Pool slots',
       readySessions: 'Ready sessions',
     },
-    server: { reachable: 'Reachable', unreachable: 'Unreachable', unknown: 'Not checked', unset: 'Not configured' },
+    server: {
+      reachable: 'Reachable',
+      unreachable: 'Unreachable',
+      unknown: 'Not checked',
+      unset: 'Not configured',
+      probe: 'Health probe: {detail}',
+    },
     session: { connected: 'Connected', disconnected: 'No session' },
     tunnels: {
       heading: 'Tunnels',
@@ -179,6 +218,7 @@ export default {
       button: 'Check configuration',
       running: 'Checking…',
       valid: 'Every check passed.',
+      validWithWarnings: 'Checks passed with {count} warning(s).',
       invalid: 'Some checks failed. Fix them before starting the client.',
       checkedAt: 'Checked at {time}',
       empty: 'Nothing has been checked yet.',
@@ -196,7 +236,19 @@ export default {
   about: {
     title: 'About',
     build: { heading: 'Build', version: 'Version', commit: 'Commit', buildTime: 'Built' },
-    system: { heading: 'System', os: 'Operating system', osVersion: 'macOS version', arch: 'Architecture', runtime: 'Runtime' },
+    system: {
+      heading: 'System',
+      os: 'Operating system',
+      osVersion: 'System version',
+      arch: 'Architecture',
+      runtime: 'Runtime',
+      renderer: 'Interface renderer',
+      rendererDetail: 'Renderer version',
+    },
+    renderer: {
+      fallbackTitle: 'Microsoft Edge WebView2 runtime not found',
+      fallbackBody: 'The settings window opens in your default browser instead, and everything still works. Install the WebView2 Runtime to get the embedded window back.',
+    },
     files: {
       heading: 'Configuration',
       configDir: 'Directory',
@@ -254,7 +306,7 @@ export default {
     },
   },
   errors: {
-    unauthorized: 'The window lost its connection to the tray. Reopen it from the menu bar.',
+    unauthorized: 'The window lost its connection to the tray. Reopen it from the tray menu.',
     conflict: 'Another TunnelMesh client is already running with this configuration.',
     unusable: 'The configuration is not usable yet.',
   },

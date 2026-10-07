@@ -1,4 +1,5 @@
-// Command trayicon draws the macOS application icon for the TunnelMesh client tray.
+// Command trayicon draws the application and notification-area icons for the
+// TunnelMesh client tray: the macOS .icns and menu-bar glyph, and the Windows .ico pair.
 //
 // The repository has no design toolchain and no editable binary source for artwork, so the
 // icon is generated from geometry instead: the shape is reviewable text, the output is
@@ -13,10 +14,12 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"math"
 	"os"
@@ -56,6 +59,31 @@ var (
 	linkHalf   = 0.050
 	peerSpread = 0.240
 )
+
+// Menu-bar variant: the same mark, one colour, no tile.
+//
+// NSStatusItem draws a *template* image, so only the alpha channel survives and the system
+// tints it for the current menu-bar appearance. The glyph reuses insideMark with the tile's
+// own radii and link width rather than redrawing a lighter copy, because the point of the
+// exercise is that the menu bar and Finder show one shape: a second geometry is a second
+// thing to keep in sync, and it is exactly the drift that made the two disagree before.
+//
+// Only the framing differs. glyphInset is the share of the canvas left clear around the
+// mark, and 0.20 puts the clover at 80% of the 18pt box, which is how much of the box a
+// system menu-bar symbol fills.
+const glyphInset = 0.20
+
+// menuBarSizes are the edge lengths written for the status item, at 1x, 2x and 3x of the
+// 18pt bar. Naming them ...@2x and ...@3x is what lets NSImage pick a representation per
+// display instead of scaling one bitmap.
+var menuBarSizes = []struct {
+	suffix string
+	size   int
+}{
+	{"", 18},
+	{"@2x", 36},
+	{"@3x", 54},
+}
 
 // hubCenter is the hub of the mark. It sits below the canvas centre because one peer points
 // straight up: the bounding box of the whole mark, not its centre point, is what has to look
@@ -106,17 +134,31 @@ func lerp(from, to rgba, t float64) rgba {
 	}
 }
 
+// tile is the rounded-square background geometry. appTile is what Finder and Explorer show:
+// an inset tile, because a tile that bleeds to the edge of its canvas looks oversized in a
+// grid and macOS applies no mask of its own. trayTile is the notification-area variant: full
+// bleed, so at 16 pixels the block is the icon rather than a mark floating inside padding
+// that stops reading as a shape on a taskbar.
+type tile struct {
+	left, right, top, bottom, radius float64
+}
+
+var (
+	appTile  = tile{tileLeft, tileRight, tileTop, tileBottom, tileRadius}
+	trayTile = tile{0, 1, 0, 1, tileRadius / (tileRight - tileLeft)}
+)
+
 // insideRoundedRect reports whether a unit-space point falls inside the tile.
-func insideRoundedRect(p point) bool {
-	if p.x < tileLeft || p.x > tileRight || p.y < tileTop || p.y > tileBottom {
+func insideRoundedRect(p point, t tile) bool {
+	if p.x < t.left || p.x > t.right || p.y < t.top || p.y > t.bottom {
 		return false
 	}
 	// Corner regions are decided by the circle that rounds them; anywhere else the point is
 	// inside the rectangle by construction.
-	nearestX := math.Max(tileLeft+tileRadius, math.Min(p.x, tileRight-tileRadius))
-	nearestY := math.Max(tileTop+tileRadius, math.Min(p.y, tileBottom-tileRadius))
+	nearestX := math.Max(t.left+t.radius, math.Min(p.x, t.right-t.radius))
+	nearestY := math.Max(t.top+t.radius, math.Min(p.y, t.bottom-t.radius))
 	dx, dy := p.x-nearestX, p.y-nearestY
-	return dx*dx+dy*dy <= tileRadius*tileRadius
+	return dx*dx+dy*dy <= t.radius*t.radius
 }
 
 // distanceToSegment is the planar distance from p to the segment a..b, used to give the
@@ -151,6 +193,74 @@ func insideMark(p point) bool {
 	return false
 }
 
+// markBounds returns the axis-aligned bounding box of the mesh mark in unit space. The node
+// radii exceed the link half-width in both variants, so the circles decide the extent.
+func markBounds() (point, point) {
+	min := point{math.MaxFloat64, math.MaxFloat64}
+	max := point{-math.MaxFloat64, -math.MaxFloat64}
+	center := hubCenter
+	radius := hubRadius
+	min = point{math.Min(min.x, center.x-radius), math.Min(min.y, center.y-radius)}
+	max = point{math.Max(max.x, center.x+radius), math.Max(max.y, center.y+radius)}
+	for _, peer := range peerCenters() {
+		min = point{math.Min(min.x, peer.x-peerRadius), math.Min(min.y, peer.y-peerRadius)}
+		max = point{math.Max(max.x, peer.x+peerRadius), math.Max(max.y, peer.y+peerRadius)}
+	}
+	return min, max
+}
+
+// glyphPoint maps a canvas sample to mark space so the mark fills the canvas up to
+// glyphInset, and stays centred. It is a pure scale and translate: no rotation, no aspect
+// change, so the glyph is the same drawing rather than a reinterpretation of it.
+func glyphPoint(c point) point { return scalePoint(c, 1-glyphInset) }
+
+// trayPoint frames the mark inside the full-bleed block. It is larger than in the app tile
+// and smaller than in the menu-bar glyph: the peer nodes are two pixels across at 16, which
+// is where the mark stops reading as a network.
+func trayPoint(c point) point { return scalePoint(c, 0.72) }
+
+// scalePoint maps canvas space to mark space so the mark spans fill of the canvas and stays
+// centred. Like glyphPoint it is a pure scale and translate, so every variant is one drawing
+// rather than a reinterpretation of it.
+func scalePoint(c point, fill float64) point {
+	min, max := markBounds()
+	center := point{(min.x + max.x) / 2, (min.y + max.y) / 2}
+	span := math.Max(max.x-min.x, max.y-min.y)
+	factor := span / fill
+	return point{center.x + (c.x-0.5)*factor, center.y + (c.y-0.5)*factor}
+}
+
+// renderGlyph draws the monochrome menu-bar mark at size pixels: black where the mesh is,
+// transparent outside it, with the same supersampling the tile uses so the two stay in step.
+func renderGlyph(size int) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, size, size))
+	step := 1 / float64(samplesPerAxis)
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			var coverage float64
+			for sy := 0; sy < samplesPerAxis; sy++ {
+				for sx := 0; sx < samplesPerAxis; sx++ {
+					px := (float64(x) + (float64(sx)+0.5)*step) / float64(size)
+					py := (float64(y) + (float64(sy)+0.5)*step) / float64(size)
+					if insideMark(glyphPoint(point{px, py})) {
+						coverage++
+					}
+				}
+			}
+			samples := float64(samplesPerAxis * samplesPerAxis)
+			alpha := clamp255(coverage / samples * 255)
+			// Premultiplied black: colour times coverage, which for black is zero, so the
+			// stored colour stays 0 and only alpha carries the shape.
+			out.SetRGBA(x, y, color.RGBA{R: 0, G: 0, B: 0, A: uint8(alpha)})
+		}
+	}
+	return out
+}
+
+// identityPoint leaves the mark in the position the app tile has always used: it is drawn
+// from the unit-space geometry directly rather than scaled to fill the canvas.
+func identityPoint(c point) point { return c }
+
 // insideCircle is the unit-space circle test the nodes are drawn with.
 func insideCircle(p, center point, radius float64) bool {
 	dx, dy := p.x-center.x, p.y-center.y
@@ -158,21 +268,21 @@ func insideCircle(p, center point, radius float64) bool {
 }
 
 // colourAt resolves one unit-space sample to a premultiplied colour.
-func colourAt(p point) rgba {
+func colourAt(p point, t tile, mark func(point) point) rgba {
 	top, bottom := parseHex(colorTop), parseHex(colorBottom)
 	switch {
-	case insideMark(p):
+	case insideMark(mark(p)):
 		return rgba{1, 1, 1, 1}
-	case insideRoundedRect(p):
-		t := (p.y - tileTop) / (tileBottom - tileTop)
-		return lerp(top, bottom, t)
+	case insideRoundedRect(p, t):
+		depth := (p.y - t.top) / (t.bottom - t.top)
+		return lerp(top, bottom, depth)
 	default:
 		return rgba{}
 	}
 }
 
-// render draws the master image at size pixels.
-func render(size int) *image.RGBA {
+// render draws the mark on one tile at size pixels.
+func render(size int, t tile, mark func(point) point) *image.RGBA {
 	out := image.NewRGBA(image.Rect(0, 0, size, size))
 	step := 1 / float64(samplesPerAxis)
 	for y := 0; y < size; y++ {
@@ -182,7 +292,7 @@ func render(size int) *image.RGBA {
 				for sx := 0; sx < samplesPerAxis; sx++ {
 					px := (float64(x) + (float64(sx)+0.5)*step) / float64(size)
 					py := (float64(y) + (float64(sy)+0.5)*step) / float64(size)
-					c := colourAt(point{px, py})
+					c := colourAt(point{px, py}, t, mark)
 					// Premultiplied accumulation: a transparent sample contributes nothing,
 					// which is what keeps the tile edge from gaining a dark halo.
 					accR += c.r * c.a
@@ -291,9 +401,121 @@ var iconsetNames = []struct {
 	{"icon_512x512@2x.png", 1024},
 }
 
+// Icon sizes for the Windows .ico pair. The app icon carries the sizes Explorer asks for
+// between a 16-pixel list row and a 256-pixel preview; the notification-area icon carries
+// the three the taskbar and tray actually request at common scales, so the block a user
+// sees is a true render at that size rather than a downscale of a downscale.
+var (
+	appIconSizes  = []int{16, 24, 32, 48, 64, 128, 256}
+	trayIconSizes = []int{16, 24, 32}
+)
+
+// encodeICO writes one .ico file from rendered sizes.
+//
+// Every entry is an uncompressed 32-bit DIB rather than the PNG a Windows SDK tool would
+// emit for the 256-pixel size. That costs a few hundred kilobytes and buys two things the
+// tray needs: the file is readable by the shell at run time without a PNG-in-ICO special
+// case, and the bytes stay deterministic, which is what lets a test assert that the
+// committed icon still matches the geometry.
+func encodeICO(path string, master *image.RGBA, sizes []int) error {
+	images := make([]*image.RGBA, 0, len(sizes))
+	for _, size := range sizes {
+		if size == master.Bounds().Dx() {
+			images = append(images, master)
+			continue
+		}
+		images = append(images, downsample(master, size))
+	}
+	entries := make([][]byte, len(images))
+	for i, img := range images {
+		entries[i] = iconDIB(img)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	header := make([]byte, 6)
+	binary.LittleEndian.PutUint16(header[2:], 1) // type 1 is an icon, not a cursor
+	binary.LittleEndian.PutUint16(header[4:], uint16(len(images)))
+	directory := make([]byte, 16*len(images))
+	// Image data starts after the header and the directory, and each entry points at where
+	// its own bytes land in that order.
+	offset := 6 + 16*len(images)
+	for i, size := range sizes {
+		entry := directory[i*16 : (i+1)*16]
+		// A size of 256 is encoded as zero, which is how the format says "not a byte".
+		edge := size
+		if edge == 256 {
+			edge = 0
+		}
+		entry[0] = byte(edge)
+		entry[1] = byte(edge)
+		binary.LittleEndian.PutUint16(entry[4:], 1)  // planes
+		binary.LittleEndian.PutUint16(entry[6:], 32) // bits per pixel
+		binary.LittleEndian.PutUint32(entry[8:], uint32(len(entries[i])))
+		binary.LittleEndian.PutUint32(entry[12:], uint32(offset))
+		offset += len(entries[i])
+	}
+	if _, err := file.Write(header); err != nil {
+		return err
+	}
+	if _, err := file.Write(directory); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if _, err := file.Write(entry); err != nil {
+			return err
+		}
+	}
+	return file.Close()
+}
+
+// iconDIB builds one entry: a BITMAPINFOHEADER whose height counts both the colour and the
+// mask planes, bottom-up un-premultiplied BGRA pixels, and an all-zero AND mask.
+//
+// The mask has to stay zero: a 32-bit icon is alpha-blended, and a non-zero mask bit forces
+// the pixel transparent no matter what its alpha says, which would punch holes in every
+// anti-aliased edge the renderer worked to keep smooth.
+func iconDIB(img *image.RGBA) []byte {
+	size := img.Bounds().Dx()
+	rowBytes := ((size + 31) / 32) * 4
+	pixelBytes := size * size * 4
+
+	header := make([]byte, 40)
+	binary.LittleEndian.PutUint32(header[0:], 40)
+	binary.LittleEndian.PutUint32(header[4:], uint32(size))
+	// The doubled height is the format's way of describing "colour plane plus mask plane".
+	binary.LittleEndian.PutUint32(header[8:], uint32(size*2))
+	binary.LittleEndian.PutUint16(header[12:], 1)
+	binary.LittleEndian.PutUint16(header[14:], 32)
+	binary.LittleEndian.PutUint32(header[20:], uint32(pixelBytes))
+
+	pixels := make([]byte, pixelBytes)
+	// image.RGBA is premultiplied and an icon's alpha channel is not, so the conversion has
+	// to un-premultiply; drawing through an NRGBA image is how the standard library does it.
+	plain := image.NewNRGBA(img.Bounds())
+	draw.Draw(plain, img.Bounds(), img, image.Point{}, draw.Src)
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			source := plain.NRGBAAt(x, y)
+			// Rows are stored bottom-up.
+			target := ((size-1-y)*size + x) * 4
+			pixels[target] = source.B
+			pixels[target+1] = source.G
+			pixels[target+2] = source.R
+			pixels[target+3] = source.A
+		}
+	}
+	return append(append(header, pixels...), make([]byte, rowBytes*size)...)
+}
+
 func main() {
 	out := flag.String("out", "", "directory to write the .iconset into (required)")
 	preview := flag.String("preview", "", "also write a full-size PNG here, for review")
+	menubar := flag.String("menubar", "", "also write the monochrome menu-bar glyph here, at 1x/2x/3x")
+	ico := flag.String("ico", "", "also write the Windows TunnelMeshClient.ico and TunnelMeshTray.ico here")
 	flag.Parse()
 
 	if *out == "" {
@@ -305,7 +527,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	master := render(masterSize)
+	master := render(masterSize, appTile, identityPoint)
 	for _, entry := range iconsetNames {
 		img := master
 		if entry.size != masterSize {
@@ -322,5 +544,41 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("wrote %d iconset entries to %s\n", len(iconsetNames), *out)
+	written := len(iconsetNames)
+	if dir := *ico; dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "trayicon: %v\n", err)
+			os.Exit(1)
+		}
+		// Both files come out of the same geometry as the .icns, so the taskbar block and
+		// the Explorer tile cannot disagree the way two hand-placed PNGs did.
+		if err := encodeICO(filepath.Join(dir, "TunnelMeshClient.ico"), master, appIconSizes); err != nil {
+			fmt.Fprintf(os.Stderr, "trayicon: %v\n", err)
+			os.Exit(1)
+		}
+		block := render(masterSize, trayTile, trayPoint)
+		if err := encodeICO(filepath.Join(dir, "TunnelMeshTray.ico"), block, trayIconSizes); err != nil {
+			fmt.Fprintf(os.Stderr, "trayicon: %v\n", err)
+			os.Exit(1)
+		}
+		written += 2
+	}
+	if dir := *menubar; dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "trayicon: %v\n", err)
+			os.Exit(1)
+		}
+		// Rendered from the same geometry at each size rather than downsampled from the
+		// 1024 master: a 1.4px stroke survives supersampling at 18px and does not survive a
+		// 57x box filter, which would leave the small sizes visibly lighter than the large.
+		for _, entry := range menuBarSizes {
+			file := filepath.Join(dir, "TunnelMeshMenuBar"+entry.suffix+".png")
+			if err := encode(file, renderGlyph(entry.size)); err != nil {
+				fmt.Fprintf(os.Stderr, "trayicon: %v\n", err)
+				os.Exit(1)
+			}
+			written++
+		}
+	}
+	fmt.Printf("wrote %d icon entries to %s\n", written, *out)
 }

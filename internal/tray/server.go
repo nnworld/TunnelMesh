@@ -28,6 +28,24 @@ var (
 	ErrServerTooOld = errors.New("tray: the server does not provide the client agent endpoint")
 )
 
+// AnsweredError reports that the Server's origin replied with a status that is not a
+// success. It is a separate type because it is a separate fact: "something at that
+// address answered, and it refused this endpoint" leaves the configured address correct,
+// while a transport failure means nothing answered at all.
+//
+// The case that motivated it is real: a Server behind openresty answers /health/ready
+// with 403 while the WebSocket and API paths work, so a probe that conflated the two
+// reported an unreachable Server next to a tunnel carrying traffic.
+type AnsweredError struct {
+	Status int
+}
+
+// Error names the status, because an operator pastes this line into a report and the
+// endpoint it came from is already in the message.
+func (e AnsweredError) Error() string {
+	return fmt.Sprintf("server health check: unexpected status %d", e.Status)
+}
+
 // clientTokenValidatorUnavailable is the stable message the Server returns when the
 // endpoint exists but its validator was never installed.
 const clientTokenValidatorUnavailable = "client_token_validator_unavailable"
@@ -82,7 +100,7 @@ func (c *ServerClient) CheckHealth(ctx context.Context, serverURL string) error 
 		return err
 	}
 	if status < 200 || status > 299 {
-		return fmt.Errorf("server health check: unexpected status %d", status)
+		return AnsweredError{Status: status}
 	}
 	return nil
 }

@@ -26,6 +26,9 @@ export const useSettingsStore = defineStore('settings', {
       mode: 'local' as ClientMode,
       launchAtLogin: true,
       minimizeToTray: true,
+      // The tray's own default, mirrored here so a form that has never been loaded still
+      // shows the same answer the Go side would store.
+      quickPanel: false,
     },
     unsubscribeSystemTheme: null as null | (() => void),
   }),
@@ -45,6 +48,7 @@ export const useSettingsStore = defineStore('settings', {
         mode: this.draft.mode,
         launchAtLogin: view.launchAtLogin,
         minimizeToTray: view.minimizeToTray,
+        quickPanel: view.quickPanel,
       }
       this.applyAppearance()
     },
@@ -78,6 +82,7 @@ export const useSettingsStore = defineStore('settings', {
           configDir: this.draft.configDir,
           launchAtLogin: this.draft.launchAtLogin,
           minimizeToTray: this.draft.minimizeToTray,
+          quickPanel: this.draft.quickPanel,
           ...extra,
         }
         this.adopt(await saveSettings(update))

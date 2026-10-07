@@ -420,3 +420,28 @@ describe('routing tab agent picker', () => {
     wrapper.unmount()
   })
 })
+
+  it('names the warnings instead of claiming every check passed', async () => {
+    // A proxy in front of the Server refuses /health/ready with 403 while the API works, so
+    // the report is valid with a warning. "全部检测通过" over a warning teaches the operator
+    // to ignore the row that explains why the health endpoint disagrees.
+    const tray = installFakeTray({
+      'POST /api/validate': fixtures.report({
+        valid: true,
+        checks: [
+          { id: 'serverUrl.reachable', status: 'warning', message: 'server health check: unexpected status 403' },
+          { id: 'config.valid', status: 'passed' },
+        ],
+      }),
+      'GET /api/agents': fixtures.agents(),
+    })
+    const { wrapper } = mountView(RoutingView, { prepare: () => seed() })
+    await click(wrapper, '[data-test="validate"]')
+
+    const summary = wrapper.find('[data-test="validation-summary"]')
+    expect(summary.find('.el-alert').classes()).toContain('el-alert--warning')
+    expect(summary.text()).toContain('1')
+    expect(summary.text()).not.toContain('Every check passed')
+    tray.restore()
+    wrapper.unmount()
+  })

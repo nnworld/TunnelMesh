@@ -530,3 +530,48 @@ func TestAPIWithoutAssetsServesAPlaceholder(t *testing.T) {
 		t.Fatalf("placeholder = %d %q", recorder.Code, recorder.Body.String())
 	}
 }
+
+// TestAPISettingsQuickPanelRoundTrip is the transport for the general tab radio.
+func TestAPISettingsQuickPanelRoundTrip(t *testing.T) {
+	api, _ := newTestAPI(t, nil)
+	_, parsed := call(t, api, http.MethodGet, "/api/settings", nil, nil)
+	var first SettingsView
+	decode(t, parsed.Data, &first)
+	if first.QuickPanel {
+		t.Fatal("the API must report the quick panel as off by default")
+	}
+
+	on := true
+	recorder, parsed := call(t, api, http.MethodPut, "/api/settings", SettingsUpdate{QuickPanel: &on}, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	var saved SettingsView
+	decode(t, parsed.Data, &saved)
+	if !saved.QuickPanel {
+		t.Fatalf("saved view = %+v", saved)
+	}
+
+	recorder, parsed = call(t, api, http.MethodGet, "/api/settings", nil, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", recorder.Code)
+	}
+	var reread SettingsView
+	decode(t, parsed.Data, &reread)
+	if !reread.QuickPanel {
+		t.Fatalf("re-read view = %+v, want the quick panel on", reread)
+	}
+}
+
+// TestAPIPanelURL checks the address the quick panel's web view is pointed at. The hash
+// is part of the contract with the bundle: it is how one embedded application renders two
+// different windows without a second HTTP surface.
+func TestAPIPanelURL(t *testing.T) {
+	api, _ := newTestAPI(t, nil)
+	if got := api.PanelURL(); got != api.URL()+"#/panel" {
+		t.Fatalf("PanelURL() = %q, want %q", got, api.URL()+"#/panel")
+	}
+	if !strings.Contains(api.PanelURL(), "secret=") {
+		t.Fatalf("PanelURL() = %q, want the launch secret so the panel can call the API", api.PanelURL())
+	}
+}

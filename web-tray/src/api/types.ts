@@ -17,6 +17,10 @@ export interface SettingsView {
   launchAtLoginSupported: boolean
   launchAtLoginError?: string
   minimizeToTray: boolean
+  /** Menu-bar quick panel. Off by default: the left click keeps showing the menu. */
+  quickPanel: boolean
+  /** "macos", "windows", or absent for a shell neither word describes. */
+  platform?: string
   languages: LanguagePreference[]
   themes: ThemePreference[]
   modes: ClientMode[]
@@ -29,6 +33,7 @@ export interface SettingsUpdate {
   configDir?: string
   launchAtLogin?: boolean
   minimizeToTray?: boolean
+  quickPanel?: boolean
 }
 
 export interface TunnelView {
@@ -139,6 +144,10 @@ export interface SystemInfo {
   goos: string
   arch: string
   osVersion?: string
+  /** The web view that draws this window, or "browser" when no embedded one was found. */
+  renderer?: string
+  /** Runtime version, or the reason there is not one. */
+  rendererDetail?: string
 }
 
 export interface AboutView {

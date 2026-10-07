@@ -196,3 +196,45 @@ func TestServerClientListAgentsRequiresToken(t *testing.T) {
 		t.Fatalf("error = %v, want ErrMissingToken", err)
 	}
 }
+
+// TestServerClientCheckHealthDistinguishesAnAnswer covers the difference a deployment
+// behind a reverse proxy forces. A real Server sits behind openresty, which answers
+// /health/ready with 403 while the WebSocket and API paths work: "answered, refused" and
+// "nothing at that address replied" need different advice, and only the second one means
+// the configured address is wrong.
+func TestServerClientCheckHealthDistinguishesAnAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	err := NewServerClient(0).CheckHealth(context.Background(), testServerURL(t, server))
+	if err == nil {
+		t.Fatal("a refused health endpoint must still be reported as unhealthy")
+	}
+	var answered AnsweredError
+	if !errors.As(err, &answered) {
+		t.Fatalf("CheckHealth error = %T %v, want an AnsweredError", err, err)
+	}
+	if answered.Status != http.StatusForbidden {
+		t.Fatalf("Status = %d, want 403", answered.Status)
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("CheckHealth error = %v, want the status in the message", err)
+	}
+}
+
+func TestServerClientCheckHealthTransportFailureIsNotAnAnswer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	target := testServerURL(t, server)
+	server.Close()
+
+	err := NewServerClient(0).CheckHealth(context.Background(), target)
+	if err == nil {
+		t.Fatal("a refused connection must be an error")
+	}
+	var answered AnsweredError
+	if errors.As(err, &answered) {
+		t.Fatalf("CheckHealth error = %v, want no answer recorded for a connection that never completed", err)
+	}
+}

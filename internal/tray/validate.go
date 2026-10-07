@@ -135,7 +135,16 @@ func (v *Validator) Validate(ctx context.Context, settings ClientSettings) Valid
 	if !urlOK {
 		add(CheckServerReachable, StatusSkipped, "the server URL is not usable")
 	} else if err := v.server.CheckHealth(ctx, serverURL); err != nil {
-		add(CheckServerReachable, StatusFailed, err.Error())
+		var answered AnsweredError
+		if errors.As(err, &answered) {
+			// The address is right and this one endpoint is refused, which is a warning
+			// rather than a verdict: the API the rest of the checks use may well be open,
+			// and skipping it would hide the failure the operator can actually fix.
+			reachable = true
+			add(CheckServerReachable, StatusWarning, err.Error())
+		} else {
+			add(CheckServerReachable, StatusFailed, err.Error())
+		}
 	} else {
 		reachable = true
 		add(CheckServerReachable, StatusPassed, "")

@@ -3,6 +3,7 @@ package tray
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -122,5 +123,73 @@ func TestValidLanguagesAndThemes(t *testing.T) {
 	}
 	if validTheme("solarized") || validTheme("") {
 		t.Fatal("validTheme accepted an unsupported value")
+	}
+}
+
+// TestQuickPanelDefaultsToOff pins the requirement that the menu-bar quick panel is off
+// until the operator asks for it. A tray that hijacks the left click on first run would
+// be a behaviour change nobody consented to.
+func TestQuickPanelDefaultsToOff(t *testing.T) {
+	if DefaultPreferences().QuickPanel {
+		t.Fatal("QuickPanel = true, want the quick panel off by default")
+	}
+	dir := t.TempDir()
+	store := NewPrefsStore(filepath.Join(dir, PrefsFileName))
+	prefs, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefs.QuickPanel {
+		t.Fatalf("loaded QuickPanel = true, want false for a file that never mentioned it")
+	}
+
+	// A hand written file that predates the field must load as "off" rather than as
+	// "unset", which is what keeps an upgrade from flipping the behaviour.
+	if err := os.WriteFile(store.Path(), []byte(`{"language":"zh-CN","minimizeToTray":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened := NewPrefsStore(store.Path())
+	legacy, err := reopened.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.QuickPanel || legacy.Language != LanguageZhCN {
+		t.Fatalf("legacy file loaded as %+v", legacy)
+	}
+}
+
+// TestQuickPanelRoundTrip covers the general tab's radio button: the choice has to
+// survive a restart of the tray, not just the current session.
+func TestQuickPanelRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store := NewPrefsStore(filepath.Join(dir, PrefsFileName))
+	if err := store.Save(Preferences{QuickPanel: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewPrefsStore(store.Path()).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.QuickPanel {
+		t.Fatalf("QuickPanel = false, want the stored true; stored file = %+v", got)
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"quickPanel": true`) {
+		t.Fatalf("stored preferences = %s, want an explicit quickPanel key", data)
+	}
+
+	// Turning it back off has to be persisted too: the cache must not resurrect true.
+	if err := store.Save(Preferences{QuickPanel: false}); err != nil {
+		t.Fatal(err)
+	}
+	off, err := NewPrefsStore(store.Path()).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.QuickPanel {
+		t.Fatal("QuickPanel = true after being turned off")
 	}
 }
