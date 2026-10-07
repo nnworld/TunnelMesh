@@ -1,7 +1,6 @@
 package scripts
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -70,15 +69,7 @@ func (list *stringList) UnmarshalYAML(node *yaml.Node) error {
 
 func loadWorkflow(t *testing.T) workflowFile {
 	t.Helper()
-	data, err := os.ReadFile(releaseWorkflow)
-	if err != nil {
-		t.Fatalf("read %s: %v", releaseWorkflow, err)
-	}
-	var parsed workflowFile
-	if err := yaml.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("parse %s: %v", releaseWorkflow, err)
-	}
-	return parsed
+	return loadWorkflowFile(t, releaseWorkflow)
 }
 
 func requireJob(t *testing.T, workflow workflowFile, name string) job {
@@ -284,6 +275,126 @@ func TestReleaseWorkflowKeepsWritePermissionOnlyForPublishing(t *testing.T) {
 		}
 		if strings.Contains(runs(target), "gh ") {
 			t.Errorf("jobs.%s calls gh but does not need release permission", name)
+		}
+	}
+}
+
+// The Windows tray half of the split: it cross-compiles from Linux, so it must not be waiting
+// for a Mac, and it must not be folded into the release job either, because the release job
+// publishes from a directory it never builds into.
+const (
+	windowsTrayJob       = "windows-tray"
+	windowsTrayArtifact  = "windows-tray"
+	windowsPackageScript = "./scripts/package-windows-tray.sh"
+)
+
+func TestReleaseWorkflowBuildsTheWindowsTrayOnLinux(t *testing.T) {
+	workflow := loadWorkflow(t)
+	tray := requireJob(t, workflow, windowsTrayJob)
+
+	if !strings.HasPrefix(tray.RunsOn, "ubuntu-") {
+		t.Errorf("jobs.%s runs-on %q, want a Linux runner: the windows shell is pure Go over WebView2 "+
+			"and makensis is a cross compiler", windowsTrayJob, tray.RunsOn)
+	}
+	if !contains(tray.Needs, versionJob) {
+		t.Errorf("jobs.%s must need jobs.%s, or it can name its assets after a different version", windowsTrayJob, versionJob)
+	}
+	if got := tray.Env["VERSION"]; !strings.Contains(got, "needs."+versionJob+".outputs.version") {
+		t.Errorf("jobs.%s must take VERSION from the %s job, got %q", windowsTrayJob, versionJob, got)
+	}
+
+	body := runs(tray)
+	for _, want := range []string{
+		"apt-get install -y --no-install-recommends nsis",
+		"cd web-tray && npm ci",
+		"cd web-tray && npm test -- --run",
+		"cd web-tray && npm run build",
+		windowsPackageScript,
+		"SHA256SUMS",
+		"installerLayout",
+		"-windows-amd64-setup.exe",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("jobs.%s must run or assert %q", windowsTrayJob, want)
+		}
+	}
+	if strings.Contains(body, "build-release.sh") || strings.Contains(body, "package-macos-tray.sh") {
+		t.Errorf("jobs.%s must only package the windows tray", windowsTrayJob)
+	}
+
+	node := stepUsing(tray, "actions/setup-node")
+	if node == nil {
+		t.Fatalf("jobs.%s must set up node for the settings bundle", windowsTrayJob)
+	}
+	if got, _ := node.With["cache-dependency-path"].(string); got != "web-tray/package-lock.json" {
+		t.Errorf("jobs.%s caches npm against %q, want web-tray/package-lock.json", windowsTrayJob, got)
+	}
+	upload := stepUsing(tray, "actions/upload-artifact")
+	if upload == nil {
+		t.Fatalf("jobs.%s must upload its artifacts for the release job", windowsTrayJob)
+	}
+	if got, _ := upload.With["name"].(string); got != windowsTrayArtifact {
+		t.Errorf("jobs.%s uploads artifact %q, want %q", windowsTrayJob, got, windowsTrayArtifact)
+	}
+	path, _ := upload.With["path"].(string)
+	if !strings.Contains(path, "windows-tray") || !strings.Contains(path, "dist/") {
+		t.Errorf("jobs.%s uploads %q, want the windows tray output directory under dist/", windowsTrayJob, path)
+	}
+	if got, _ := upload.With["if-no-files-found"].(string); got != "error" {
+		t.Errorf("jobs.%s must fail instead of uploading nothing, got if-no-files-found=%q", windowsTrayJob, got)
+	}
+}
+
+func TestReleaseWorkflowPublishesBothTrayPlatforms(t *testing.T) {
+	workflow := loadWorkflow(t)
+	release := requireJob(t, workflow, releaseJob)
+
+	for _, want := range []string{trayJobName, windowsTrayJob} {
+		if !contains(release.Needs, want) {
+			t.Errorf("jobs.%s must need jobs.%s before publishing", releaseJob, want)
+		}
+	}
+
+	downloaded := map[string]string{}
+	for _, entry := range release.Steps {
+		if !strings.HasPrefix(entry.Uses, "actions/download-artifact") {
+			continue
+		}
+		name, _ := entry.With["name"].(string)
+		target, _ := entry.With["path"].(string)
+		if name == "" || target == "" {
+			t.Errorf("jobs.%s has a download-artifact step without both name and path", releaseJob)
+			continue
+		}
+		downloaded[name] = target
+	}
+	for _, artifact := range []string{trayArtifact, windowsTrayArtifact} {
+		if _, ok := downloaded[artifact]; !ok {
+			t.Errorf("jobs.%s must download the %s artifact, got %v", releaseJob, artifact, downloaded)
+		}
+	}
+
+	body := runs(release)
+	for _, want := range []string{
+		"TRAY_DIST_DIR=" + downloaded[trayArtifact],
+		"WINDOWS_TRAY_DIST_DIR=" + downloaded[windowsTrayArtifact],
+		// Each hand-off keeps its own manifest, so a published release can say which job
+		// produced which asset and the two cannot overwrite each other.
+		"manifest-tray.json",
+		"manifest-windows-tray.json",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("jobs.%s must reference %q", releaseJob, want)
+		}
+	}
+	if strings.Contains(body, windowsPackageScript) {
+		t.Errorf("jobs.%s must not package the windows tray; it merges what the tray job built", releaseJob)
+	}
+	// The asset census is the last line of defence against a partial release: six platform
+	// archives, two disk images, two green windows archives and one windows installer.
+	for _, want := range []string{"-name '*.dmg'", "-name '*.exe'", "-eq 8", "-eq 2", "-eq 1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("jobs.%s must assert the published asset census with %q", releaseJob, want)
 		}
 	}
 }

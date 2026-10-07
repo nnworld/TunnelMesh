@@ -28,6 +28,45 @@ func TestPlatformNameMapsGoosToTheInterfaceVocabulary(t *testing.T) {
 	}
 }
 
+// assertPlatformField checks the settings payload for the platform field the window
+// branches on. A known platform must be reported; the empty one (an untagged build, or a
+// GOOS with no tray shell) must not be reported as something else, and `omitempty` is
+// allowed to drop the key entirely - the front end then uses its neutral wording.
+func assertPlatformField(t *testing.T, encoded []byte, want string) {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("decode settings payload: %v", err)
+	}
+	value, ok := payload["platform"]
+	if want == "" {
+		if ok && value != "" {
+			t.Fatalf("an unknown platform must not claim %v", value)
+		}
+		return
+	}
+	if !ok {
+		t.Fatalf("platform %q: settings payload has no platform field: %s", want, encoded)
+	}
+	if value != want {
+		t.Fatalf("platform = %v, want %q", value, want)
+	}
+}
+
+// TestPlatformFieldContract covers the JSON shape the settings window branches on. The
+// empty value is not hypothetical: an untagged or unsupported GOOS builds and tests this
+// package on Linux, where Platform() is empty, so the contract has to say what that means
+// instead of asserting a key that encoding::omitempty is free to drop.
+func TestPlatformFieldContract(t *testing.T) {
+	for _, platform := range []string{PlatformMacOS, PlatformWindows, ""} {
+		encoded, err := json.Marshal(SettingsView{Platform: platform})
+		if err != nil {
+			t.Fatalf("marshal %q: %v", platform, err)
+		}
+		assertPlatformField(t, encoded, platform)
+	}
+}
+
 // TestSettingsCarriesThePlatformWithoutCarryingSecrets keeps the new field honest: it is
 // the only addition to the general tab payload, and the tab must never leak a token.
 func TestSettingsCarriesThePlatformWithoutCarryingSecrets(t *testing.T) {
@@ -43,9 +82,7 @@ func TestSettingsCarriesThePlatformWithoutCarryingSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if !strings.Contains(string(encoded), `"platform":`) {
-		t.Fatalf("settings payload has no platform field: %s", encoded)
-	}
+	assertPlatformField(t, encoded, Platform())
 	if strings.Contains(strings.ToLower(string(encoded)), "token") {
 		t.Fatalf("settings payload mentions a token: %s", encoded)
 	}

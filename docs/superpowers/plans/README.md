@@ -8,12 +8,14 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 67 份计划，按日期倒序排列。
+共 69 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-10-07 | [TunnelMesh Client 系统托盘（Windows）](2026-10-07-client-system-tray-windows.md) | — | [PR：macOS 系统托盘 Client](../../pull-requests/2026-10-05-client-system-tray-macos.md)<br>[PR：任务栏快捷小窗与统一的菜单栏图标](../../pull-requests/2026-10-06-tray-quick-panel.md)<br>[PR：Windows 系统托盘客户端与 NSIS 发行打包](../../pull-requests/2026-10-07-client-system-tray-windows.md) |
+| 2026-10-06 | [TunnelMesh 托盘：任务栏快捷小窗（macOS）](2026-10-06-tray-quick-panel.md) | — | [PR：macOS 系统托盘 Client](../../pull-requests/2026-10-05-client-system-tray-macos.md)<br>[PR：任务栏快捷小窗与统一的菜单栏图标](../../pull-requests/2026-10-06-tray-quick-panel.md) |
 | 2026-10-05 | [TunnelMesh Client 系统托盘（macOS）Implementation Plan](2026-10-05-client-system-tray-macos.md) | — | [PR：macOS 系统托盘 Client](../../pull-requests/2026-10-05-client-system-tray-macos.md)<br>[ADR：Open a public UDP ingress for an embedded…](../../architecture/adr/0002-public-ingress-and-embedded-vpn.md) |
 | 2026-09-29 | [还原发行管理页各平台下载地址实施计划（补记计划）](2026-09-29-downloads-platform-assets-restore.md) | — | [PR：还原发行管理页各平台下载地址](../../pull-requests/2026-09-29-downloads-platform-assets-restore.md) |
 | 2026-09-29 | [概览“最近事件”补全审计属性实施计划](2026-09-29-dashboard-recent-event-attributes.md) | — | [PR：概览“最近事件”补全审计属性](../../pull-requests/2026-09-29-dashboard-recent-event-attributes.md) |

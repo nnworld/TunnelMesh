@@ -1,7 +1,7 @@
 # tunnelmesh-client 使用帮助
 
-> macOS 上也可以用菜单栏的图形界面客户端，它承载同样的隧道、读写同一份 `client.yaml`，
-> 并与本文的 `run` 子命令互斥：[macOS 系统托盘 Client](client-tray.md)。
+> macOS 与 Windows 上也可以用系统托盘的图形界面客户端，它承载同样的隧道、读写同一份 `client.yaml`，
+> 并与本文的 `run` 子命令互斥：[系统托盘 Client（macOS / Windows）](client-tray.md)。
 
 ## 1. 准备配置
 

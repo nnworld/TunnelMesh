@@ -1,7 +1,8 @@
 # Release Workflow Manual Checks
 
 自动化守卫见 `scripts/merge_tray_dist_test.go`、`scripts/release_workflow_test.go`、
-`deploy/macos/tray_bundle_test.go` 与 `scripts/tray_build_tag_test.go`；下面这些需要一个真实
+`scripts/ci_workflow_test.go`、`deploy/macos/tray_bundle_test.go`、
+`deploy/windows/tray_bundle_test.go` 与 `scripts/tray_build_tag_test.go`；下面这些需要一个真实
 runner（Linux 或 macOS）才能确认，因此在改发行链路时手工走一遍。
 
 ## 跨平台矩阵（`release` 作业，ubuntu）
@@ -27,17 +28,29 @@ runner（Linux 或 macOS）才能确认，因此在改发行链路时手工走�
 16. `DMG_BACKGROUND=<png>` puts the picture at `.background/background.png` inside the volume with the `hidden` flag set, and the image's `.DS_Store` carries a `backgroundImageAlias`.
 17. When the layout cannot be applied - replace `deploy/macos/tray-dmg-layout.applescript` with a script that always fails - the build still succeeds, reports three failed attempts plus one warning on stderr, and records `installerLayout: false`. A silent downgrade to a plain folder window is the failure this guards.
 
-## 合并（`TRAY_DIST_DIR`）
+## Windows 托盘（`windows-tray` 作业，ubuntu）
 
-18. `VERSION=v0.0.0-test TRAY_DIST_DIR=dist/v0.0.0-test/macos-tray ./scripts/build-release.sh` publishes eight assets, and `sha256sum -c dist/v0.0.0-test/SHA256SUMS` passes for all of them.
-19. `dist/v0.0.0-test/manifest-tray.json` is the tray manifest, and `manifest.json` keeps the six-asset cross-platform schema unchanged.
-20. `scripts/merge-tray-dist.sh --check <dir>` exits non-zero for a directory missing `SHA256SUMS`, `manifest.json` or any `.dmg`, and for an image whose bytes do not match the source checksums.
-21. A wrong `TRAY_DIST_DIR` fails before any cross-compilation starts, not after the whole matrix.
-22. Merging refuses to overwrite an asset name that already exists in the release directory.
+18. `bash -n scripts/package-windows-tray.sh` exits 0.
+19. `VERSION=v0.0.0-test ./scripts/package-windows-tray.sh` creates one `.zip` per architecture plus one `-amd64-setup.exe`, `SHA256SUMS` and `manifest.json` - from Linux or macOS, with no Windows host involved.
+20. `go version -m` reports `GOOS=windows`, the matching `GOARCH`, `tags=tray` and `CGO_ENABLED=0` for each exe, and the PE `Subsystem` field reads 2 (GUI), so starting the tray from Explorer opens no console window.
+21. Each archive holds `TunnelMeshClient.exe`, `README.txt`, `LICENSE` and `NOTICE` flat at the root (`unzip -l` shows no wrapping directory), and `shasum -a 256 -c SHA256SUMS` passes inside the dist directory.
+22. `go run github.com/tc-hib/go-winres extract <exe>` finds exactly one `RT_MANIFEST` (per-monitor-v2 DPI, `asInvoker`, common controls v6), one `RT_GROUP_ICON/APP` and a `RT_VERSION` block whose `OriginalFilename` is `TunnelMeshClient.exe`; Explorer's Properties sheet and the taskbar icon agree with it.
+23. The script exits non-zero without `makensis`, without `internal/tray/webdist/dist/index.html`, when that directory is stale relative to `web-tray/dist`, for an `ARCHES`/`INSTALLER_ARCH` combination it cannot build, and when `makensis` produced no installer file.
+24. `makensis -DVERSION=... -DARCH=amd64 -DBUILD_DIR=<staged exe dir> -DICON_FILE=deploy/windows/TunnelMeshClient.ico -DOUTFILE=<path> deploy/windows/installer.nsi` compiles; the resulting installer needs no UAC prompt, installs under `%LOCALAPPDATA%\Programs\TunnelMesh Client`, and its uninstaller deletes the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value.
+25. On a machine without the WebView2 runtime the tray still starts, the notification-area tooltip says the runtime is required, "Open main window" opens the same loopback URL in the default browser, and the About tab shows the fallback banner.
+26. `client.yaml`, `tray.json`, `client.lock` and `tray.log` live under `%USERPROFILE%\.config\tunnelmesh\`; running `tunnelmesh-client run -c` on the same file while the tray holds it reports the mutex error and exits non-zero, and killing the tray releases the lock without deleting anything by hand.
+
+## 合并（`TRAY_DIST_DIR` 与 `WINDOWS_TRAY_DIST_DIR`）
+
+27. `VERSION=v0.0.0-test TRAY_DIST_DIR=dist/v0.0.0-test/macos-tray WINDOWS_TRAY_DIST_DIR=dist/v0.0.0-test/windows-tray ./scripts/build-release.sh` publishes eleven assets, and `sha256sum -c dist/v0.0.0-test/SHA256SUMS` passes for all of them.
+28. `dist/v0.0.0-test/manifest-tray.json` and `manifest-windows-tray.json` are the two tray manifests, neither overwrites the other, and `manifest.json` keeps the six-asset cross-platform schema unchanged.
+29. `scripts/merge-tray-dist.sh --check <dir>` exits non-zero for a directory missing `SHA256SUMS` or `manifest.json`, for one holding nothing but those two files, and for an artifact whose bytes do not match the source checksums.
+30. A wrong `TRAY_DIST_DIR` or `WINDOWS_TRAY_DIST_DIR` fails before any cross-compilation starts, not after the whole matrix. Only the hand-offs that are set get validated: a macOS-only run still works.
+31. Merging refuses to overwrite an asset name that already exists in the release directory.
 
 ## workflow 结构
 
-23. `version` resolves the tag or the dispatch input once; both build jobs read `VERSION` from its output.
-24. Only `macos-tray` runs `scripts/package-macos-tray.sh`, and only `release` runs `scripts/build-release.sh` and `gh release create`.
-25. `macos-tray` uploads an artifact named `macos-tray` with `if-no-files-found: error`; `release` downloads it into `tray-dist` and passes `TRAY_DIST_DIR=tray-dist`.
-26. `permissions` stays `contents: write` at the workflow level and no job other than `release` calls `gh`.
+32. `version` resolves the tag or the dispatch input once; all three build jobs read `VERSION` from its output.
+33. Only `macos-tray` runs `scripts/package-macos-tray.sh`, only `windows-tray` runs `scripts/package-windows-tray.sh`, and only `release` runs `scripts/build-release.sh` and `gh release create`.
+34. Each tray job uploads its artifact with `if-no-files-found: error`; `release` downloads `macos-tray` into `tray-dist` and `windows-tray` into `windows-tray-dist` and passes both. `release` needs both tray jobs, so it cannot publish before the Windows installer exists.
+35. `permissions` stays `contents: write` at the workflow level and no job other than `release` calls `gh`.

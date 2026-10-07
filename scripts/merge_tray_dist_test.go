@@ -356,3 +356,96 @@ func TestBuildReleaseScriptHandsTheTrayOff(t *testing.T) {
 		t.Errorf("%s merges the tray before building the matrix", releaseScriptPath)
 	}
 }
+
+// TestMergeTrayDistFoldsEveryArtifactShape covers the Windows hand-off: two green archives
+// plus one installer, and a manifest published under its own name. The helper may not assume
+// ".dmg", because a release that quietly drops the setup.exe and keeps only the zips is the
+// same silent failure as a release with no macOS client at all.
+func TestMergeTrayDistFoldsEveryArtifactShape(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "windows-tray-dist")
+	release := filepath.Join(root, "dist")
+	artifacts := []string{
+		"TunnelMeshClient-v0.0.0-test-windows-amd64.zip",
+		"TunnelMeshClient-v0.0.0-test-windows-arm64.zip",
+		"TunnelMeshClient-v0.0.0-test-windows-amd64-setup.exe",
+	}
+	writeTrayFixture(t, source, artifacts)
+	archive := writeReleaseFixture(t, release)
+
+	out, err := runMergeScript(t, "--manifest-name=manifest-windows-tray.json", source, release)
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", mergeScript, err, out)
+	}
+	for _, name := range artifacts {
+		body, err := os.ReadFile(filepath.Join(release, name))
+		if err != nil {
+			t.Fatalf("read merged %s: %v", name, err)
+		}
+		original, err := os.ReadFile(filepath.Join(source, name))
+		if err != nil {
+			t.Fatalf("read source %s: %v", name, err)
+		}
+		if string(body) != string(original) {
+			t.Errorf("%s was copied with different contents", name)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(readOrFailPath(t, filepath.Join(release, "SHA256SUMS"))), "\n")
+	if len(lines) != len(artifacts)+1 {
+		t.Errorf("merged SHA256SUMS has %d entries, want %d:\n%s", len(lines), len(artifacts)+1, strings.Join(lines, "\n"))
+	}
+	verifyChecksums(t, release)
+
+	named := readOrFailPath(t, filepath.Join(release, "manifest-windows-tray.json"))
+	if !strings.Contains(named, "v0.0.0-test") {
+		t.Errorf("manifest-windows-tray.json was not copied from the tray output: %s", named)
+	}
+	// Two platforms, two manifests: the macOS hand-off must stay reachable under its own
+	// name, and neither may be mistaken for the cross-platform manifest.json.
+	if _, err := os.Stat(filepath.Join(release, "manifest-tray.json")); !os.IsNotExist(err) {
+		t.Errorf("--manifest-name must not also write manifest-tray.json")
+	}
+	if _, err := os.Stat(filepath.Join(release, "manifest.json")); !os.IsNotExist(err) {
+		t.Errorf("the merge must not create or overwrite manifest.json, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(release, archive)); err != nil {
+		t.Errorf("the existing platform archive disappeared: %v", err)
+	}
+}
+
+// TestMergeTrayDistIgnoresBookkeepingAndStaging proves the merge copies published files only:
+// a packaging script's staging directory has to stay out of the release, and its own
+// SHA256SUMS must not be flattened next to the release-wide one.
+func TestMergeTrayDistIgnoresBookkeepingAndStaging(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "tray-dist")
+	release := filepath.Join(root, "dist")
+	artifact := "TunnelMeshClient-v0.0.0-test-windows-amd64.zip"
+	writeTrayFixture(t, source, []string{artifact})
+	if err := os.MkdirAll(filepath.Join(source, ".build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeOrFail(t, filepath.Join(source, ".build", "leftover"), "staged bytes\n")
+	writeOrFail(t, filepath.Join(source, "build.log"), "noise\n")
+	writeReleaseFixture(t, release)
+
+	if out, err := runMergeScript(t, source, release); err != nil {
+		t.Fatalf("%s: %v\n%s", mergeScript, err, out)
+	}
+	for _, unwanted := range []string{"build.log", "SHA256SUMS.orig", ".build"} {
+		if _, err := os.Stat(filepath.Join(release, unwanted)); err == nil {
+			t.Errorf("%s copied %s into the release directory", mergeScript, unwanted)
+		}
+	}
+	entries, err := os.ReadDir(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		var names []string
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("release directory holds %v, want the platform archive, SHA256SUMS, the artifact and manifest-tray.json", names)
+	}
+}

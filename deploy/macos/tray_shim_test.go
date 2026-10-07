@@ -127,3 +127,196 @@ func TestShimTurnsOffSystemTextAssists(t *testing.T) {
 		}
 	}
 }
+
+// nativeGo and trayMain are the other two halves of the quick panel contract. The shell
+// can only be reviewed as a whole: a flag that Go never pushes, or a popover whose URL the
+// Go side never builds, both compile and both do nothing.
+const (
+	nativeGo = "../../internal/tray/native/native.go"
+	trayMain = "../../cmd/tunnelmesh-client-tray/main.go"
+)
+
+// TestShellRoutesTheQuickPanelFromTheMenuBarItem pins the menu-bar click behaviour.
+//
+// NSStatusBarButton shows its attached menu for every click, and while a menu is attached
+// the button's action never fires. So the quick panel cannot be layered on top of the
+// current wiring: the shell has to own the click, pop the menu up itself for the right
+// button, and open the panel for the left one. Each string below is the load-bearing part
+// of that, in the order the events arrive.
+func TestShellRoutesTheQuickPanelFromTheMenuBarItem(t *testing.T) {
+	bridge := readOrFail(t, nativeGo)
+	shim := readOrFail(t, trayShim)
+
+	// The config struct is declared twice, once per compiler, and has to stay identical.
+	for _, source := range []struct{ name, text string }{{nativeGo, bridge}, {trayShim, shim}} {
+		for _, field := range []string{"const char *panelURL;", "int quickPanel;"} {
+			if !strings.Contains(source.text, field) {
+				t.Errorf("%s must declare %s; the two TMTrayConfig definitions are compiled separately", source.name, field)
+			}
+		}
+	}
+	if !strings.Contains(bridge, "void TMTraySetQuickPanel(int enabled);") {
+		t.Errorf("%s must export TMTraySetQuickPanel so a save in the general tab reaches the shell", nativeGo)
+	}
+	if !strings.Contains(shim, "void TMTraySetQuickPanel(int enabled)") {
+		t.Errorf("%s must implement TMTraySetQuickPanel", trayShim)
+	}
+
+	// The panel is a real web view pointed at the panel route, not a re-skinned window.
+	for _, want := range []string{"NSPopover", "NSPopoverBehaviorTransient", "panelURLString"} {
+		if !strings.Contains(shim, want) {
+			t.Errorf("%s must build the quick panel with %s", trayShim, want)
+		}
+	}
+
+	// Left click takeover: an action on the status button, and no permanently attached menu.
+	if !strings.Contains(shim, "sendActionOn:") {
+		t.Errorf("%s must ask the status button for the mouse events it has to route", trayShim)
+	}
+	if strings.Contains(shim, "statusItem.menu = menu") {
+		t.Fatalf("%s must not attach the menu to the status item: while a menu is attached "+
+			"NSStatusBarButton swallows every click and the panel can never open", trayShim)
+	}
+	// The menu still has to be reachable, because 打开官网首页 and 退出 are the only way out
+	// of a stuck client. Right click (and ⌃-click, which AppKit reports as a right click for
+	// status items) is the documented gesture.
+	for _, want := range []string{"popUpMenuPositioningItem:", "NSEventTypeRightMouseDown", "NSEventModifierFlagControl"} {
+		if !strings.Contains(shim, want) {
+			t.Errorf("%s must keep the menu reachable via %s", trayShim, want)
+		}
+	}
+	// The flag is read when the click happens, so turning the setting off takes effect
+	// without relaunching; a cached decision made at start-up would be a stale second copy
+	// of a preference that has one authoritative source in tray.json.
+	if !strings.Contains(shim, "self.quickPanel") {
+		t.Errorf("%s must consult the quick-panel flag at click time", trayShim)
+	}
+	// A panel that outlives 退出 would keep an event source alive past the run loop.
+	if !strings.Contains(shim, "closeQuickPanel") {
+		t.Errorf("%s must close the quick panel before the shell stops", trayShim)
+	}
+}
+
+// TestTrayMainWiresThePanelAndWindowActions covers the Go half of the same feature.
+//
+// The panel's buttons call /api/actions/show-window and /api/actions/quit, and those
+// handlers only work once the shell installs them; a tray that serves the panel but never
+// wires the actions shows buttons that answer 501.
+func TestTrayMainWiresThePanelAndWindowActions(t *testing.T) {
+	main := readOrFail(t, trayMain)
+	for _, want := range []string{"api.PanelURL()", "native.SetQuickPanel", "api.SetWindowHandlers", "prefs.QuickPanel"} {
+		if !strings.Contains(main, want) {
+			t.Errorf("%s must wire the quick panel with %s", trayMain, want)
+		}
+	}
+}
+
+// TestShimPrefersTheBrandGlyphInTheMenuBar keeps the menu bar and Finder showing one mark.
+//
+// The system symbol was the original drawing, and it is still the right fallback for a bare
+// binary run out of a checkout, so the guard is about order: the bundle's own glyph has to
+// be tried first, and it has to be marked as a template, because a status item that ignores
+// the menu-bar appearance looks broken in dark mode.
+func TestShimPrefersTheBrandGlyphInTheMenuBar(t *testing.T) {
+	shim := readOrFail(t, trayShim)
+
+	if !strings.Contains(shim, `imageNamed:@"TunnelMeshMenuBar"`) {
+		t.Errorf("%s must load the bundled brand glyph for the status item, so the menu bar matches Finder", trayShim)
+	}
+	if !strings.Contains(shim, "template = YES") {
+		t.Errorf("%s must mark the status-item image as a template so the system tints it", trayShim)
+	}
+	symbol := strings.Index(shim, "imageWithSystemSymbolName")
+	if symbol < 0 {
+		t.Fatalf("%s must keep a system-symbol fallback for a bundle without resources", trayShim)
+	}
+	if named := strings.Index(shim, `imageNamed:@"TunnelMeshMenuBar"`); named > symbol {
+		t.Errorf("%s tries the SF Symbol before the bundled glyph; the fallback has to stay the fallback", trayShim)
+	}
+	if !strings.Contains(shim, `if (@available(macOS 11.0, *))`) {
+		t.Errorf("%s must guard the SF Symbol API with @available rather than an expression, which "+
+			"does not actually gate availability", trayShim)
+	}
+}
+
+// TestShimMakesTheQuickPanelKeyAndDismissable covers what a popover needs beyond being on
+// screen.
+//
+// An accessory application usually has no key window at all, and a web view only receives
+// keyboard input in the key window; a control in a non-key window can also swallow the
+// first click. The other half is Escape: the panel is dismissed by clicking elsewhere, and
+// an operator who reaches for Escape must not have the panel sit there, because a panel
+// that cannot be dismissed by keyboard reads as a frozen application.
+func TestShimMakesTheQuickPanelKeyAndDismissable(t *testing.T) {
+	shim := readOrFail(t, trayShim)
+
+	if !strings.Contains(shim, "makeKeyAndOrderFront:") {
+		t.Errorf("%s must make the panel's own window key after showing the popover, or the web view "+
+			"never sees the keyboard and the first click can be dropped", trayShim)
+	}
+	if !strings.Contains(shim, "keyCode == 53") {
+		t.Errorf("%s must dismiss the quick panel on Escape", trayShim)
+	}
+	// The Escape handler has to be scoped to the panel being shown: an unbound Escape would
+	// be stolen from the settings window, where it closes popovers and dialogs of its own.
+	if !strings.Contains(shim, "panelPopover.isShown") {
+		t.Errorf("%s must only treat Escape as a panel dismissal while the panel is shown", trayShim)
+	}
+}
+
+// TestShimIgnoresCloseOfAHiddenWindow keeps a stray close from ending the client.
+//
+// windowShouldClose: is where "closing the window means hide, not quit" is decided, and the
+// quit branch is legitimate only for a window the operator can actually see. A cancel
+// operation that reaches the hidden settings window (a dismissed panel, a key equivalent
+// aimed at the wrong responder) must not stop the tunnels.
+func TestShimIgnoresCloseOfAHiddenWindow(t *testing.T) {
+	shim := readOrFail(t, trayShim)
+
+	shouldClose := shim[strings.Index(shim, "- (BOOL)windowShouldClose:"):]
+	if !strings.Contains(shouldClose, "isVisible") {
+		t.Errorf("%s must ignore a close for a window that is not visible; with minimize-to-tray off "+
+			"that path quits the client and drops every tunnel", trayShim)
+	}
+}
+
+// TestShimActsOnMouseUpNotMouseDown is the nested-run-loop regression.
+//
+// -[NSStatusBarButton rightMouseDown:] enters -[NSCell trackMouse:...untilMouseUp:], which
+// owns the main thread until the mouse is released. Sending the action on mouse-down runs
+// -[NSMenu popUpMenuPositioningItem:...] inside that loop: the menu's own tracking consumes
+// the mouse-up, the button's tracking never sees it, and the main thread stays parked there
+// forever. Measured on a macOS host: after right-click then Escape, the icon stopped
+// answering and SIGTERM left the process running, because TMTrayStop queues its work onto
+// the very thread that is blocked. Acting on mouse-up leaves the loop before the menu runs.
+func TestShimActsOnMouseUpNotMouseDown(t *testing.T) {
+	shim := readOrFail(t, trayShim)
+
+	if !strings.Contains(shim, "sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)") {
+		t.Errorf("%s must send the status-item action on mouse-up; on mouse-down the menu would be "+
+			"popped up inside the button's own mouse tracking, which never ends", trayShim)
+	}
+	if strings.Contains(shim, "sendActionOn:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown)") {
+		t.Errorf("%s must not ask for the mouse-down masks on the status item", trayShim)
+	}
+	// Both release gestures still have to be recognised, or a right click would open the
+	// panel: the event that triggers the action is now the up event.
+	if !strings.Contains(shim, "NSEventTypeRightMouseUp") {
+		t.Errorf("%s must treat the right mouse-up as the menu gesture", trayShim)
+	}
+}
+
+// TestTrayMainBoundsItsOwnShutdown keeps SIGTERM meaningful.
+//
+// The clean path is native.Stop() returning from native.Run so main can unwind. If the main
+// thread is parked in AppKit tracking, that never happens, and a logout would wait for the
+// process to be killed hard with the runtime lock and the tunnels still held. A bounded wait
+// turns that into a logged, deliberate exit.
+func TestTrayMainBoundsItsOwnShutdown(t *testing.T) {
+	main := readOrFail(t, trayMain)
+	for _, want := range []string{"shutdownWatchdog", "os.Exit"} {
+		if !strings.Contains(main, want) {
+			t.Errorf("%s must bound the wait for the shell to stop (looking for %q)", trayMain, want)
+		}
+	}
+}
