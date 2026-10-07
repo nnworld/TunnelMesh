@@ -5,7 +5,12 @@
   --tm-muted: #667085;
   --tm-border: #d9e2f2;
   color-scheme: light;
-  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', Inter, system-ui, sans-serif;
+  /* Apple names first, then Windows: -apple-system and BlinkMacSystemFont only resolve on
+   Apple platforms, so Segoe UI is what a Windows tray renders with and Microsoft YaHei UI
+   is its Chinese counterpart. Without them every CJK glyph comes from a fallback of last
+   resort, which is how the Chinese interface ends up with mixed stroke weights. */
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei UI', 'Helvetica Neue', Inter, system-ui, sans-serif;
   color: var(--tm-text);
   background: var(--tm-bg);
 }
@@ -42,7 +47,7 @@ select {
 }
 
 code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, 'Cascadia Mono', Consolas, monospace;
   font-size: 12px;
 }
 

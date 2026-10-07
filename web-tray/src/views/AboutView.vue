@@ -23,12 +23,27 @@ const buildRows = computed(() => {
 
 const systemRows = computed(() => {
   const view = about.view
-  return [
+  const rows = [
     { label: t('about.system.os'), value: view?.system.goos ?? '' },
     { label: t('about.system.osVersion'), value: view?.system.osVersion ?? t('common.unknown') },
     { label: t('about.system.arch'), value: view?.system.arch ?? '' },
   ]
+  // Only named when the shell reports one: a tray built before the renderer existed has
+  // nothing to say here, and a row of "unknown" would read as a fault rather than as an
+  // older build.
+  if (view?.system.renderer) {
+    rows.push({ label: t('about.system.renderer'), value: view.system.renderer })
+  }
+  if (view?.system.rendererDetail) {
+    rows.push({ label: t('about.system.rendererDetail'), value: view.system.rendererDetail })
+  }
+  return rows
 })
+
+// degradedRenderer is the Windows case where no WebView2 runtime was found and the shell
+// opened the page in the system browser instead. It is worth a line of its own because the
+// operator can fix it, and nothing else in the window hints that it exists.
+const degradedRenderer = computed(() => about.view?.system.renderer === 'browser')
 
 const fileRows = computed(() => {
   const view = about.view
@@ -83,6 +98,16 @@ onMounted(() => {
         {{ t('about.links.releases') }}
       </el-button>
     </header>
+
+    <el-alert
+      v-if="degradedRenderer"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="t('about.renderer.fallbackTitle')"
+      :description="t('about.renderer.fallbackBody')"
+      data-test="renderer-fallback"
+    />
 
     <el-descriptions :title="t('about.build.heading')" :column="3" border size="small" data-test="build-info">
       <el-descriptions-item v-for="row in buildRows" :key="row.label" :label="row.label">

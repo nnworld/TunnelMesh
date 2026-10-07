@@ -111,6 +111,12 @@ function stateLabel(state: string) {
         <template v-else>{{ item.value }}</template>
       </el-descriptions-item>
     </el-descriptions>
+    <!-- The reachability answer is a probe, not a verdict: a proxy in front of the Server
+         can refuse /health/ready while every tunnel works. Showing what it answered is
+         what turns "可达" from a guess into a fact the operator can act on. -->
+    <p v-if="stats.view?.serverProbe" class="tm-hint" data-test="stats-server-probe">
+      {{ t('stats.server.probe', { detail: stats.view.serverProbe }) }}
+    </p>
 
     <!--
       Plain tables rather than el-table: the statistics tab is a compact read-out in a

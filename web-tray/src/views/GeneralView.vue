@@ -7,6 +7,7 @@ import { applyTheme, watchSystemTheme } from '../theme'
 import { useRoutingStore } from '../stores/routing'
 import { describe, useSettingsStore } from '../stores/settings'
 import { technicalInput } from '../textInput'
+import { platformMessage } from '../platform'
 
 const { t } = useI18n()
 const settings = useSettingsStore()
@@ -24,6 +25,7 @@ const theme = ref<ThemePreference>(settings.draft.theme)
 const configDir = ref(settings.draft.configDir)
 const launchAtLogin = ref(settings.draft.launchAtLogin)
 const minimizeToTray = ref(settings.draft.minimizeToTray)
+const quickPanel = ref(settings.draft.quickPanel)
 const mode = ref<ClientMode>(routing.mode)
 
 watch(
@@ -34,6 +36,7 @@ watch(
     configDir.value = draft.configDir
     launchAtLogin.value = draft.launchAtLogin
     minimizeToTray.value = draft.minimizeToTray
+    quickPanel.value = draft.quickPanel
   },
   { deep: true, immediate: true },
 )
@@ -71,6 +74,30 @@ const modeOptions = computed(() => [
   { value: 'cluster', label: t('general.mode.cluster') },
 ])
 
+// A two-way radio rather than a switch, because the requirement names both answers:
+// "关闭" is the default and "开启" is the opt-in, and the tray's own menu behaviour differs
+// between them. A switch would show one state and hide the other.
+const quickPanelOptions = computed(() => [
+  { value: false, label: t('general.quickPanel.off') },
+  { value: true, label: t('general.quickPanel.on') },
+])
+
+// Nothing reaches disk until save() runs, so a clicked radio button changes the form and
+// not the tray. That difference is invisible unless it is said: the quick panel is the
+// clearest case, because the menu bar keeps behaving the way the stored value says.
+const dirty = computed(() => {
+  const draft = settings.draft
+  return (
+    language.value !== draft.language ||
+    theme.value !== draft.theme ||
+    configDir.value !== draft.configDir ||
+    launchAtLogin.value !== draft.launchAtLogin ||
+    minimizeToTray.value !== draft.minimizeToTray ||
+    quickPanel.value !== draft.quickPanel ||
+    mode.value !== routing.mode
+  )
+})
+
 async function save() {
   saving.value = true
   notice.value = ''
@@ -80,6 +107,7 @@ async function save() {
   settings.draft.configDir = configDir.value
   settings.draft.launchAtLogin = launchAtLogin.value
   settings.draft.minimizeToTray = minimizeToTray.value
+  settings.draft.quickPanel = quickPanel.value
   try {
     await settings.save()
     notice.value = t('general.saved')
@@ -134,7 +162,7 @@ async function save() {
             {{ option.label }}
           </el-radio-button>
         </el-radio-group>
-        <p class="tm-hint">{{ t('general.theme.hint') }}</p>
+        <p class="tm-hint">{{ t(platformMessage('general.theme.hint', settings.view?.platform)) }}</p>
       </el-form-item>
 
       <el-form-item :label="t('general.configDir.label')">
@@ -168,7 +196,7 @@ async function save() {
           />
           <span>{{ t('general.launchAtLogin.label') }}</span>
         </div>
-        <p class="tm-hint">{{ t('general.launchAtLogin.hint') }}</p>
+        <p class="tm-hint">{{ t(platformMessage('general.launchAtLogin.hint', settings.view?.platform)) }}</p>
         <el-alert
           v-if="settings.view && !settings.view.launchAtLoginSupported"
           type="info"
@@ -179,7 +207,9 @@ async function save() {
           v-if="settings.view?.launchAtLoginError"
           type="warning"
           :closable="false"
-          :title="t('general.launchAtLogin.failed', { error: settings.view.launchAtLoginError })"
+          :title="t(platformMessage('general.launchAtLogin.failed', settings.view?.platform), {
+            error: settings.view.launchAtLoginError,
+          })"
           data-test="launch-at-login-error"
         />
       </el-form-item>
@@ -191,12 +221,22 @@ async function save() {
         </div>
         <p class="tm-hint">{{ t('general.minimizeToTray.hint') }}</p>
       </el-form-item>
+
+      <el-form-item :label="t('general.quickPanel.label')">
+        <el-radio-group v-model="quickPanel" data-test="quick-panel-group">
+          <el-radio-button v-for="option in quickPanelOptions" :key="String(option.value)" :value="option.value">
+            {{ option.label }}
+          </el-radio-button>
+        </el-radio-group>
+        <p class="tm-hint">{{ t(platformMessage('general.quickPanel.hint', settings.view?.platform)) }}</p>
+      </el-form-item>
     </el-form>
 
     <footer class="tm-actions">
       <el-button type="primary" :loading="saving" data-test="save-general" @click="save">
         {{ saving ? t('app.actions.saving') : t('app.actions.save') }}
       </el-button>
+      <p v-if="dirty" class="tm-unsaved" data-test="general-unsaved">{{ t('general.unsaved') }}</p>
       <el-alert v-if="notice" type="success" :closable="false" :title="notice" data-test="general-notice" />
       <el-alert v-if="failure" type="error" :closable="false" :title="failure" data-test="general-error" />
     </footer>
@@ -251,5 +291,17 @@ async function save() {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  /* The tab is taller than a half-screen window and the controls that need a save sit at
+     the bottom of it. A footer that scrolls out of sight is how a changed radio button
+     ends up looking like a setting that does nothing. */
+  position: sticky;
+  bottom: 0;
+  padding: 8px 0;
+  background: var(--el-bg-color);
+}
+.tm-unsaved {
+  margin: 0;
+  font-size: 12px;
+  color: var(--el-color-warning);
 }
 </style>

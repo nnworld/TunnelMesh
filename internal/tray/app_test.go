@@ -657,3 +657,100 @@ func storedToken(t *testing.T, app *App) string {
 	}
 	return settings.Token
 }
+
+// TestAppQuickPanelIsReportedAndObservable covers the general tab radio end to end on the
+// Go side: the view has to report the stored value, saving has to persist it, and the
+// native shell has to be told in the same call so the very next menu-bar click follows it.
+func TestAppQuickPanelIsReportedAndObservable(t *testing.T) {
+	var seen []Preferences
+	app, dir := newTestApp(t, func(options *AppOptions) {
+		options.OnPreferencesChanged = func(prefs Preferences) { seen = append(seen, prefs) }
+	})
+
+	view, err := app.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.QuickPanel {
+		t.Fatal("Settings().QuickPanel = true, the quick panel must start off")
+	}
+
+	on := true
+	saved, err := app.SaveSettings(context.Background(), SettingsUpdate{QuickPanel: &on})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.QuickPanel {
+		t.Fatalf("saved view = %+v, want QuickPanel true", saved)
+	}
+	if len(seen) != 1 || !seen[0].QuickPanel {
+		t.Fatalf("the shell was not told about the quick panel: %+v", seen)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, PrefsFileName))
+	if err != nil {
+		t.Fatalf("preferences were not written: %v", err)
+	}
+	if !strings.Contains(string(data), `"quickPanel": true`) {
+		t.Fatalf("stored preferences = %s", data)
+	}
+
+	// An update that does not mention the field must not flip it: every other general-tab
+	// save goes through the same struct.
+	off := false
+	if _, err := app.SaveSettings(context.Background(), SettingsUpdate{QuickPanel: &off}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.QuickPanel {
+		t.Fatal("QuickPanel stayed on after being turned off")
+	}
+	if _, err := app.SaveSettings(context.Background(), SettingsUpdate{Language: LanguageEnUS}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := app.Preferences()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.QuickPanel {
+		t.Fatal("an unrelated save re-enabled the quick panel")
+	}
+	if !seen[0].QuickPanel || len(seen) != 3 {
+		t.Fatalf("preference notifications = %+v", seen)
+	}
+}
+
+// TestStatsProbeCountsAnAnsweredRefusalAsReachable is the reachability line the quick
+// panel and the statistics tab show. A 403 from a proxy in front of the Server proves
+// the address answers; reporting "unreachable" next to a tunnel that is carrying traffic
+// is the contradiction this pins down.
+func TestStatsProbeCountsAnAnsweredRefusalAsReachable(t *testing.T) {
+	app, _ := newTestApp(t, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+	target := testServerURL(t, server)
+
+	// The first call schedules the probe and returns the cold answer, so the test waits
+	// for the background refresh rather than asserting against a value that never had a
+	// chance to be measured.
+	deadline := time.Now().Add(3 * time.Second)
+	var reachable bool
+	var detail string
+	for time.Now().Before(deadline) {
+		reachable, detail = app.refreshServerProbe(target)
+		if reachable {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !reachable {
+		t.Fatalf("ServerReachable stayed false for an origin that answered 403 (detail %q)", detail)
+	}
+	if !strings.Contains(detail, "403") {
+		t.Fatalf("probe detail = %q, want the refused status to stay visible", detail)
+	}
+}

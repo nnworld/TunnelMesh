@@ -140,3 +140,16 @@ describe('statistics tab', () => {
     wrapper.unmount()
   })
 })
+
+  it('shows what the health probe answered, so a proxy refusal is not a mystery', () => {
+    const tray = installFakeTray()
+    const { wrapper } = mountView(StatsView, {
+      prepare: () =>
+        seed(fixtures.stats({ serverReachable: true, serverProbe: 'server health check: unexpected status 403' })),
+    })
+    const probe = wrapper.find('[data-test="stats-server-probe"]')
+    expect(probe.exists(), 'probe detail line').toBe(true)
+    expect(probe.text()).toContain('403')
+    tray.restore()
+    wrapper.unmount()
+  })

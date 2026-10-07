@@ -6,12 +6,14 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 51 份记录，按日期倒序排列。
+共 53 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-10-07 | [feat(tray): Windows 系统托盘客户端与 NSIS 发行打包](2026-10-07-client-system-tray-windows.md) | [计划：TunnelMesh Client 系统托盘（Windows）](../superpowers/plans/2026-10-07-client-system-tray-windows.md) | — |
+| 2026-10-06 | [feat(tray): 任务栏快捷小窗与统一的菜单栏图标](2026-10-06-tray-quick-panel.md) | [计划：TunnelMesh 托盘：任务栏快捷小窗（macOS）](../superpowers/plans/2026-10-06-tray-quick-panel.md) | — |
 | 2026-10-06 | [概览页“查看审计日志”跳转路径修正](2026-10-06-dashboard-audit-route-link.md) | — | — |
 | 2026-10-05 | [macOS 系统托盘 Client](2026-10-05-client-system-tray-macos.md) | [计划：TunnelMesh Client 系统托盘（macOS）](../superpowers/plans/2026-10-05-client-system-tray-macos.md) | — |
 | 2026-09-29 | [还原发行管理页各平台下载地址](2026-09-29-downloads-platform-assets-restore.md) | [计划：还原发行管理页各平台下载地址实施计划（补记计划）](../superpowers/plans/2026-09-29-downloads-platform-assets-restore.md) | — |

@@ -40,11 +40,12 @@ describe('general tab', () => {
       'client 模式',
       '开机启动',
       '关闭时最小化到系统托盘',
+      '任务栏快捷小窗',
       fixtures.settings().clientConfigPath,
     ]) {
       expect(text, expected).toContain(expected)
     }
-    for (const target of ['language-group', 'theme-group', 'mode-select', 'launch-at-login', 'minimize-to-tray']) {
+    for (const target of ['language-group', 'theme-group', 'mode-select', 'launch-at-login', 'minimize-to-tray', 'quick-panel-group']) {
       expect(wrapper.find(`[data-test="${target}"]`).exists(), target).toBe(true)
     }
     tray.restore()
@@ -185,7 +186,7 @@ describe('general tab', () => {
       useSettingsStore().adopt(fixtures.settings({ launchAtLoginSupported: false }))
       useRoutingStore().adopt(fixtures.routing())
     } })
-    expect(wrapper.text()).toContain('Login items are not available in this build.')
+    expect(wrapper.text()).toContain('Launch at login is not available in this build.')
     tray.restore()
     wrapper.unmount()
   })
@@ -213,6 +214,98 @@ describe('general tab text input hygiene', () => {
     expect(dir.attributes('autocorrect')).toBe('off')
     expect(dir.attributes('spellcheck')).toBe('false')
     expect(dir.attributes('autocomplete')).toBe('off')
+    tray.restore()
+    wrapper.unmount()
+  })
+})
+
+describe('quick panel setting', () => {
+  it('renders an off-by-default radio pair for the menu-bar quick panel', () => {
+    installFakeTray({ 'GET /api/settings': fixtures.settings() })
+    const { wrapper } = mountView(GeneralView, { locale: 'zh-CN', prepare: seed })
+
+    const group = wrapper.find('[data-test="quick-panel-group"]')
+    expect(group.exists(), '任务栏快捷小窗 control').toBe(true)
+    const options = group.findAll('.el-radio-button')
+    expect(options).toHaveLength(2)
+    expect(options.map((node) => node.text())).toEqual(['关闭', '开启'])
+    // The requirement is "default off": the checked button has to be 关闭, and it is the
+    // store that decides that, not the order of the options.
+    expect(group.find('.el-radio-button.is-active').text()).toBe('关闭')
+    expect(useSettingsStore().draft.quickPanel).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('saves the quick panel choice with the rest of the preferences', async () => {
+    const tray = installFakeTray({
+      'PUT /api/settings': (body: unknown) =>
+        fixtures.settings({ ...(body as Record<string, unknown>) } as never),
+    })
+    const { wrapper } = mountView(GeneralView, { locale: 'zh-CN', prepare: seed })
+    await flush()
+
+    await pickRadio(wrapper, '[data-test="quick-panel-group"]', 1)
+    await wrapper.find('[data-test="save-general"]').trigger('click')
+    await flush(10)
+
+    const write = tray.calls.find((call) => call.path === '/api/settings')
+    expect(write?.body).toMatchObject({ quickPanel: true })
+    // The shell is told through the same save, so the next menu-bar click already follows
+    // the new value without a relaunch.
+    expect(useSettingsStore().view?.quickPanel).toBe(true)
+    tray.restore()
+    wrapper.unmount()
+  })
+
+  it('keeps the panel off when the operator picks 关闭 again', async () => {
+    installFakeTray({
+      'GET /api/settings': fixtures.settings({ quickPanel: true }),
+      'PUT /api/settings': (body: unknown) =>
+        fixtures.settings({ ...(body as Record<string, unknown>) } as never),
+    })
+    const { wrapper } = mountView(GeneralView, { locale: 'zh-CN', prepare: () => {
+      useSettingsStore().adopt(fixtures.settings({ quickPanel: true }))
+      useRoutingStore().adopt(fixtures.routing())
+    } })
+    await flush()
+    expect(wrapper.find('[data-test="quick-panel-group"] .el-radio-button.is-active').text()).toBe('开启')
+
+    await pickRadio(wrapper, '[data-test="quick-panel-group"]', 0)
+    await wrapper.find('[data-test="save-general"]').trigger('click')
+    await flush(10)
+    expect(useSettingsStore().draft.quickPanel).toBe(false)
+    wrapper.unmount()
+  })
+})
+
+describe('unsaved changes', () => {
+  /**
+   * The form writes nothing until 保存 is pressed, which is exactly the gap that made the
+   * quick panel look like a setting that does nothing: the radio moved, the menu bar did
+   * not, and the button that would have made it real was below the fold.
+   */
+  it('says a choice is pending and stops saying it after the save', async () => {
+    const tray = installFakeTray({
+      'GET /api/settings': fixtures.settings(),
+      'PUT /api/settings': (body: unknown) =>
+        fixtures.settings({ ...(body as Record<string, unknown>) } as never),
+    })
+    const { wrapper } = mountView(GeneralView, { locale: 'zh-CN', prepare: seed })
+    await flush()
+
+    expect(wrapper.find('[data-test="general-unsaved"]').exists(), 'untouched form').toBe(false)
+
+    await pickRadio(wrapper, '[data-test="quick-panel-group"]', 1)
+    await flush()
+    const pending = wrapper.find('[data-test="general-unsaved"]')
+    expect(pending.exists(), 'form with a pending choice').toBe(true)
+    expect(pending.text()).toContain('未保存')
+
+    await wrapper.find('[data-test="save-general"]').trigger('click')
+    await flush(10)
+    expect(wrapper.find('[data-test="general-unsaved"]').exists(), 'after the save').toBe(false)
+    expect(useSettingsStore().draft.quickPanel).toBe(true)
+
     tray.restore()
     wrapper.unmount()
   })

@@ -108,6 +108,26 @@ function checkTagType(status: CheckResult['status']) {
   }
 }
 
+// A warning is not a failure, and the headline has to keep them apart. The health endpoint
+// can be refused by a proxy in front of a Server whose API works, and "every check passed"
+// printed above a warning row is how an operator learns to distrust the report.
+const warningCount = computed(
+  () => (routing.report?.checks ?? []).filter((check) => check.status === 'warning').length,
+)
+const summaryType = computed(() => {
+  const report = routing.report
+  if (!report || report.valid) return warningCount.value > 0 ? 'warning' : 'success'
+  return 'error'
+})
+const summaryTitle = computed(() => {
+  const report = routing.report
+  if (!report) return ''
+  if (!report.valid) return t('routing.validate.invalid')
+  return warningCount.value > 0
+    ? t('routing.validate.validWithWarnings', { count: warningCount.value })
+    : t('routing.validate.valid')
+})
+
 async function loadAgents() {
   agentsNotice.value = ''
   try {
@@ -368,9 +388,9 @@ watch(
       <p v-if="!routing.report" class="tm-hint" data-test="validation-empty">{{ t('routing.validate.empty') }}</p>
       <template v-else>
         <el-alert
-          :type="routing.report.valid ? 'success' : 'error'"
+          :type="summaryType"
           :closable="false"
-          :title="routing.report.valid ? t('routing.validate.valid') : t('routing.validate.invalid')"
+          :title="summaryTitle"
           data-test="validation-summary"
         />
         <ul class="tm-checks" data-test="validation-results">

@@ -147,3 +147,45 @@ describe('settings window', () => {
     wrapper.unmount()
   })
 })
+
+describe('general tab reflects the tray after an asynchronous load', () => {
+  /**
+   * The window mounts before /api/settings answers, so the store is populated by adopt()
+   * while the form is already on screen. Every earlier test seeded the store before
+   * mounting, which cannot catch a control that only reads its initial value.
+   */
+  it('shows the stored quick-panel choice once the settings arrive', async () => {
+    const tray = installFakeTray(trayRoutes({ 'GET /api/settings': fixtures.settings({ quickPanel: true }) }))
+    const { wrapper } = mountView(App, { locale: 'zh-CN' })
+    await flush(10)
+
+    const group = wrapper.find('[data-test="quick-panel-group"]')
+    expect(group.exists(), 'quick panel control').toBe(true)
+    // The option index is asserted rather than its label: the fixture leaves the language
+    // on "system", which jsdom resolves to English, and the point of the test is which
+    // button is checked, not which dictionary rendered it.
+    const options = group.findAll('.el-radio-button')
+    expect(options).toHaveLength(2)
+    expect(options.findIndex((node) => node.classes('is-active')), 'checked option').toBe(1)
+    tray.restore()
+    wrapper.unmount()
+  })
+
+  it('shows the stored appearance choices for the same reason', async () => {
+    const tray = installFakeTray(
+      trayRoutes({ 'GET /api/settings': fixtures.settings({ language: 'en-US', theme: 'dark', minimizeToTray: false }) }),
+    )
+    const { wrapper } = mountView(App, { locale: 'en-US' })
+    await flush(10)
+
+    for (const [group, expected] of [
+      ['language-group', 'English'],
+      ['theme-group', 'Dark'],
+    ] as Array<[string, string]>) {
+      const active = wrapper.find(`[data-test="${group}"] .el-radio-button.is-active`)
+      expect(active.text(), group).toBe(expected)
+    }
+    tray.restore()
+    wrapper.unmount()
+  })
+})

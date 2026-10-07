@@ -2,13 +2,18 @@
 
 TunnelMesh 的发行物包含三个可执行文件：`tunnelmesh-server`、`tunnelmesh-agent`、`tunnelmesh-client`。发行构建默认使用 `CGO_ENABLED=0`，不把配置、Token、密码、DSN、证书、私钥、数据库和日志放进归档。
 
-macOS 的菜单栏客户端 `tunnelmesh-client-tray` 同样进 Release，但**不由这个脚本编译**：它通过
-cgo 链接 Cocoa 与 WebKit，只能在 macOS 主机上构建，因此由 `release` workflow 的 `macos-tray`
-作业在 macOS runner 上调用 [macOS 托盘客户端打包](macos-client-tray.md) 产出 `.dmg`，再由
-`scripts/build-release.sh` 合并进同一个 Release 目录（见[托盘产物的合并](#托盘产物的合并)）。
-跨平台矩阵始终是 `CGO_ENABLED=0`，永远不依赖一台 Mac；这条边界由
-`scripts/tray_build_tag_test.go`、`deploy/macos/tray_bundle_test.go` 与
-`scripts/release_workflow_test.go` 共同守卫。
+系统托盘客户端 `tunnelmesh-client-tray` 同样进 Release，但**不由这个脚本编译**，两个平台各有各
+的原因：macOS 那半通过 cgo 链接 Cocoa 与 WebKit，只能在 macOS 主机上构建，由 `macos-tray` 作业
+调用 [macOS 托盘客户端打包](macos-client-tray.md) 产出 `.dmg`；Windows 那半是纯 Go 的 Win32 与
+WebView2 绑定，能从 Linux 交叉编译，但资源戳记与 NSIS 安装包属于独立的打包步骤，由
+`windows-tray` 作业调用 [Windows 托盘客户端打包](windows-client-tray.md) 产出绿色 `.zip` 与
+`setup.exe`。两份产物都由 `scripts/build-release.sh` 合并进同一个 Release 目录（见
+[托盘产物的合并](#托盘产物的合并)）。
+
+跨平台矩阵始终不出现 `-tags tray`：托盘的原生壳要么需要一台 Mac，要么需要一套发行打包流程，
+把它们混进矩阵只会让六个归档的构建去承担第八个作业的失败。这条边界由
+`scripts/tray_build_tag_test.go`、`deploy/macos/tray_bundle_test.go`、
+`deploy/windows/tray_bundle_test.go` 与 `scripts/release_workflow_test.go` 共同守卫。
 
 ## GitHub Release
 
@@ -32,9 +37,10 @@ Release 由以下两种方式触发：
 | --- | --- | --- |
 | `version` | ubuntu-latest | 解析并校验 `^v[0-9]+\.[0-9]+\.[0-9]+$`，输出版本号 |
 | `macos-tray` | macos-15 | `web-tray` 的 `npm ci` / `npm test` / `npm run build`；`-tags tray` + `CGO_ENABLED=1` 打包两个 darwin 架构的 `.dmg`；校验磁盘映像与 `SHA256SUMS`；上传 artifact `macos-tray` |
-| `release` | ubuntu-latest | `web` 前端测试/构建、embed 一致性检查、跨平台矩阵、下载并合并托盘 artifact、校验全部资产、`gh release create` |
+| `windows-tray` | ubuntu-latest | 装 `nsis`；同样的 `web-tray` 前端步骤；`CGO_ENABLED=0` 交叉编译两个 windows 架构 + `go-winres` 资源 + `makensis`；校验两个 `.zip`、`setup.exe`、`SHA256SUMS` 与 `manifest.json`；上传 artifact `windows-tray` |
+| `release` | ubuntu-latest | `web` 前端测试/构建、embed 一致性检查、跨平台矩阵、下载并合并两份托盘 artifact、校验全部资产、`gh release create` |
 
-`release` 作业不编译托盘（Linux 上没有 WebKit 工具链），`macos-tray` 作业不编译跨平台矩阵。
+`release` 作业不编译任何托盘（它只合并别人编译好的东西），两个托盘作业都不碰跨平台矩阵。
 两个作业用同一份 `go.mod` 里的 Go 版本。Go 单测、race 与 vet 不在 `release` workflow 里执行，
 按 [AGENTS.md](../../AGENTS.md) 属于发布前必须手工完成的验证；`ci` workflow 目前只跑前端与
 MySQL 5.6 契约测试，通用 Go 构建作业是既有缺口。
@@ -77,48 +83,65 @@ tunnelmesh-vMAJOR.MINOR.PATCH-PLATFORM.ARCHIVE
 
 - 六个平台归档；
 - 两个 macOS 托盘磁盘映像，命名 `tunnelmesh-client-tray-vMAJOR.MINOR.PATCH-darwin-<arch>.dmg`；
-- `SHA256SUMS`，覆盖以上全部八个资产；
+- 两个 Windows 绿色归档与一个安装包，命名
+  `TunnelMeshClient-vMAJOR.MINOR.PATCH-windows-<arch>.zip` 与
+  `TunnelMeshClient-vMAJOR.MINOR.PATCH-windows-amd64-setup.exe`；
+- `SHA256SUMS`，覆盖以上全部十一个资产；
 - `manifest.json`；
-- `manifest-tray.json`。
+- `manifest-tray.json` 与 `manifest-windows-tray.json`。
 
 `manifest.json` 记录版本、主版本、Commit、UTC 构建时间、Schema 版本、三个二进制、六个平台和资产清单。其中 `schemaVersion` 不是打包脚本自己的常量，而是构建时从 `internal/storage/db.go` 的 `SchemaVersion` 读取，因此永远与二进制内的实际 Schema 版本一致；当前值为 16。
 
 `manifest.json` 的 schema 是对外契约：`internal/server/download_api.go` 把它作为 `manifestUrl`
-暴露给后台“发行管理”页，因此托盘**不**并进去，而是把打包脚本产出的清单原样发布为
-`manifest-tray.json`——额外记录 bundle identifier、可执行文件名、最低系统版本、签名身份与
-`notarized`，`assets[]` 每项带 `installerLayout`：磁盘映像的安装器布局由 Finder 写入，没有
-window server 会话的 runner 写不出来，该字段说明这份映像到底是安装窗口还是普通文件夹窗口。
+暴露给后台“发行管理”页，因此托盘**不**并进去，而是把每个打包脚本产出的清单原样发布为
+`manifest-tray.json` / `manifest-windows-tray.json`——额外记录 bundle identifier、可执行文件名、
+最低系统版本、签名身份与 `notarized`，`assets[]` 每项带 `installerLayout`：磁盘映像的安装器布局
+由 Finder 写入，没有 window server 会话的 runner 写不出来，该字段说明这份映像到底是安装窗口还是
+普通文件夹窗口；Windows 侧它是“这份资产是不是安装包”的事实（`.zip` 为 false、`setup.exe` 为
+true）。两份清单字段形状对齐，是为了让同一个解析器读得懂两个平台的发行记录。
 
 需要知道的现状：`download_api.go` 里的资产列表是六个跨平台归档的**固定命名**，它不解析
-`manifest.json`，也还不包含托盘 `.dmg`。管理员在后台看到的仍是六个归档，macOS 使用者从 GitHub
-Release 页面下载磁盘映像。把托盘接进下载接口是独立的后续决策（涉及后台 UI 与“平台”语义），
+`manifest.json`，也还不包含托盘资产。管理员在后台看到的仍是六个归档，桌面使用者从 GitHub
+Release 页面下载磁盘映像、绿色归档或安装包。把托盘接进下载接口是独立的后续决策（涉及后台 UI 与“平台”语义），
 本次不做。
 
 ## 托盘产物的合并
 
-`scripts/build-release.sh` 接受可选环境变量 `TRAY_DIST_DIR`，指向
-`scripts/package-macos-tray.sh` 的输出目录：
+`scripts/build-release.sh` 接受两个可选环境变量，各自指向一份托盘输出目录：`TRAY_DIST_DIR`
+（`scripts/package-macos-tray.sh`）与 `WINDOWS_TRAY_DIST_DIR`（`scripts/package-windows-tray.sh`）：
 
 ```bash
-# macOS 主机上打包托盘
+# macOS 主机上打包 macOS 托盘；任意装了 nsis 的主机上打包 Windows 托盘
 VERSION=v1.2.3 ./scripts/package-macos-tray.sh
-# 任意主机上打包跨平台矩阵并合并托盘
-VERSION=v1.2.3 TRAY_DIST_DIR=dist/v1.2.3/macos-tray ./scripts/build-release.sh
+VERSION=v1.2.3 ./scripts/package-windows-tray.sh
+# 任意主机上打包跨平台矩阵并合并两份托盘
+VERSION=v1.2.3 \
+  TRAY_DIST_DIR=dist/v1.2.3/macos-tray \
+  WINDOWS_TRAY_DIST_DIR=dist/v1.2.3/windows-tray \
+  ./scripts/build-release.sh
 ```
+
+等价的一行入口是 `make release-with-trays VERSION=v1.2.3`（需要 macOS 主机 + `makensis`）；
+`make release-with-tray` 仍然只管 macOS 一份。
 
 合并逻辑在 `scripts/merge-tray-dist.sh` 里，行为是固定的：
 
 - 先校验来源目录自己的 `SHA256SUMS`。磁盘映像要经过 artifact 上传与下载，文件名相同不等于内容
   相同，这是唯一能拦住截断或改写的地方。
-- 逐个 `.dmg` 复制到 Release 目录，重算校验和并**追加**到同一个 `SHA256SUMS`，因此运维侧一条
-  `sha256sum -c` 覆盖全部资产。
-- 托盘的 `manifest.json` 复制为 `manifest-tray.json`，不覆盖跨平台契约。
-- 来源不是打包脚本的输出（缺 `SHA256SUMS`、`manifest.json` 或 `.dmg`）、校验失败，或 Release
-  目录已有同名资产时立即非零退出，不留半成品：两个构建争用同一个资产名时，不能由复制顺序决定
-  运维下载到哪一个。
+- 把来源目录里**除** `SHA256SUMS`/`manifest.json` **外的已发布文件**复制到 Release 目录，重算
+  校验和并**追加**到同一个 `SHA256SUMS`，因此运维侧一条 `sha256sum -c` 覆盖全部资产。扩展名不是
+  白名单也不是黑名单：两个平台发布形状不同（`.dmg` 对 `.zip` + `.exe`），而“清单以外的东西都要
+  发布”这条规则对两边一致。以点开头的文件与 `.log`/`.txt`/`.json` 不会进 Release，构建暂存目录
+  同理。
+- 托盘的 `manifest.json` 按 `--manifest-name` 复制为 `manifest-tray.json` 或
+  `manifest-windows-tray.json`，不覆盖跨平台契约，也互不覆盖。
+- 来源不是打包脚本的输出（缺 `SHA256SUMS`、`manifest.json`，或除这两个文件之外什么都没有）、
+  校验失败，或 Release 目录已有同名资产时立即非零退出，不留半成品：两个构建争用同一个资产名时，
+  不能由复制顺序决定运维下载到哪一个。
 
-`TRAY_DIST_DIR` 未设置时脚本行为与从前完全一致，本地手工打跨平台包不受影响。校验放在矩阵
-**之前**执行，握手不完整时几秒内失败，而不是等十八次交叉编译跑完才发现没有 macOS 产物。
+`TRAY_DIST_DIR` 与 `WINDOWS_TRAY_DIST_DIR` 未设置时脚本行为与从前完全一致，本地手工打跨平台包
+不受影响。两份握手都在矩阵**之前**校验，不完整时几秒内失败，而不是等十八次交叉编译跑完才发现
+少了某个平台的托盘产物。
 `scripts/merge_tray_dist_test.go` 用 fixture 直接执行该脚本，覆盖上述每条分支。
 
 在 Release 目录内校验：

@@ -366,3 +366,44 @@ func TestValidateStaysSilentWithoutAnAuthURL(t *testing.T) {
 		}
 	}
 }
+
+// blockedHealthServer is the deployment shape a reverse proxy produces: /health/ready is
+// refused with 403 by the proxy in front of the Server, while the API path answers.
+func blockedHealthServer(t *testing.T, agents []AgentRef) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health/ready" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 200, "msg": "OK",
+			"data": map[string]any{"items": agents, "nextCursor": "", "hasMore": false},
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestValidateWarnsWhenTheHealthEndpointIsRefused keeps the checker honest about a proxy
+// that blocks /health/ready: the origin answered, so the address is right and the checks
+// that go through the API have to run rather than be skipped.
+func TestValidateWarnsWhenTheHealthEndpointIsRefused(t *testing.T) {
+	server := blockedHealthServer(t, []AgentRef{{ID: "agent-a", Name: "office", Online: true}})
+	report := newTestValidator(t, server).Validate(context.Background(), validSettings(testServerURL(t, server)))
+
+	check := checkByID(t, report, CheckServerReachable)
+	if check.Status != StatusWarning {
+		t.Fatalf("serverUrl.reachable = %+v, want a warning for an answered-but-refused probe", check)
+	}
+	if !strings.Contains(check.Message, "403") {
+		t.Fatalf("serverUrl.reachable message = %q, want the refused status", check.Message)
+	}
+	if got := checkByID(t, report, CheckTokenValid); got.Status != StatusPassed {
+		t.Fatalf("serverUrl.token = %+v, want the token check to run because the API answers", got)
+	}
+	if !report.Valid {
+		t.Fatalf("a refused health endpoint must not invalidate a working configuration: %+v", report.Checks)
+	}
+}

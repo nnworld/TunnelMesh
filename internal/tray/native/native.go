@@ -1,16 +1,5 @@
 //go:build tray && darwin
 
-// Package native is the macOS shell around the tray: the menu-bar item, the settings
-// window, the WKWebView that renders the embedded interface and the login item.
-//
-// It is the only package in the module that touches Cocoa, and it sits behind the "tray"
-// build tag for the same reason the VPN gateway sits behind "vpn": a default
-// CGO_ENABLED=0 build must not need a toolchain that can link WebKit, and the cross
-// platform release matrix must not produce a binary that does.
-//
-// One shim owns the Cocoa run loop. Driving NSApplication from several libraries at once
-// is how menu-bar apps end up with two event loops fighting over the main thread, so
-// everything native lives in tray_darwin.m and Go only calls in and receives callbacks.
 package native
 
 /*
@@ -23,12 +12,14 @@ package native
 // rather than hardcoded so the menu follows the interface language preference.
 typedef struct {
 	const char *url;
+	const char *panelURL;
 	const char *windowTitle;
 	const char *statusTooltip;
 	const char *openMainLabel;
 	const char *openWebsiteLabel;
 	const char *quitLabel;
 	int minimizeToTray;
+	int quickPanel;
 	double widthFraction;
 	double heightFraction;
 } TMTrayConfig;
@@ -38,6 +29,7 @@ void TMTrayStop(void);
 void TMTrayShowWindow(void);
 void TMTrayHideWindow(void);
 void TMTraySetMinimizeToTray(int enabled);
+void TMTraySetQuickPanel(int enabled);
 void TMTrayOpenURL(const char *url);
 char *TMTrayLoginItemSet(int enabled);
 int TMTrayLoginItemStatus(void);
@@ -54,73 +46,6 @@ import (
 	"unsafe"
 )
 
-// Menu actions the shell reports back. The values are part of the contract between
-// tray_darwin.m and the callbacks below, so they are named rather than numbered inline.
-const (
-	actionOpenMain = 0
-	actionOpenSite = 1
-	actionQuit     = 2
-)
-
-// Handlers receives the shell's callbacks. Every field is optional; a nil field makes
-// the corresponding menu entry a no-op rather than a crash, which matters because the
-// window is still usable while the Go side is starting up.
-type Handlers struct {
-	// OpenMain is called when the operator picks "打开主界面". The shell has already
-	// brought the window forward; this is a notification, not a request.
-	OpenMain func()
-	// OpenWebsite is called for "打开官网首页". Routing it through Go keeps one
-	// implementation of "open a URL", shared with the about tab's links.
-	OpenWebsite func() error
-	// Quit is called for "退出" and for a window close when minimize-to-tray is off.
-	Quit func()
-	// MinimizeToTray is consulted when a window closes. It is a callback rather than a
-	// cached flag so the general tab's switch takes effect without telling the shell.
-	MinimizeToTray func() bool
-	// WindowVisibilityChanged reports the window becoming visible or hidden.
-	WindowVisibilityChanged func(visible bool)
-}
-
-// Config describes the shell to start.
-type Config struct {
-	// URL is the loopback address carrying the launch secret.
-	URL              string
-	WindowTitle      string
-	StatusTooltip    string
-	OpenMainLabel    string
-	OpenWebsiteLabel string
-	QuitLabel        string
-	MinimizeToTray   bool
-	// WidthFraction and HeightFraction size the window against the main screen. Zero
-	// selects the default of one half, which is the documented initial size.
-	WidthFraction  float64
-	HeightFraction float64
-}
-
-var (
-	handlers       Handlers
-	errUnsupported = errors.New("native: the macOS tray shell is only available in a -tags tray build on macOS")
-)
-
-// SetHandlers installs the callbacks before Run. The shell keeps a pointer to the same
-// struct, so this must happen first: a menu click before Run has no receiver otherwise.
-func SetHandlers(next Handlers) { handlers = next }
-
-// DefaultConfig fills the fields an operator does not configure.
-func DefaultConfig(url string) Config {
-	return Config{
-		URL:              url,
-		WindowTitle:      "TunnelMesh Client",
-		StatusTooltip:    "TunnelMesh Client",
-		OpenMainLabel:    "Open Dashboard",
-		OpenWebsiteLabel: "Open Website",
-		QuitLabel:        "Quit",
-		MinimizeToTray:   true,
-		WidthFraction:    0.5,
-		HeightFraction:   0.5,
-	}
-}
-
 // Run starts the Cocoa application and blocks until the shell stops.
 //
 // The caller must be on the process's main thread: NSApplication is main-thread only, and
@@ -131,6 +56,7 @@ func Run(config Config) error {
 	}
 	runtime.LockOSThread()
 	cURL := C.CString(config.URL)
+	cPanel := C.CString(config.PanelURL)
 	cTitle := C.CString(config.WindowTitle)
 	cTooltip := C.CString(config.StatusTooltip)
 	cOpenMain := C.CString(config.OpenMainLabel)
@@ -138,6 +64,7 @@ func Run(config Config) error {
 	cQuit := C.CString(config.QuitLabel)
 	defer func() {
 		C.free(unsafe.Pointer(cURL))
+		C.free(unsafe.Pointer(cPanel))
 		C.free(unsafe.Pointer(cTitle))
 		C.free(unsafe.Pointer(cTooltip))
 		C.free(unsafe.Pointer(cOpenMain))
@@ -147,30 +74,18 @@ func Run(config Config) error {
 
 	C.TMTrayRun(C.TMTrayConfig{
 		url:              cURL,
+		panelURL:         cPanel,
 		windowTitle:      cTitle,
 		statusTooltip:    cTooltip,
 		openMainLabel:    cOpenMain,
 		openWebsiteLabel: cOpenSite,
 		quitLabel:        cQuit,
 		minimizeToTray:   cBool(config.MinimizeToTray),
+		quickPanel:       cBool(config.QuickPanel),
 		widthFraction:    C.double(fraction(config.WidthFraction)),
 		heightFraction:   C.double(fraction(config.HeightFraction)),
 	})
 	return nil
-}
-
-// fraction clamps a screen fraction into a usable range.
-func fraction(value float64) float64 {
-	if value <= 0 {
-		return 0.5
-	}
-	if value > 0.9 {
-		return 0.9
-	}
-	if value < 0.2 {
-		return 0.2
-	}
-	return value
 }
 
 func cBool(value bool) C.int {
@@ -191,6 +106,9 @@ func HideWindow() { C.TMTrayHideWindow() }
 
 // SetMinimizeToTray updates what a window close means.
 func SetMinimizeToTray(enabled bool) { C.TMTraySetMinimizeToTray(cBool(enabled)) }
+
+// SetQuickPanel updates what a left click on the menu-bar item means.
+func SetQuickPanel(enabled bool) { C.TMTraySetQuickPanel(cBool(enabled)) }
 
 // OpenURL hands a URL to the system browser.
 func OpenURL(target string) error {
@@ -249,13 +167,6 @@ func SystemInfoJSON() string {
 	return C.GoString(cValue)
 }
 
-// SystemInfo is the decoded shape of SystemInfoJSON.
-type SystemInfo struct {
-	OS        string `json:"os"`
-	OSVersion string `json:"osVersion"`
-	Arch      string `json:"arch"`
-}
-
 // System describes the host macOS.
 func System() SystemInfo {
 	var info SystemInfo
@@ -267,6 +178,17 @@ func System() SystemInfo {
 	}
 	return info
 }
+
+// RendererName identifies the web view that draws the settings window.
+//
+// It is the same answer on every macOS, so it is a constant rather than a probe; the
+// Windows shell reports "browser" when the WebView2 runtime is missing, which is the case
+// the about tab exists to explain.
+func RendererName() string { return "wkwebview" }
+
+// RendererDetail is empty on macOS: WKWebView is part of the operating system and the
+// reported system version already identifies it.
+func RendererDetail() string { return "" }
 
 // PreferredLanguage is the operator's first macOS UI language, as a BCP-47 tag.
 //

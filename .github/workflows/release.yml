@@ -102,8 +102,69 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The Windows tray is pure Go over WebView2, so it cross-compiles from Linux; only the NSIS
+  # installer step needs a tool that is not in the Go toolchain, and apt provides it. This job
+  # is separate from the macOS one because the two halves have opposite prerequisites - one
+  # needs a Mac and a C toolchain, the other needs makensis and nothing else - and a single job
+  # would inherit both failure modes and could not tell them apart.
+  windows-tray:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-tray/package-lock.json
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nsis zip
+      # The settings interface is compiled into the binary, so the bundle has to exist before
+      # the Go build; the packaging script refuses to run without it.
+      - run: cd web-tray && npm ci
+      - run: cd web-tray && npm test -- --run
+      - run: cd web-tray && npm run build
+      - name: Package TunnelMeshClient.exe for both windows architectures
+        run: ./scripts/package-windows-tray.sh
+      - name: Verify the packaged tray
+        run: |
+          set -euo pipefail
+          dir="dist/${VERSION}/windows-tray"
+          for arch in amd64 arm64; do
+            test -f "${dir}/TunnelMeshClient-${VERSION}-windows-${arch}.zip"
+          done
+          # One installer is the contract: NSIS embeds a single executable, so a second
+          # architecture would need a second build rather than a second copy.
+          test -f "${dir}/TunnelMeshClient-${VERSION}-windows-amd64-setup.exe"
+          (cd "${dir}" && sha256sum -c SHA256SUMS)
+          python3 -m json.tool "${dir}/manifest.json" > /dev/null
+          # The archive has to contain the exe itself, not a directory entry: Explorer's
+          # "Extract all" and `Expand-Archive` both behave differently when the member is a
+          # folder, and the notification area icon would then be missing rather than wrong.
+          unzip -l "${dir}/TunnelMeshClient-${VERSION}-windows-amd64.zip" | grep -q "TunnelMeshClient.exe"
+          python3 - "${dir}/manifest.json" <<'PY'
+          import json, sys
+          assets = json.load(open(sys.argv[1]))["assets"]
+          installers = [asset for asset in assets if asset.get("installerLayout")]
+          if not installers:
+              print("::error::no windows asset is an installer; the setup.exe step was skipped", file=sys.stderr)
+              sys.exit(1)
+          print("windows tray assets: %d, installers: %d" % (len(assets), len(installers)))
+          PY
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-tray
+          path: dist/${{ needs.version.outputs.version }}/windows-tray
+          if-no-files-found: error
+          retention-days: 7
+
   release:
-    needs: [version, macos-tray]
+    needs: [version, macos-tray, windows-tray]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -127,8 +188,12 @@ jobs:
         with:
           name: macos-tray
           path: tray-dist
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: windows-tray
+          path: windows-tray-dist
       - name: Build the cross-platform archives and merge the tray disk images
-        run: TRAY_DIST_DIR=tray-dist ./scripts/build-release.sh
+        run: TRAY_DIST_DIR=tray-dist WINDOWS_TRAY_DIST_DIR=windows-tray-dist ./scripts/build-release.sh
       - name: Verify every published asset
         run: |
           set -euo pipefail
@@ -137,10 +202,13 @@ jobs:
           (cd "${dir}" && sha256sum -c SHA256SUMS)
           test -f "${dir}/manifest.json"
           test -f "${dir}/manifest-tray.json"
-          # Six platform archives plus two tray disk images: publishing a partial release
-          # is worse than publishing none, so a missing asset stops the job here.
+          test -f "${dir}/manifest-windows-tray.json"
+          # Six platform archives plus two tray disk images plus three windows tray assets
+          # (two green archives and one installer): publishing a partial release is worse than
+          # publishing none, so a missing asset stops the job here.
           test "$(find "${dir}" -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 2
-          test "$(find "${dir}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 6
+          test "$(find "${dir}" -maxdepth 1 -type f -name '*.exe' | wc -l)" -eq 1
+          test "$(find "${dir}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 8
       - name: Create the GitHub release
         run: gh release create "${VERSION}" dist/"${VERSION}"/* --target "${GITHUB_SHA}" --title "${VERSION}" --generate-notes
         env:

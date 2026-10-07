@@ -52,6 +52,7 @@ VERSION=v1.2.3 ./scripts/package-macos-tray.sh
 | `SIGN_IDENTITY` | `-` | codesign 身份，默认 ad-hoc |
 | `DIST_DIR` | `dist/<VERSION>/macos-tray` | 输出目录 |
 | `ICON_SOURCE` | `deploy/macos/TunnelMeshClient.icns` | 图标，可缺省 |
+| `MENUBAR_SOURCE_DIR` | `deploy/macos` | 菜单栏单色图标（`TunnelMeshMenuBar.png` 及 `@2x`/`@3x`）所在目录；缺文件时菜单栏回退到系统符号 |
 | `DMG_BACKGROUND` | 空 | 图标背后的 png；仓库不带背景，留空即无背景 |
 
 `CFBundleShortVersionString` 用去掉 `v` 前缀的版本号（Apple 的约定是三段点分整数），而
@@ -146,6 +147,9 @@ TunnelMesh Client.app/Contents/
 ├── MacOS/tunnelmesh-client-tray        # -tags tray，CGO_ENABLED=1
 └── Resources/
     ├── AppIcon.icns                    # 来自 deploy/macos/TunnelMeshClient.icns
+    ├── TunnelMeshMenuBar.png           # 菜单栏状态项的单色图标（同一枚标记）
+    ├── TunnelMeshMenuBar@2x.png        # 18pt 的 2x/3x 表示，Retina 上不放大位图
+    ├── TunnelMeshMenuBar@3x.png
     ├── LICENSE                         # Apache-2.0 4(a)/4(d) 要求随分发附带
     └── NOTICE
 ```
@@ -160,6 +164,16 @@ TunnelMesh Client.app/Contents/
 scripts/generate-tray-icon.sh                 # 默认写 deploy/macos/TunnelMeshClient.icns
 PREVIEW=/tmp/icons scripts/generate-tray-icon.sh   # 同时保留 1024px 主图与 .iconset
 ```
+同一条命令还会在旁边写出菜单栏用的 `TunnelMeshMenuBar.png`（含 `@2x`/`@3x`）。它是**同一枚
+标记的单色版**：`scripts/trayicon` 里两者共用同一个 `insideMark` 判定与同一组半径，只有取景
+（`glyphInset`）不同，所以菜单栏与 Finder 不可能再各画各的。状态项按 *template* 渲染该图，
+只取 alpha 通道并由系统着色，因此浅色/深色菜单栏都自动正确；带颜色反而会在深色菜单栏上变成
+一块贴纸。用 `imageNamed:` 而不是直接读文件，是为了让 `@2x`/`@3x` 一起被解析成一个多尺寸
+`NSImage`，Retina 上不会去放大 18px 位图。
+
+早期版本的状态项是 SF Symbol `network`，与 Finder 里的品牌图标是两幅画——这正是「托盘图标和
+Finder 不一致」的来源。系统符号仍然保留为回退：从 checkout 里直接跑裸二进制时没有
+`Contents/Resources`，此时有符号总比通用图标好。
 
 `iconutil` 负责写 `.icns` 里按尺寸命名的表示（`ic05`/`ic07`/`ic10` …），因此重新生成必须走
 它而不是自己拼字节。`deploy/macos/tray_bundle_test.go` 会解析已提交的 `.icns`，断言 16 / 128

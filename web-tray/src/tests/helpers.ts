@@ -163,6 +163,7 @@ export const fixtures = {
       launchAtLogin: true,
       launchAtLoginSupported: true,
       minimizeToTray: true,
+      quickPanel: false,
       languages: ['system', 'zh-CN', 'en-US'],
       themes: ['system', 'light', 'dark'],
       modes: ['local', 'cluster'],

@@ -40,7 +40,11 @@ export default {
     },
     theme: {
       label: '外观主题',
-      hint: '跟随系统会跟随 macOS 的浅色/深色外观。',
+      hint: {
+        macos: '跟随系统会跟随 macOS 的浅色/深色外观。',
+        windows: '跟随系统会跟随 Windows 的浅色/深色应用模式；窗口标题栏始终跟随系统设置。',
+        other: '跟随系统会跟随操作系统的浅色/深色外观。',
+      },
       system: '跟随系统',
       light: '浅色',
       dark: '深色',
@@ -62,20 +66,48 @@ export default {
     },
     launchAtLogin: {
       label: '开机启动',
-      hint: '将 App 包注册为 macOS 登录项。',
-      unsupported: '当前构建不支持登录项。',
-      failed: 'macOS 拒绝了登录项：{error}',
+      hint: {
+        macos: '将 App 包注册为 macOS 登录项。',
+        windows: '写入当前用户的注册表 Run 项，登录 Windows 时自动启动，无需管理员权限。',
+        other: '登录系统时自动启动客户端。',
+      },
+      unsupported: '当前构建不支持开机启动。',
+      failed: {
+        macos: 'macOS 拒绝了登录项：{error}',
+        windows: 'Windows 拒绝了开机启动项：{error}',
+        other: '系统拒绝了开机启动：{error}',
+      },
     },
     minimizeToTray: {
       label: '关闭时最小化到系统托盘',
       hint: '关闭后，关闭窗口会退出客户端及其隧道。',
     },
+    quickPanel: {
+      label: '任务栏快捷小窗',
+      hint: {
+        macos: '开启后，点击菜单栏图标弹出快捷小窗；右键（或 ⌃ 点击）仍打开菜单。点“保存”后立即对下一次点击生效，无需重启。',
+        windows: '开启后，点击通知区域图标弹出快捷小窗；右键仍打开菜单。点“保存”后立即对下一次点击生效，无需重启。',
+        other: '开启后，点击托盘图标弹出快捷小窗；右键仍打开菜单。',
+      },
+      off: '关闭',
+      on: '开启',
+    },
     saved: '偏好设置已保存。',
     saveFailed: '保存偏好设置失败：{error}',
+    unsaved: '有未保存的更改，点“保存”后生效。',
+  },
+  panel: {
+    heading: '快捷小窗',
+    tunnels: '隧道',
+    empty: '尚未配置任何隧道。',
+    openMain: '打开主界面',
+    quit: '退出',
+    notRunning: '客户端已停止。',
+    updated: '更新于 {time}',
   },
   stats: {
     title: '统计',
-    description: '菜单栏应用所承载客户端的实时状态。',
+    description: '托盘应用所承载客户端的实时状态。',
     summary: {
       state: '状态',
       uptime: '运行时长',
@@ -90,7 +122,13 @@ export default {
       openSlots: '连接槽位',
       readySessions: '就绪会话',
     },
-    server: { reachable: '可达', unreachable: '不可达', unknown: '未检测', unset: '未配置' },
+    server: {
+      reachable: '可达',
+      unreachable: '不可达',
+      unknown: '未检测',
+      unset: '未配置',
+      probe: '健康检查结果：{detail}',
+    },
     session: { connected: '已连接', disconnected: '无会话' },
     tunnels: {
       heading: '隧道',
@@ -179,6 +217,7 @@ export default {
       button: '检测配置',
       running: '检测中…',
       valid: '全部检测通过。',
+      validWithWarnings: '检测通过，但有 {count} 项警告。',
       invalid: '存在未通过的检测项，请先修复再启动客户端。',
       checkedAt: '检测于 {time}',
       empty: '尚未执行检测。',
@@ -196,7 +235,19 @@ export default {
   about: {
     title: '关于',
     build: { heading: '构建信息', version: '版本', commit: 'Commit', buildTime: '构建时间' },
-    system: { heading: '系统', os: '操作系统', osVersion: 'macOS 版本', arch: '架构', runtime: '运行时' },
+    system: {
+      heading: '系统',
+      os: '操作系统',
+      osVersion: '系统版本',
+      arch: '架构',
+      runtime: '运行时',
+      renderer: '界面渲染',
+      rendererDetail: '渲染引擎版本',
+    },
+    renderer: {
+      fallbackTitle: '未找到 Microsoft Edge WebView2 运行时',
+      fallbackBody: '设置窗口已改为用系统浏览器打开，所有功能仍然可用。安装 WebView2 Runtime 后即恢复内嵌窗口。',
+    },
     files: {
       heading: '配置',
       configDir: '目录',
@@ -254,7 +305,7 @@ export default {
     },
   },
   errors: {
-    unauthorized: '窗口与托盘的连接已失效，请从菜单栏重新打开。',
+    unauthorized: '窗口与托盘的连接已失效，请从托盘菜单重新打开。',
     conflict: '已有另一个 TunnelMesh 客户端在使用该配置运行。',
     unusable: '配置尚不可用。',
   },

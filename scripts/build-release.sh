@@ -43,18 +43,30 @@ if [[ -f "$ROOT_DIR/web/dist/index.html" ]] && ! diff -qr "$ROOT_DIR/web/dist" "
   exit 1
 fi
 
-# The macOS tray client cannot be built here: it links Cocoa and WebKit through cgo, while
-# this script cross-compiles everything with CGO_ENABLED=0. The release workflow packages
-# it on a macOS runner (scripts/package-macos-tray.sh) and hands the disk images over
-# through TRAY_DIST_DIR. Validating the hand-off *before* the matrix means a missing or
-# corrupt artifact fails in seconds instead of after eighteen cross-compilations.
+# Neither tray client can be built here: the macOS one links Cocoa and WebKit through cgo and
+# needs a Mac, the Windows one belongs to the NSIS packaging step. The release workflow builds
+# them separately (scripts/package-macos-tray.sh, scripts/package-windows-tray.sh) and hands
+# the artifacts over through TRAY_DIST_DIR and WINDOWS_TRAY_DIST_DIR. Validating both hand-offs
+# *before* the matrix means a missing or corrupt artifact fails in seconds instead of after
+# eighteen cross-compilations.
+#
+# One loop for both platforms because the contract is identical - a directory with SHA256SUMS
+# and manifest.json - and the only difference is which published name keeps the manifest.
 TRAY_DIST_DIR="${TRAY_DIST_DIR:-}"
-if [[ -n "$TRAY_DIST_DIR" ]]; then
-  if [[ "$TRAY_DIST_DIR" != /* ]]; then
-    TRAY_DIST_DIR="$ROOT_DIR/$TRAY_DIST_DIR"
+WINDOWS_TRAY_DIST_DIR="${WINDOWS_TRAY_DIST_DIR:-}"
+tray_handoffs=("TRAY_DIST_DIR:manifest-tray.json" "WINDOWS_TRAY_DIST_DIR:manifest-windows-tray.json")
+for handoff in "${tray_handoffs[@]}"; do
+  handoff_var="${handoff%%:*}"
+  handoff_manifest="${handoff##*:}"
+  # Indirect expansion is safe here precisely because both variables are given a value above.
+  handoff_dir="${!handoff_var}"
+  [[ -n "$handoff_dir" ]] || continue
+  if [[ "$handoff_dir" != /* ]]; then
+    handoff_dir="$ROOT_DIR/$handoff_dir"
   fi
-  "$ROOT_DIR/scripts/merge-tray-dist.sh" --check "$TRAY_DIST_DIR"
-fi
+  eval "$handoff_var=\"$handoff_dir\""
+  "$ROOT_DIR/scripts/merge-tray-dist.sh" --check "$handoff_dir"
+done
 
 mkdir -p "$OUTPUT_DIR"
 : > "$OUTPUT_DIR/SHA256SUMS"
@@ -151,11 +163,15 @@ for target in "${targets[@]}"; do
   rm -rf "$stage"
 done
 
-# Fold the tray disk images in after the matrix, so one release directory and one
-# SHA256SUMS describe every published asset. This never compiles anything.
-if [[ -n "$TRAY_DIST_DIR" ]]; then
-  "$ROOT_DIR/scripts/merge-tray-dist.sh" "$TRAY_DIST_DIR" "$OUTPUT_DIR"
-fi
+# Fold the tray artifacts in after the matrix, so one release directory and one SHA256SUMS
+# describe every published asset. This never compiles anything.
+for handoff in "${tray_handoffs[@]}"; do
+  handoff_var="${handoff%%:*}"
+  handoff_manifest="${handoff##*:}"
+  handoff_dir="${!handoff_var}"
+  [[ -n "$handoff_dir" ]] || continue
+  "$ROOT_DIR/scripts/merge-tray-dist.sh" --manifest-name="$handoff_manifest" "$handoff_dir" "$OUTPUT_DIR"
+done
 
 platform_json="$(IFS=,; printf '%s' "${platforms[*]}")"
 archive_json="$(IFS=,; printf '%s' "${archives[*]}")"

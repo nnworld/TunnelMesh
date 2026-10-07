@@ -235,18 +235,25 @@ type SettingsView struct {
 	PrefsPath        string `json:"prefsPath"`
 	LockPath         string `json:"lockPath"`
 	LaunchAtLogin    bool   `json:"launchAtLogin"`
+	// Platform names the operating system the shell runs on so the general tab can word
+	// things correctly ("menu bar" versus "notification area"). Empty means neither of
+	// the two shells this tray ships with, and the interface falls back to neutral text.
+	Platform string `json:"platform,omitempty"`
 	// LaunchAtLoginSupported is false where the platform has no login-item API, so the
 	// interface can disable the switch instead of pretending it worked.
 	LaunchAtLoginSupported bool `json:"launchAtLoginSupported"`
 	// LaunchAtLoginError carries the reason the last registration attempt failed. An
 	// unsigned or ad-hoc signed bundle is refused by SMAppService, and the operator has
 	// to be told rather than left looking at a switch that silently does nothing.
-	LaunchAtLoginError string   `json:"launchAtLoginError,omitempty"`
-	MinimizeToTray     bool     `json:"minimizeToTray"`
-	Languages          []string `json:"languages"`
-	Themes             []string `json:"themes"`
-	Modes              []string `json:"modes"`
-	Protocols          []string `json:"protocols"`
+	LaunchAtLoginError string `json:"launchAtLoginError,omitempty"`
+	MinimizeToTray     bool   `json:"minimizeToTray"`
+	// QuickPanel mirrors the tray.json flag so the general tab can render the radio and
+	// the shell can be told about it in the same save.
+	QuickPanel bool     `json:"quickPanel"`
+	Languages  []string `json:"languages"`
+	Themes     []string `json:"themes"`
+	Modes      []string `json:"modes"`
+	Protocols  []string `json:"protocols"`
 }
 
 // SettingsUpdate is a general-tab save. Pointer fields keep "not supplied" distinct
@@ -257,6 +264,9 @@ type SettingsUpdate struct {
 	ConfigDir      string `json:"configDir"`
 	LaunchAtLogin  *bool  `json:"launchAtLogin,omitempty"`
 	MinimizeToTray *bool  `json:"minimizeToTray,omitempty"`
+	// QuickPanel is a pointer for the same reason MinimizeToTray is: an update that
+	// leaves it out must not turn the panel off.
+	QuickPanel *bool `json:"quickPanel,omitempty"`
 }
 
 // Settings renders the general tab.
@@ -270,6 +280,7 @@ func (a *App) Settings(ctx context.Context) (SettingsView, error) {
 	a.mu.Unlock()
 	return SettingsView{
 		Language:               prefs.Language,
+		Platform:               Platform(),
 		Theme:                  prefs.Theme,
 		ConfigDir:              paths.ConfigDir,
 		ClientConfigPath:       paths.ClientYAML,
@@ -279,6 +290,7 @@ func (a *App) Settings(ctx context.Context) (SettingsView, error) {
 		LaunchAtLoginSupported: a.autostart.Supported(),
 		LaunchAtLoginError:     autostartErr,
 		MinimizeToTray:         prefs.MinimizeToTray,
+		QuickPanel:             prefs.QuickPanel,
 		Languages:              []string{LanguageSystem, LanguageZhCN, LanguageEnUS},
 		Themes:                 []string{ThemeSystem, ThemeLight, ThemeDark},
 		Modes:                  []string{config.ModeLocal, config.ModeCluster},
@@ -304,6 +316,9 @@ func (a *App) SaveSettings(ctx context.Context, update SettingsUpdate) (Settings
 	}
 	if update.MinimizeToTray != nil {
 		prefs.MinimizeToTray = *update.MinimizeToTray
+	}
+	if update.QuickPanel != nil {
+		prefs.QuickPanel = *update.QuickPanel
 	}
 
 	var paths Paths
@@ -797,15 +812,21 @@ func (a *App) refreshServerProbe(serverURL string) (bool, string) {
 		ctx, cancel := context.WithTimeout(context.Background(), serverProbeTimeout)
 		defer cancel()
 		err := client.CheckHealth(ctx, serverURL)
+		// An origin that answered and refused this endpoint is still an origin that
+		// answers. The reachability line sits next to a tunnel that is demonstrably
+		// carrying traffic, so "unreachable" would contradict what the operator can see;
+		// the refusal itself stays visible in the probe detail.
+		var answered AnsweredError
+		reached := err == nil || errors.As(err, &answered)
+		detail := ""
+		if err != nil {
+			detail = err.Error()
+		}
 		a.mu.Lock()
 		a.probe.inflight = false
 		a.probe.at = time.Now()
-		a.probe.reachable = err == nil
-		if err != nil {
-			a.probe.detail = err.Error()
-		} else {
-			a.probe.detail = ""
-		}
+		a.probe.reachable = reached
+		a.probe.detail = detail
 		a.mu.Unlock()
 	}()
 	return reachable, detail
@@ -917,11 +938,18 @@ func (a *App) RestartRuntime(ctx context.Context) error {
 	return a.StartRuntime(ctx)
 }
 
-// SystemInfo identifies the host for the about tab.
+// SystemInfo identifies the host and the web view that draws the interface.
+//
+// The renderer is reported because it is the one part an operator cannot fix from inside the
+// settings window: a Windows machine without the WebView2 runtime falls back to the system
+// browser, and the about tab has to say so in the operator's own language. The values are
+// machine tokens, so the wording stays in the interface rather than being formatted here.
 type SystemInfo struct {
-	GOOS      string `json:"goos"`
-	Arch      string `json:"arch"`
-	OSVersion string `json:"osVersion,omitempty"`
+	GOOS           string `json:"goos"`
+	Arch           string `json:"arch"`
+	OSVersion      string `json:"osVersion,omitempty"`
+	Renderer       string `json:"renderer,omitempty"`
+	RendererDetail string `json:"rendererDetail,omitempty"`
 }
 
 func defaultSystemInfo() SystemInfo {

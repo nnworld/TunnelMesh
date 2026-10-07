@@ -1,10 +1,14 @@
 package macos
 
 import (
+	"image/color"
+	"image/png"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/tray"
 )
 
 const (
@@ -12,7 +16,12 @@ const (
 	infoTemplate  = "TunnelMeshClient-Info.plist"
 	packageScript = "../../scripts/package-macos-tray.sh"
 	iconGenerator = "../../scripts/generate-tray-icon.sh"
-	releaseScript = "../../scripts/build-release.sh"
+	// iconGeometry is the drawing itself. The .icns and the menu-bar glyph have to come out
+	// of one set of numbers, and this is the file that holds them.
+	iconGeometry = "../../scripts/trayicon/main.go"
+	// panelRouteSource is the front end's half of the quick-panel address.
+	panelRouteSource = "../../web-tray/src/panelRoute.ts"
+	releaseScript    = "../../scripts/build-release.sh"
 
 	// layoutScript is the Finder pass that turns the archive into an installer window.
 	// It lives beside the plist rather than inside the shell script because it is
@@ -403,4 +412,110 @@ var icnsEdges = map[string]int{
 	"ic07": 128,
 	"ic11": 256, "ic08": 256,
 	"ic09": 512, "ic10": 1024,
+}
+
+// menuBarGlyphs are the status-item renderings, at 1x, 2x and 3x of the 18pt bar. They are
+// committed artifacts for the same reason the .icns is: the bundle has to be reproducible
+// from the repository without a design tool, and a menu bar that shows a different shape
+// from Finder is the bug this guards.
+var menuBarGlyphs = []struct {
+	file string
+	edge int
+}{
+	{"TunnelMeshMenuBar.png", 18},
+	{"TunnelMeshMenuBar@2x.png", 36},
+	{"TunnelMeshMenuBar@3x.png", 54},
+}
+
+// TestMenuBarGlyphIsATemplateOfTheBrandMark checks the committed glyph files.
+//
+// A template image is tinted by the system, which means only its alpha channel is read.
+// Colour in the file would therefore be invisible on the menu bar and visible in a
+// preview, so the two halves of the review would disagree. These files are generated, so
+// the assertions are about the generator's output contract rather than about bytes.
+func TestMenuBarGlyphIsATemplateOfTheBrandMark(t *testing.T) {
+	for _, glyph := range menuBarGlyphs {
+		path := glyph.file
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v (regenerate with scripts/generate-tray-icon.sh)", path, err)
+		}
+		img, err := png.Decode(file)
+		file.Close()
+		if err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		bounds := img.Bounds()
+		if bounds.Dx() != glyph.edge || bounds.Dy() != glyph.edge {
+			t.Errorf("%s is %dx%d, want %dpx square", path, bounds.Dx(), bounds.Dy(), glyph.edge)
+		}
+		var covered, coloured int
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				pixel := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
+				rgba := color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)
+				if rgba.A > 200 {
+					covered++
+					// GrayModel flattens against black, so a coloured pixel reads as a
+					// lighter grey than a black one at the same alpha.
+					if pixel.Y > 8 {
+						coloured++
+					}
+				}
+			}
+		}
+		total := bounds.Dx() * bounds.Dy()
+		// The mark has to be present and has to leave the bar mostly empty: a blank file
+		// and a filled square both pass "some pixels are set" but neither is a glyph.
+		if covered*100 < total*12 {
+			t.Errorf("%s covers %d of %d pixels, want at least 12%%: the mark is missing", path, covered, total)
+		}
+		if covered*100 > total*75 {
+			t.Errorf("%s covers %d of %d pixels, want under 75%%: that is a tile, not a glyph", path, covered, total)
+		}
+		if coloured != 0 {
+			t.Errorf("%s has %d non-black opaque pixels; a template image is tinted by the system "+
+				"and colour in the file only misleads whoever previews it", path, coloured)
+		}
+	}
+}
+
+// TestMenuBarGlyphPackagingAndGeneration pins the pipeline: generated beside the .icns,
+// copied into the bundle, and drawn from the same geometry as the .icns.
+func TestMenuBarGlyphPackagingAndGeneration(t *testing.T) {
+	packageScript := readOrFail(t, packageScript)
+	for _, want := range []string{"TunnelMeshMenuBar.png", "TunnelMeshMenuBar@2x.png", "Contents/Resources/"} {
+		if !strings.Contains(packageScript, want) {
+			t.Errorf("%s must copy the menu-bar glyph into the bundle (looking for %q)", packageScript, want)
+		}
+	}
+	generator := readOrFail(t, iconGenerator)
+	if !strings.Contains(generator, "-menubar") {
+		t.Errorf("%s must regenerate the menu-bar glyph with -menubar, so one command updates both halves of the brand", generator)
+	}
+	// One geometry, two framings. The glyph calls the same predicate the tile does, which
+	// is what makes "the menu bar icon does not match Finder" structurally impossible.
+	sources := readOrFail(t, iconGeometry)
+	for _, want := range []string{"insideMark(glyphPoint(", "glyphInset"} {
+		if !strings.Contains(sources, want) {
+			t.Errorf("%s must draw the menu-bar glyph from the tile's own mark (looking for %q)", iconGeometry, want)
+		}
+	}
+	if strings.Contains(sources, "func drawGlyphMark") || strings.Contains(sources, "glyphStrokeScale") {
+		t.Errorf("%s must not keep a second copy of the mark geometry; the glyph and the tile drift apart the "+
+			"moment either one is redrawn by hand", iconGeometry)
+	}
+}
+
+// TestPanelRouteMatchesTheBundle pins the two ends of the quick panel's address together.
+//
+// The shell loads tray.PanelURL() and the bundle picks its root component from the same
+// fragment. Either side renaming it alone produces a settings window where a panel should
+// be, which no test on one side alone can see.
+func TestPanelRouteMatchesTheBundle(t *testing.T) {
+	source := readOrFail(t, panelRouteSource)
+	if !strings.Contains(source, `PANEL_ROUTE = '`+tray.PanelRoute+`'`) {
+		t.Errorf("%s must export the same fragment tray.PanelRoute (%q) builds, or the shell loads the "+
+			"full window into the panel", panelRouteSource, tray.PanelRoute)
+	}
 }

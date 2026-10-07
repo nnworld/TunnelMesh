@@ -4,7 +4,7 @@
 //
 // It is a separate package from the admin console's internal/server/web_dist because
 // the two are different applications with different lifecycles: the admin bundle is
-// embedded in the Server, this one in the macOS tray client. Keeping them apart means
+// embedded in the Server, this one in the tray client. Keeping them apart means
 // rebuilding one never touches the other, and the cross-platform Server build stays
 // free of anything the tray needs.
 //
@@ -16,7 +16,8 @@
 // its pattern matches nothing, so an untagged embed would make every `go build ./...`
 // depend on a front-end toolchain nobody asked for - including a Linux checkout that can
 // never run the tray. Tagging it keeps the default build independent and moves the
-// requirement to `scripts/package-macos-tray.sh`, which refuses to package without it.
+// requirement to the packaging scripts - `scripts/package-macos-tray.sh` and
+// `scripts/package-windows-tray.sh` - which refuse to package without it.
 package webdist
 
 import (

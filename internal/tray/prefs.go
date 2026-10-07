@@ -37,6 +37,11 @@ type Preferences struct {
 	LaunchAtLogin *bool `json:"launchAtLogin,omitempty"`
 	// MinimizeToTray decides whether closing the window hides it or quits the tray.
 	MinimizeToTray bool `json:"minimizeToTray"`
+	// QuickPanel turns the menu-bar left click into a compact status panel. It is off by
+	// default: a tray that stops showing its menu on its own is a behaviour change the
+	// operator has to ask for, and a missing key in an older tray.json has to keep the
+	// menu.
+	QuickPanel bool `json:"quickPanel"`
 }
 
 // LaunchAtLoginEnabled reports the effective launch-at-login choice.
