@@ -169,3 +169,29 @@ internal/tray/webdist/embed.go:32:12: pattern all:dist: no matching files found
   `go build` → 两条 `go vet` → 守卫与逻辑测试，全部通过；`release.yml` 的 `windows-tray` 作业
   不受影响，因为 `package-windows-tray.sh` 只编译 `./cmd/tunnelmesh-client-tray` 且已构建
   `web-tray`。
+
+## 追加：CI 首跑反馈的第二处——快捷小窗测试在数微任务
+
+Release 作业的 macOS runner 与 Linux runner 同时红在 4 个 `quick-panel` 用例上，本机 97 用例全绿：
+
+```
+× renders the run summary and one row per tunnel   expected '已停止' to contain '运行中'
+× reports a blocked lock instead of an empty panel  expected '已停止' to contain '另一个'
+× names the live session ...                       expected '未配置' to be '已连接'
+× keeps saying 不可达 ...                           expected '未配置' to be '不可达'
+```
+
+- 根因：测试用 `flush(6)` 这类手调的微任务圈数等接口回填 DOM。小窗是**串行两跳**
+  （`settings` 应用语言/主题 → `stats` 渲染摘要），一跳花几拍由运行时的 `fetch` 实现决定：
+  本机 Node 24 恰好够，runner 的 Node 22 不够，于是渲染出“取数之前”的状态。属于测试写法问题，
+  不是小窗功能问题——三处 `已停止`/`未配置` 正是组件的初始值。
+- 修法按根因来：`src/tests/helpers.ts` 增加 `flushUntil(谓词)`（微任务自旋到条件成立，默认
+  4000 轮；只用微任务，因为有 3 个用例跑在 fake timers 下），小窗的 11 处等待全部改为看条件；
+  `flush(n)` 保留给“点一下再看调用记录”的场合，实现改成每单元排空一轮，不再假设一跳一拍。
+- 为什么不是把 6 改成更大的数：新增的 `src/tests/panel-timing.spec.ts` 给每个响应人为加 500 拍，
+  用固定圈数（即便 6×64）必红、用 `flushUntil` 必绿——把这条教训钉成可执行断言。
+- 顺带补缺口：`ci.yml` 的 `windows-tray` 作业此前只构建不测试托盘前端，所以托盘前端要等到
+  Release 作业才被第一次跑到。现在该作业必须执行 `cd web-tray && npm test -- --run`，
+  `scripts/ci_workflow_test.go` 对这一步有断言。
+- 复验：`cd web-tray && npx vitest run` 12 文件 98 用例全绿（新增 1 个守卫用例）；
+  `npm run build` 重新镜像托盘产物；`go test ./scripts` 绿；`go test ./... -count=1` 绿。

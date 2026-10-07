@@ -142,13 +142,43 @@ export function mountView(component: Component | DefineComponent, options: Mount
   return { wrapper, pinia }
 }
 
+/**
+ * Turns yielded per `flush` unit.
+ *
+ * A round trip through the runtime's `fetch` costs a handful of promise turns, and the
+ * handful belongs to the runtime rather than to this code base: the same test passed on
+ * the Node 24 dev box and failed on the Node 22 runners until the panel showed its
+ * pre-fetch state. One unit therefore drains a queue instead of taking a single turn.
+ */
+const FLUSH_DRAIN = 64
+
 export function flush(times = 4): Promise<void> {
-  // One microtask per awaited call in the component chain, plus a spare for watchers.
   let chain = Promise.resolve()
-  for (let index = 0; index < times; index += 1) {
+  for (let turn = 0; turn < times * FLUSH_DRAIN; turn += 1) {
     chain = chain.then(() => Promise.resolve())
   }
   return chain
+}
+
+/**
+ * Yields microtasks until `settled` is true, up to `maxRounds` rounds.
+ *
+ * Use it wherever a test asserts on something an API round trip paints: it waits for the
+ * condition instead of for a hand-counted number of runtime turns. It deliberately does
+ * not throw on timeout - the test's own expectation then reports the mismatch with the
+ * real DOM, which is the message a reviewer needs. The bound is deliberately roomy: a
+ * yielded microtask costs nanoseconds, while the chain being waited on is composed by the
+ * runtime's fetch, and guessing its length is what broke the panel on the runners.
+ * Microtask-only on purpose: three specs run under fake timers, where a macrotask wait
+ * would never resume.
+ */
+export async function flushUntil(settled: () => boolean, maxRounds = 4000): Promise<boolean> {
+  for (let turn = 0; turn < maxRounds; turn += 1) {
+    await Promise.resolve()
+    await Promise.resolve()
+    if (settled()) return true
+  }
+  return false
 }
 
 export const fixtures = {

@@ -77,6 +77,10 @@ jobs:
       # of on the code it exists to check. The admin bundle is deliberately not built here -
       # the package list below is why this job must not reach internal/server.
       - run: cd web-tray && npm ci
+      # The tray front end is tested by no other job: the release jobs only meet it when a tag
+      # is already being published, which is how a panel spec that counted microtasks reached
+      # a runner with a different fetch chain and turned red there instead of here.
+      - run: cd web-tray && npm test -- --run
       - run: cd web-tray && npm run build
       - uses: actions/setup-go@v7.0.0
         with:

@@ -7,7 +7,8 @@
 | --- | --- | --- |
 | Go 单元与集成 | `go test ./... -count=1`、`go test -race ./...`、`go vet ./...` | 协议状态机、流控、Repository 契约（SQLite 与 MySQL 双方言）、迁移、API 授权与分页、跨层集成 |
 | 前端单元 | `cd web && npm test -- --run`、`npm run build` | SSH/SFTP/ZMODEM 客户端逻辑、WebSocket 字节流背压、store、路由、视图交互 |
-| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端、Agent 选择器（配置在挂载后才到位也要自动拉取一次、每窗口一次、未拉取/失败/确实为空三种空态不得混写）、按 `platform` 取词（macOS / Windows / 未知平台回落中性文案） |
+| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端、Agent 选择器（配置在挂载后才到位也要自动拉取一次、每窗口一次、未拉取/失败/确实为空三种空态不得混写）、按 `platform` 取词（macOS / Windows / 未知平台回落中性文案）、任务栏快捷小窗（两跳串行
+  settings→stats 后渲染运行摘要、锁被占用与错误态、失焦隐藏的路由判定） |
 | 浏览器端到端 | `node test/e2e/webssh/run.mjs` | 真实 Chrome + 真实 Server/Agent/SSH 主机，验证凭据自动认证、pty 终端、ZMODEM 双向传输、SFTP 复用与上传逐字节完整性、刷新恢复、浏览器控制台洁净 |
 | OpenResty 端到端 | `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | 真实 OpenResty 容器 + 内部入口替身，验证 CONNECT 搬运、请求头白名单、非 200 响应原样透传、绝对形式改写、客户端断开后隧道回收、日志不含凭据 |
 
@@ -130,6 +131,25 @@ go test ./scripts ./deploy/windows ./internal/tray ./internal/client -count=1
 Windows GUI 行为同样无法在 `go test` 里执行，兜底方式与 macOS 一致：交叉编译 + 结构断言 +
 真机冒烟清单，见 [Windows 托盘客户端打包](../deployment/windows-client-tray.md#真机冒烟清单)。
 
+## 托盘前端等条件，不等微任务数
+
+`web-tray` 的组件测试原先靠 `flush(6)` 这类**手调的微任务圈数**等接口回来再断言 DOM。圈数不够
+就渲染出“取数之前”的状态：快捷小窗要等**串行两跳**（先 `settings` 应用语言/主题，再 `stats`），
+一跳花掉几拍取决于运行时 `fetch` 的实现，本机 Node 24 够用、GitHub runner 的 Node 22 不够，
+于是 macOS 与 Linux 两个作业同时红在 4 个用例上（状态停在 `已停止`、服务行进停在 `未配置`），
+本地全绿。
+
+规则因此是：**断言渲染结果的等待必须看条件**，即 `src/tests/helpers.ts` 的
+`flushUntil(() => ...)`（微任务自旋到谓词成立，默认放宽到 4000 轮——一次_yield_ 是纳秒级，
+而被等的链长不由本仓库决定；只用微任务是因为有 3 个作业跑在 fake timers 下，宏任务等待永远不会
+返回）。`flush(n)` 仍用于“点一下按钮再看调用记录”的场合，它的实现已经改成每单元排空一轮，
+不再假设一跳等于一拍。
+
+`src/tests/panel-timing.spec.ts` 把这条不变量钉住：它给每个响应人为加上 500 拍，如果谁再把
+小窗的等待退回固定圈数，这个用例就先红。同一次反馈还补了 CI 缺口——`ci.yml` 的 `windows-tray`
+作业此前只构建不测试，托盘前端只在 Release 作业里第一次被跑到，故现在该作业必须跑
+`cd web-tray && npm test -- --run`。
+
 ## MySQL 与 etcd 相关验证
 
 - CI 的 `mysql56` job 起一个 `mysql:5.6` 服务容器（项目声明的最低支持版本，生产实例为
@@ -234,7 +254,7 @@ Windows 上实际执行一次安装与卸载，并确认渲染出的 `*-service.
 | 测试 | 守护的不变量 |
 | --- | --- |
 | `scripts/release_workflow_test.go` | 解析 `.github/workflows/release.yml`：版本号只在 `version` 作业解析一次并被三个构建作业共用；托盘只由 `macos-tray`（macOS runner）与 `windows-tray`（Linux runner + `nsis`）产出，各自校验产物、汇总 `installerLayout`、上传 artifact；Linux 的 `release` 作业必须下载**两个** artifact，以 `TRAY_DIST_DIR` 与 `WINDOWS_TRAY_DIST_DIR` 交给 `build-release.sh`，并断言资产清点（2 个 `.dmg`、1 个 `.exe`、8 个 `tar.gz|zip`）与三份 manifest，且不得自己打包托盘 |
-| `scripts/ci_workflow_test.go` | 解析 `.github/workflows/ci.yml`：必须有 `-tags tray` 的 `go build`/`go vet`（amd64 + arm64）、托盘前端 `npm ci`+`npm run build`、`gofmt` 检查、托盘守卫测试与 `makensis` 冒烟编译；包清单必须限定在带 `tray` 标签的目录（断言里同时禁止 `./...`，否则该作业会去要求一份它根本不用的管理后台产物），且该作业不得发布 |
+| `scripts/ci_workflow_test.go` | 解析 `.github/workflows/ci.yml`：必须有 `-tags tray` 的 `go build`/`go vet`（amd64 + arm64）、托盘前端 `npm ci` + `npm test -- --run` + `npm run build`、`gofmt` 检查、托盘守卫测试与 `makensis` 冒烟编译；包清单必须限定在带 `tray` 标签的目录（断言里同时禁止 `./...`，否则该作业会去要求一份它根本不用的管理后台产物），且该作业不得发布 |
 | `scripts/merge_tray_dist_test.go` | **执行** `scripts/merge-tray-dist.sh`：合并后一条 `sha256sum -c` 覆盖全部资产；清单按 `--manifest-name` 发布为 `manifest-tray.json` / `manifest-windows-tray.json` 而不覆盖 `manifest.json`，也不互相覆盖；形状无关（`.dmg` 与 `.zip`+`.exe` 同样通过）；来源缺 `SHA256SUMS`/`manifest.json` 或除这两个文件外什么都没有、资产与校验和不符、目标已有同名资产时失败且不留半成品；`.build/`、`*.log` 之类不会被误发布；`--check` 只校验不写 |
 | `scripts/tray_build_tag_test.go` | 任何含 cgo、import `internal/tray/native`、`//go:embed` 托盘产物的文件都必须带 `tray` 标签，默认构建不触达 WebKit；Windows 侧额外要求纯 Go、两端符号集相等、不提交 `.syso` |
 

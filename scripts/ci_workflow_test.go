@@ -60,7 +60,10 @@ func TestCIWorkflowCompilesTheWindowsTray(t *testing.T) {
 		trayVet,
 		// -tags tray makes internal/tray/webdist/embed.go live: with no bundle on disk the
 		// pattern matches nothing and every Go step in the job fails before checking anything.
+		// The window tests run here too: the tray front end belongs to no other job, and the
+		// panel specs first broke on a runner that no CI job had ever exercised them on.
 		"cd web-tray && npm ci",
+		"cd web-tray && npm test -- --run",
 		"cd web-tray && npm run build",
 		// go vet reads test files, so this is the only place the windows-only client lock
 		// test gets compiled without a Windows host.
