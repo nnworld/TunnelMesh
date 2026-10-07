@@ -7,7 +7,8 @@
 | --- | --- | --- |
 | Go 单元与集成 | `go test ./... -count=1`、`go test -race ./...`、`go vet ./...` | 协议状态机、流控、Repository 契约（SQLite 与 MySQL 双方言）、迁移、API 授权与分页、跨层集成 |
 | 前端单元 | `cd web && npm test -- --run`、`npm run build` | SSH/SFTP/ZMODEM 客户端逻辑、WebSocket 字节流背压、store、路由、视图交互 |
-| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端、Agent 选择器（配置在挂载后才到位也要自动拉取一次、每窗口一次、未拉取/失败/确实为空三种空态不得混写） |
+| 托盘前端单元 | `cd web-tray && npm test -- --run`、`npm run build` | 设置界面四个 tab、i18n 跟随与切换、主题浅/深/跟随、路由表单与检测渲染、token 掩码、本地 API 客户端、Agent 选择器（配置在挂载后才到位也要自动拉取一次、每窗口一次、未拉取/失败/确实为空三种空态不得混写）、按 `platform` 取词（macOS / Windows / 未知平台回落中性文案）、任务栏快捷小窗（两跳串行
+  settings→stats 后渲染运行摘要、锁被占用与错误态、失焦隐藏的路由判定） |
 | 浏览器端到端 | `node test/e2e/webssh/run.mjs` | 真实 Chrome + 真实 Server/Agent/SSH 主机，验证凭据自动认证、pty 终端、ZMODEM 双向传输、SFTP 复用与上传逐字节完整性、刷新恢复、浏览器控制台洁净 |
 | OpenResty 端到端 | `TM_PROXY_E2E_NGINX=1 node test/e2e/proxy-entry/run.mjs` | 真实 OpenResty 容器 + 内部入口替身，验证 CONNECT 搬运、请求头白名单、非 200 响应原样透传、绝对形式改写、客户端断开后隧道回收、日志不含凭据 |
 
@@ -63,7 +64,8 @@ cd web && npm run build && cd ..
 ```bash
 go build ./... && go test ./... -count=1        # 无需前端产物，走 stub 半
 cd web-tray && npm test -- --run && npm run build
-CGO_ENABLED=1 go vet -tags tray ./...           # 需要前端产物与 macOS 工具链
+# 需要 macOS 工具链与托盘前端产物；./... 会连带要求管理后台产物，故点名包
+CGO_ENABLED=1 go vet -tags tray ./cmd/tunnelmesh-client-tray ./internal/tray/...
 ```
 
 无标签时 `webdist.FS()` 必须返回 `nil` 而不是一个空 `fs.FS`：`internal/tray/api.go` 正是用这个
@@ -87,7 +89,66 @@ WKWebView 收不到任何 ⌘ 编辑快捷键）、必须用 `NSEventMaskKeyDown
 清单见 [macOS 托盘客户端打包](../deployment/macos-client-tray.md#验证)。
 
 图标不是手工资产：`scripts/generate-tray-icon.sh` 从 `scripts/trayicon` 的几何重新生成
-`deploy/macos/TunnelMeshClient.icns`，改图标即改代码，产物可复现。
+`deploy/macos/TunnelMeshClient.icns` 与 `deploy/windows/*.ico`，改图标即改代码，产物可复现。
+
+## Windows 托盘的构建隔离
+
+Windows 的原生壳是**纯 Go**，因此它的隔离方式与 macOS 不同，但目的相同：默认构建绝不能需要
+一个 Windows 主机。`scripts/tray_build_tag_test.go` 为此额外断言三件事：
+
+- `internal/tray/native/*_windows.go` 必须带 `tray` 构建标签，且**不得** `import "C"`；
+- 两端 `native` 的导出符号集必须逐个相等（`shellAPISurface`），否则共享的 `main.go` 就得按平台
+  分叉，而分叉的入口是标签隔离最先失守的地方；
+- 树里不得出现 `.syso`（`go-winres` 的产物一旦被提交，就会被之后的每次 `go build` 静默链接）。
+
+因此这四条必须同时绿，缺一条就等于把 Windows 托盘从 CI 里摘掉：
+
+```bash
+for arch in amd64 arm64; do
+  CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -tags tray ./cmd/tunnelmesh-client-tray ./internal/tray/...
+done
+GOOS=windows go vet -tags tray ./cmd/tunnelmesh-client-tray ./internal/tray/...
+GOOS=windows go vet -tags tray ./internal/client    # 顺带编译 windows 侧的锁测试
+go test ./scripts ./deploy/windows ./internal/tray ./internal/client -count=1
+```
+
+包清单只列带 `tray` 标签的目录加 client 锁：用 `./...` 会把 `internal/server` 拖进来，它的
+`//go:embed all:web_dist` 在未构建管理后台的树里直接编译失败，`.github/workflows/ci.yml` 的
+`windows-tray` 作业因此构建 `web-tray` 而不构建 `web`。
+
+`deploy/windows/tray_bundle_test.go` 把 Windows 侧的“资产即契约”守成可执行断言：解析两个
+`.ico` 的目录（尺寸齐全、全 BMP 条目、32 bpp）、`deploy` 与 `embed` 两份
+`TunnelMeshTray.ico` 逐字节一致、`winres.json` 的 类型→名称→语言 ID→资源 三层结构与兄弟文件
+引用、`installer.nsi` 的每用户属性（`RequestExecutionLevel user`、`$LOCALAPPDATA`、卸载必须删
+`HKCU` 启动值）、打包脚本的关键参数与失败分支、`PANEL_ROUTE` 与前端 `panelRoute.ts` 对齐、
+以及 `scripts/build-release.sh` 里不得出现 `-tags tray`。
+
+`internal/client` 的 Windows 文件锁测试（`runtime_lock_windows_test.go`）带 `//go:build windows`，
+只能在 Windows 上执行；Linux/macOS 侧由 `runtime_lock_test.go` 覆盖同一组语义（第二个持有者取锁
+失败、释放后可重取）。这是本次交付中唯一无法在本机自动执行的测试，其余 Windows 逻辑
+（`platformName`、`fraction` 钳位、锁文件路径派生、清单字段）都是平台无关的普通单测。
+
+Windows GUI 行为同样无法在 `go test` 里执行，兜底方式与 macOS 一致：交叉编译 + 结构断言 +
+真机冒烟清单，见 [Windows 托盘客户端打包](../deployment/windows-client-tray.md#真机冒烟清单)。
+
+## 托盘前端等条件，不等微任务数
+
+`web-tray` 的组件测试原先靠 `flush(6)` 这类**手调的微任务圈数**等接口回来再断言 DOM。圈数不够
+就渲染出“取数之前”的状态：快捷小窗要等**串行两跳**（先 `settings` 应用语言/主题，再 `stats`），
+一跳花掉几拍取决于运行时 `fetch` 的实现，本机 Node 24 够用、GitHub runner 的 Node 22 不够，
+于是 macOS 与 Linux 两个作业同时红在 4 个用例上（状态停在 `已停止`、服务行进停在 `未配置`），
+本地全绿。
+
+规则因此是：**断言渲染结果的等待必须看条件**，即 `src/tests/helpers.ts` 的
+`flushUntil(() => ...)`（微任务自旋到谓词成立，默认放宽到 4000 轮——一次_yield_ 是纳秒级，
+而被等的链长不由本仓库决定；只用微任务是因为有 3 个作业跑在 fake timers 下，宏任务等待永远不会
+返回）。`flush(n)` 仍用于“点一下按钮再看调用记录”的场合，它的实现已经改成每单元排空一轮，
+不再假设一跳等于一拍。
+
+`src/tests/panel-timing.spec.ts` 把这条不变量钉住：它给每个响应人为加上 500 拍，如果谁再把
+小窗的等待退回固定圈数，这个用例就先红。同一次反馈还补了 CI 缺口——`ci.yml` 的 `windows-tray`
+作业此前只构建不测试，托盘前端只在 Release 作业里第一次被跑到，故现在该作业必须跑
+`cd web-tray && npm test -- --run`。
 
 ## MySQL 与 etcd 相关验证
 
@@ -183,25 +244,28 @@ Windows 上实际执行一次安装与卸载，并确认渲染出的 `*-service.
 
 ## 发行链路校验
 
-发行链路跨两种 runner：`scripts/build-release.sh` 在 Linux 上用 `CGO_ENABLED=0` 交叉编译三个
-二进制，`scripts/package-macos-tray.sh` 在 macOS 上打包托盘 `.dmg`，`scripts/merge-tray-dist.sh`
-把后者并进前者的输出目录。这条链路上的错误全是静默的——少一个 macOS 资产、`SHA256SUMS` 不再
-覆盖全部资产、两个作业各自解析出不同版本号——因此有普通 Go 测试守卫，包含在
-`go test ./... -count=1` 里：
+发行链路跨三种构建：`scripts/build-release.sh` 在 Linux 上用 `CGO_ENABLED=0` 交叉编译三个
+二进制，`scripts/package-macos-tray.sh` 在 macOS 上打包托盘 `.dmg`，
+`scripts/package-windows-tray.sh` 在任意装了 `makensis` 的主机上打包 Windows 托盘的绿色 `.zip`
+与 `setup.exe`，`scripts/merge-tray-dist.sh` 把后两者并进前者的输出目录。这条链路上的错误全是
+静默的——少某个平台的资产、`SHA256SUMS` 不再覆盖全部资产、几个作业各自解析出不同版本号——因此
+有普通 Go 测试守卫，包含在 `go test ./... -count=1` 里：
 
 | 测试 | 守护的不变量 |
 | --- | --- |
-| `scripts/release_workflow_test.go` | 解析 `.github/workflows/release.yml`：版本号只在 `version` 作业解析一次并被两个构建作业共用；只有 macOS 作业调用打包脚本并校验、汇总 `installerLayout`、上传产物；Linux 的 `release` 作业必须下载该 artifact 并以 `TRAY_DIST_DIR` 交给 `build-release.sh`，且不得自己打包托盘 |
-| `scripts/merge_tray_dist_test.go` | **执行** `scripts/merge-tray-dist.sh`：合并后一条 `sha256sum -c` 覆盖全部资产；托盘清单发布为 `manifest-tray.json` 而不覆盖 `manifest.json`；来源缺 `SHA256SUMS`/`manifest.json`/`.dmg`、映像与校验和不符、或目标已有同名资产时失败且不留半成品；`--check` 只校验不写 |
-| `scripts/tray_build_tag_test.go` | 任何含 cgo、import `internal/tray/native`、`//go:embed` 托盘产物的文件都必须带 `tray` 标签，默认构建不触达 WebKit |
+| `scripts/release_workflow_test.go` | 解析 `.github/workflows/release.yml`：版本号只在 `version` 作业解析一次并被三个构建作业共用；托盘只由 `macos-tray`（macOS runner）与 `windows-tray`（Linux runner + `nsis`）产出，各自校验产物、汇总 `installerLayout`、上传 artifact；Linux 的 `release` 作业必须下载**两个** artifact，以 `TRAY_DIST_DIR` 与 `WINDOWS_TRAY_DIST_DIR` 交给 `build-release.sh`，并断言资产清点（2 个 `.dmg`、1 个 `.exe`、8 个 `tar.gz|zip`）与三份 manifest，且不得自己打包托盘 |
+| `scripts/ci_workflow_test.go` | 解析 `.github/workflows/ci.yml`：必须有 `-tags tray` 的 `go build`/`go vet`（amd64 + arm64）、托盘前端 `npm ci` + `npm test -- --run` + `npm run build`、`gofmt` 检查、托盘守卫测试与 `makensis` 冒烟编译；包清单必须限定在带 `tray` 标签的目录（断言里同时禁止 `./...`，否则该作业会去要求一份它根本不用的管理后台产物），且该作业不得发布 |
+| `scripts/merge_tray_dist_test.go` | **执行** `scripts/merge-tray-dist.sh`：合并后一条 `sha256sum -c` 覆盖全部资产；清单按 `--manifest-name` 发布为 `manifest-tray.json` / `manifest-windows-tray.json` 而不覆盖 `manifest.json`，也不互相覆盖；形状无关（`.dmg` 与 `.zip`+`.exe` 同样通过）；来源缺 `SHA256SUMS`/`manifest.json` 或除这两个文件外什么都没有、资产与校验和不符、目标已有同名资产时失败且不留半成品；`.build/`、`*.log` 之类不会被误发布；`--check` 只校验不写 |
+| `scripts/tray_build_tag_test.go` | 任何含 cgo、import `internal/tray/native`、`//go:embed` 托盘产物的文件都必须带 `tray` 标签，默认构建不触达 WebKit；Windows 侧额外要求纯 Go、两端符号集相等、不提交 `.syso` |
 
 `merge_tray_dist_test.go` 用 fixture 真跑脚本，而不是像其他 shell 守卫那样做字符串匹配：“合并后
 校验和文件仍然可用”这件事证明不了就只能靠人。它只依赖 `bash` 与 `sha256sum`/`shasum` 之一，
 因此 Linux CI 与 macOS 本机都能跑。
 
-打包脚本本身需要真实的 `codesign`、`plutil`、`ditto`、`hdiutil` 与 Go cgo 工具链，不进
-`go test`；产物行为按 [.github/workflows/release-test.md](../../.github/workflows/release-test.md)
-在目标平台手工走一遍。
+两个打包脚本本身需要真实的主机能力（macOS 侧的 `codesign`/`plutil`/`ditto`/`hdiutil` 与 cgo
+工具链、Windows 侧的 `makensis`），不进 `go test`；产物行为按
+[.github/workflows/release-test.md](../../.github/workflows/release-test.md) 与
+[Windows 托盘客户端打包](../deployment/windows-client-tray.md#真机冒烟清单) 在目标平台手工走一遍。
 
 ## 文档索引校验
 

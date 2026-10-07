@@ -56,6 +56,70 @@ jobs:
           docker compose -f docker-compose.cluster.yml --profile mysql56 config
           | grep -Eq '^  mysql56:'
 
+  # The Windows tray shell is guarded by a build tag and compiled by no other job: the default
+  # build never enables the tag, and the release workflow only packages it on a tag. Without
+  # this job the whole native shell could stop compiling and the pull request would be green.
+  windows-tray:
+    runs-on: ubuntu-latest
+    env:
+      # The tray is pure Go over WebView2, so cgo has to stay off: enabling it here would
+      # silently turn a cross-compilation check into a host-compiler check.
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-tray/package-lock.json
+      # `-tags tray` activates internal/tray/webdist/embed.go, whose pattern matches nothing
+      # in a fresh checkout: without the bundle every Go step below fails on the embed instead
+      # of on the code it exists to check. The admin bundle is deliberately not built here -
+      # the package list below is why this job must not reach internal/server.
+      - run: cd web-tray && npm ci
+      # The tray front end is tested by no other job: the release jobs only meet it when a tag
+      # is already being published, which is how a panel spec that counted microtasks reached
+      # a runner with a different fetch chain and turned red there instead of here.
+      - run: cd web-tray && npm test -- --run
+      - run: cd web-tray && npm run build
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nsis
+      - name: Check formatting of the tray packages
+        # The tray code is excluded from the default build, so a formatting error in it would
+        # otherwise be noticed by nothing.
+        run: test -z "$(gofmt -l internal/tray internal/client cmd/tunnelmesh-client-tray scripts/trayicon | tee /dev/stderr)"
+      - name: Build and vet the tray shell for both windows architectures
+        # The package list is exactly the directories carrying a `tray` build constraint.
+        # `./...` is not usable: it also reaches internal/server, whose `//go:embed
+        # all:web_dist` needs the admin bundle. The client lock is vetted separately because
+        # go reads test files, and that is the only way its windows-only test gets compiled
+        # without a Windows host.
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            GOOS=windows GOARCH="$arch" go build -tags tray ./cmd/tunnelmesh-client-tray ./internal/tray/...
+            GOOS=windows GOARCH="$arch" go vet -tags tray ./cmd/tunnelmesh-client-tray ./internal/tray/...
+            GOOS=windows GOARCH="$arch" go vet -tags tray ./internal/client
+          done
+      - name: Run the tray guard and logic tests
+        # These packages hold the assertions that keep the build tag honest and the windows
+        # bundle (icons, winres, installer, panel route) in sync with the Go side.
+        run: go test ./scripts ./internal/tray ./internal/client ./deploy/windows ./deploy/macos -count=1
+      - name: Compile the NSIS installer against a stub executable
+        # A syntax error or a missing include in installer.nsi would otherwise fail the release
+        # job minutes before anything is published. The stub is not a tunnel client; it only
+        # has to be a file for the installer's File command to embed.
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          printf 'MZ' > "${stage}/TunnelMeshClient.exe"
+          makensis -DVERSION=0.0.0-ci -DARCH=amd64 -DBUILD_DIR="${stage}" \
+            -DICON_FILE="${GITHUB_WORKSPACE}/deploy/windows/TunnelMeshClient.ico" \
+            -DOUTFILE="${stage}/setup.exe" "${GITHUB_WORKSPACE}/deploy/windows/installer.nsi"
+          test -s "${stage}/setup.exe"
   mysql56:
     # MySQL 5.6 is the lowest server version the project supports; a production
     # fleet still runs 5.6.51. The MySQL-backed contract tests are gated behind

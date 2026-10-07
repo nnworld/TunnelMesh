@@ -14,7 +14,12 @@
 | `macos/TunnelMeshClient-Info.plist` | macOS 托盘客户端 app bundle 的 Info.plist 模板，由打包脚本渲染；**不是** launchd 服务定义 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md) |
 | `macos/tray-dmg-layout.applescript` | 托盘磁盘映像的安装器布局：驱动 Finder 把挂载窗口摆成图标视图、app 与 `Applications` 别名各就各位。窗口尺寸与图标坐标只在这里定义 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md#产物布局) |
 | `macos/TunnelMeshClient.icns` | 托盘 app 与安装器卷的图标，由 `scripts/generate-tray-icon.sh` 从 `scripts/trayicon` 的几何生成；不要手工编辑，改图标改代码 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md#应用图标) |
+| `macos/TunnelMeshMenuBar.png`、`@2x`、`@3x` | 菜单栏状态项的单色图标（与 `.icns` 同一枚标记、同一组几何，由同一个生成器产出）。状态项按 template 渲染，只取 alpha 通道由系统着色 | [macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md#应用图标) |
 | `windows/tunnelmesh-service.xml` | WinSW 服务模板，三角色共用，占位符渲染 | [Windows Service 安装](../docs/deployment/windows-service.md) |
+| `windows/TunnelMeshClient.ico` | Windows exe / 任务栏 / 安装包的品牌图标（16–256px，全 BMP 条目），`winres.json` 以**兄弟文件**名引用它，由 `scripts/generate-tray-icon.sh` 生成 | [Windows 托盘客户端打包](../docs/deployment/windows-client-tray.md#图标与-exe-资源) |
+| `windows/TunnelMeshTray.ico` | 通知区域图标（16/24/32px）。同一份字节被复制进 `internal/tray/native/icons/` 供 `go:embed` 使用，两边必须逐字节一致 | 同上 |
+| `windows/winres.json` | Windows 资源声明：图标、版本信息与应用清单（DPI 感知、asInvoker）。层级是 类型 → 名称 → **语言 ID** → 资源，Windows 没有 Info.plist 这样的旁路元数据 | 同上 |
+| `windows/installer.nsi` | NSIS 每用户安装包定义：`$LOCALAPPDATA`、开始菜单、`HKCU` 卸载登记与启动项清理，全程不提示 UAC | 同上 |
 | `install/linux-install.sh`、`macos-install.sh`、`windows-install.ps1`、`windows-uninstall.ps1` | 安装与卸载脚本 | 同上三篇 |
 | `install/oneclick/install-{server,agent,client}.sh`、`install-{server,agent,client}.ps1` | 三平台 × 三角色的一键安装入口，只声明参数与角色问答 | [一键安装脚本](../docs/deployment/oneclick-install.md) |
 | `install/oneclick/tunnelmesh-install-common.sh`、`tunnelmesh-install-common.ps1` | 一键安装的共享实现：下载校验、交互、渲染、服务生命周期、升级与卸载 | 同上 |
@@ -134,13 +139,20 @@ CA 私钥刻意放在 `relay/` 之外：Compose 只挂载 CA 证书和该节点�
 自行构建的产物，`certs/` 是本地生成物且包含私钥。调整目录名或文件名前必须
 先更新 `scripts/build-release.sh` 和上述发布文档。
 
-Release 目录里除六个平台归档外，还有两个 macOS 托盘磁盘映像
-（`tunnelmesh-client-tray-<VERSION>-darwin-<arch>.dmg`，内含 `TunnelMesh Client.app`）。它们由
-`scripts/package-macos-tray.sh` 在 macOS runner 上产出、`scripts/merge-tray-dist.sh` 合并进同一
-目录，因此与归档共用一份 `SHA256SUMS`；托盘清单发布为 `manifest-tray.json`，跨平台
+Release 目录里除六个平台归档外，还有两批托盘产物：两个 macOS 磁盘映像
+（`tunnelmesh-client-tray-<VERSION>-darwin-<arch>.dmg`，内含 `TunnelMesh Client.app`）与
+Windows 的绿色归档加每用户安装包
+（`TunnelMeshClient-<VERSION>-windows-<arch>.zip`、
+`TunnelMeshClient-<VERSION>-windows-amd64-setup.exe`）。它们分别由
+`scripts/package-macos-tray.sh`（macOS runner）与 `scripts/package-windows-tray.sh`
+（任意装有 `makensis` 的 runner，交叉编译无需 Windows 主机）产出，再由
+`scripts/merge-tray-dist.sh` 合并进同一目录，因此与归档共用一份 `SHA256SUMS`；
+托盘清单分别发布为 `manifest-tray.json` 与 `manifest-windows-tray.json`，跨平台
 `manifest.json` 的 schema 不变。`macos/TunnelMeshClient-Info.plist` 有双重身份：既随 darwin 归档
-分发给需要自行打包的运维，也是打包脚本渲染 app bundle 的模板。详见
-[macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md)。
+分发给需要自行打包的运维，也是打包脚本渲染 app bundle 的模板；`windows/winres.json` 同理，
+它声明的图标与版本信息由 `scripts/package-windows-tray.sh` 在构建期编进 exe。详见
+[macOS 托盘客户端打包](../docs/deployment/macos-client-tray.md) 与
+[Windows 托盘客户端打包](../docs/deployment/windows-client-tray.md)。
 
 ## 校验
 

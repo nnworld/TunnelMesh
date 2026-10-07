@@ -1,12 +1,17 @@
-//go:build tray && darwin
+//go:build tray && (darwin || windows)
 
-// Command tunnelmesh-client-tray is the macOS menu-bar client.
+// Command tunnelmesh-client-tray is the desktop tray client: the macOS menu-bar item and
+// the Windows notification-area icon.
 //
 // It hosts the same tunnels as `tunnelmesh-client run` in this process, shares the same
-// ~/.config/tunnelmesh/client.yaml, and is mutually exclusive with it through the
-// advisory lock the runtime derives from that path. Everything the operator can change
-// lives in a WKWebView served from a loopback port by the Go process; the native shell
-// only owns the status item, the window and the login item.
+// ~/.config/tunnelmesh/client.yaml, and is mutually exclusive with it through the advisory
+// lock the runtime derives from that path. Everything the operator can change lives in a
+// web view served from a loopback port by the Go process — WKWebView on macOS, WebView2 on
+// Windows — and the native shell owns only the tray item, the window and the login entry.
+//
+// That split is why one main.go serves both shells: every function in internal/tray/native
+// has a macOS and a Windows implementation behind the same name, so nothing here has to ask
+// which platform it is on.
 package main
 
 import (
@@ -17,11 +22,9 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/build"
@@ -35,6 +38,16 @@ import (
 // and expects the process to go away promptly; the tunnels close immediately, so this only
 // has to cover the HTTP server and the lock release.
 const shutdownTimeout = 5 * time.Second
+
+// shutdownWatchdog bounds how long a signal handler waits for the Cocoa run loop to return
+// after it has been asked to stop.
+//
+// It normally returns within a frame. It cannot return at all if the main thread is parked
+// in an AppKit tracking loop, and a logout then hangs until the process is killed hard -
+// with the runtime lock and the tunnels still held, which is the opposite of what the
+// signal handler exists to do. By the time this fires the client is already stopped and the
+// API is shut down, so leaving is a clean, logged exit rather than an interruption.
+const shutdownWatchdog = 3 * time.Second
 
 // init pins the main goroutine to the process's main thread.
 //
@@ -108,6 +121,11 @@ func run(configDir string, logger *log.Logger) error {
 			// The shell asks Go what a window close means, but pushing the value too keeps
 			// the native side from calling back for something it already knows.
 			native.SetMinimizeToTray(prefs.MinimizeToTray)
+			// The quick panel is pushed for the same reason, and it is the click handler
+			// that reads the pushed value: dispatching back into Go from inside an AppKit
+			// mouse event would put a second owner on the main thread's queue for something
+			// this callback already carries.
+			native.SetQuickPanel(prefs.QuickPanel)
 		},
 	})
 	if err != nil {
@@ -141,6 +159,7 @@ func run(configDir string, logger *log.Logger) error {
 		return err
 	}
 	native.SetMinimizeToTray(prefs.MinimizeToTray)
+	native.SetQuickPanel(prefs.QuickPanel)
 	if err := app.SyncAutostart(); err != nil {
 		// Not fatal: an unsigned or moved bundle is refused by SMAppService, and refusing
 		// to run the tunnels over a login item would be the wrong trade.
@@ -151,17 +170,31 @@ func run(configDir string, logger *log.Logger) error {
 		logStartFailure(logger, err)
 	}
 
-	native.SetHandlers(shellHandlers(app, logger))
-	installShutdownSignals(logger, app, api)
+	// One quit path for the menu, the window close, ⌘Q and the quick panel: it stops the
+	// hosted client, releases the runtime lock and then ends the run loop.
+	quit := quitHandler(app, logger)
+	shellDone := make(chan struct{})
+	native.SetHandlers(shellHandlers(app, logger, quit))
+	// The panel's buttons call /api/actions/show-window and /api/actions/quit, which only
+	// work once the shell hands these over. Without them the panel answers 501.
+	api.SetWindowHandlers(native.ShowWindow, quit)
+	installShutdownSignals(logger, app, api, shellDone)
 
 	shell := native.DefaultConfig(api.URL())
+	// The embedded browser keeps its own profile beside the tray preferences rather than in
+	// the machine-wide browser profile, so a settings window cannot collect a page history it
+	// never asked for. macOS shares the system data store and ignores it.
+	shell.WebViewDataDir = filepath.Join(app.Paths().PrefsDir, "webview2")
 	applyMenuLabels(&shell, prefs.Language)
 	shell.MinimizeToTray = prefs.MinimizeToTray
-	logger.Printf("starting the menu bar shell")
+	shell.PanelURL = api.PanelURL()
+	shell.QuickPanel = prefs.QuickPanel
+	logger.Printf("starting the %s tray shell", runtime.GOOS)
 	if err := native.Run(shell); err != nil {
 		return err
 	}
-	logger.Printf("menu bar shell stopped")
+	close(shellDone)
+	logger.Printf("tray shell stopped")
 	return nil
 }
 
@@ -170,7 +203,7 @@ func run(configDir string, logger *log.Logger) error {
 // MinimizeToTray is a callback rather than a value captured at start-up: the operator can
 // change it in the general tab while the window is open, and the very next close has to
 // honour the new choice.
-func shellHandlers(app *tray.App, logger *log.Logger) native.Handlers {
+func shellHandlers(app *tray.App, logger *log.Logger, quit func()) native.Handlers {
 	return native.Handlers{
 		OpenMain: func() { logger.Printf("settings window opened from the menu") },
 		OpenWebsite: func() error {
@@ -180,14 +213,7 @@ func shellHandlers(app *tray.App, logger *log.Logger) native.Handlers {
 			}
 			return nil
 		},
-		Quit: func() {
-			logger.Printf("quit requested")
-			app.RequestQuit()
-			if err := app.StopRuntime(); err != nil {
-				logger.Printf("stopping the client on quit failed: %v", err)
-			}
-			native.Stop()
-		},
+		Quit: quit,
 		MinimizeToTray: func() bool {
 			prefs, err := app.Preferences()
 			if err != nil {
@@ -207,6 +233,18 @@ func shellHandlers(app *tray.App, logger *log.Logger) native.Handlers {
 }
 
 // logStartFailure explains why the client did not come up without dumping a stack.
+func quitHandler(app *tray.App, logger *log.Logger) func() {
+	return func() {
+		logger.Printf("quit requested")
+		app.RequestQuit()
+		if err := app.StopRuntime(); err != nil {
+			logger.Printf("stopping the client on quit failed: %v", err)
+		}
+		native.Stop()
+	}
+}
+
+// logStartFailure explains why the client did not come up without dumping a stack.
 func logStartFailure(logger *log.Logger, err error) {
 	switch {
 	case errors.Is(err, client.ErrRuntimeAlreadyRunning):
@@ -218,28 +256,20 @@ func logStartFailure(logger *log.Logger, err error) {
 	}
 }
 
-// installShutdownSignals turns a logout or an explicit kill into a clean teardown.
-func installShutdownSignals(logger *log.Logger, app *tray.App, api *tray.APIServer) {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		received := <-signals
-		logger.Printf("received %s, shutting down", received)
-		if err := app.StopRuntime(); err != nil {
-			logger.Printf("stopping the client failed: %v", err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = api.Shutdown(ctx)
-		// Ends the Cocoa run loop so Run returns and main can exit.
-		native.Stop()
-	}()
-}
-
-// systemProbe reports the host for the about tab.
+// systemProbe reports the host and the renderer for the about tab.
+//
+// The web view is named because it is the part an operator has to reason about when a
+// display scale or a missing runtime changes what the window can do, and it is the part the
+// tray cannot upgrade from its own settings.
 func systemProbe() tray.SystemInfo {
 	info := native.System()
-	return tray.SystemInfo{GOOS: runtime.GOOS, Arch: info.Arch, OSVersion: info.OSVersion}
+	return tray.SystemInfo{
+		GOOS:           runtime.GOOS,
+		Arch:           info.Arch,
+		OSVersion:      info.OSVersion,
+		Renderer:       native.RendererName(),
+		RendererDetail: native.RendererDetail(),
+	}
 }
 
 // applyMenuLabels localizes the status-item menu.

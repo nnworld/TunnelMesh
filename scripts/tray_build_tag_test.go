@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"go/ast"
 	"go/build/constraint"
 	"go/parser"
 	"go/token"
@@ -291,4 +292,170 @@ func TestTrayCommandKeepsAnUnsupportedPlatformFallback(t *testing.T) {
 	if fallbacks == 0 {
 		t.Errorf("%s has no file that builds without the tray tag; non-macOS builds would fail instead of reporting that the tray is macOS only", dir)
 	}
+}
+
+// shellAPISurface is every symbol of the native shell that cmd/tunnelmesh-client-tray
+// calls. They are listed rather than discovered because the point of the list is that the
+// command stays one file: a function the two shells disagree about forces a second main.go
+// behind a build tag, which is how a shared code path silently becomes two.
+var shellAPISurface = []string{
+	"Run", "Stop", "ShowWindow", "HideWindow", "SetMinimizeToTray", "SetQuickPanel",
+	"SetHandlers", "DefaultConfig", "OpenURL", "System", "PreferredLanguage",
+	"RendererName", "RendererDetail", "NewAutostart",
+}
+
+// shellAPITypes are the types that same command passes across the boundary.
+var shellAPITypes = []string{"Config", "Handlers", "SystemInfo", "Autostart"}
+
+// buildConstraintsFor returns the Go files of the native package that a build with the
+// "tray" tag on one operating system would compile, together with their top-level
+// declarations.
+func buildConstraintsFor(t *testing.T, goos string) map[string]bool {
+	t.Helper()
+	declared := map[string]bool{}
+	entries, err := os.ReadDir("../internal/tray/native")
+	if err != nil {
+		t.Fatalf("read internal/tray/native: %v", err)
+	}
+	found := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		if !trayBuildIncludes(t, filepath.Join("../internal/tray/native", name), goos) {
+			continue
+		}
+		found++
+		for _, symbol := range topLevelSymbols(t, filepath.Join("../internal/tray/native", name)) {
+			declared[symbol] = true
+		}
+	}
+	if found == 0 {
+		t.Fatalf("no native shell file builds for %s, so the guard proves nothing", goos)
+	}
+	return declared
+}
+
+// trayBuildIncludes reports whether a file compiles when the tray is built for one OS.
+//
+// "unix" is answered from the two platforms this module supports rather than from a table:
+// the darwin files need it, and a future plan9 shell would show up as a missing symbol in
+// the surface test instead of quietly disappearing from here.
+func trayBuildIncludes(t *testing.T, path, goos string) bool {
+	t.Helper()
+	line := buildConstraintOf(t, path)
+	if line == "" {
+		return true
+	}
+	expr, err := constraint.Parse(line)
+	if err != nil {
+		t.Fatalf("%s has an unparsable build constraint %q: %v", path, line, err)
+	}
+	return expr.Eval(func(tag string) bool {
+		switch tag {
+		case "tray":
+			return true
+		case "darwin", "windows", "linux":
+			return tag == goos
+		case "unix":
+			return goos == "darwin" || goos == "linux"
+		default:
+			return false
+		}
+	})
+}
+
+// topLevelSymbols lists the exported functions and types declared by one file.
+func topLevelSymbols(t *testing.T, path string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.DeclarationErrors)
+	if err != nil {
+		t.Fatalf("%s does not parse: %v", path, err)
+	}
+	var symbols []string
+	for _, declaration := range file.Decls {
+		switch typed := declaration.(type) {
+		case *ast.FuncDecl:
+			if typed.Recv != nil || !typed.Name.IsExported() {
+				continue
+			}
+			symbols = append(symbols, typed.Name.Name)
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				switch value := spec.(type) {
+				case *ast.TypeSpec:
+					if value.Name.IsExported() {
+						symbols = append(symbols, value.Name.Name)
+					}
+				}
+			}
+		}
+	}
+	return symbols
+}
+
+// TestBothShellsExportTheSameSurface keeps the two tray implementations interchangeable.
+//
+// The macOS shell was written first, and a Windows shell that renamed or dropped one entry
+// point would push a build-tag fork into cmd/tunnelmesh-client-tray. That fork is the
+// expensive outcome: two entry points drift, and the platform nobody tests locally is the
+// one that ships broken.
+func TestBothShellsExportTheSameSurface(t *testing.T) {
+	darwin, windows := buildConstraintsFor(t, "darwin"), buildConstraintsFor(t, "windows")
+	for _, symbol := range append(append([]string{}, shellAPISurface...), shellAPITypes...) {
+		for platform, declared := range map[string]map[string]bool{"macOS": darwin, "Windows": windows} {
+			if !declared[symbol] {
+				t.Errorf("the %s tray shell does not declare %s; cmd/tunnelmesh-client-tray calls it on both platforms", platform, symbol)
+			}
+		}
+	}
+}
+
+// TestWindowsShellStaysPureGo protects the cross-compilation the release matrix depends on.
+//
+// A cgo file in this package would not break a macOS build, so no compile on the machines
+// that run the tests would notice. It would break the Windows tray entirely: the packaging
+// job builds GOOS=windows with CGO_ENABLED=0 from a Linux runner, and a Windows shell that
+// needed a C toolchain could not be produced there at all.
+func TestWindowsShellStaysPureGo(t *testing.T) {
+	fset := token.NewFileSet()
+	checked := 0
+	entries, err := os.ReadDir("../internal/tray/native")
+	if err != nil {
+		t.Fatalf("read internal/tray/native: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || !strings.HasSuffix(name, "_windows.go") {
+			continue
+		}
+		path := filepath.Join("../internal/tray/native", name)
+		checked++
+		if builtWithoutTrayTag(t, path) {
+			t.Errorf("%s builds without the tray tag, so a plain ./... would need WebView2; constraint is %q",
+				path, buildConstraintOf(t, path))
+		}
+		if cgo, _ := importsC(t, fset, path); cgo {
+			t.Errorf("%s uses cgo; the Windows tray must cross-compile with CGO_ENABLED=0", path)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("internal/tray/native has no Windows shell files, so the guard proves nothing")
+	}
+}
+
+// TestNoCompiledWindowsResourcesAreCommitted keeps generated .syso files out of the module.
+//
+// go-winres writes the version resource and the exe icon beside the command before the
+// Windows build, and a committed artifact would be a binary nobody can re-create: the whole
+// point of generating it is that it comes out of deploy/windows/winres.json and the version
+// the release job passes in.
+func TestNoCompiledWindowsResourcesAreCommitted(t *testing.T) {
+	walkModule(t, func(path string, entry fs.DirEntry) {
+		if strings.HasSuffix(entry.Name(), ".syso") {
+			t.Errorf("%s is a generated Windows resource; build it with scripts/package-windows-tray.sh instead of committing it", path)
+		}
+	})
 }

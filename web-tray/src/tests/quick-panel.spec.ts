@@ -4,7 +4,7 @@ import { isPanelRoute, PANEL_ROUTE } from '../panelRoute'
 import { useSettingsStore } from '../stores/settings'
 import { useStatsStore } from '../stores/stats'
 import { STATS_POLL_MS } from '../stores/stats'
-import { fixtures, flush, installFakeTray, mountView } from './helpers'
+import { fixtures, flushUntil, installFakeTray, mountView } from './helpers'
 
 function mountPanel(routes: Parameters<typeof installFakeTray>[0] = {}, locale: 'zh-CN' | 'en-US' = 'zh-CN') {
   const tray = installFakeTray(
@@ -37,7 +37,7 @@ describe('quick panel', () => {
 
   it('renders the run summary and one row per tunnel', async () => {
     const { tray, wrapper } = mountPanel()
-    await flush(6)
+    await flushUntil(() => wrapper.findAll('[data-test="panel-tunnel"]').length === 2)
 
     expect(wrapper.find('[data-test="panel-status"]').text()).toContain('运行中')
     const text = wrapper.text()
@@ -58,7 +58,7 @@ describe('quick panel', () => {
     const { tray, wrapper } = mountPanel({
       'GET /api/settings': fixtures.settings({ language: 'zh-CN', theme: 'dark', quickPanel: true }),
     })
-    await flush(6)
+    await flushUntil(() => document.documentElement.classList.contains('dark'))
     expect(document.documentElement.classList.contains('dark')).toBe(true)
     expect(wrapper.find('[data-test="panel-open-main"]').text()).toBe('打开主界面')
     tray.restore()
@@ -67,19 +67,19 @@ describe('quick panel', () => {
 
   it('asks the tray to open the window, toggle the client and quit', async () => {
     const { tray, wrapper } = mountPanel({ 'POST /api/actions/stop': fixtures.stats({ running: false }) })
-    await flush(6)
+    await flushUntil(() => wrapper.find('[data-test="panel-status"]').text().includes('运行中'))
 
     await wrapper.find('[data-test="panel-open-main"]').trigger('click')
-    await flush(4)
+    await flushUntil(() => tray.calls.some((call) => call.method === 'POST' && call.path === '/api/actions/show-window'))
     expect(tray.calls.some((call) => call.method === 'POST' && call.path === '/api/actions/show-window')).toBe(true)
 
     // Running, so the single toggle button stops the hosted client.
     await wrapper.find('[data-test="panel-toggle"]').trigger('click')
-    await flush(6)
+    await flushUntil(() => tray.calls.some((call) => call.path === '/api/actions/stop'))
     expect(tray.calls.some((call) => call.path === '/api/actions/stop')).toBe(true)
 
     await wrapper.find('[data-test="panel-quit"]').trigger('click')
-    await flush(4)
+    await flushUntil(() => tray.calls.some((call) => call.method === 'POST' && call.path === '/api/actions/quit'))
     expect(tray.calls.some((call) => call.method === 'POST' && call.path === '/api/actions/quit')).toBe(true)
     tray.restore()
     wrapper.unmount()
@@ -87,7 +87,7 @@ describe('quick panel', () => {
 
   it('offers 启动 when the client is stopped', async () => {
     const { tray, wrapper } = mountPanel({ 'GET /api/stats': fixtures.stats({ running: false }) })
-    await flush(6)
+    await flushUntil(() => wrapper.find('[data-test="panel-toggle"]').text() === '启动客户端')
     expect(wrapper.find('[data-test="panel-toggle"]').text()).toBe('启动客户端')
     expect(wrapper.find('[data-test="panel-status"]').text()).toContain('已停止')
     tray.restore()
@@ -96,7 +96,7 @@ describe('quick panel', () => {
 
   it('reports a blocked lock instead of an empty panel', async () => {
     const { tray, wrapper } = mountPanel({ 'GET /api/stats': fixtures.stats({ running: false, lockBlocked: true }) })
-    await flush(6)
+    await flushUntil(() => wrapper.find('[data-test="panel-status"]').text().includes('另一个'))
     expect(wrapper.find('[data-test="panel-status"]').text()).toContain('另一个')
     tray.restore()
     wrapper.unmount()
@@ -129,7 +129,12 @@ describe('quick panel', () => {
   it('surfaces a tray that answers nothing', async () => {
     const tray = installFakeTray({}, { 'GET /api/stats': { status: 500, msg: 'tray exploded' } })
     const { wrapper } = mountView(QuickPanelApp)
-    await flush(8)
+    await flushUntil(() => {
+      // The error line only exists once the statistics call has come back broken,
+      // so the waiter has to look before it reads.
+      const notice = wrapper.find('[data-test="panel-error"]')
+      return notice.exists() && notice.text().includes('tray exploded')
+    })
     expect(wrapper.find('[data-test="panel-error"]').text()).toContain('tray exploded')
     tray.restore()
     wrapper.unmount()
@@ -151,7 +156,7 @@ describe('quick panel server line', () => {
         serverProbe: 'server health check: unexpected status 403',
       }),
     })
-    await flush(6)
+    await flushUntil(() => wrapper.find('[data-test="panel-server"]').text() === '已连接')
 
     expect(wrapper.find('[data-test="panel-server"]').text()).toBe('已连接')
     tray.restore()
@@ -162,7 +167,7 @@ describe('quick panel server line', () => {
     const { tray, wrapper } = mountPanel({
       'GET /api/stats': fixtures.stats({ connected: false, serverReachable: false, serverProbe: '' }),
     })
-    await flush(6)
+    await flushUntil(() => wrapper.find('[data-test="panel-server"]').text() === '不可达')
 
     expect(wrapper.find('[data-test="panel-server"]').text()).toBe('不可达')
     tray.restore()

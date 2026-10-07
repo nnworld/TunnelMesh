@@ -8,8 +8,8 @@
 
 | 目录 | 面向 | 内容 |
 | --- | --- | --- |
-| [`user-guide/`](user-guide/) | 使用者 | Client、macOS 托盘 Client、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、VPN 网关、SSH over WebSocket |
-| [`deployment/`](deployment/) | 部署者 | 一键安装、Docker、前端构建、Nginx、OpenResty 代理入口、VPN 网关、systemd/launchd/Windows Service、发行打包、macOS 托盘打包 |
+| [`user-guide/`](user-guide/) | 使用者 | Client、系统托盘 Client（macOS / Windows）、Agent、管理后台、单点登录与两步验证、托管路由、HTTP 代理入口、VPN 网关、SSH over WebSocket |
+| [`deployment/`](deployment/) | 部署者 | 一键安装、Docker、前端构建、Nginx、OpenResty 代理入口、VPN 网关、systemd/launchd/Windows Service、发行打包、macOS / Windows 托盘打包 |
 | [`operations/`](operations/) | 运维 | 配置、Schema 升级、relay mTLS、连接池、VPN 网关、可观测性、探针、日志、SLO、容量、排障 |
 | [`architecture/`](architecture/) | 架构 | 架构概览、集群架构、ADR |
 | [`protocol/`](protocol/) | 协议实现 | WebSocket frame、代理协议模块 |
@@ -31,7 +31,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 ## 使用者
 
 - [Client 使用帮助](user-guide/client.md)：TCP/UDP/HTTP 转发、SOCKS5、HTTP 代理、发布、`proxy tcp`、隧道管理
-- [macOS 系统托盘 Client](user-guide/client-tray.md)：菜单栏常驻客户端，图形化编辑 `client.yaml`、Agent 选择、配置检测、运行统计；与命令行 `run` 共用配置并互斥
+- [系统托盘 Client（macOS / Windows）](user-guide/client-tray.md)：菜单栏 / 通知区域常驻客户端，图形化编辑 `client.yaml`、Agent 选择、配置检测、运行统计、快捷小窗；与命令行 `run` 共用配置并互斥
 - [Agent 使用帮助](user-guide/agent.md)：注册、连接池运行、受控 metadata 上报、网络与 TLS 要求
 - [Server 管理后台](user-guide/server-admin.md)：Dashboard、账号与语言、Agent 列表与详情、Agent Policy、审计日志、角色与 Service Token
   - [单点登录与两步验证](user-guide/sso-and-mfa.md)：OIDC 提供商配置与 role mapping、TOTP 绑定与恢复码、受信任设备、认证策略、按 `data.error` 归类的排障表（英文版见 [SSO and MFA](en/user-guide/sso-and-mfa.md)）
@@ -54,6 +54,7 @@ Grafana Dashboard）不在 `docs/` 下，而在仓库根目录的 [`deploy/`](..
 - [VPN 网关部署](deployment/vpn-gateway.md)：`-tags vpn` 构建变体与体积实测、公网 UDP 放行、`listen` 与 `endpoint_host`、节点私钥注入、IP 池规划、验证与 5 分钟回滚
 - [跨平台可执行文件打包](deployment/binary-release.md)：构建矩阵、`SHA256SUMS`、`manifest.json`
 - [macOS 托盘客户端打包](deployment/macos-client-tray.md)：`-tags tray` 构建、`TunnelMesh Client.app` 组装、Info.plist 模板、ad-hoc 与 Developer ID 签名、登录项与卸载
+- [Windows 托盘客户端打包](deployment/windows-client-tray.md)：`CGO_ENABLED=0` 交叉编译 WebView2 原生壳、`go-winres` 资源戳记、NSIS 每用户安装包、SmartScreen 与真机冒烟清单
 - [一键安装脚本](deployment/oneclick-install.md)：三角色一条命令，交互/非交互、升级与卸载、镜像源与离线安装
 - [Linux systemd 安装](deployment/linux-systemd.md)、[macOS launchd 安装](deployment/macos-launchd.md)、[Windows Service 安装](deployment/windows-service.md)
 - [部署产物清单](../deploy/README.md)：`deploy/` 下每个文件的用途、模板占位符约定和发布归档布局
