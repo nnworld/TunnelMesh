@@ -25,6 +25,7 @@ type SOCKS5ForwardConfig struct {
 	ListenAddr       string
 	AgentID          string
 	ConnectTimeout   time.Duration
+	OpenTimeout      time.Duration
 	HandshakeTimeout time.Duration
 	AllowRemote      bool
 	AuthMode         SOCKS5AuthMode
@@ -252,8 +253,12 @@ func (f *SOCKS5Forward) negotiateAndAuthenticate(local net.Conn) bool {
 func (f *SOCKS5Forward) openStreamResult(request proxy.SOCKS5Request) (io.ReadWriteCloser, protocol.OpenResultPayload, error) {
 	ctx := context.Background()
 	var cancel context.CancelFunc
-	if f.cfg.ConnectTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, f.cfg.ConnectTimeout)
+	timeout := f.cfg.OpenTimeout
+	if timeout <= 0 {
+		timeout = f.cfg.ConnectTimeout
+	}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 	req := StreamRequest{

@@ -47,6 +47,19 @@ describe('local API client', () => {
     tray.restore()
   })
 
+  it('posts a pending token when agent discovery uses an unsaved token', async () => {
+    setSecret(TEST_SECRET)
+    const tray = installFakeTray({ 'POST /api/agents': fixtures.agents() })
+    await listAgents('wss://mesh.example.com/ws/client', 'new-token')
+    expect(tray.calls[0].path).toBe('/api/agents')
+    expect(tray.calls[0].method).toBe('POST')
+    expect(tray.calls[0].body).toMatchObject({
+      serverUrl: 'wss://mesh.example.com/ws/client',
+      token: 'new-token',
+    })
+    tray.restore()
+  })
+
   it('sends a JSON body for writes and undefined for an empty validation', async () => {
     setSecret(TEST_SECRET)
     const tray = installFakeTray({

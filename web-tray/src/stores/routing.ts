@@ -116,7 +116,8 @@ export const useRoutingStore = defineStore('routing', {
       this.agentsLoading = true
       this.agentsError = ''
       try {
-        this.agents = (await listAgents(this.serverUrl)) ?? []
+        const pendingToken = this.tokenTouched || this.clearToken ? this.tokenIntent() : undefined
+        this.agents = (await listAgents(this.serverUrl, pendingToken)) ?? []
         this.agentsFetched = true
       } catch (cause) {
         this.agentsError = describe(cause)

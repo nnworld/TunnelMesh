@@ -338,6 +338,36 @@ func TestPackageScriptBuildsEveryArtifactItPromises(t *testing.T) {
 	}
 }
 
+func TestWindowsWebViewsUseSeparateUserDataDirectories(t *testing.T) {
+	source := readOrFail(t, "../../internal/tray/native/tray_windows.go")
+	for _, want := range []string{
+		`newWebView(s.main, s.config.URL, filepath.Join(s.dataDir, "main"))`,
+		`newWebView(s.panel, s.config.PanelURL, filepath.Join(s.dataDir, "panel"))`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("tray_windows.go must isolate WebView2 data directories with %s", want)
+		}
+	}
+}
+
+func TestWindowsNativeUsesCorrectWin32LayoutsAndMessageParameters(t *testing.T) {
+	winapi := readOrFail(t, "../../internal/tray/native/winapi_windows.go")
+	if !strings.Contains(winapi, "dwInfoFlags") || !strings.Contains(winapi, "hBalloonIcon") {
+		t.Fatal("NOTIFYICONDATAW must use the official trailing fields")
+	}
+	if strings.Contains(winapi, "hIconOverlay") || strings.Contains(winapi, "dwReserved") {
+		t.Fatal("NOTIFYICONDATAW must not contain the old overlay/reserved layout")
+	}
+	native := readOrFail(t, "../../internal/tray/native/tray_windows.go")
+	if !strings.Contains(native, "func (s *winShell) resizeView(hwnd, wParam uintptr)") || !strings.Contains(native, "wParam == windows.SW_MINIMIZE") {
+		t.Fatal("WM_SIZE minimization must be read from wParam")
+	}
+	icon := readOrFail(t, "../../internal/tray/native/icon_windows.go")
+	if !strings.Contains(icon, "rowBytes := width * 4") {
+		t.Fatal("32-bit ICO color rows must use width*4 bytes")
+	}
+}
+
 // TestPackageScriptRefusesAnUnfinishedBuild covers the two silent failures: an installer that
 // makensis could not write, and an archive built from a bundle that is not the one the front
 // end just compiled.

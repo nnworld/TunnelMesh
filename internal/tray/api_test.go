@@ -159,6 +159,17 @@ func TestAPIRejectsForeignOrigins(t *testing.T) {
 	}
 }
 
+func TestAPIRejectsTrailingJSONValues(t *testing.T) {
+	api, _ := newTestAPI(t, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/agents", strings.NewReader(`{"serverUrl":"","token":null}{}`))
+	request.Header.Set("X-Tray-Secret", testSecret)
+	recorder := httptest.NewRecorder()
+	api.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for trailing JSON", recorder.Code)
+	}
+}
+
 func TestAPIServesTheUIWithoutTheSecret(t *testing.T) {
 	api, _ := newTestAPI(t, nil)
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -281,6 +292,28 @@ func TestAPIAgentsProxiesTheServer(t *testing.T) {
 	decode(t, parsed.Data, &agents)
 	if len(agents) != 1 || agents[0].ID != "agent-a" || !agents[0].Online {
 		t.Fatalf("agents = %+v", agents)
+	}
+}
+
+func TestAPIAgentsUsesPendingTokenBeforeSave(t *testing.T) {
+	const pending = "pending-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+pending {
+			t.Fatalf("Authorization = %q, want pending token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":200,"msg":"OK","data":{"items":[],"nextCursor":"","hasMore":false}}`)
+	}))
+	defer server.Close()
+	api, app := newTestAPI(t, nil)
+	writeClientConfig(t, app, loopbackTunnel(22))
+	update := struct {
+		ServerURL string  `json:"serverUrl"`
+		Token     *string `json:"token"`
+	}{ServerURL: strings.Replace(server.URL, "http://", "ws://", 1), Token: func() *string { value := pending; return &value }()}
+	recorder, _ := call(t, api, http.MethodPost, "/api/agents", update, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

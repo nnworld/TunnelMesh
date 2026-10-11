@@ -93,6 +93,7 @@ type App struct {
 	runCancel context.CancelFunc
 
 	mu            sync.Mutex
+	runtimeOps    sync.Mutex
 	prefs         *PrefsStore
 	paths         Paths
 	config        *ConfigStore
@@ -500,6 +501,11 @@ func tunnelViews(tunnels []config.TunnelConfig) []TunnelView {
 // Validation happens through the real loader before anything touches disk, so a
 // rejected save leaves the previous configuration - and the tunnels it carries - intact.
 func (a *App) SaveRouting(ctx context.Context, update RoutingUpdate) (RoutingSaveResult, error) {
+	// Treat read, validate, write and optional restart as one lifecycle operation.
+	// Otherwise a concurrent StartRuntime can observe the old file between any two
+	// steps and keep the hosted client out of sync with the form.
+	a.runtimeOps.Lock()
+	defer a.runtimeOps.Unlock()
 	candidate, err := a.candidateSettings(update)
 	if err != nil {
 		return RoutingSaveResult{}, err
@@ -520,7 +526,9 @@ func (a *App) SaveRouting(ctx context.Context, update RoutingUpdate) (RoutingSav
 	result := RoutingSaveResult{}
 	wasRunning := a.RuntimeRunning()
 	if wasRunning {
-		if err := a.RestartRuntime(ctx); err != nil {
+		if err := a.stopRuntime(); err != nil {
+			result.RuntimeError = err.Error()
+		} else if err := a.startRuntime(ctx); err != nil {
 			result.RuntimeError = err.Error()
 		} else {
 			result.Restarted = true
@@ -576,13 +584,29 @@ func (a *App) storedSettings() (ClientSettings, Paths, error) {
 // Agents returns the Agents the stored token may use.
 //
 // serverURL may be blank to use the configured one, which is what the routing tab does
-// before the form is saved. The token is never accepted from the caller: it stays in Go.
+// before the form is saved. AgentsWithToken is the only exception: it accepts a pending
+// token through the authenticated local API without persisting it.
 func (a *App) Agents(ctx context.Context, serverURL string) ([]AgentRef, error) {
+	return a.agents(ctx, serverURL, nil)
+}
+
+// AgentsWithToken resolves Agents using a pending form token without writing it first.
+// The token crosses only the authenticated loopback API and never appears in a URL or
+// response, so trying a replacement credential cannot leak it into browser history.
+func (a *App) AgentsWithToken(ctx context.Context, serverURL string, pendingToken *string) ([]AgentRef, error) {
+	return a.agents(ctx, serverURL, pendingToken)
+}
+
+func (a *App) agents(ctx context.Context, serverURL string, pendingToken *string) ([]AgentRef, error) {
 	settings, _, err := a.storedSettings()
 	if err != nil {
 		return nil, err
 	}
-	token := strings.TrimSpace(settings.Token)
+	token := settings.Token
+	if pendingToken != nil {
+		token = *pendingToken
+	}
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return nil, ErrMissingToken
 	}
@@ -649,9 +673,9 @@ type StatTotals struct {
 	ActiveStreams int `json:"activeStreams"`
 	Reconnects    int `json:"reconnects"`
 	// BytesInbound counts frame payload the client session read from the Server. Only
-	// the inbound direction is instrumented today, so the view reports one honest
-	// counter instead of a symmetric pair with a fabricated half.
-	BytesInbound int64 `json:"bytesInbound"`
+	// frame payload is counted, not protocol headers.
+	BytesInbound  int64 `json:"bytesInbound"`
+	BytesOutbound int64 `json:"bytesOutbound"`
 }
 
 // StatsView is the statistics tab.
@@ -734,7 +758,8 @@ func (a *App) Stats(ctx context.Context) StatsView {
 			view.Totals.Failed++
 		}
 	}
-	view.Totals.BytesInbound = a.inboundBytes()
+	view.Totals.BytesInbound = a.bytes("inbound")
+	view.Totals.BytesOutbound = a.bytes("outbound")
 	view.ServerReachable, view.ServerProbe = a.refreshServerProbe(view.ServerURL)
 	return view
 }
@@ -746,8 +771,8 @@ func tunnelTargetOf(tunnel config.TunnelConfig) string {
 	return fmt.Sprintf("%s:%d", strings.TrimSpace(tunnel.TargetHost), tunnel.TargetPort)
 }
 
-// inboundBytes gathers the client's inbound frame counter from the private registry.
-func (a *App) inboundBytes() int64 {
+// bytes gathers one direction of the client's frame counter from the private registry.
+func (a *App) bytes(wantDirection string) int64 {
 	if a.registry == nil {
 		return 0
 	}
@@ -761,16 +786,16 @@ func (a *App) inboundBytes() int64 {
 			continue
 		}
 		for _, metric := range family.GetMetric() {
-			var component, direction string
+			var component, metricDirection string
 			for _, pair := range metric.GetLabel() {
 				switch pair.GetName() {
 				case "component":
 					component = pair.GetValue()
 				case "direction":
-					direction = pair.GetValue()
+					metricDirection = pair.GetValue()
 				}
 			}
-			if component != "client" || direction != "inbound" {
+			if component != "client" || metricDirection != wantDirection {
 				continue
 			}
 			total += int64(metric.GetCounter().GetValue())
@@ -845,6 +870,12 @@ func (a *App) RuntimeRunning() bool {
 // It is idempotent, and it reports the two failures the interface has to explain
 // separately: an unusable configuration and a lock held by another client.
 func (a *App) StartRuntime(ctx context.Context) error {
+	a.runtimeOps.Lock()
+	defer a.runtimeOps.Unlock()
+	return a.startRuntime(ctx)
+}
+
+func (a *App) startRuntime(ctx context.Context) error {
 	a.mu.Lock()
 	if a.runtime != nil && a.runtime.Stats().Running {
 		a.mu.Unlock()
@@ -920,6 +951,12 @@ func (a *App) recordStartFailure(err error) error {
 
 // StopRuntime ends the hosted client and releases the advisory lock. It is idempotent.
 func (a *App) StopRuntime() error {
+	a.runtimeOps.Lock()
+	defer a.runtimeOps.Unlock()
+	return a.stopRuntime()
+}
+
+func (a *App) stopRuntime() error {
 	a.mu.Lock()
 	rt := a.runtime
 	a.runtime = nil
@@ -932,10 +969,12 @@ func (a *App) StopRuntime() error {
 
 // RestartRuntime stops and starts the hosted client so saved routing takes effect.
 func (a *App) RestartRuntime(ctx context.Context) error {
-	if err := a.StopRuntime(); err != nil {
+	a.runtimeOps.Lock()
+	defer a.runtimeOps.Unlock()
+	if err := a.stopRuntime(); err != nil {
 		return err
 	}
-	return a.StartRuntime(ctx)
+	return a.startRuntime(ctx)
 }
 
 // SystemInfo identifies the host and the web view that draws the interface.

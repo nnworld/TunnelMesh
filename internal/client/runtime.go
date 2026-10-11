@@ -75,6 +75,7 @@ type Runtime struct {
 	forwards []*runtimeForward
 
 	mu        sync.Mutex
+	lifecycle sync.Mutex
 	lock      runtimeLock
 	runCtx    context.Context
 	cancel    context.CancelFunc
@@ -205,6 +206,8 @@ func (r *Runtime) countingRunner(inner SessionPoolRunner) SessionPoolRunner {
 // in the background. It returns once the listeners are up, so a caller can report
 // "ready" without waiting for the run to end.
 func (r *Runtime) Start(ctx context.Context) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	if r.started {
 		r.mu.Unlock()
@@ -239,7 +242,8 @@ func (r *Runtime) Start(ctx context.Context) error {
 	for _, entry := range r.forwards {
 		if err := entry.forward.Start(runCtx); err != nil {
 			_ = entry.forward.Close()
-			r.fail(cancel)
+			r.setTunnelState(entry, TunnelStateFailed, err.Error())
+			r.fail(cancel, err)
 			return err
 		}
 		r.setTunnelState(entry, TunnelStateListening, "")
@@ -254,13 +258,15 @@ func (r *Runtime) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		defer close(done)
 		err := SuperviseRun(func() error { return r.manager.Run(runCtx) }, watcher)
 		r.mu.Lock()
 		r.runErr = err
 		r.stoppedAt = time.Now().UTC()
+		r.started = false
 		r.mu.Unlock()
 		r.markStopped()
+		_ = r.releaseLock()
+		close(done)
 	}()
 	return nil
 }
@@ -287,9 +293,10 @@ func (r *Runtime) Wait(ctx context.Context) error {
 // Stop ends the run, closes listeners in reverse start order and releases the lock.
 // It is idempotent and safe to call after a failed Start.
 func (r *Runtime) Stop() error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
-	cancel, done, lock := r.cancel, r.done, r.lock
-	r.lock = nil
+	cancel, done := r.cancel, r.done
 	r.mu.Unlock()
 
 	if cancel != nil {
@@ -299,10 +306,7 @@ func (r *Runtime) Stop() error {
 	if done != nil {
 		<-done
 	}
-	if lock == nil {
-		return nil
-	}
-	return lock.Release()
+	return r.releaseLock()
 }
 
 // Stats returns a point-in-time snapshot safe to poll from another goroutine.
@@ -367,13 +371,31 @@ func (r *Runtime) Stats() RuntimeStats {
 
 // fail unwinds a partially started run. Listeners are closed in reverse order so the
 // newest ingress is withdrawn before the one an operator is most likely using.
-func (r *Runtime) fail(cancel context.CancelFunc) {
+func (r *Runtime) fail(cancel context.CancelFunc, runErr error) {
 	cancel()
 	r.closeForwards()
 	r.mu.Lock()
 	r.started = false
 	r.stoppedAt = time.Now().UTC()
+	r.runErr = runErr
+	done := r.done
 	r.mu.Unlock()
+	r.markStopped()
+	_ = r.releaseLock()
+	if done != nil {
+		close(done)
+	}
+}
+
+func (r *Runtime) releaseLock() error {
+	r.mu.Lock()
+	lock := r.lock
+	r.lock = nil
+	r.mu.Unlock()
+	if lock == nil {
+		return nil
+	}
+	return lock.Release()
 }
 
 func (r *Runtime) closeForwards() {
@@ -545,13 +567,15 @@ func NewConfiguredForward(opener StreamOpener, cfg config.ClientConfig, tunnel c
 		forward, err := NewTCPForward(opener, TCPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
-			AllowRemote: tunnel.AllowRemote,
+			ConnectTimeout: cfg.Stream.OpenTimeout,
+			AllowRemote:    tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("tcp tunnel %s listening on %s", TunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "udp":
 		forward, err := NewUDPForward(opener, UDPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			OpenTimeout: cfg.Stream.OpenTimeout,
 			AllowRemote: tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("udp tunnel %s listening on %s", TunnelDisplayName(tunnel), tunnel.ListenAddr), err
@@ -559,6 +583,7 @@ func NewConfiguredForward(opener StreamOpener, cfg config.ClientConfig, tunnel c
 		forward, err := NewHTTPForward(opener, HTTPForwardConfig{
 			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			OpenTimeout: cfg.Stream.OpenTimeout,
 			AllowRemote: tunnel.AllowRemote,
 		})
 		return forward, fmt.Sprintf("http tunnel %s listening on %s", TunnelDisplayName(tunnel), tunnel.ListenAddr), err
@@ -590,6 +615,7 @@ func newConfiguredSOCKS5Forward(opener StreamOpener, cfg config.ClientConfig, tu
 	return NewSOCKS5Forward(opener, SOCKS5ForwardConfig{
 		ListenAddr:  tunnel.ListenAddr,
 		AgentID:     tunnel.AgentID,
+		OpenTimeout: cfg.Stream.OpenTimeout,
 		AllowRemote: tunnel.AllowRemote,
 		AuthMode:    SOCKS5AuthMode(authMode),
 		Username:    username,
@@ -621,6 +647,7 @@ func newConfiguredHTTPProxyForward(opener StreamOpener, cfg config.ClientConfig,
 	return NewHTTPProxyForward(opener, HTTPProxyForwardConfig{
 		ListenAddr:  tunnel.ListenAddr,
 		AgentID:     tunnel.AgentID,
+		OpenTimeout: cfg.Stream.OpenTimeout,
 		AllowRemote: tunnel.AllowRemote,
 		AuthMode:    HTTPProxyAuthMode(authMode),
 		Username:    username,

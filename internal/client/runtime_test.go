@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,6 +80,42 @@ func TestNewConfiguredForwardDescriptions(t *testing.T) {
 		if forward == nil {
 			t.Fatalf("%s produced a nil forward", test.tunnel.Protocol)
 		}
+	}
+}
+
+func TestNewConfiguredForwardPassesClientOpenTimeout(t *testing.T) {
+	contexts := make(chan context.Context, 1)
+	opener := openerFunc(func(ctx context.Context, _ StreamRequest) (io.ReadWriteCloser, error) {
+		contexts <- ctx
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	forward, _, err := NewConfiguredForward(opener, config.ClientConfig{
+		Stream: config.ClientStreamConfig{OpenTimeout: 25 * time.Millisecond},
+	}, config.TunnelConfig{
+		Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a",
+		TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpForward := forward.(*TCPForward)
+	if err := tcpForward.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tcpForward.Close() }()
+	connection, err := net.Dial("tcp", tcpForward.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	select {
+	case ctx := <-contexts:
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("forward opener context has no deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forward did not open a stream")
 	}
 }
 
@@ -183,6 +221,82 @@ func TestRuntimeIsMutuallyExclusivePerConfig(t *testing.T) {
 	}
 	if err := third.Stop(); err != nil {
 		t.Fatalf("third Stop: %v", err)
+	}
+}
+
+func TestRuntimeFailedStartReleasesLockAndStopReturns(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr := listener.Addr().String()
+	_ = listener.Close()
+
+	tunnel := config.TunnelConfig{Name: "web", Protocol: "tcp", ListenAddr: listenAddr, AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22}
+	configPath := filepath.Join(t.TempDir(), "client.yaml")
+	rt, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(tunnel, tunnel), RuntimeOptions{
+		ConfigPath: configPath, Runner: newPoolTestRunner(make(chan *poolTestTransport, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Start(context.Background()); err == nil {
+		t.Fatal("Start must fail when a later tunnel cannot bind")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- rt.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop after failed Start: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop after failed Start did not return")
+	}
+
+	retry, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(tunnel), RuntimeOptions{
+		ConfigPath: configPath, Runner: newPoolTestRunner(make(chan *poolTestTransport, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := retry.Start(context.Background()); err != nil {
+		t.Fatalf("Start after failed Start: %v", err)
+	}
+	if err := retry.Stop(); err != nil {
+		t.Fatalf("retry Stop: %v", err)
+	}
+}
+
+func TestRuntimeNaturalExitReleasesLock(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "client.yaml")
+	tunnel := config.TunnelConfig{Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(tunnel), RuntimeOptions{
+		ConfigPath: configPath, Runner: newPoolTestRunner(make(chan *poolTestTransport, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitForCondition(t, 2*time.Second, func() bool { return !first.Stats().Running })
+
+	second, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(tunnel), RuntimeOptions{
+		ConfigPath: configPath, Runner: newPoolTestRunner(make(chan *poolTestTransport, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatalf("Start after natural exit: %v", err)
+	}
+	if err := second.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
 	}
 }
 

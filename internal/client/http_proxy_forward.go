@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type HTTPProxyAuthMode string
@@ -23,6 +24,7 @@ const (
 type HTTPProxyForwardConfig struct {
 	ListenAddr       string
 	AgentID          string
+	OpenTimeout      time.Duration
 	AllowRemote      bool
 	AuthMode         HTTPProxyAuthMode
 	Username         string
@@ -162,7 +164,13 @@ func (f *HTTPProxyForward) handleConnect(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "remote validation denied", http.StatusForbidden)
 		return
 	}
-	stream, err := f.opener.OpenStream(r.Context(), StreamRequest{
+	ctx := r.Context()
+	cancel := func() {}
+	if f.cfg.OpenTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, f.cfg.OpenTimeout)
+	}
+	defer cancel()
+	stream, err := f.opener.OpenStream(ctx, StreamRequest{
 		AgentID: f.cfg.AgentID, Protocol: "tcp", TargetHost: host, TargetPort: port,
 	})
 	if err != nil {
@@ -220,7 +228,13 @@ func (f *HTTPProxyForward) handleAbsoluteForm(w http.ResponseWriter, r *http.Req
 		http.Error(w, "remote validation denied", http.StatusForbidden)
 		return
 	}
-	stream, err := f.opener.OpenStream(r.Context(), StreamRequest{
+	ctx := r.Context()
+	cancel := func() {}
+	if f.cfg.OpenTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, f.cfg.OpenTimeout)
+	}
+	defer cancel()
+	stream, err := f.opener.OpenStream(ctx, StreamRequest{
 		AgentID: f.cfg.AgentID, Protocol: "http", TargetHost: host, TargetPort: port,
 	})
 	if err != nil {

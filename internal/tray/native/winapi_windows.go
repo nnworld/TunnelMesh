@@ -202,10 +202,9 @@ type notifyIconData struct {
 	szInfo           [256]uint16
 	uVersion         uint32
 	szInfoTitle      [64]uint16
-	dwFlags          uint32
+	dwInfoFlags      uint32
 	guidItem         [16]byte
-	hIconOverlay     windows.Handle
-	dwReserved       uint32
+	hBalloonIcon     windows.Handle
 }
 
 // monitorInfo is MONITORINFO: the header repeats the size because GetMonitorInfoW refuses
