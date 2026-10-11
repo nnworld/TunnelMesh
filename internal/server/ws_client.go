@@ -41,6 +41,7 @@ type clientReceiveTransport interface {
 type clientRelayStream struct {
 	conn             io.ReadWriteCloser
 	protocol         string
+	sendMu           sync.Mutex
 	clientHalfClosed bool
 	relayHalfClosed  bool
 	// counted says whether this stream still holds one slot of the
@@ -149,14 +150,14 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 	defer func() {
 		mu.Lock()
 		remaining := make([]*clientRelayStream, 0, len(streams))
+		ids := make([]uint32, 0, len(streams))
 		for id, stream := range streams {
-			delete(streams, id)
+			ids = append(ids, id)
 			remaining = append(remaining, stream)
 		}
 		mu.Unlock()
-		for _, stream := range remaining {
-			stream.inbound.Close()
-			_ = stream.conn.Close()
+		for index, stream := range remaining {
+			retireClientStream(ids[index], stream, &mu, streams, releaseStreamCount)
 		}
 		for _, future := range openings {
 			future.Cancel()
@@ -488,6 +489,8 @@ func serveClientSessionWithService(ctx context.Context, principal ClientSessionP
 // already released by the other close path, is skipped instead of decrementing a
 // count that belongs to a live stream.
 func retireClientStream(id uint32, stream *clientRelayStream, mu *sync.Mutex, streams map[uint32]*clientRelayStream, release func()) {
+	stream.sendMu.Lock()
+	defer stream.sendMu.Unlock()
 	mu.Lock()
 	if streams[id] == stream {
 		delete(streams, id)
@@ -554,12 +557,22 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 		// DATA read; otherwise a window-exhausted peer cannot make progress.
 		if controlReader, ok := stream.conn.(interface{ ReadControl() (protocol.Frame, bool) }); ok {
 			if control, available := controlReader.ReadControl(); available {
+				stream.sendMu.Lock()
+				mu.Lock()
+				current := streams[id]
+				mu.Unlock()
+				if current != stream {
+					stream.sendMu.Unlock()
+					return
+				}
 				control.Version = protocol.CurrentVersion
 				control.StreamID = id
 				if err := writer.EnqueueControl(control); err != nil {
+					stream.sendMu.Unlock()
 					retireClientStream(id, stream, mu, streams, release)
 					return
 				}
+				stream.sendMu.Unlock()
 				continue
 			}
 		}
@@ -569,17 +582,32 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 		}
 		n, err := stream.conn.Read(buffer[:limit])
 		if n > 0 {
+			stream.sendMu.Lock()
 			mu.Lock()
 			current := streams[id]
 			mu.Unlock()
 			if current != stream {
+				stream.sendMu.Unlock()
 				return
 			}
+			stream.sendMu.Unlock()
+			// Waiting for peer credit must not hold sendMu: a concurrent RESET
+			// retires the stream through the same lock, and otherwise both paths
+			// wait forever when the peer withdraws a stream with no credit.
 			if err := waitForClientWindow(id, stream, mu, streams, n); err != nil {
 				retireClientStream(id, stream, mu, streams, release)
 				return
 			}
+			stream.sendMu.Lock()
+			mu.Lock()
+			current = streams[id]
+			mu.Unlock()
+			if current != stream {
+				stream.sendMu.Unlock()
+				return
+			}
 			if sendErr := writer.EnqueueData(id, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: id, Payload: append([]byte(nil), buffer[:n]...)}); sendErr != nil {
+				stream.sendMu.Unlock()
 				slog.WarnContext(ctx, "client_stream_queue_full_reset",
 					"protocol", stream.protocol, "stream_id", id,
 					"error_class", observability.NormalizeErrorClass(sendErr))
@@ -592,6 +620,7 @@ func relayToClient(ctx context.Context, id uint32, stream *clientRelayStream, wr
 				_ = writer.EnqueueControl(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: id, Payload: []byte(clientStreamResetMessage)})
 				return
 			}
+			stream.sendMu.Unlock()
 		}
 		if err != nil {
 			mu.Lock()

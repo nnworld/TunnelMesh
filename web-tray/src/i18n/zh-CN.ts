@@ -119,6 +119,7 @@ export default {
       failed: '失败',
       activeStreams: '活跃流',
       bytesInbound: '已接收',
+      bytesOutbound: '已发送',
       openSlots: '连接槽位',
       readySessions: '就绪会话',
     },

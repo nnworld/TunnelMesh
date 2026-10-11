@@ -39,6 +39,7 @@ type UDPAssociationConfig struct {
 	AgentID         string
 	TargetHost      string
 	TargetPort      int
+	OpenTimeout     time.Duration
 	IdleTimeout     time.Duration
 	MaxDatagram     int
 	MaxAssociations int
@@ -113,11 +114,16 @@ func (m *UDPAssociationManager) HandleDatagram(ctx context.Context, source *net.
 		req := StreamRequest{AgentID: m.cfg.AgentID, Protocol: "udp", TargetHost: m.cfg.TargetHost, TargetPort: m.cfg.TargetPort}
 		var ds DatagramStream
 		var err error
+		openCtx := ctx
+		var cancel context.CancelFunc
+		if m.cfg.OpenTimeout > 0 {
+			openCtx, cancel = context.WithTimeout(ctx, m.cfg.OpenTimeout)
+		}
 		if opener, ok := m.opener.(DatagramOpener); ok {
-			ds, err = opener.OpenDatagram(ctx, req)
+			ds, err = opener.OpenDatagram(openCtx, req)
 		} else {
 			var stream io.ReadWriteCloser
-			stream, err = m.opener.OpenStream(ctx, req)
+			stream, err = m.opener.OpenStream(openCtx, req)
 			if err == nil {
 				ds, _ = stream.(DatagramStream)
 				if ds == nil {
@@ -125,6 +131,9 @@ func (m *UDPAssociationManager) HandleDatagram(ctx context.Context, source *net.
 					err = errors.New("client: UDP opener does not preserve datagram boundaries")
 				}
 			}
+		}
+		if cancel != nil {
+			cancel()
 		}
 		if err != nil {
 			return err

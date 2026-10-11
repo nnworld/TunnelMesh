@@ -109,7 +109,13 @@ export const getRouting = () => apiFetch<RoutingView>('/api/routing')
 export const saveRouting = (update: RoutingUpdate) =>
   apiFetch<RoutingSaveResult>('/api/routing', { method: 'PUT', body: JSON.stringify(update) })
 
-export const listAgents = (serverUrl?: string) => {
+export const listAgents = (serverUrl?: string, token?: string | null) => {
+  if (token !== undefined) {
+    return apiFetch<AgentRef[] | null>('/api/agents', {
+      method: 'POST',
+      body: JSON.stringify({ serverUrl: serverUrl ?? '', token }),
+    })
+  }
   const query = serverUrl ? `?serverUrl=${encodeURIComponent(serverUrl)}` : ''
   return apiFetch<AgentRef[] | null>(`/api/agents${query}`)
 }

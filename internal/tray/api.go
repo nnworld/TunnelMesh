@@ -278,6 +278,7 @@ var apiRoutes = []route{
 	{"/api/routing", http.MethodGet, (*APIServer).handleGetRouting},
 	{"/api/routing", http.MethodPut, (*APIServer).handleSaveRouting},
 	{"/api/agents", http.MethodGet, (*APIServer).handleAgents},
+	{"/api/agents", http.MethodPost, (*APIServer).handleAgentsWithToken},
 	{"/api/validate", http.MethodPost, (*APIServer).handleValidate},
 	{"/api/stats", http.MethodGet, (*APIServer).handleStats},
 	{"/api/about", http.MethodGet, (*APIServer).handleAbout},
@@ -440,6 +441,22 @@ func (s *APIServer) handleAgents(w http.ResponseWriter, r *http.Request) {
 	writeEnvelope(w, http.StatusOK, agents)
 }
 
+func (s *APIServer) handleAgentsWithToken(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ServerURL string  `json:"serverUrl"`
+		Token     *string `json:"token"`
+	}
+	if err := decodeBody(w, r, &request); err != nil {
+		return
+	}
+	agents, err := s.app.AgentsWithToken(r.Context(), request.ServerURL, request.Token)
+	if err != nil {
+		writeAPIFailure(w, err)
+		return
+	}
+	writeEnvelope(w, http.StatusOK, agents)
+}
+
 func (s *APIServer) handleValidate(w http.ResponseWriter, r *http.Request) {
 	// An empty body validates the stored configuration, which is what the routing tab
 	// does before the operator has touched the form. Decoding it anyway would report a
@@ -551,9 +568,13 @@ func decodeBody(w http.ResponseWriter, r *http.Request, target any) error {
 		writeAPIError(w, http.StatusBadRequest, "the request body is not valid JSON: "+err.Error())
 		return err
 	}
-	if decoder.More() {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
 		writeAPIError(w, http.StatusBadRequest, "the request body must hold exactly one JSON object")
-		return errors.New("trailing content in the request body")
+		return fmt.Errorf("trailing content in the request body: %w", err)
 	}
 	return nil
 }

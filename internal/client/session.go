@@ -157,16 +157,29 @@ func (s *Session) sendFrame(frame protocol.Frame) error {
 	if s == nil {
 		return ErrSessionClosed
 	}
+	var err error
 	if s.writer == nil {
 		if s.transport == nil {
 			return ErrSessionClosed
 		}
-		return s.transport.Send(frame)
+		err = s.transport.Send(frame)
+	} else if frame.Type == protocol.FrameData && frame.StreamID != 0 {
+		err = s.writer.EnqueueData(frame.StreamID, frame)
+	} else {
+		err = s.writer.EnqueueControl(frame)
 	}
-	if frame.Type == protocol.FrameData && frame.StreamID != 0 {
-		return s.writer.EnqueueData(frame.StreamID, frame)
+	if err == nil && frame.Type == protocol.FrameData && len(frame.Payload) > 0 && s.Metrics != nil {
+		s.mu.RLock()
+		protocolName := ""
+		if stream := s.streams[frame.StreamID]; stream != nil {
+			protocolName = stream.protocol
+		} else if datagram := s.datagrams[frame.StreamID]; datagram != nil {
+			protocolName = datagram.protocol
+		}
+		s.mu.RUnlock()
+		s.Metrics.ObserveBytes("client", "outbound", protocolName, int64(len(frame.Payload)))
 	}
-	return s.writer.EnqueueControl(frame)
+	return err
 }
 
 func (s *Session) OpenMode() SessionOpenMode {
@@ -354,7 +367,7 @@ func (s *Session) OpenDatagram(ctx context.Context, req StreamRequest) (Datagram
 	if !ok || tr == nil {
 		return nil, errors.New("client session transport does not receive frames")
 	}
-	stream := newFrameDatagramStream(s, req.StreamID)
+	stream := newFrameDatagramStream(s, req.StreamID, req.Protocol)
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
 		s.mu.Unlock()
@@ -392,7 +405,7 @@ func (s *Session) OpenStreamConn(ctx context.Context, req StreamRequest) (io.Rea
 	if !ok || tr == nil {
 		return nil, errors.New("client session transport does not receive frames")
 	}
-	stream := newFrameStream(s, req.StreamID)
+	stream := newFrameStream(s, req.StreamID, req.Protocol)
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
 		s.mu.Unlock()
@@ -431,7 +444,7 @@ func (s *Session) OpenStreamResult(ctx context.Context, req StreamRequest) (io.R
 	if !ok || tr == nil {
 		return nil, failureOpenResult(protocol.OpenResultCodeInternalError), errors.New("client session transport does not receive frames")
 	}
-	stream := newFrameStream(s, req.StreamID)
+	stream := newFrameStream(s, req.StreamID, req.Protocol)
 	stream.openResult = make(chan protocol.OpenResultPayload, 1)
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
@@ -594,7 +607,13 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			}
 		case protocol.FrameData:
 			if s.Metrics != nil && len(f.Payload) > 0 {
-				s.Metrics.ObserveBytes("client", "inbound", "frame", int64(len(f.Payload)))
+				protocolName := ""
+				if stream != nil {
+					protocolName = stream.protocol
+				} else if datagram != nil {
+					protocolName = datagram.protocol
+				}
+				s.Metrics.ObserveBytes("client", "inbound", protocolName, int64(len(f.Payload)))
 			}
 			if stream != nil {
 				stream.push(f.Payload)
@@ -667,6 +686,7 @@ func failureOpenResult(code protocol.OpenResultCode) protocol.OpenResultPayload 
 type frameStream struct {
 	session        *Session
 	id             uint32
+	protocol       string
 	readQueue      *streamsession.BoundedFrameQueue
 	readSignal     chan struct{}
 	openResult     chan protocol.OpenResultPayload
@@ -698,9 +718,13 @@ func (s *frameStream) deliverOpenResult(payload protocol.OpenResultPayload) bool
 	return delivered
 }
 
-func newFrameStream(s *Session, id uint32) *frameStream {
+func newFrameStream(s *Session, id uint32, protocols ...string) *frameStream {
+	protocolName := ""
+	if len(protocols) > 0 {
+		protocolName = protocols[0]
+	}
 	stream := &frameStream{
-		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
+		session: s, id: id, protocol: protocolName, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
 		readSignal: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 	if s.OpenMode().supportsFlowControl() {
@@ -932,6 +956,7 @@ func (s *frameStream) fail(err error) { s.finish(err) }
 type frameDatagramStream struct {
 	session    *Session
 	id         uint32
+	protocol   string
 	readQueue  *streamsession.BoundedFrameQueue
 	readSignal chan struct{}
 	done       chan struct{}
@@ -941,9 +966,13 @@ type frameDatagramStream struct {
 	closeOnce  sync.Once
 }
 
-func newFrameDatagramStream(s *Session, id uint32) *frameDatagramStream {
+func newFrameDatagramStream(s *Session, id uint32, protocols ...string) *frameDatagramStream {
+	protocolName := ""
+	if len(protocols) > 0 {
+		protocolName = protocols[0]
+	}
 	return &frameDatagramStream{
-		session: s, id: id, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
+		session: s, id: id, protocol: protocolName, readQueue: streamsession.NewBoundedFrameQueue(s.inboundBufferBytes()),
 		readSignal: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 }

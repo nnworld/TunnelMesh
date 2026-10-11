@@ -49,6 +49,7 @@ const tunnelSummary = computed(() => {
   return `${all.listening}/${all.tunnels}`
 })
 const bytesIn = computed(() => formatBytes(totals.value?.bytesInbound ?? 0))
+const bytesOut = computed(() => formatBytes(totals.value?.bytesOutbound ?? 0))
 const activeStreams = computed(() => totals.value?.activeStreams ?? 0)
 const reconnects = computed(() => totals.value?.reconnects ?? 0)
 const collectedAt = computed(() => formatTimeOfDay(stats.view?.collectedAt))
@@ -127,6 +128,8 @@ onBeforeUnmount(() => {
       <div class="tm-fact">
         <dt>{{ t('stats.summary.bytesInbound') }}</dt>
         <dd>{{ bytesIn }}</dd>
+        <dt>{{ t('stats.summary.bytesOutbound') }}</dt>
+        <dd>{{ bytesOut }}</dd>
       </div>
       <div class="tm-fact">
         <dt>{{ t('stats.summary.reconnects') }}</dt>

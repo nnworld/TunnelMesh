@@ -140,7 +140,7 @@ func decodeICOEntry(data []byte, size int) (*image.NRGBA, error) {
 	if binary.LittleEndian.Uint32(data[16:]) != 0 {
 		return nil, errors.New("native: icon entry uses an unsupported compression")
 	}
-	rowBytes := ((width + 31) / 32) * 4
+	rowBytes := width * 4
 	pixels := data[40:]
 	out := image.NewNRGBA(image.Rect(0, 0, width, height/2))
 	if len(pixels) < out.Bounds().Dy()*rowBytes {

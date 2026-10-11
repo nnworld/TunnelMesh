@@ -131,15 +131,7 @@ func (s *ConfigStore) Save(settings ClientSettings) error {
 	if err := setNodeValue(clientNode, "token", settings.Token); err != nil {
 		return err
 	}
-	tunnels := make([]tunnelYAML, 0, len(settings.Tunnels))
-	for _, tunnel := range settings.Tunnels {
-		tunnels = append(tunnels, tunnelYAML{
-			Name: tunnel.Name, Protocol: tunnel.Protocol, ListenAddr: tunnel.ListenAddr,
-			AgentID: tunnel.AgentID, TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
-			AuthMode: tunnel.AuthMode, AllowRemote: tunnel.AllowRemote, AuthURL: tunnel.AuthURL,
-		})
-	}
-	if err := setNodeValue(clientNode, "tunnels", tunnels); err != nil {
+	if err := setTunnelsValue(clientNode, settings.Tunnels); err != nil {
 		return err
 	}
 
@@ -151,6 +143,94 @@ func (s *ConfigStore) Save(settings ClientSettings) error {
 		return fmt.Errorf("render client configuration: %w", err)
 	}
 	return atomicWrite(s.path, data, 0o600)
+}
+
+// setTunnelsValue updates the fields owned by the tray in place. Tunnel entries may carry
+// protocol-specific extensions that config.TunnelConfig does not model; replacing the whole
+// sequence with a slice would silently erase those extensions on every save.
+func setTunnelsValue(clientNode *yaml.Node, tunnels []config.TunnelConfig) error {
+	sequence := mappingValueNode(clientNode, "tunnels")
+	if sequence == nil || sequence.Kind != yaml.SequenceNode {
+		encoded, err := encodeTunnelSequence(tunnels)
+		if err != nil {
+			return err
+		}
+		return setNodeValue(clientNode, "tunnels", encoded)
+	}
+	updated := make([]*yaml.Node, 0, len(tunnels))
+	for index, tunnel := range tunnels {
+		var node *yaml.Node
+		if index < len(sequence.Content) && sequence.Content[index].Kind == yaml.MappingNode {
+			node = sequence.Content[index]
+		} else {
+			node = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		}
+		if err := updateTunnelNode(node, tunnel); err != nil {
+			return err
+		}
+		updated = append(updated, node)
+	}
+	sequence.Content = updated
+	return nil
+}
+
+func encodeTunnelSequence(tunnels []config.TunnelConfig) (*yaml.Node, error) {
+	values := make([]tunnelYAML, 0, len(tunnels))
+	for _, tunnel := range tunnels {
+		values = append(values, tunnelYAML{
+			Name: tunnel.Name, Protocol: tunnel.Protocol, ListenAddr: tunnel.ListenAddr,
+			AgentID: tunnel.AgentID, TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
+			AuthMode: tunnel.AuthMode, AllowRemote: tunnel.AllowRemote, AuthURL: tunnel.AuthURL,
+		})
+	}
+	encoded := &yaml.Node{}
+	if err := encoded.Encode(values); err != nil {
+		return nil, fmt.Errorf("encode tunnels: %w", err)
+	}
+	if len(tunnels) == 0 {
+		*encoded = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	}
+	return encoded, nil
+}
+
+func updateTunnelNode(node *yaml.Node, tunnel config.TunnelConfig) error {
+	fields := []struct {
+		key   string
+		value any
+		keep  bool
+	}{
+		{"name", tunnel.Name, tunnel.Name != ""},
+		{"protocol", tunnel.Protocol, tunnel.Protocol != ""},
+		{"listen", tunnel.ListenAddr, tunnel.ListenAddr != ""},
+		{"agent_id", tunnel.AgentID, tunnel.AgentID != ""},
+		{"target_host", tunnel.TargetHost, tunnel.TargetHost != ""},
+		{"target_port", tunnel.TargetPort, tunnel.TargetPort != 0},
+		{"auth_mode", tunnel.AuthMode, tunnel.AuthMode != ""},
+		{"allow_remote", tunnel.AllowRemote, tunnel.AllowRemote},
+		{"auth_url", tunnel.AuthURL, tunnel.AuthURL != ""},
+	}
+	for _, field := range fields {
+		if !field.keep {
+			deleteMappingValue(node, field.key)
+			continue
+		}
+		if err := setNodeValue(node, field.key, field.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteMappingValue(mapping *yaml.Node, key string) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			mapping.Content = append(mapping.Content[:index], mapping.Content[index+2:]...)
+			return
+		}
+	}
 }
 
 // LoadConfig runs the real loader and validator over the file.

@@ -34,6 +34,11 @@ const summary = computed(() => {
       label: t('stats.summary.bytesInbound'),
       value: formatBytes(stats.totals?.bytesInbound ?? 0),
     },
+    {
+      key: 'bytesOutbound',
+      label: t('stats.summary.bytesOutbound'),
+      value: formatBytes(stats.totals?.bytesOutbound ?? 0),
+    },
   ]
 })
 

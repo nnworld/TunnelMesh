@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
@@ -90,6 +91,7 @@ func (r ValidationReport) find(id string) (CheckResult, bool) {
 type Validator struct {
 	server *ServerClient
 	store  *ConfigStore
+	mu     sync.RWMutex
 	// bindProbes decides whether listen addresses are test-bound. It has to be off
 	// while the tray hosts the client, because the tray itself holds every listener and
 	// a probe would report the operator's own tunnels as unavailable.
@@ -102,13 +104,20 @@ func NewValidator(server *ServerClient, store *ConfigStore) *Validator {
 }
 
 // SetBindProbes enables or disables listen-address probing.
-func (v *Validator) SetBindProbes(enabled bool) { v.bindProbes = enabled }
+func (v *Validator) SetBindProbes(enabled bool) {
+	v.mu.Lock()
+	v.bindProbes = enabled
+	v.mu.Unlock()
+}
 
 // Validate runs every check and returns the full report.
 //
 // Checks that depend on an earlier one are reported as skipped rather than omitted, so
 // the interface can explain why it has nothing to say instead of looking broken.
 func (v *Validator) Validate(ctx context.Context, settings ClientSettings) ValidationReport {
+	v.mu.RLock()
+	bindProbes := v.bindProbes
+	v.mu.RUnlock()
 	report := ValidationReport{CheckedAt: time.Now().UTC()}
 	add := func(id, status, message string) {
 		report.Checks = append(report.Checks, CheckResult{ID: id, Status: status, Message: message})
@@ -200,7 +209,7 @@ func (v *Validator) Validate(ctx context.Context, settings ClientSettings) Valid
 	for index, tunnel := range settings.Tunnels {
 		number := index + 1
 		name := client.TunnelDisplayName(tunnel)
-		v.checkTunnel(ctx, addTunnel, number, name, tunnel, byID, agentsKnown)
+		v.checkTunnel(ctx, addTunnel, number, name, tunnel, byID, agentsKnown, bindProbes)
 	}
 
 	// The authoritative structural check. Running the real loader is what guarantees a
@@ -222,7 +231,7 @@ func (v *Validator) checkTunnel(
 	_ context.Context,
 	addTunnel func(id string, index int, name, status, message string),
 	index int, name string, tunnel config.TunnelConfig,
-	agents map[string]AgentRef, agentsKnown bool,
+	agents map[string]AgentRef, agentsKnown, bindProbes bool,
 ) {
 	protocol := strings.ToLower(strings.TrimSpace(tunnel.Protocol))
 	if supportedProtocol(protocol) {
@@ -235,7 +244,7 @@ func (v *Validator) checkTunnel(
 	switch {
 	case strings.TrimSpace(tunnel.ListenAddr) == "":
 		addTunnel(CheckTunnelListen, index, name, StatusFailed, "listen address is required")
-	case !v.bindProbes:
+	case !bindProbes:
 		if _, _, err := net.SplitHostPort(strings.TrimSpace(tunnel.ListenAddr)); err != nil {
 			addTunnel(CheckTunnelListen, index, name, StatusFailed, fmt.Sprintf("listen must be a host:port address: %v", err))
 		} else {

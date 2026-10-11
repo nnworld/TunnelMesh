@@ -17,8 +17,10 @@ package native
 import (
 	"errors"
 	"log"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unsafe"
@@ -65,6 +67,10 @@ const (
 	wmMsgEmbedMain  = wmApp + 2
 	wmMsgEmbedPanel = wmApp + 3
 	wmMsgQuitShell  = wmApp + 4
+	wmMsgShowMain   = wmApp + 5
+	wmMsgHideMain   = wmApp + 6
+	wmMsgSetMin     = wmApp + 7
+	wmMsgSetQuick   = wmApp + 8
 )
 
 // shell is the running instance.
@@ -72,6 +78,7 @@ const (
 // Win32 window procedures are plain functions with no receiver, so the shell they act on is
 // reachable through this variable for exactly as long as Run is on the stack.
 var shell *winShell
+var shellMu sync.RWMutex
 
 // The window procedures are registered once per class. windows.NewCallback hands a Go
 // function to native code that keeps the pointer forever, so the handles live in package
@@ -116,7 +123,10 @@ func Run(config Config) error {
 	if config.URL == "" {
 		return errors.New("native: the settings window needs a URL to load")
 	}
-	if shell != nil {
+	shellMu.RLock()
+	running := shell != nil
+	shellMu.RUnlock()
+	if running {
 		return errors.New("native: the tray shell is already running")
 	}
 	runtime.LockOSThread()
@@ -139,14 +149,20 @@ func Run(config Config) error {
 	if instance.runtimeVersion == "" {
 		log.Printf("tray: %v; the settings window will open in the system browser", errNoRenderer)
 	}
+	shellMu.Lock()
 	shell = instance
+	shellMu.Unlock()
 	if err := instance.start(); err != nil {
+		shellMu.Lock()
 		shell = nil
+		shellMu.Unlock()
 		return err
 	}
 	instance.messageLoop()
 	instance.teardown()
+	shellMu.Lock()
 	shell = nil
+	shellMu.Unlock()
 	return nil
 }
 
@@ -156,10 +172,13 @@ func Run(config Config) error {
 // menu's 退出 both reach it: posting rather than calling keeps the run loop the only thing
 // that touches windows on this thread.
 func Stop() {
-	if shell == nil {
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance == nil {
 		return
 	}
-	post(shell.host, wmMsgQuitShell)
+	post(instance.host, wmMsgQuitShell)
 }
 
 // ShowWindow brings the settings window forward.
@@ -168,37 +187,43 @@ func Stop() {
 // system browser on the same loopback address: the settings stay reachable, which matters
 // more than the shape they arrive in.
 func ShowWindow() {
-	if shell == nil {
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance == nil {
 		return
 	}
-	if !shell.hasRenderer() {
-		_ = OpenURL(shell.config.URL)
-		return
-	}
-	shell.showMain()
-	notifyVisibility(true)
+	post(instance.host, wmMsgShowMain)
 }
 
 // HideWindow withdraws the settings window without quitting.
 func HideWindow() {
-	if shell == nil {
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance == nil {
 		return
 	}
-	shell.hideMain()
-	notifyVisibility(false)
+	post(instance.host, wmMsgHideMain)
 }
 
 // SetMinimizeToTray updates what a window close means.
 func SetMinimizeToTray(enabled bool) {
-	if shell != nil {
-		shell.minimizeToTray = enabled
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance != nil {
+		postValue(instance.host, wmMsgSetMin, enabled)
 	}
 }
 
 // SetQuickPanel updates what a left click on the notification-area icon means.
 func SetQuickPanel(enabled bool) {
-	if shell != nil {
-		shell.quickPanel = enabled
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance != nil {
+		postValue(instance.host, wmMsgSetQuick, enabled)
 	}
 }
 
@@ -207,10 +232,13 @@ func SetQuickPanel(enabled bool) {
 // "browser" is the degraded case where no WebView2 runtime was found, and the interface
 // turns it into an explanation the operator can read.
 func RendererName() string {
-	if shell == nil {
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance == nil {
 		return "webview2"
 	}
-	if shell.runtimeVersion == "" {
+	if instance.runtimeVersion == "" {
 		return "browser"
 	}
 	return "webview2"
@@ -218,10 +246,13 @@ func RendererName() string {
 
 // RendererDetail is the runtime version, or the reason there is none.
 func RendererDetail() string {
-	if shell == nil || shell.runtimeVersion == "" {
+	shellMu.RLock()
+	instance := shell
+	shellMu.RUnlock()
+	if instance == nil || instance.runtimeVersion == "" {
 		return errNoRenderer.Error()
 	}
-	return shell.runtimeVersion
+	return instance.runtimeVersion
 }
 
 // OpenURL hands a URL to the system browser.
@@ -281,12 +312,15 @@ func (s *winShell) start() error {
 	s.sizeMainWindow()
 
 	if s.hasRenderer() {
-		s.mainView = newWebView(s.main, s.config.URL, s.dataDir)
+		// WebView2 does not allow two environments in one process to open the same user
+		// data folder concurrently. The main page and quick panel are separate Chromium
+		// environments, so sharing s.dataDir makes the second Embed fail during startup.
+		s.mainView = newWebView(s.main, s.config.URL, filepath.Join(s.dataDir, "main"))
 		if s.config.PanelURL != "" {
 			s.panel = createWindow(wsExToolwindow|wsExTopmost, panelWindowClass, s.config.WindowTitle,
 				wsPopup, 0, 0, 0, 0, s.host)
 			if s.panel != 0 {
-				s.panelView = newWebView(s.panel, s.config.PanelURL, s.dataDir)
+				s.panelView = newWebView(s.panel, s.config.PanelURL, filepath.Join(s.dataDir, "panel"))
 			}
 		}
 	}
@@ -343,7 +377,7 @@ func dispatchWindowMessage(hwnd, message, wParam, lParam uintptr) uintptr {
 		shell.enforceMinimumSize(hwnd, lParam)
 		return 0
 	case wmSize:
-		shell.resizeView(hwnd, lParam)
+		shell.resizeView(hwnd, wParam)
 		return 0
 	case wmDpiChanged:
 		shell.applyDpiChange(hwnd, lParam)
@@ -356,10 +390,32 @@ func dispatchWindowMessage(hwnd, message, wParam, lParam uintptr) uintptr {
 		shell.handleTrayMouse(lParam)
 		return 0
 	case wmMsgEmbedMain:
-		shell.mainView.embed()
+		if !shell.mainView.embed() {
+			log.Printf("tray: failed to embed the main WebView2 controller")
+		}
 		return 0
 	case wmMsgEmbedPanel:
-		shell.panelView.embed()
+		if !shell.panelView.embed() {
+			log.Printf("tray: failed to embed the quick-panel WebView2 controller")
+		}
+		return 0
+	case wmMsgShowMain:
+		if !shell.hasRenderer() {
+			_ = OpenURL(shell.config.URL)
+			return 0
+		}
+		shell.showMain()
+		notifyVisibility(true)
+		return 0
+	case wmMsgHideMain:
+		shell.hideMain()
+		notifyVisibility(false)
+		return 0
+	case wmMsgSetMin:
+		shell.minimizeToTray = wParam != 0
+		return 0
+	case wmMsgSetQuick:
+		shell.quickPanel = wParam != 0
 		return 0
 	case wmMsgQuitShell:
 		procPostQuitMessage.Call(0)
@@ -372,8 +428,8 @@ func dispatchWindowMessage(hwnd, message, wParam, lParam uintptr) uintptr {
 //
 // The minimised size is zero, and a controller sized to zero starts logging lost surfaces,
 // so a close is the point at which the web view is left where it is rather than shrunk.
-func (s *winShell) resizeView(hwnd, lParam uintptr) {
-	if uint32(lParam) == windows.SW_MINIMIZE {
+func (s *winShell) resizeView(hwnd, wParam uintptr) {
+	if wParam == windows.SW_MINIMIZE {
 		return
 	}
 	switch hwnd {
@@ -602,7 +658,7 @@ func (s *winShell) applyDpiChange(hwnd, lParam uintptr) {
 	suggested := (*windows.Rect)(pointerFromLParam(lParam))
 	placeWindow(hwndOf(hwnd), suggested.Left, suggested.Top,
 		suggested.Right-suggested.Left, suggested.Bottom-suggested.Top, swpNoZOrder)
-	shell.resizeView(hwnd, wmSize)
+	shell.resizeView(hwnd, 0)
 }
 
 // tooltip is the notification-area hover text, with the renderer problem spelled out when
@@ -666,6 +722,7 @@ func acquireSingleInstance() (func(), error) {
 		return nil, err
 	}
 	if code, _, _ := procGetLastErrorID.Call(); uint32(code) == errorAlreadyExists {
+		_ = windows.CloseHandle(windows.Handle(handle))
 		return nil, errors.New("native: another TunnelMesh client tray is already running")
 	}
 	return func() { _ = windows.CloseHandle(windows.Handle(handle)) }, nil
@@ -763,6 +820,14 @@ func appendMenu(menu, flags, identifier uintptr, label string) {
 
 func post(hwnd windows.Handle, message uint32) {
 	procPostMessageW.Call(uintptr(hwnd), uintptr(message), 0, 0)
+}
+
+func postValue(hwnd windows.Handle, message uint32, value bool) {
+	wParam := uintptr(0)
+	if value {
+		wParam = 1
+	}
+	procPostMessageW.Call(uintptr(hwnd), uintptr(message), wParam, 0)
 }
 
 func defWindowProc(hwnd, message, wParam, lParam uintptr) uintptr {

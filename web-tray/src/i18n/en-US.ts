@@ -120,6 +120,7 @@ export default {
       failed: 'Failed',
       activeStreams: 'Active streams',
       bytesInbound: 'Received',
+      bytesOutbound: 'Sent',
       openSlots: 'Pool slots',
       readySessions: 'Ready sessions',
     },

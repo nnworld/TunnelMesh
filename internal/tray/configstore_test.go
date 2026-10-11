@@ -154,6 +154,30 @@ client:
 	}
 }
 
+func TestConfigStorePreservesUnknownTunnelKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.yaml")
+	contents := "mode: local\nclient:\n  server_url: wss://server.example/ws/client\n  token: secret\n  tunnels:\n    - name: web\n      protocol: tcp\n      listen: 127.0.0.1:8080\n      agent_id: agent-a\n      target_host: 10.0.0.8\n      target_port: 22\n      custom_policy:\n        retries: 3\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewConfigStore(path)
+	settings, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Tunnels[0].Name = "renamed"
+	if err := store.Save(settings); err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), "custom_policy:") || !strings.Contains(string(rendered), "retries: 3") {
+		t.Fatalf("unknown tunnel keys were dropped:\n%s", rendered)
+	}
+}
+
 // TestConfigStoreTokenIsReadableByExistingClient is the load-bearing guarantee behind
 // storing the token in client.yaml: ClientConfig.Token carries yaml:"-", yet
 // config.Load decodes through viper and mapstructure, so the file value is picked up

@@ -122,6 +122,7 @@ export interface StatTotals {
   activeStreams: number
   reconnects: number
   bytesInbound: number
+  bytesOutbound?: number
 }
 
 export interface StatsView {
