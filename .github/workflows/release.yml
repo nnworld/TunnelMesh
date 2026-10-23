@@ -184,11 +184,11 @@ jobs:
       - run: cd web && npm run build
       - run: rsync -a --delete web/dist/ internal/server/web_dist/
       - run: ./scripts/verify-web-embed.sh
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: macos-tray
           path: tray-dist
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: windows-tray
           path: windows-tray-dist
