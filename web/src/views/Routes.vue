@@ -5,10 +5,17 @@
     </PageHeader>
 
     <div class="tm-card">
-	  <div class="toolbar">
-	    <el-input v-model="keyword" class="keyword-input" clearable :placeholder="t('routes.domain')" @keyup.enter="reload" @clear="reload" />
-	    <el-button :loading="loading" @click="reload">{{ t('common.query') }}</el-button>
-	  </div>
+      <el-form class="filter-form" label-position="top" @submit.prevent="query">
+        <div class="filter-grid">
+          <el-form-item :label="t('routes.domain')">
+            <el-input v-model="keyword" clearable :placeholder="t('routes.domain')" />
+          </el-form-item>
+        </div>
+        <div class="filter-actions">
+          <el-button @click="reset">{{ t('common.reset') }}</el-button>
+          <el-button type="primary" :loading="loading" @click="query">{{ t('common.query') }}</el-button>
+        </div>
+      </el-form>
       <DataState
         :loading="loading"
         :error="error"
@@ -361,6 +368,8 @@ async function load() {
 }
 
 function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function query() { reload() }
+function reset() { keyword.value = ''; reload() }
 function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void load() }
 function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
 function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'domain' ? 'domain' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
@@ -673,6 +682,9 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.filter-form { margin-bottom: 18px; }
+.filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.filter-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .field-help {
   margin-top: 4px;
   color: var(--tm-muted);
@@ -711,5 +723,9 @@ onMounted(() => {
   color: var(--tm-muted);
   font-size: 12px;
   line-height: 1.6;
+}
+@media (max-width: 640px) {
+  .filter-actions { justify-content: stretch; }
+  .filter-actions .el-button { flex: 1; }
 }
 </style>
