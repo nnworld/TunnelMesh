@@ -118,6 +118,16 @@ describe('admin routes', () => {
     expect(source).toContain('crypto.randomUUID()')
   })
 
+  it('uses the shared client-style filter layout for managed routes', () => {
+    const source = readFileSync('src/views/Routes.vue', 'utf8')
+    expect(source).toContain('<el-form class="filter-form"')
+    expect(source).toContain('<div class="filter-grid">')
+    expect(source).toContain('<div class="filter-actions">')
+    expect(source).toContain('@submit.prevent="query"')
+    expect(source).toContain("t('common.reset')")
+    expect(source).toContain('function reset()')
+  })
+
   it('exposes a managed route edit workflow', () => {
     const source = readFileSync('src/views/Routes.vue', 'utf8')
     expect(source).toContain("t('routes.edit')")
