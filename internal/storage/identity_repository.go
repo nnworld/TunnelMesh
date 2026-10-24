@@ -52,6 +52,18 @@ type OIDCProviderRepository interface {
 	CountEnabled(context.Context) (int, error)
 }
 
+type SortedOIDCProviderRepository interface {
+	ListSorted(context.Context, SortSpec, string, int) (Page[OIDCProvider], error)
+}
+
+type OIDCProviderListFilter struct {
+	Keyword string
+}
+
+type FilteredSortedOIDCProviderRepository interface {
+	ListSortedFiltered(context.Context, OIDCProviderListFilter, SortSpec, string, int) (Page[OIDCProvider], error)
+}
+
 // UserIdentityRepository links external subjects to local accounts.
 type UserIdentityRepository interface {
 	Create(context.Context, UserIdentity) (UserIdentity, error)
@@ -309,6 +321,71 @@ func (r *oidcProviderRepo) List(ctx context.Context, cursor string, limit int) (
 		page.Items = page.Items[:limit]
 		page.HasMore = true
 		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+	}
+	return page, nil
+}
+
+func (r *oidcProviderRepo) ListSorted(ctx context.Context, spec SortSpec, cursor string, limit int) (Page[OIDCProvider], error) {
+	return r.ListSortedFiltered(ctx, OIDCProviderListFilter{}, spec, cursor, limit)
+}
+
+func (r *oidcProviderRepo) ListSortedFiltered(ctx context.Context, filter OIDCProviderListFilter, spec SortSpec, cursor string, limit int) (Page[OIDCProvider], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	if spec.Column == "" {
+		spec = SortSpec{Column: "updated_at", Descending: true, Composite: true}
+	}
+	conditions := []string{}
+	args := []any{}
+	if keyword := boundedAgentFilter(strings.TrimSpace(filter.Keyword)); keyword != "" {
+		conditions = append(conditions, `(INSTR(name, ?)>0 OR INSTR(display_name, ?)>0 OR INSTR(issuer, ?)>0 OR INSTR(client_id, ?)>0)`)
+		args = append(args, keyword, keyword, keyword, keyword)
+	}
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if sortValue, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(sortValue, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
+	}
+	query := `SELECT ` + oidcProviderColumns + ` FROM oidc_providers`
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[OIDCProvider]{}, err
+	}
+	defer rows.Close()
+	page := Page[OIDCProvider]{}
+	for rows.Next() {
+		provider, err := scanOIDCProvider(rows)
+		if err != nil {
+			return Page[OIDCProvider]{}, err
+		}
+		page.Items = append(page.Items, provider)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[OIDCProvider]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else if spec.Column == "created_at" {
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		} else if spec.Column == "name" {
+			page.NextCursor = spec.NextCursor(last.Name, last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		}
 	}
 	return page, nil
 }

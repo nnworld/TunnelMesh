@@ -6,6 +6,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/auth/oidc"
+	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
 
 // roleMappingRequest mirrors oidc.RoleMapping. It is redeclared at the transport
@@ -107,7 +108,12 @@ func (a *API) handleSSO(w http.ResponseWriter, r *http.Request, p auth.Principal
 func (a *API) handleSSOProviderCollection(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	switch r.Method {
 	case http.MethodGet:
-		page, err := a.identity.Providers.List(r.Context(), r.URL.Query().Get("cursor"), queryLimit(r))
+		sort, sortErr := parseListSort(r, map[string]string{"updatedAt": "updated_at", "createdAt": "created_at", "name": "name", "id": "id"}, "updatedAt")
+		if sortErr != nil {
+			sortErr.write(w)
+			return
+		}
+		page, err := a.identity.Providers.ListSortedFiltered(r.Context(), storage.OIDCProviderListFilter{Keyword: strings.TrimSpace(r.URL.Query().Get("keyword"))}, sort.Spec(), r.URL.Query().Get("cursor"), queryLimit(r))
 		if err != nil {
 			writeAuthError(w, err)
 			return

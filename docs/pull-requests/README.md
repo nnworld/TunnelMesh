@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 53 份记录，按日期倒序排列。
+共 54 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-10-24 | [后台管理列表体验与 Client/Agent 链路加固](2026-10-24-admin-console-client-resilience.md) | [计划：Admin Console List Redesign](../superpowers/plans/2026-10-24-admin-console-redesign.md)<br>[计划：Client/Agent 便携性与容错加固](../superpowers/plans/2026-10-24-client-agent-portability-resilience.md) | — |
 | 2026-10-07 | [feat(tray): Windows 系统托盘客户端与 NSIS 发行打包](2026-10-07-client-system-tray-windows.md) | [计划：TunnelMesh Client 系统托盘（Windows）](../superpowers/plans/2026-10-07-client-system-tray-windows.md) | — |
 | 2026-10-06 | [feat(tray): 任务栏快捷小窗与统一的菜单栏图标](2026-10-06-tray-quick-panel.md) | [计划：TunnelMesh 托盘：任务栏快捷小窗（macOS）](../superpowers/plans/2026-10-06-tray-quick-panel.md) | — |
 | 2026-10-06 | [概览页“查看审计日志”跳转路径修正](2026-10-06-dashboard-audit-route-link.md) | — | — |

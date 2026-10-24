@@ -107,16 +107,27 @@ func (r *clientInstanceRepo) Get(ctx context.Context, id string) (ClientInstance
 // is what lets cursor pagination neither repeat nor skip a row.
 func (r *clientInstanceRepo) List(ctx context.Context, filter ClientInstanceFilter, cursor string, limit int) (Page[ClientInstance], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		spec = SortSpec{Column: "last_seen_at", Descending: true, Composite: true}
+	}
 	conditions, args := clientInstanceConditions(filter, time.Now().UTC())
-	if seen, id, ok := decodeCompositeCursor(cursor); ok {
-		conditions = append(conditions, `(last_seen_at<? OR (last_seen_at=? AND id<?))`)
-		args = append(args, seen, seen, id)
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if seen, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(seen, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
 	}
 	query := `SELECT ` + clientInstanceColumns + ` FROM client_instance_metadata`
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY last_seen_at DESC,id DESC LIMIT ?`
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -138,7 +149,11 @@ func (r *clientInstanceRepo) List(ctx context.Context, filter ClientInstanceFilt
 		page.Items = page.Items[:limit]
 		page.HasMore = true
 		last := page.Items[len(page.Items)-1]
-		page.NextCursor = encodeCursor(tm(last.LastSeenAt) + "\x00" + last.ID)
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.LastSeenAt), last.ID)
+		}
 	}
 	return page, nil
 }

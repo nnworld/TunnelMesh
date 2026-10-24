@@ -319,8 +319,11 @@ func (c Credential) HasSecret() bool { return c.SecretCiphertext != "" }
 type CredentialFilter struct {
 	OwnerUserID string
 	Type        CredentialType
+	Types       []CredentialType
 	Status      CredentialStatus
+	Statuses    []CredentialStatus
 	Keyword     string
+	Sort        SortSpec
 }
 
 type RemoteServerStatus string
@@ -356,7 +359,9 @@ type RemoteServerFilter struct {
 	OwnerUserID string
 	AgentID     string
 	Status      RemoteServerStatus
+	Statuses    []RemoteServerStatus
 	Keyword     string
+	Sort        SortSpec
 }
 
 type WebSSHSessionStatus string
@@ -528,6 +533,7 @@ type ClientInstanceFilter struct {
 	MetadataState string
 	AgentID       string
 	Keyword       string
+	Sort          SortSpec
 }
 
 // ClientInstanceSummary aggregates the whole filtered Client population, not a
@@ -597,6 +603,7 @@ type AuditFilter struct {
 	ResourceID   string
 	CreatedFrom  *time.Time
 	CreatedTo    *time.Time
+	Sort         SortSpec
 }
 
 type IdempotencyRecord struct {
@@ -656,7 +663,9 @@ type VPNPeerFilter struct {
 	NodeID      string
 	AgentID     string
 	Status      VPNPeerStatus
+	Statuses    []VPNPeerStatus
 	Keyword     string
+	Sort        SortSpec
 }
 
 // VPNIPLease is one node's claim on a /24 carved out of server.vpn.ip_pool.

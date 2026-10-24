@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 var (
@@ -33,6 +35,7 @@ type WebSocketRunOptions struct {
 	// InboundBufferBytes overrides the per-stream buffer both directions use.
 	// Zero keeps the compiled-in default.
 	InboundBufferBytes int
+	Dialer             *sharedtransport.Dialer
 }
 
 func RunWebSocket(ctx context.Context, serverURL, token string, onReady func(*Session) error) error {
@@ -66,7 +69,7 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		transport, err := dialWebSocketWithLegacyFallback(ctx, serverURL, token)
+		transport, err := dialWebSocketWithLegacyFallback(ctx, serverURL, token, options.Dialer)
 		if err == nil {
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("client", "websocket", "started", "")
@@ -117,11 +120,11 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 }
 
 func DialWebSocket(ctx context.Context, serverURL, token string) (ReceiveTransport, error) {
-	return dialWebSocket(ctx, serverURL, token, true)
+	return dialWebSocket(ctx, serverURL, token, true, nil)
 }
 
-func dialWebSocketWithLegacyFallback(ctx context.Context, serverURL, token string) (ReceiveTransport, error) {
-	transport, err := dialWebSocket(ctx, serverURL, token, true)
+func dialWebSocketWithLegacyFallback(ctx context.Context, serverURL, token string, dialer *sharedtransport.Dialer) (ReceiveTransport, error) {
+	transport, err := dialWebSocket(ctx, serverURL, token, true, dialer)
 	if err == nil {
 		return transport, nil
 	}
@@ -130,7 +133,7 @@ func dialWebSocketWithLegacyFallback(ctx context.Context, serverURL, token strin
 	// subprotocol so legacy deployments remain reachable.
 	var dialErr *websocket.DialError
 	if errors.As(err, &dialErr) && errors.Is(dialErr.Err, websocket.ErrBadStatus) {
-		legacyTransport, legacyErr := dialWebSocket(ctx, serverURL, token, false)
+		legacyTransport, legacyErr := dialWebSocket(ctx, serverURL, token, false, dialer)
 		if legacyErr == nil {
 			return legacyTransport, nil
 		}
@@ -138,7 +141,7 @@ func dialWebSocketWithLegacyFallback(ctx context.Context, serverURL, token strin
 	return nil, err
 }
 
-func dialWebSocket(ctx context.Context, serverURL, token string, offerSubprotocols bool) (ReceiveTransport, error) {
+func dialWebSocket(ctx context.Context, serverURL, token string, offerSubprotocols bool, dialer *sharedtransport.Dialer) (ReceiveTransport, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, ErrClientTokenRequired
 	}
@@ -157,7 +160,13 @@ func dialWebSocket(ctx context.Context, serverURL, token string, offerSubprotoco
 	if offerSubprotocols {
 		config.Protocol = protocol.ClientSubprotocols()
 	}
-	conn, err := config.DialContext(ctx)
+	if dialer == nil {
+		dialer, err = sharedtransport.NewDialer(sharedtransport.DialOptions{Mode: sharedtransport.ProxyModeDirect})
+		if err != nil {
+			return nil, err
+		}
+	}
+	conn, err := dialWithTransport(ctx, config, dialer)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +178,38 @@ func dialWebSocket(ctx context.Context, serverURL, token string, offerSubprotoco
 		selectedProtocol = conn.Config().Protocol[0]
 	}
 	return &clientWebSocketTransport{conn: conn, subprotocol: selectedProtocol}, nil
+}
+
+func dialWithTransport(ctx context.Context, config *websocket.Config, dialer *sharedtransport.Dialer) (*websocket.Conn, error) {
+	address := config.Location.Host
+	if config.Location.Port() == "" {
+		address += ":80"
+		if config.Location.Scheme == "wss" {
+			address = config.Location.Host + ":443"
+		}
+	}
+	conn, err := dialer.DialContextForScheme(ctx, "tcp", address, config.Location.Scheme)
+	if err != nil {
+		return nil, &websocket.DialError{Config: config, Err: err}
+	}
+	if config.Location.Scheme == "wss" {
+		secure := tls.Client(conn, &tls.Config{ServerName: config.Location.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := secure.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, &websocket.DialError{Config: config, Err: err}
+		}
+		conn = secure
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	ws, err := websocket.NewClient(config, conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, &websocket.DialError{Config: config, Err: err}
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return ws, nil
 }
 
 func sessionOpenModeForTransport(transport FrameTransport) SessionOpenMode {

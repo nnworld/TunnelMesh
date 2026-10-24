@@ -36,7 +36,7 @@ func TestClientProxyUsesAuthenticatedSessionAndStdio(t *testing.T) {
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
-	root.SetArgs([]string{"proxy", "tcp", "--client.server_url", "ws://server.example/ws/client", "--client.token", "client-secret", "--agent", "agent-a", "--target-host", "10.0.0.8", "--target-port", "22"})
+	root.SetArgs([]string{"proxy", "tcp", "--client.server_url", "wss://server.example/ws/client", "--client.token", "client-secret", "--agent", "agent-a", "--target-host", "10.0.0.8", "--target-port", "22"})
 	done := make(chan error, 1)
 	go func() { done <- root.ExecuteContext(context.Background()) }()
 
@@ -67,7 +67,7 @@ func TestClientProxyUsesAuthenticatedSessionAndStdio(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("proxy command error = %v", err)
 	}
-	if gotURL != "ws://server.example/ws/client" || gotToken != "client-secret" {
+	if gotURL != "wss://server.example/ws/client" || gotToken != "client-secret" {
 		t.Fatalf("runner URL=%q token=%q", gotURL, gotToken)
 	}
 	if out.String() != "response" {
@@ -83,7 +83,7 @@ func TestClientForwardCommandsStartOnAuthenticatedSession(t *testing.T) {
 			called := false
 			runClientWebSocket = func(_ context.Context, serverURL, token string, onReady func(*client.Session) error) error {
 				called = true
-				if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
+				if serverURL != "wss://server.example/ws/client" || token != "client-secret" {
 					t.Fatalf("runner URL=%q token=%q", serverURL, token)
 				}
 				return onReady(client.NewSession(&cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}))
@@ -92,7 +92,7 @@ func TestClientForwardCommandsStartOnAuthenticatedSession(t *testing.T) {
 			var out bytes.Buffer
 			root.SetOut(&out)
 			root.SetErr(&out)
-			root.SetArgs([]string{"forward", proto, "--client.server_url", "ws://server.example/ws/client", "--client.token", "client-secret", "--listen", "127.0.0.1:0", "--agent", "agent-a", "--target-host", "10.0.0.8", "--target-port", "22"})
+			root.SetArgs([]string{"forward", proto, "--client.server_url", "wss://server.example/ws/client", "--client.token", "client-secret", "--listen", "127.0.0.1:0", "--agent", "agent-a", "--target-host", "10.0.0.8", "--target-port", "22"})
 			if err := root.ExecuteContext(context.Background()); err != nil {
 				t.Fatalf("ExecuteContext() error = %v", err)
 			}
@@ -114,7 +114,7 @@ func TestClientRunUsesOneWebSocketPerAgent(t *testing.T) {
 	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
-  server_url: ws://server.example/ws/client
+  server_url: wss://server.example/ws/client
   token: client-secret
   instance_id_path: ` + identityPath + `
   tunnels:
@@ -134,7 +134,7 @@ client:
 	transports := make(chan *cliFrameTransport, 2)
 	ready := make(chan error, 2)
 	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error, _ client.WebSocketRunOptions) error {
-		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
+		if serverURL != "wss://server.example/ws/client" || token != "client-secret" {
 			ready <- fmt.Errorf("runner URL=%q token=%q", serverURL, token)
 			return <-ready
 		}
@@ -240,7 +240,7 @@ func TestClientRunPassesRuntimeMetadataToSessionPool(t *testing.T) {
 	path := filepath.Join(dir, "client.yaml")
 	yaml := `mode: local
 client:
-  server_url: ws://server.example/ws/client
+  server_url: wss://server.example/ws/client
   token: client-secret
   instance_id_path: ` + identityPath + `
   metadata:
@@ -329,7 +329,7 @@ func TestClientRunStartsHTTPProxyTunnel(t *testing.T) {
 	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
-  server_url: ws://server.example/ws/client
+  server_url: wss://server.example/ws/client
   token: client-secret
   instance_id_path: ` + identityPath + `
   tunnels:
@@ -346,7 +346,7 @@ client:
 	ready := make(chan error, 1)
 	transport := &cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}
 	runClientSessionPool = func(ctx context.Context, serverURL, token string, onReady func(*client.Session) error, _ client.WebSocketRunOptions) error {
-		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
+		if serverURL != "wss://server.example/ws/client" || token != "client-secret" {
 			ready <- fmt.Errorf("runner URL=%q token=%q", serverURL, token)
 			return <-ready
 		}
@@ -432,7 +432,7 @@ func TestClientRunKeepsTunnelsAfterWebSocketReconnect(t *testing.T) {
 	identityPath := filepath.Join(dir, "client-instance-id")
 	yaml := `mode: local
 client:
-  server_url: ws://server.example/ws/client
+  server_url: wss://server.example/ws/client
   token: client-secret
   instance_id_path: ` + identityPath + `
   tunnels:
@@ -513,7 +513,7 @@ func TestClientSOCKS5ForwardUsesAuthenticatedSessionAndPasswordEnv(t *testing.T)
 	called := false
 	runClientWebSocket = func(_ context.Context, serverURL, token string, onReady func(*client.Session) error) error {
 		called = true
-		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
+		if serverURL != "wss://server.example/ws/client" || token != "client-secret" {
 			t.Fatalf("runner URL=%q token=%q", serverURL, token)
 		}
 		return onReady(client.NewSession(&cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}))
@@ -527,7 +527,7 @@ func TestClientSOCKS5ForwardUsesAuthenticatedSessionAndPasswordEnv(t *testing.T)
 	root.SetErr(&out)
 	root.SetArgs([]string{
 		"forward", "socks5",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",
@@ -557,7 +557,7 @@ func TestClientSOCKS5ForwardAcceptsAuthURL(t *testing.T) {
 	root.SetErr(&out)
 	root.SetArgs([]string{
 		"forward", "socks5",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",
@@ -577,7 +577,7 @@ func TestClientHTTPProxyForwardUsesAuthenticatedSessionAndBasicEnv(t *testing.T)
 	called := false
 	runClientWebSocket = func(_ context.Context, serverURL, token string, onReady func(*client.Session) error) error {
 		called = true
-		if serverURL != "ws://server.example/ws/client" || token != "client-secret" {
+		if serverURL != "wss://server.example/ws/client" || token != "client-secret" {
 			t.Fatalf("runner URL=%q token=%q", serverURL, token)
 		}
 		return onReady(client.NewSession(&cliFrameTransport{incoming: make(chan protocol.Frame), sent: make(chan protocol.Frame, 4)}))
@@ -591,7 +591,7 @@ func TestClientHTTPProxyForwardUsesAuthenticatedSessionAndBasicEnv(t *testing.T)
 	root.SetErr(&out)
 	root.SetArgs([]string{
 		"forward", "http-proxy",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",
@@ -621,7 +621,7 @@ func TestClientHTTPProxyForwardAcceptsAuthURL(t *testing.T) {
 	root.SetErr(&out)
 	root.SetArgs([]string{
 		"forward", "http-proxy",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",
@@ -655,7 +655,7 @@ func TestClientHTTPProxyForwardRejectsUnsafeNonLoopbackListener(t *testing.T) {
 			root.SetErr(io.Discard)
 			root.SetArgs(append([]string{
 				"forward", "http-proxy",
-				"--client.server_url", "ws://server.example/ws/client",
+				"--client.server_url", "wss://server.example/ws/client",
 				"--client.token", "client-secret",
 				"--agent", "agent-a",
 			}, test.args...))
@@ -679,7 +679,7 @@ func TestClientHTTPProxyForwardRequiresBasicEnvironment(t *testing.T) {
 	root.SetErr(io.Discard)
 	root.SetArgs([]string{
 		"forward", "http-proxy",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",
@@ -710,7 +710,7 @@ func TestClientSOCKS5ForwardRejectsUnsafeNonLoopbackListener(t *testing.T) {
 			root.SetErr(io.Discard)
 			root.SetArgs(append([]string{
 				"forward", "socks5",
-				"--client.server_url", "ws://server.example/ws/client",
+				"--client.server_url", "wss://server.example/ws/client",
 				"--client.token", "client-secret",
 				"--agent", "agent-a",
 			}, test.args...))
@@ -734,7 +734,7 @@ func TestClientSOCKS5ForwardRequiresPasswordEnvironment(t *testing.T) {
 	root.SetErr(io.Discard)
 	root.SetArgs([]string{
 		"forward", "socks5",
-		"--client.server_url", "ws://server.example/ws/client",
+		"--client.server_url", "wss://server.example/ws/client",
 		"--client.token", "client-secret",
 		"--listen", "127.0.0.1:0",
 		"--agent", "agent-a",

@@ -32,10 +32,10 @@
     </div>
 
     <div class="tm-card panel table-panel">
-      <div class="toolbar"><el-button :loading="loading" @click="reload">{{ t('sso.refresh') }}</el-button></div>
+      <div class="toolbar"><el-input v-model="keyword" clearable class="keyword-input" :placeholder="t('sso.name')" @keyup.enter="reload" @clear="reload" /><el-button :loading="loading" @click="reload">{{ t('sso.refresh') }}</el-button></div>
       <DataState :loading="loading" :error="loadError" :empty="!items.length" :error-label="t('sso.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('sso.empty')" @retry="reload">
-        <el-table :data="items" row-key="id">
-          <el-table-column prop="displayName" :label="t('sso.displayName')" min-width="150" />
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="displayName" :label="t('sso.displayName')" min-width="150" sortable="custom" />
           <el-table-column prop="name" :label="t('sso.name')" width="130" />
           <el-table-column :label="t('sso.issuer')" min-width="240"><template #default="{ row }"><span class="ellipsis" :title="row.issuer">{{ row.issuer }}</span></template></el-table-column>
           <el-table-column :label="t('sso.clientId')" min-width="180"><template #default="{ row }"><span class="ellipsis" :title="row.clientId">{{ row.clientId }}</span></template></el-table-column>
@@ -53,7 +53,7 @@
           <el-table-column :label="t('sso.defaultRole')" width="110">
             <template #default="{ row }">{{ row.defaultRole === 'admin' ? t('sso.roleAdmin') : t('sso.roleUser') }}</template>
           </el-table-column>
-          <el-table-column :label="t('sso.updatedAt')" min-width="170"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
+          <el-table-column prop="updatedAt" :label="t('sso.updatedAt')" min-width="170" sortable="custom"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
           <el-table-column :label="t('sso.actions')" width="240" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" :data-test="`provider-edit-${row.id}`" @click="openEdit(row)">{{ t('sso.edit') }}</el-button>
@@ -63,7 +63,7 @@
           </el-table-column>
         </el-table>
       </DataState>
-      <div v-if="page.nextCursor" class="load-more"><el-button :loading="loadingMore" :disabled="!page.hasMore" @click="loadMore">{{ t('sso.loadMore') }}</el-button></div>
+      <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!page.nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
     </div>
 
     <el-dialog v-model="formVisible" :title="editing ? t('sso.edit') : t('sso.create')" width="min(720px,94vw)">
@@ -190,6 +190,12 @@ const page = ref<SSOProviderPage>({ items: [] })
 const items = computed(() => page.value.items)
 const loading = ref(false)
 const loadingMore = ref(false)
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const keyword = ref('')
+const sort = ref('updatedAt')
+const order = ref<'asc' | 'desc'>('desc')
 const loadError = ref(false)
 
 const policy = reactive<AuthPolicy>({ mfaMode: 'disabled', deviceTrustEnabled: false, deviceTrustTtlSeconds: 2592000, allowTrustedDeviceBypass: false, maxTrustedDevices: 5, sessionTokenTtlSeconds: 43200 })
@@ -223,22 +229,17 @@ const endpointEntries = computed(() => Object.entries(testReport.value?.endpoint
 
 function splitList(value: string) { return value.split(',').map(item => item.trim()).filter(Boolean) }
 
-async function reload() {
+async function load() {
   loading.value = true; loadError.value = false
-  try { page.value = await getSSOProviders({ limit: 50 }) }
+	try { page.value = await getSSOProviders({ keyword: keyword.value.trim() || undefined, limit: pageSize.value, cursor: cursors.value[pageIndex.value] || undefined, sort: sort.value, order: order.value }) }
   catch { loadError.value = true }
   finally { loading.value = false }
 }
 
-async function loadMore() {
-  if (!page.value.nextCursor) return
-  loadingMore.value = true
-  try {
-    const next = await getSSOProviders({ limit: 50, cursor: page.value.nextCursor })
-    page.value = { items: [...page.value.items, ...next.items], nextCursor: next.nextCursor, hasMore: next.hasMore }
-  } catch { loadError.value = true }
-  finally { loadingMore.value = false }
-}
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!page.value.nextCursor) return; cursors.value[pageIndex.value + 1] = page.value.nextCursor; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'displayName' ? 'name' : 'updatedAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 async function loadPolicy() {
   policyLoading.value = true; policyLoadError.value = false; policyError.value = ''
@@ -355,8 +356,8 @@ void reload()
 .table-panel { padding: 0; overflow: hidden; }
 .panel-head h2 { margin: 0; font-size: 17px; }
 .hint { margin: 4px 0 0; color: var(--tm-muted); font-size: 12px; line-height: 1.5; }
-.toolbar { display: flex; justify-content: flex-end; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); }
-.load-more { display: flex; justify-content: center; padding: 14px; }
+.toolbar { display: flex; justify-content: flex-end; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); }.keyword-input { width: min(240px, 100%); }
+.list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:14px; }.page-size { width:100px; }
 .policy-form { max-width: 520px; padding-top: 16px; }
 .actions { display: flex; gap: 8px; align-items: center; }
 .notice { margin-top: 14px; }

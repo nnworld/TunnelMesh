@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     disabled INTEGER NOT NULL DEFAULT 0,
     deleted_at VARCHAR(32),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL,
     -- auth_source records where the primary credential comes from. A stored
     -- password_hash of '*' marks an external-only account that has no local
     -- password, and Argon2id verification can never succeed against it.
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     mfa_required INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_users_role_deleted ON users(role, deleted_at, id);
+CREATE INDEX idx_users_created ON users(created_at, id);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id VARBINARY(255) PRIMARY KEY,
@@ -50,12 +51,13 @@ CREATE TABLE IF NOT EXISTS service_tokens (
     expires_at TEXT,
     revoked_at TEXT,
     last_used_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL
 );
 CREATE INDEX idx_service_tokens_owner_type ON service_tokens(owner_user_id, token_type, id);
 CREATE INDEX idx_service_tokens_agent ON service_tokens(agent_id, token_type, id);
 CREATE INDEX idx_service_tokens_node ON service_tokens(node_id, token_type, id);
+CREATE INDEX idx_service_tokens_created ON service_tokens(created_at, id);
 -- Recoverable bearer secrets are encrypted before persistence. ALTER statements
 -- are intentionally idempotent at the application layer for older databases.
 ALTER TABLE service_tokens ADD COLUMN secret_ciphertext TEXT;
@@ -107,6 +109,7 @@ CREATE TABLE IF NOT EXISTS oidc_providers (
     updated_at VARCHAR(32) NOT NULL
 );
 CREATE INDEX idx_oidc_providers_enabled ON oidc_providers(enabled, public_listed, id);
+CREATE INDEX idx_oidc_providers_created ON oidc_providers(created_at, id);
 
 CREATE TABLE IF NOT EXISTS user_identities (
     id VARBINARY(255) PRIMARY KEY,
@@ -191,10 +194,11 @@ CREATE TABLE IF NOT EXISTS agents (
     owner_user_id VARBINARY(255) NOT NULL,
     capabilities TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL
 );
 CREATE INDEX idx_agents_owner ON agents(owner_user_id);
+CREATE INDEX idx_agents_created ON agents(created_at, id);
 
 CREATE TABLE IF NOT EXISTS agent_policies (
     id VARBINARY(255) PRIMARY KEY,
@@ -205,10 +209,11 @@ CREATE TABLE IF NOT EXISTS agent_policies (
     allowed_cidrs TEXT NOT NULL,
     allowed_ports TEXT NOT NULL,
     deleted_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL
 );
 CREATE INDEX idx_agent_policies_agent ON agent_policies(agent_id);
+CREATE INDEX idx_agent_policies_created ON agent_policies(created_at, id);
 
 CREATE TABLE IF NOT EXISTS tunnel_groups (
     id VARBINARY(255) PRIMARY KEY,
@@ -230,12 +235,13 @@ CREATE TABLE IF NOT EXISTS tunnels (
     public_port INTEGER,
     status VARCHAR(32) NOT NULL DEFAULT 'active',
     config TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL,
     UNIQUE(domain, path_prefix)
 );
 CREATE INDEX idx_tunnels_agent ON tunnels(agent_id);
 CREATE INDEX idx_tunnels_domain_path ON tunnels(domain, path_prefix);
+CREATE INDEX idx_tunnels_created ON tunnels(created_at, id);
 
 CREATE TABLE IF NOT EXISTS server_nodes (
     id VARBINARY(255) PRIMARY KEY,
@@ -247,9 +253,10 @@ CREATE TABLE IF NOT EXISTS server_nodes (
     deleted_at TEXT,
     last_seen_at TEXT,
     expires_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at VARCHAR(32) NOT NULL,
+    updated_at VARCHAR(32) NOT NULL
 );
+CREATE INDEX idx_server_nodes_created ON server_nodes(created_at, id);
 
 CREATE TABLE IF NOT EXISTS agent_connection_leases (
     agent_id VARBINARY(255) NOT NULL,
@@ -300,6 +307,7 @@ CREATE TABLE IF NOT EXISTS client_instance_metadata (
 );
 CREATE INDEX idx_client_instance_metadata_owner ON client_instance_metadata(owner_user_id, stale, last_seen_at);
 CREATE INDEX idx_client_instance_metadata_stale ON client_instance_metadata(stale, updated_at);
+CREATE INDEX idx_client_metadata_last_seen ON client_instance_metadata(last_seen_at, id);
 
 CREATE TABLE IF NOT EXISTS client_connection_leases (
     connection_id VARBINARY(128) PRIMARY KEY,
@@ -332,11 +340,12 @@ CREATE TABLE IF NOT EXISTS credentials (
     secret_version INTEGER,
     enabled INTEGER NOT NULL DEFAULT 1,
     deleted_at VARCHAR(32),
-    created_at TEXT NOT NULL,
+    created_at VARCHAR(32) NOT NULL,
     updated_at VARCHAR(32) NOT NULL
 );
 CREATE INDEX idx_credentials_owner ON credentials(owner_user_id, credential_type, id);
 CREATE INDEX idx_credentials_deleted ON credentials(deleted_at, updated_at);
+CREATE INDEX idx_credentials_updated ON credentials(updated_at, id);
 
 CREATE TABLE IF NOT EXISTS remote_servers (
     id VARBINARY(255) PRIMARY KEY,
@@ -358,6 +367,7 @@ CREATE TABLE IF NOT EXISTS remote_servers (
 CREATE INDEX idx_remote_servers_owner ON remote_servers(owner_user_id, enabled, id);
 CREATE INDEX idx_remote_servers_agent ON remote_servers(agent_id, enabled, id);
 CREATE INDEX idx_remote_servers_deleted ON remote_servers(deleted_at, updated_at);
+CREATE INDEX idx_remote_servers_updated ON remote_servers(updated_at, id);
 
 CREATE TABLE IF NOT EXISTS webssh_sessions (
     id VARBINARY(255) PRIMARY KEY,
@@ -414,6 +424,7 @@ CREATE TABLE IF NOT EXISTS vpn_peers (
 CREATE INDEX idx_vpn_peers_owner ON vpn_peers(owner_id, id);
 CREATE INDEX idx_vpn_peers_node ON vpn_peers(node_id, status);
 CREATE INDEX idx_vpn_peers_expires ON vpn_peers(expires_at);
+CREATE INDEX idx_vpn_peers_created ON vpn_peers(created_at, id);
 
 CREATE TABLE IF NOT EXISTS vpn_ip_leases (
     id VARBINARY(255) PRIMARY KEY,

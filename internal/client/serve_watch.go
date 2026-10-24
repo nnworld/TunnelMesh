@@ -82,22 +82,10 @@ func (w *ForwardServeWatcher) FirstErr() error {
 	return w.first
 }
 
-// SuperviseRun waits for the session pool while a listener failure takes
-// precedence over it.
-//
-// A dead listener cancels the run, which usually makes the pool return
-// context.Canceled. Reporting that instead would hide the real cause, so the
-// recorded failure wins.
+// SuperviseRun waits for the session pool. Listener failures are recovered by the
+// Runtime at tunnel scope and therefore do not cancel unrelated tunnels.
 func SuperviseRun(run func() error, watcher *ForwardServeWatcher) error {
-	results := make(chan error, 1)
-	go func() { results <- run() }()
-	var err error
-	select {
-	case err = <-results:
-	case <-watcher.Err():
-		err = nil
-	}
-	return ForwardServeResult(watcher, err)
+	return run()
 }
 
 // ForwardServeResult prefers a recorded listener failure over the run error.

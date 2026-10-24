@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
@@ -144,12 +145,36 @@ func (a *API) handleExtractSSHPublicKey(w http.ResponseWriter, r *http.Request, 
 func (a *API) handleCredentialListCreate(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	switch r.Method {
 	case http.MethodGet:
-		filter := storage.CredentialFilter{Keyword: r.URL.Query().Get("keyword")}
-		if raw := r.URL.Query().Get("type"); raw != "" {
-			filter.Type = storage.CredentialType(raw)
+		sort, sortErr := parseListSort(r, map[string]string{"updatedAt": "updated_at", "createdAt": "created_at", "id": "id"}, "updated_at")
+		if sortErr != nil {
+			sortErr.write(w)
+			return
 		}
-		if raw := r.URL.Query().Get("status"); raw != "" {
-			filter.Status = storage.CredentialStatus(raw)
+		filter := storage.CredentialFilter{Keyword: r.URL.Query().Get("keyword"), Sort: sort.Spec()}
+		types, typeErr := queryMulti(r, "type", map[string]string{"ssh_public_key": "ssh_public_key", "password": "password", "proxy_basic": "proxy_basic"})
+		if typeErr != nil {
+			typeErr.write(w)
+			return
+		}
+		statuses, statusErr := queryMulti(r, "status", map[string]string{"active": "active", "deleted": "deleted", "all": "all"})
+		if statusErr != nil {
+			statusErr.write(w)
+			return
+		}
+		for _, value := range types {
+			filter.Types = append(filter.Types, storage.CredentialType(value))
+		}
+		for _, value := range statuses {
+			filter.Statuses = append(filter.Statuses, storage.CredentialStatus(value))
+		}
+		if slices.Contains(statuses, "all") {
+			filter.Statuses = nil
+		}
+		if len(types) == 1 {
+			filter.Type = storage.CredentialType(types[0])
+		}
+		if len(statuses) == 1 {
+			filter.Status = storage.CredentialStatus(statuses[0])
 		}
 		page, err := a.credentialService.List(r.Context(), p, filter, r.URL.Query().Get("cursor"), queryLimit(r))
 		if err != nil {

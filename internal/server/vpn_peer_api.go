@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -404,12 +405,33 @@ func (a *API) handleVPNPeerListCreate(w http.ResponseWriter, r *http.Request, p 
 // service from the authenticated principal, never from a query parameter, so a
 // caller cannot widen their own view by asking for somebody else's rows.
 func (a *API) listVPNPeers(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	sort, sortErr := parseListSort(r, map[string]string{"expiresAt": "expires_at", "createdAt": "created_at", "updatedAt": "updated_at", "id": "id"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
 	query := r.URL.Query()
 	filter := storage.VPNPeerFilter{
 		Keyword: strings.TrimSpace(query.Get("keyword")),
 		NodeID:  strings.TrimSpace(query.Get("nodeId")),
 		AgentID: strings.TrimSpace(query.Get("agentId")),
 		Status:  storage.VPNPeerStatus(strings.TrimSpace(query.Get("status"))),
+		Sort:    sort.Spec(),
+	}
+	statuses, statusErr := queryMulti(r, "status", map[string]string{"active": "active", "disabled": "disabled", "revoked": "revoked", "all": "all"})
+	if statusErr != nil {
+		statusErr.write(w)
+		return
+	}
+	for _, value := range statuses {
+		filter.Statuses = append(filter.Statuses, storage.VPNPeerStatus(value))
+	}
+	if slices.Contains(statuses, "all") {
+		filter.Statuses = nil
+		filter.Status = ""
+	}
+	if len(statuses) == 1 {
+		filter.Status = storage.VPNPeerStatus(statuses[0])
 	}
 	page, err := a.vpnPeerService.List(r.Context(), p, filter, query.Get("cursor"), queryLimit(r))
 	if err != nil {

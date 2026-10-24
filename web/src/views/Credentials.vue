@@ -11,8 +11,8 @@
         <el-button :loading="loading" @click="reload">{{ t('credentials.refresh') }}</el-button>
       </div>
       <DataState :loading="loading" :error="loadError" :empty="!items.length" :error-label="t('credentials.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('credentials.empty')" @retry="reload">
-        <el-table :data="items" row-key="id">
-          <el-table-column prop="name" :label="t('credentials.name')" min-width="150" />
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="name" :label="t('credentials.name')" min-width="150" sortable="custom" />
           <el-table-column :label="t('credentials.type')" width="140">
             <template #default="{ row }">{{ credentialTypeLabel(row.type) }}</template>
           </el-table-column>
@@ -29,6 +29,7 @@
           <el-table-column :label="t('credentials.enabled')" width="110">
             <template #default="{ row }"><StatusTag :kind="row.enabled ? 'success' : 'warning'" :label="row.enabled ? t('common.yes') : t('common.no')" /></template>
           </el-table-column>
+          <el-table-column prop="updatedAt" :label="t('credentials.updatedAt')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
           <el-table-column :label="t('credentials.status')" width="110">
             <template #default="{ row }"><StatusTag :kind="row.status === 'active' ? 'success' : 'info'" :label="row.status === 'active' ? t('credentials.active') : t('credentials.deleted')" /></template>
           </el-table-column>
@@ -42,7 +43,7 @@
           </el-table-column>
         </el-table>
       </DataState>
-      <div v-if="page.nextCursor" class="load-more"><el-button :loading="loadingMore" :disabled="!page.hasMore" @click="loadMore">{{ t('credentials.loadMore') }}</el-button></div>
+      <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!page.nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
     </div>
 
     <el-dialog v-model="formVisible" :title="editingCredential ? t('credentials.edit') : t('credentials.create')" width="min(680px,94vw)" @closed="clearSensitiveKeyInput">
@@ -139,6 +140,11 @@ const page = ref<{ items: Credential[]; nextCursor?: string; hasMore?: boolean }
 const items = computed(() => page.value.items)
 const loading = ref(false)
 const loadingMore = ref(false)
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const sort = ref('updatedAt')
+const order = ref<'asc' | 'desc'>('desc')
 const loadError = ref(false)
 const keyword = ref('')
 const filterStatus = ref<StatusFilter>('active')
@@ -221,24 +227,21 @@ const detailLoading = ref(false)
 const detailError = ref(false)
 const detailCredential = ref<Credential | null>(null)
 
-async function load(cursor?: string) {
-  const appending = Boolean(cursor)
-  appending ? loadingMore.value = true : loading.value = true
-  if (!appending) loadError.value = false
+async function load() {
+  loading.value = true
+  loadError.value = false
   try {
     const result = await listCredentials({
       keyword: keyword.value || undefined,
       status: filterStatus.value,
-      cursor,
-      limit: 20,
+      cursor: cursors.value[pageIndex.value] || undefined,
+      limit: pageSize.value,
+      sort: sort.value,
+      order: order.value,
     })
-    page.value = appending ? {
-      items: [...page.value.items, ...result.items],
-      nextCursor: result.nextCursor,
-      hasMore: result.hasMore,
-    } : result
+    page.value = result
   } catch {
-    if (!appending) loadError.value = true
+    loadError.value = true
     ElMessage.error(t('credentials.loadFailed'))
   } finally {
     loading.value = false
@@ -246,8 +249,10 @@ async function load(cursor?: string) {
   }
 }
 
-function reload() { page.value = { items: [] }; void load() }
-function loadMore() { if (page.value.nextCursor) void load(page.value.nextCursor) }
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!page.value.nextCursor) return; cursors.value[pageIndex.value + 1] = page.value.nextCursor; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'name' ? 'id' : 'updatedAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 // Values only: the credential type and the "store private key" choice are form
 // state rather than secret material, so extraction can wipe the key without

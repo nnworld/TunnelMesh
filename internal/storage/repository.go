@@ -49,6 +49,13 @@ type AccountUserRepository interface {
 	Restore(context.Context, string) error
 }
 
+// SortedAccountUserRepository is an optional extension used by the management
+// console. Keeping it separate preserves the narrow account repository contract
+// implemented by authentication fakes.
+type SortedAccountUserRepository interface {
+	ListChildrenSorted(context.Context, AccountStatus, string, []string, SortSpec, string, int) (Page[User], error)
+}
+
 // UserIdentityWriter covers the schema v14 identity columns. It is a separate
 // interface so the authentication contract implemented by test fakes stays
 // narrow.
@@ -68,8 +75,13 @@ type TokenRepository interface {
 type ServiceTokenFilter struct {
 	OwnerUserID string
 	Type        TokenType
+	Types       []TokenType
 	AgentID     string
 	NodeID      string
+	Status      string
+	Statuses    []string
+	Keyword     string
+	Sort        SortSpec
 }
 
 type ServiceTokenRepository interface {
@@ -170,6 +182,7 @@ type AgentListFilter struct {
 	// Keyword matches a substring of the name or the id, the same shape the
 	// client list uses, so an operator can type either.
 	Keyword string
+	Sort    SortSpec
 }
 
 type AgentRepository interface {
@@ -206,6 +219,18 @@ type TunnelRepository interface {
 	List(context.Context, string, int) (Page[Tunnel], error)
 }
 
+type SortedTunnelRepository interface {
+	ListSorted(context.Context, string, SortSpec, string, int) (Page[Tunnel], error)
+}
+
+type TunnelListFilter struct {
+	Keyword string
+}
+
+type FilteredSortedTunnelRepository interface {
+	ListSortedFiltered(context.Context, TunnelListFilter, SortSpec, string, int) (Page[Tunnel], error)
+}
+
 type NodeRepository interface {
 	Create(context.Context, ServerNode) error
 	Ensure(context.Context, ServerNode) error
@@ -215,6 +240,10 @@ type NodeRepository interface {
 	List(context.Context, string, int) (Page[ServerNode], error)
 	Touch(context.Context, string, time.Time, time.Time) error
 	StatsByNodeIDs(context.Context, []string) (map[string]ServerNodeStats, error)
+}
+
+type SortedNodeRepository interface {
+	ListSorted(context.Context, SortSpec, string, int) (Page[ServerNode], error)
 }
 
 var ErrMetadataStale = errors.New("runtime metadata is stale")
@@ -781,6 +810,81 @@ func (r *userRepo) ListChildren(ctx context.Context, status AccountStatus, curso
 	return page, nil
 }
 
+func (r *userRepo) ListChildrenSorted(ctx context.Context, status AccountStatus, keyword string, roles []string, spec SortSpec, cursor string, limit int) (Page[User], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	if spec.Column == "" {
+		spec = SortSpec{Column: "created_at", Descending: true, Composite: true}
+	}
+	conditions := []string{"role <> 'admin'"}
+	args := make([]any, 0, len(roles)+4)
+	switch status {
+	case "", AccountStatusActive:
+		conditions = append(conditions, `deleted_at IS NULL`)
+	case AccountStatusDeleted:
+		conditions = append(conditions, `deleted_at IS NOT NULL`)
+	case AccountStatusAll:
+	default:
+		return Page[User]{}, fmt.Errorf("invalid account status %q", status)
+	}
+	if len(roles) > 0 {
+		placeholders := make([]string, 0, len(roles))
+		for _, role := range roles {
+			placeholders = append(placeholders, "?")
+			args = append(args, role)
+		}
+		conditions = append(conditions, `role IN (`+strings.Join(placeholders, ",")+`)`)
+	}
+	if keyword = strings.TrimSpace(boundedAgentFilter(keyword)); keyword != "" {
+		conditions = append(conditions, `(INSTR(username, ?)>0 OR INSTR(id, ?)>0)`)
+		args = append(args, keyword, keyword)
+	}
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if sortValue, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(sortValue, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
+	}
+	query := `SELECT ` + userColumns + ` FROM users WHERE ` + strings.Join(conditions, ` AND `) + ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[User]{}, err
+	}
+	defer rows.Close()
+	page := Page[User]{}
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return Page[User]{}, err
+		}
+		page.Items = append(page.Items, user)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[User]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		last := page.Items[len(page.Items)-1]
+		switch spec.Column {
+		case "id":
+			page.NextCursor = spec.NextCursor("", last.ID)
+		case "updated_at":
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		case "role":
+			page.NextCursor = spec.NextCursor(last.Role, last.ID)
+		default:
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
+	}
+	return page, nil
+}
+
 func (r *userRepo) SoftDelete(ctx context.Context, id string, when time.Time) error {
 	when = timeOrNow(when)
 	res, err := r.db.ExecContext(ctx, `UPDATE users SET deleted_at=CASE WHEN deleted_at IS NULL THEN ? ELSE deleted_at END,disabled=1,updated_at=? WHERE id=?`, tm(when), tm(when), id)
@@ -961,13 +1065,29 @@ func (r *serviceTokenRepo) GetByHash(ctx context.Context, hash string) (ServiceT
 
 func (r *serviceTokenRepo) List(ctx context.Context, filter ServiceTokenFilter, cursor string, limit int) (Page[ServiceToken], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		// Keep the repository's historical direct-call order. API handlers always
+		// pass an explicit business-time sort, while older embedders and contract
+		// tests rely on ID-seek pagination when no sort was requested.
+		spec = SortSpec{Column: "id"}
+	}
 	conditions := make([]string, 0, 5)
 	args := make([]any, 0, 6)
 	if filter.OwnerUserID != "" {
 		conditions = append(conditions, `owner_user_id=?`)
 		args = append(args, filter.OwnerUserID)
 	}
-	if filter.Type != "" {
+	if len(filter.Types) > 0 {
+		placeholders := make([]string, len(filter.Types))
+		for index := range placeholders {
+			placeholders[index] = "?"
+		}
+		conditions = append(conditions, `token_type IN (`+strings.Join(placeholders, ",")+`)`)
+		for _, value := range filter.Types {
+			args = append(args, value)
+		}
+	} else if filter.Type != "" {
 		conditions = append(conditions, `token_type=?`)
 		args = append(args, filter.Type)
 	}
@@ -979,15 +1099,40 @@ func (r *serviceTokenRepo) List(ctx context.Context, filter ServiceTokenFilter, 
 		conditions = append(conditions, `node_id=?`)
 		args = append(args, filter.NodeID)
 	}
-	if decoded := decodeCursor(cursor); decoded != "" {
-		conditions = append(conditions, `id>?`)
-		args = append(args, decoded)
+	if len(filter.Statuses) > 0 {
+		placeholders := make([]string, len(filter.Statuses))
+		for index := range placeholders {
+			placeholders[index] = "?"
+		}
+		conditions = append(conditions, `CASE WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at IS NOT NULL AND expires_at<? THEN 'expired' ELSE 'active' END IN (`+strings.Join(placeholders, ",")+`)`)
+		args = append(args, tm(time.Now().UTC()))
+		for _, value := range filter.Statuses {
+			args = append(args, value)
+		}
+	} else if filter.Status != "" {
+		conditions = append(conditions, `CASE WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at IS NOT NULL AND expires_at<? THEN 'expired' ELSE 'active' END=?`)
+		args = append(args, tm(time.Now().UTC()), filter.Status)
+	}
+	if keyword := boundedAgentFilter(strings.TrimSpace(filter.Keyword)); keyword != "" {
+		conditions = append(conditions, `(INSTR(token_prefix, ?)>0 OR INSTR(id, ?)>0)`)
+		args = append(args, keyword, keyword)
+	}
+	if spec.Column == "id" {
+		if decoded := decodeCursor(cursor); decoded != "" {
+			predicate, cursorArgs := spec.CursorCondition("", decoded)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if created, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(created, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
 	}
 	query := `SELECT ` + serviceTokenColumns + ` FROM service_tokens`
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY id LIMIT ?`
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1008,7 +1153,14 @@ func (r *serviceTokenRepo) List(ctx context.Context, filter ServiceTokenFilter, 
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
 		page.HasMore = true
-		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else if spec.Column == "updated_at" {
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
 	}
 	return page, nil
 }
@@ -1227,6 +1379,10 @@ func (r *agentRepo) Delete(ctx context.Context, id string) error {
 }
 func (r *agentRepo) List(ctx context.Context, filter AgentListFilter, cursor string, limit int) (Page[Agent], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		spec = SortSpec{Column: "created_at", Descending: true, Composite: true}
+	}
 	q := `SELECT id,name,owner_user_id,capabilities,enabled,created_at,updated_at FROM agents`
 	conditions := []string{}
 	args := []any{}
@@ -1244,14 +1400,21 @@ func (r *agentRepo) List(ctx context.Context, filter AgentListFilter, cursor str
 	// the id tie-break is part of the cursor as well. Both columns are TEXT
 	// holding RFC3339 UTC, so the database compares them in the same order the
 	// console renders them, on either dialect.
-	if created, id, ok := decodeCompositeCursor(cursor); ok {
-		conditions = append(conditions, `(created_at<? OR (created_at=? AND id<?))`)
-		args = append(args, created, created, id)
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if created, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(created, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
 	}
 	if len(conditions) > 0 {
 		q += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	q += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1277,7 +1440,13 @@ func (r *agentRepo) List(ctx context.Context, filter AgentListFilter, cursor str
 		p.Items = out[:limit]
 		p.HasMore = true
 		last := p.Items[len(p.Items)-1]
-		p.NextCursor = encodeCursor(tm(last.CreatedAt) + "\x00" + last.ID)
+		if spec.Column == "id" {
+			p.NextCursor = spec.NextCursor("", last.ID)
+		} else if spec.Column == "updated_at" {
+			p.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		} else {
+			p.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
 	}
 	return p, nil
 }
@@ -1500,6 +1669,85 @@ func (r *tunnelRepo) List(ctx context.Context, cursor string, limit int) (Page[T
 	}
 	return p, nil
 }
+
+func (r *tunnelRepo) ListSorted(ctx context.Context, ownerCursor string, spec SortSpec, cursor string, limit int) (Page[Tunnel], error) {
+	return r.ListSortedFiltered(ctx, TunnelListFilter{}, spec, cursor, limit)
+}
+
+func (r *tunnelRepo) ListSortedFiltered(ctx context.Context, filter TunnelListFilter, spec SortSpec, cursor string, limit int) (Page[Tunnel], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	if spec.Column == "" {
+		spec = SortSpec{Column: "created_at", Descending: true, Composite: true}
+	}
+	conditions := []string{}
+	args := []any{}
+	if keyword := boundedAgentFilter(strings.TrimSpace(filter.Keyword)); keyword != "" {
+		conditions = append(conditions, `(INSTR(id, ?)>0 OR INSTR(domain, ?)>0 OR INSTR(target_host, ?)>0 OR INSTR(agent_id, ?)>0)`)
+		args = append(args, keyword, keyword, keyword, keyword)
+	}
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if sortValue, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(sortValue, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
+	}
+	query := `SELECT id,group_id,agent_id,protocol,domain,path_prefix,target_host,target_port,public_port,status,config,created_at,updated_at FROM tunnels`
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[Tunnel]{}, err
+	}
+	defer rows.Close()
+	page := Page[Tunnel]{}
+	for rows.Next() {
+		var tunnel Tunnel
+		var group, domain, path, created, updated sql.NullString
+		var public sql.NullInt64
+		if err := rows.Scan(&tunnel.ID, &group, &tunnel.AgentID, &tunnel.Protocol, &domain, &path, &tunnel.TargetHost, &tunnel.TargetPort, &public, &tunnel.Status, &tunnel.Config, &created, &updated); err != nil {
+			return Page[Tunnel]{}, err
+		}
+		if group.Valid {
+			tunnel.GroupID = group.String
+		}
+		if domain.Valid {
+			tunnel.Domain = domain.String
+		}
+		if path.Valid {
+			tunnel.PathPrefix = path.String
+		}
+		if public.Valid {
+			tunnel.PublicPort = int(public.Int64)
+		}
+		tunnel.CreatedAt = parseTime(created.String)
+		tunnel.UpdatedAt = parseTime(updated.String)
+		page.Items = append(page.Items, tunnel)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[Tunnel]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else if spec.Column == "updated_at" {
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
+	}
+	return page, nil
+}
 func nullableString(v string) any {
 	if v == "" {
 		return nil
@@ -1635,6 +1883,78 @@ func (r *nodeRepo) List(ctx context.Context, cursor string, limit int) (Page[Ser
 		p.NextCursor = encodeCursor(p.Items[len(p.Items)-1].ID)
 	}
 	return p, nil
+}
+
+func (r *nodeRepo) ListSorted(ctx context.Context, spec SortSpec, cursor string, limit int) (Page[ServerNode], error) {
+	cursor, limit = pageArgs(cursor, limit)
+	if spec.Column == "" {
+		spec = SortSpec{Column: "created_at", Descending: true, Composite: true}
+	}
+	conditions := []string{}
+	args := []any{}
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if sortValue, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(sortValue, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
+	}
+	query := `SELECT id,name,address,epoch,metadata,enabled,deleted_at,last_seen_at,expires_at,created_at,updated_at FROM server_nodes`
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Page[ServerNode]{}, err
+	}
+	defer rows.Close()
+	page := Page[ServerNode]{}
+	for rows.Next() {
+		var node ServerNode
+		var meta, seen, exp, deleted, created, updated sql.NullString
+		var enabled int
+		if err := rows.Scan(&node.ID, &node.Name, &node.Address, &node.Epoch, &meta, &enabled, &deleted, &seen, &exp, &created, &updated); err != nil {
+			return Page[ServerNode]{}, err
+		}
+		node.Enabled = enabled != 0
+		if meta.Valid {
+			node.Metadata = meta.String
+		}
+		node.LastSeenAt = parseTM(seen)
+		node.ExpiresAt = parseTM(exp)
+		node.DeletedAt = parseTM(deleted)
+		node.CreatedAt = parseTime(created.String)
+		node.UpdatedAt = parseTime(updated.String)
+		page.Items = append(page.Items, node)
+	}
+	if err := rows.Err(); err != nil {
+		return Page[ServerNode]{}, err
+	}
+	if len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		page.HasMore = true
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else if spec.Column == "updated_at" {
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		} else if spec.Column == "last_seen_at" {
+			sortValue := ""
+			if last.LastSeenAt != nil {
+				sortValue = tm(*last.LastSeenAt)
+			}
+			page.NextCursor = spec.NextCursor(sortValue, last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
+	}
+	return page, nil
 }
 
 func (r *nodeRepo) Touch(ctx context.Context, id string, lastSeen, expires time.Time) error {
@@ -2294,6 +2614,10 @@ func (r *auditRepo) PurgeOlderThan(ctx context.Context, olderThan time.Time, lim
 
 func (r *auditRepo) List(ctx context.Context, filter AuditFilter, cursor string, limit int) (Page[AuditLog], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		spec = SortSpec{Column: "created_at", Descending: true, Composite: true}
+	}
 	q := `SELECT id,actor_user_id,action,resource_type,resource_id,details,created_at FROM audit_logs`
 	args := []any{}
 	conditions := []string{}
@@ -2321,18 +2645,27 @@ func (r *auditRepo) List(ctx context.Context, filter AuditFilter, cursor string,
 		conditions = append(conditions, "created_at<=?")
 		args = append(args, tm(*filter.CreatedTo))
 	}
-	cursorCreatedAt, cursorID, err := r.decodeAuditCursor(ctx, cursor)
-	if err != nil {
-		return Page[AuditLog]{}, err
-	}
-	if cursorID != "" {
-		conditions = append(conditions, `(created_at<? OR (created_at=? AND id<?))`)
-		args = append(args, cursorCreatedAt, cursorCreatedAt, cursorID)
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else {
+		cursorCreatedAt, cursorID, err := r.decodeAuditCursor(ctx, cursor)
+		if err != nil {
+			return Page[AuditLog]{}, err
+		}
+		if cursorID != "" {
+			predicate, cursorArgs := spec.CursorCondition(cursorCreatedAt, cursorID)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
 	}
 	if len(conditions) > 0 {
 		q += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	q += ` ORDER BY created_at DESC,id DESC LIMIT ?`
+	q += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -2366,7 +2699,11 @@ func (r *auditRepo) List(ctx context.Context, filter AuditFilter, cursor string,
 		p.Items = out[:limit]
 		p.HasMore = true
 		last := p.Items[len(p.Items)-1]
-		p.NextCursor = encodeAuditCursor(last.CreatedAt, last.ID)
+		if spec.Column == "id" {
+			p.NextCursor = spec.NextCursor("", last.ID)
+		} else {
+			p.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
 	}
 	return p, nil
 }

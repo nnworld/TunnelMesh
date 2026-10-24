@@ -94,10 +94,10 @@
         <el-empty v-if="!policies.length" :description="t('agentDetail.policyEmpty')" />
         <el-table v-else :data="policies" row-key="id">
           <el-table-column prop="protocol" :label="t('agentDetail.policyProtocol')" width="100" />
-          <el-table-column :label="t('agentDetail.policyTargetHost')" min-width="180">
+          <el-table-column prop="targetHost" :label="t('agentDetail.policyTargetHost')" min-width="180" sortable="true">
             <template #default="scope">{{ formatPolicyTargetHost(scope.row.targetHost) }}</template>
           </el-table-column>
-          <el-table-column :label="t('agentDetail.policyTargetPort')" width="130">
+          <el-table-column prop="targetPort" :label="t('agentDetail.policyTargetPort')" width="130" sortable="true">
             <template #default="scope">{{ formatPolicyTargetPort(scope.row.targetPort) }}</template>
           </el-table-column>
           <el-table-column :label="t('agentDetail.policyAllowedCIDRs')" min-width="180">
@@ -111,7 +111,7 @@
               <StatusTag :kind="scope.row.deletedAt ? 'danger' : 'success'" :label="scope.row.deletedAt ? t('agentDetail.policyStatusDeleted') : t('agentDetail.policyStatusActive')" />
             </template>
           </el-table-column>
-          <el-table-column :label="t('agentDetail.updatedAt')" min-width="170">
+          <el-table-column prop="updatedAt" :label="t('agentDetail.updatedAt')" min-width="170" sortable="true">
             <template #default="scope">{{ formatDate(scope.row.updatedAt) }}</template>
           </el-table-column>
           <!-- Keep actions unfixed: sticky body cells can desynchronize from headers and make buttons unclickable. -->
@@ -125,6 +125,7 @@
             </template>
           </el-table-column>
         </el-table>
+        <div class="list-pager"><el-button :disabled="policyPageIndex === 0 || policiesLoading" @click="previousPolicyPage">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: policyPageIndex + 1 }) }}</span><el-button :disabled="!policyNextCursor || policiesLoading" @click="nextPolicyPage">{{ t('common.nextPage') }}</el-button><el-select v-model="policyPageSize" class="page-size" @change="changePolicyPageSize"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
     </div>
 
@@ -238,6 +239,10 @@ const policyDeleting = ref(false)
 const policyDeleteError = ref('')
 const policyDeleteTarget = ref<AgentPolicy | null>(null)
 const policyRestoringId = ref('')
+const policyPageIndex = ref(0)
+const policyPageSize = ref(20)
+const policyCursors = ref<string[]>([''])
+const policyNextCursor = ref('')
 const formatDate = useFormatDateTime()
 
 const healthyConnections = computed(() => clusterConnections.value.filter(connection => connection.healthy))
@@ -289,9 +294,9 @@ async function loadConnections() {
 async function loadPolicies() {
   policiesLoading.value = true; policiesError.value = false
   try {
-    policies.value = policyStatus.value === 'active'
-      ? (await listAgentPolicies(String(route.params.id))).items
-      : (await listAgentPolicies(String(route.params.id), { status: policyStatus.value })).items
+    const page = await listAgentPolicies(String(route.params.id), { status: policyStatus.value, limit: policyPageSize.value, cursor: policyCursors.value[policyPageIndex.value] || undefined })
+    policies.value = page.items
+    policyNextCursor.value = page.nextCursor || ''
   }
   catch { policiesError.value = true }
   finally { policiesLoading.value = false }
@@ -300,7 +305,32 @@ async function loadPolicies() {
 async function setPolicyStatus(status: 'active' | 'deleted' | 'all') {
   if (policyStatus.value === status) return
   policyStatus.value = status
+  resetPolicyPaging()
   await loadPolicies()
+}
+
+function resetPolicyPaging() {
+  policyPageIndex.value = 0
+  policyCursors.value = ['']
+  policyNextCursor.value = ''
+}
+
+function changePolicyPageSize() {
+  resetPolicyPaging()
+  void loadPolicies()
+}
+
+function nextPolicyPage() {
+  if (!policyNextCursor.value) return
+  policyCursors.value[policyPageIndex.value + 1] = policyNextCursor.value
+  policyPageIndex.value += 1
+  void loadPolicies()
+}
+
+function previousPolicyPage() {
+  if (!policyPageIndex.value) return
+  policyPageIndex.value -= 1
+  void loadPolicies()
 }
 
 function openCloseConnection(connection: ClusterAgentConnection) {
@@ -473,6 +503,8 @@ onMounted(() => {
 .policy-description { margin-top: 4px; max-width: 720px; color: #6b7280; font-size: 13px; line-height: 1.5; }
 .policy-actions { display: flex; align-items: center; gap: 12px; }
 .policy-status-filter { display: flex; align-items: center; gap: 4px; }
+.list-pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px 0 0; }
+.page-size { width: 100px; }
 .policy-delete-warning { margin: 14px 0 0; color: #4b5563; font-size: 13px; line-height: 1.5; }
 .field-help { margin-top: 5px; color: #6b7280; font-size: 12px; line-height: 1.5; }
 </style>

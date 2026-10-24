@@ -14,8 +14,8 @@
         <el-button :loading="loading" @click="reload">{{ t('remoteServers.refresh') }}</el-button>
       </div>
       <DataState :loading="loading" :error="loadError" :empty="!items.length" :error-label="t('remoteServers.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('remoteServers.empty')" @retry="reload">
-        <el-table :data="items" row-key="id">
-          <el-table-column prop="name" :label="t('remoteServers.name')" min-width="150" />
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="name" :label="t('remoteServers.name')" min-width="150" sortable="custom" />
           <el-table-column prop="host" :label="t('remoteServers.host')" min-width="140" />
           <el-table-column prop="port" :label="t('remoteServers.port')" width="90" />
           <el-table-column prop="defaultUsername" :label="t('remoteServers.username')" min-width="120" />
@@ -38,6 +38,7 @@
           <el-table-column :label="t('remoteServers.status')" width="110">
             <template #default="{ row }"><StatusTag :kind="row.status === 'enabled' ? 'success' : row.status === 'disabled' ? 'warning' : 'info'" :label="statusLabel(row.status)" /></template>
           </el-table-column>
+          <el-table-column prop="updatedAt" :label="t('common.updatedAt')" min-width="170" sortable="custom"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
           <el-table-column :label="t('remoteServers.lastError')" min-width="130">
             <template #default="{ row }"><span v-if="row.lastErrorClass" class="error-text">{{ row.lastErrorClass }}</span><span v-else>—</span></template>
           </el-table-column>
@@ -53,7 +54,7 @@
           </el-table-column>
         </el-table>
       </DataState>
-      <div v-if="page.nextCursor" class="load-more"><el-button :loading="loadingMore" :disabled="!page.hasMore" @click="loadMore">{{ t('remoteServers.loadMore') }}</el-button></div>
+      <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!page.nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
     </div>
 
     <!-- Active sessions sit below the server list: the list is the primary
@@ -197,6 +198,11 @@ const page = ref<{ items: RemoteServer[]; nextCursor?: string; hasMore?: boolean
 const items = computed(() => page.value.items)
 const loading = ref(false)
 const loadingMore = ref(false)
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const sort = ref('updatedAt')
+const order = ref<'asc' | 'desc'>('desc')
 const loadError = ref(false)
 const filterKeyword = ref('')
 const filterAgentId = ref('')
@@ -269,26 +275,23 @@ async function loadResources() {
   }
 }
 
-async function load(cursor?: string) {
-  const appending = Boolean(cursor)
-  appending ? loadingMore.value = true : loading.value = true
-  if (!appending) loadError.value = false
+async function load() {
+  loading.value = true
+  loadError.value = false
   try {
     const result = await listRemoteServers({
       keyword: filterKeyword.value || undefined,
       agentId: filterAgentId.value || undefined,
       status: filterStatus.value,
-      cursor,
-      limit: 20,
+      cursor: cursors.value[pageIndex.value] || undefined,
+      limit: pageSize.value,
+      sort: sort.value,
+      order: order.value,
     })
-    page.value = appending ? {
-      items: [...page.value.items, ...result.items],
-      nextCursor: result.nextCursor,
-      hasMore: result.hasMore,
-    } : result
-    if (!appending) void openSSHFromQuery()
+    page.value = result
+    if (pageIndex.value === 0) void openSSHFromQuery()
   } catch {
-    if (!appending) loadError.value = true
+    loadError.value = true
     ElMessage.error(t('remoteServers.loadFailed'))
   } finally {
     loading.value = false
@@ -296,8 +299,10 @@ async function load(cursor?: string) {
   }
 }
 
-function reload() { page.value = { items: [] }; void load() }
-function loadMore() { if (page.value.nextCursor) void load(page.value.nextCursor) }
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!page.value.nextCursor) return; cursors.value[pageIndex.value + 1] = page.value.nextCursor; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'name' ? 'id' : 'updatedAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 async function loadSessions() {
   sessionsLoading.value = true

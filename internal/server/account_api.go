@@ -102,7 +102,17 @@ func (a *API) handleUsers(w http.ResponseWriter, r *http.Request, principal auth
 }
 
 func (a *API) listUsers(w http.ResponseWriter, r *http.Request) {
-	page, err := a.accounts.ListChildren(r.Context(), r.URL.Query().Get("status"), r.URL.Query().Get("cursor"), queryLimit(r))
+	sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at", "updatedAt": "updated_at", "id": "id", "role": "role"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
+	roles, roleErr := queryMulti(r, "role", map[string]string{"user": "user"})
+	if roleErr != nil {
+		roleErr.write(w)
+		return
+	}
+	page, err := a.accounts.ListChildrenSorted(r.Context(), r.URL.Query().Get("status"), r.URL.Query().Get("keyword"), roles, sort.Spec(), r.URL.Query().Get("cursor"), queryLimit(r))
 	if err != nil {
 		writeAccountError(w, err)
 		return

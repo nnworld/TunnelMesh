@@ -120,10 +120,13 @@ export type AuthPolicy = {
   sessionTokenTtlSeconds: number
 }
 
-function pageQuery(params: { cursor?: string; limit?: number }) {
+function pageQuery(params: { cursor?: string; limit?: number; sort?: string; order?: 'asc' | 'desc'; keyword?: string }) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+	if (params.sort) query.set('sort', params.sort)
+	if (params.order) query.set('order', params.order)
+	if (params.keyword) query.set('keyword', params.keyword)
   return query.size ? `?${query}` : ''
 }
 
@@ -193,7 +196,7 @@ export function unlinkIdentity(id: string) {
 
 // --- administrator: OIDC providers ---
 
-export function getSSOProviders(params: { cursor?: string; limit?: number } = {}) {
+export function getSSOProviders(params: { cursor?: string; limit?: number; sort?: string; order?: 'asc' | 'desc'; keyword?: string } = {}) {
   return api<SSOProviderPage>(`/sso/providers${pageQuery(params)}`)
 }
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 // WebSocketPoolOptions contains the single Server URL and identity shared by
@@ -20,6 +21,7 @@ type WebSocketPoolOptions struct {
 	Collector          *MetadataCollector
 	Factory            ConnectionSessionFactory
 	WebSocket          WebSocketRunOptions
+	Dialer             *sharedtransport.Dialer
 	Min                int
 	Max                int
 	HighWatermark      int
@@ -38,6 +40,8 @@ func RunConnectionPool(ctx context.Context, options WebSocketPoolOptions) error 
 		LowWatermark: options.LowWatermark, EvaluationInterval: options.EvaluationInterval,
 		Cooldown: options.Cooldown, HighRTT: options.HighRTT,
 		Runner: func(connectionCtx context.Context, connectionID string, connectionEpoch int64) error {
+			webSocketOptions := options.WebSocket
+			webSocketOptions.Dialer = options.Dialer
 			return runWebSocketConnection(
 				connectionCtx, options.ServerURL, options.Token, options.AgentID, options.NodeID,
 				options.InstanceID, connectionID, max64(options.Epoch, connectionEpoch), options.Collector,
@@ -56,7 +60,7 @@ func RunConnectionPool(ctx context.Context, options WebSocketPoolOptions) error 
 					}
 					session.OnHeartbeatRTT = handler.observeRTT
 					return handler
-				}, options.WebSocket,
+				}, webSocketOptions,
 			)
 		},
 	})

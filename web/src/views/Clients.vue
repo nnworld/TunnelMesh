@@ -55,7 +55,7 @@
         :empty-label="t('clients.empty')"
         @retry="load"
       >
-        <el-table :data="items" row-key="id">
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
           <el-table-column prop="instanceId" :label="t('clients.instanceId')" min-width="210" />
           <el-table-column prop="ownerUserId" :label="t('clients.owner')" min-width="170" />
           <el-table-column :label="t('clients.version')" width="120"><template #default="{ row }">{{ row.version || '—' }}</template></el-table-column>
@@ -70,12 +70,12 @@
           <el-table-column :label="t('clients.metadataState')" width="150">
             <template #default="{ row }"><StatusTag :kind="metadataStateKind(row.metadataState)" :label="metadataStateLabel(row.metadataState)" /></template>
           </el-table-column>
-          <el-table-column :label="t('clients.lastSeen')" width="180"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
+          <el-table-column prop="lastSeenAt" :label="t('clients.lastSeen')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
           <el-table-column :label="t('clients.actions')" width="100" fixed="right">
             <template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">{{ t('clients.detail') }}</el-button></template>
           </el-table-column>
         </el-table>
-        <div v-if="nextCursor" class="pager"><el-button :loading="loading" @click="loadMore">{{ t('clients.loadMore') }}</el-button></div>
+        <div class="pager"><el-button :disabled="pageIndex === 0 || loading" @click="previousPage">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="nextPage">{{ t('common.nextPage') }}</el-button><el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" /></div>
       </DataState>
     </div>
 
@@ -194,6 +194,11 @@ const items = ref<ClientInstance[]>([])
 const loading = ref(false)
 const error = ref(false)
 const nextCursor = ref('')
+const pageSize = ref(20)
+const pageIndex = ref(0)
+const pageCursors = ref<string[]>([''])
+const sort = ref('lastSeenAt')
+const order = ref<'asc' | 'desc'>('desc')
 const filters = reactive({ ownerUserId: '', tokenId: '', serverNodeId: '', status: '' as '' | ClientStatus, metadataState: '' as '' | ClientMetadataState, agentId: '', keyword: '' })
 // Counters are the server's whole-population aggregate for the active filter.
 // Deriving them from the loaded rows is what made the cards disagree with the
@@ -238,7 +243,10 @@ async function load() {
       metadataState: filters.metadataState || undefined,
       agentId: filters.agentId || undefined,
       keyword: filters.keyword || undefined,
-      limit: 100,
+      cursor: pageCursors.value[pageIndex.value] || undefined,
+      limit: pageSize.value,
+      sort: sort.value,
+      order: order.value,
     })
     items.value = page.items
     summary.value = page.summary ?? null
@@ -263,7 +271,9 @@ async function loadMore() {
       keyword: filters.keyword || undefined,
       metadataState: filters.metadataState || undefined,
       cursor: nextCursor.value,
-      limit: 100,
+      limit: pageSize.value,
+      sort: sort.value,
+      order: order.value,
     })
     items.value.push(...page.items)
     summary.value = page.summary ?? summary.value
@@ -275,11 +285,15 @@ async function loadMore() {
   }
 }
 
-function query() { void load() }
+function query() { pageCursors.value = ['']; pageIndex.value = 0; void load() }
+function nextPage() { if (!nextCursor.value) return; pageCursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void load() }
+function previousPage() { if (pageIndex.value === 0) return; pageIndex.value -= 1; void load() }
+function changePageSize(size: number) { pageSize.value = size; query() }
+function onSortChange(payload: { order?: 'ascending' | 'descending' | null }) { order.value = payload.order === 'ascending' ? 'asc' : 'desc'; query() }
 function reset() {
   filters.ownerUserId = ''; filters.tokenId = ''; filters.serverNodeId = ''
   filters.status = ''; filters.metadataState = ''; filters.agentId = ''; filters.keyword = ''
-  void load()
+  query()
 }
 
 async function showDetail(row: ClientInstance) {

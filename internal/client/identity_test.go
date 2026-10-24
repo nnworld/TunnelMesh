@@ -44,6 +44,24 @@ func TestDefaultClientInstanceIDPathUsesDarwinUserStateDirectory(t *testing.T) {
 	}
 }
 
+func TestDefaultClientInstanceIDPathForWindowsConfigScope(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path policy is only applicable on Windows")
+	}
+	programData := t.TempDir()
+	localAppData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	t.Setenv("LOCALAPPDATA", localAppData)
+	serviceConfig := filepath.Join(programData, "TunnelMesh", "client.yaml")
+	trayConfig := filepath.Join(localAppData, "TunnelMesh", "client.yaml")
+	if got, want := client.DefaultClientInstanceIDPathForConfig(serviceConfig), filepath.Join(programData, "TunnelMesh", "client-instance-id"); got != want {
+		t.Fatalf("service identity path = %q, want %q", got, want)
+	}
+	if got, want := client.DefaultClientInstanceIDPathForConfig(trayConfig), filepath.Join(localAppData, "TunnelMesh", "client-instance-id"); got != want {
+		t.Fatalf("tray identity path = %q, want %q", got, want)
+	}
+}
+
 func TestClientConfigAcceptsExplicitInstanceID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.yaml")
 	contents := "mode: local\nclient:\n  server_url: wss://server.example/ws/client\n  instance_id: client-explicit-001\n"

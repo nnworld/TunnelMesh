@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
@@ -89,11 +90,27 @@ func (a *API) handleRemoteServers(w http.ResponseWriter, r *http.Request, p auth
 func (a *API) handleRemoteServerListCreate(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	switch r.Method {
 	case http.MethodGet:
-		filter := storage.RemoteServerFilter{
-			AgentID: r.URL.Query().Get("agentId"), Keyword: r.URL.Query().Get("keyword"),
+		sort, sortErr := parseListSort(r, map[string]string{"updatedAt": "updated_at", "createdAt": "created_at", "id": "id"}, "updated_at")
+		if sortErr != nil {
+			sortErr.write(w)
+			return
 		}
-		if raw := r.URL.Query().Get("status"); raw != "" {
-			filter.Status = storage.RemoteServerStatus(raw)
+		filter := storage.RemoteServerFilter{
+			AgentID: r.URL.Query().Get("agentId"), Keyword: r.URL.Query().Get("keyword"), Sort: sort.Spec(),
+		}
+		statuses, statusErr := queryMulti(r, "status", map[string]string{"enabled": "enabled", "disabled": "disabled", "deleted": "deleted", "all": "all"})
+		if statusErr != nil {
+			statusErr.write(w)
+			return
+		}
+		for _, value := range statuses {
+			filter.Statuses = append(filter.Statuses, storage.RemoteServerStatus(value))
+		}
+		if slices.Contains(statuses, "all") {
+			filter.Statuses = nil
+		}
+		if len(statuses) == 1 {
+			filter.Status = storage.RemoteServerStatus(statuses[0])
 		}
 		page, err := a.remoteServerService.List(r.Context(), p, filter, r.URL.Query().Get("cursor"), queryLimit(r))
 		if err != nil {

@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 var (
@@ -31,6 +33,7 @@ type WebSocketRunOptions struct {
 	HeartbeatInterval time.Duration
 	Rand              *rand.Rand
 	Metrics           *observability.Metrics
+	Dialer            *sharedtransport.Dialer
 }
 
 const defaultHeartbeatInterval = 30 * time.Second
@@ -99,7 +102,7 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 			return err
 		}
 		stageStarted := time.Now()
-		transport, err := DialWebSocket(ctx, serverURL, token)
+		transport, err := dialWebSocketWithDialer(ctx, serverURL, token, options.Dialer)
 		if err == nil {
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("agent", "websocket", "started", "")
@@ -154,6 +157,10 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 // DialWebSocket creates the binary protocol transport used by Agent sessions.
 // Only ws:// and wss:// endpoints are accepted; callers must provide a token.
 func DialWebSocket(ctx context.Context, serverURL, token string) (FrameTransport, error) {
+	return dialWebSocketWithDialer(ctx, serverURL, token, nil)
+}
+
+func dialWebSocketWithDialer(ctx context.Context, serverURL, token string, dialer *sharedtransport.Dialer) (FrameTransport, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, ErrAgentTokenRequired
 	}
@@ -169,10 +176,40 @@ func DialWebSocket(ctx context.Context, serverURL, token string) (FrameTransport
 		return nil, err
 	}
 	config.Header.Set("Authorization", "Bearer "+token)
-	conn, err := websocket.DialConfig(config)
-	if err != nil {
-		return nil, err
+	if dialer == nil {
+		dialer, err = sharedtransport.NewDialer(sharedtransport.DialOptions{Mode: sharedtransport.ProxyModeDirect})
+		if err != nil {
+			return nil, err
+		}
 	}
+	address := u.Host
+	if u.Port() == "" {
+		address += ":80"
+		if u.Scheme == "wss" {
+			address = u.Host + ":443"
+		}
+	}
+	netConn, err := dialer.DialContextForScheme(ctx, "tcp", address, u.Scheme)
+	if err != nil {
+		return nil, &websocket.DialError{Config: config, Err: err}
+	}
+	if u.Scheme == "wss" {
+		secure := tls.Client(netConn, &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := secure.HandshakeContext(ctx); err != nil {
+			_ = netConn.Close()
+			return nil, &websocket.DialError{Config: config, Err: err}
+		}
+		netConn = secure
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = netConn.SetDeadline(deadline)
+	}
+	conn, err := websocket.NewClient(config, netConn)
+	if err != nil {
+		_ = netConn.Close()
+		return nil, &websocket.DialError{Config: config, Err: err}
+	}
+	_ = netConn.SetDeadline(time.Time{})
 	conn.MaxPayloadBytes = protocol.MaxPayload
 	return &websocketFrameTransport{conn: conn}, nil
 }

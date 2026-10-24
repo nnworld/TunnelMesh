@@ -2,15 +2,15 @@
   <section class="tm-page">
     <PageHeader :title="t('users.title')" :description="t('users.description')"><el-button type="primary" @click="createOpen = true">{{ t('users.create') }}</el-button></PageHeader>
     <div class="tm-card panel">
-      <div class="toolbar"><el-segmented v-model="status" :options="statusOptions" @change="load" /></div>
+      <div class="toolbar"><el-input v-model="keyword" clearable class="keyword-input" :placeholder="t('users.username')" @keyup.enter="search" @clear="search" /><el-segmented v-model="status" :options="statusOptions" @change="search" /><el-button @click="search">{{ t('common.query') }}</el-button></div>
       <DataState :loading="loading" :error="loadError" :empty="!page.items.length" :error-label="t('users.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('common.empty')" @retry="load">
-        <el-table :data="page.items">
-          <el-table-column prop="username" :label="t('users.username')" min-width="180" />
+        <el-table :data="page.items" @sort-change="onSortChange">
+          <el-table-column prop="username" :label="t('users.username')" min-width="180" sortable="custom" />
           <el-table-column :label="t('users.status')" width="120"><template #default="{ row }"><StatusTag :kind="row.deletedAt ? 'info' : row.disabled ? 'warning' : 'success'" :label="row.deletedAt ? t('users.deleted') : row.disabled ? t('users.disabled') : t('users.active')" /></template></el-table-column>
           <!-- Per-account MFA requirement: it wins over the global auth policy, so
                it is an explicit switch instead of a side effect of another edit. -->
           <el-table-column :label="t('users.mfaRequired')" width="140"><template #default="{ row }"><el-switch v-model="row.mfaRequired" :disabled="Boolean(row.deletedAt)" :data-test="`mfa-required-${row.id}`" @change="value => toggleMfaRequired(row, value)" /></template></el-table-column>
-          <el-table-column :label="t('users.createdAt')" min-width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+          <el-table-column prop="createdAt" :label="t('users.createdAt')" min-width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
           <el-table-column :label="t('users.actions')" width="420" fixed="right">
             <template #default="{ row }">
               <template v-if="row.deletedAt"><el-button link type="primary" @click="restore(row)">{{ t('users.restore') }}</el-button></template>
@@ -23,6 +23,7 @@
             </template>
           </el-table-column>
         </el-table>
+        <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="search"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
     </div>
     <el-dialog v-model="createOpen" :title="t('users.create')" width="min(440px,92vw)">
@@ -48,6 +49,13 @@ import { resetUserMFA } from '../api/auth'
 
 const { t } = useI18n()
 const status = ref<'active' | 'deleted' | 'all'>('active')
+const keyword = ref('')
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const nextCursor = ref('')
+const cursors = ref<string[]>([''])
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
 const page = ref<UserPage>({ items: [] })
 const loading = ref(false)
 const loadError = ref(false)
@@ -61,10 +69,15 @@ const statusOptions = computed(() => [{ label: t('users.active'), value: 'active
 
 async function load() {
   loading.value = true; loadError.value = false
-  try { page.value = await listUsers({ status: status.value, limit: 50 }) }
+  try { page.value = await listUsers({ status: status.value, keyword: keyword.value.trim() || undefined, limit: pageSize.value, cursor: cursors.value[pageIndex.value] || undefined, sort: sort.value, order: order.value }); nextCursor.value = page.value.nextCursor || '' }
   catch { loadError.value = true }
   finally { loading.value = false }
 }
+
+function search() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void load() }
+function previous() { if (pageIndex.value === 0) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'username' ? 'id' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; search() }
 
 async function create() {
   saving.value = true
@@ -128,4 +141,4 @@ function clearTemporaryPassword() { temporaryPassword.value = ''; temporaryOpen.
 onMounted(load); onBeforeUnmount(clearTemporaryPassword)
 </script>
 
-<style scoped>.panel { overflow: hidden; } .toolbar { display: flex; justify-content: flex-end; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); } :deep(.el-table) { --el-table-border-color: #edf1f7; }</style>
+<style scoped>.panel { overflow: hidden; } .toolbar { display: flex; justify-content: flex-end; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); } .keyword-input { width: min(240px, 100%); } .list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:16px; } .page-size { width:100px; } :deep(.el-table) { --el-table-border-color: #edf1f7; }</style>

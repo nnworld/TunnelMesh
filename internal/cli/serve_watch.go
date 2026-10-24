@@ -28,7 +28,14 @@ func (w *forwardServeWatcher) Err() <-chan error { return w.inner.Err() }
 func (w *forwardServeWatcher) firstErr() error { return w.inner.FirstErr() }
 
 func superviseClientRun(run func() error, watcher *forwardServeWatcher) error {
-	return client.SuperviseRun(run, watcher.inner)
+	results := make(chan error, 1)
+	go func() { results <- run() }()
+	select {
+	case err := <-results:
+		return client.ForwardServeResult(watcher.inner, err)
+	case <-watcher.Err():
+		return client.ForwardServeResult(watcher.inner, nil)
+	}
 }
 
 func forwardServeResult(watcher *forwardServeWatcher, runErr error) error {

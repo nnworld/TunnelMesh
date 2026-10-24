@@ -482,6 +482,55 @@ func TestLoadClientConnectionPoolDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestLoadTransportDefaultsAndSecureWebSocketValidation(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Agent.Transport.ProxyMode != config.ProxyModeDirect || cfg.Client.Transport.ProxyMode != config.ProxyModeDirect {
+		t.Fatalf("transport proxy defaults = agent=%q client=%q, want direct", cfg.Agent.Transport.ProxyMode, cfg.Client.Transport.ProxyMode)
+	}
+	if cfg.Agent.Transport.AllowInsecureTransport || cfg.Client.Transport.AllowInsecureTransport {
+		t.Fatal("insecure transport must be disabled by default")
+	}
+
+	base := cfg
+	base.Agent.ServerURL = "ws://agent.example/ws/agent"
+	base.Client.ServerURL = "ws://client.example/ws/client"
+	if err := config.Validate(base); err == nil || !strings.Contains(err.Error(), "agent server URL must use wss://") || !strings.Contains(err.Error(), "client server URL must use wss://") {
+		t.Fatalf("Validate(remote ws) error = %v", err)
+	}
+	base.Agent.ServerURL = "ws://127.0.0.1:8080/ws/agent"
+	base.Client.ServerURL = "ws://localhost:8080/ws/client"
+	if err := config.Validate(base); err != nil {
+		t.Fatalf("Validate(loopback ws) error = %v", err)
+	}
+	base.Agent.ServerURL = "ws://agent.example/ws/agent"
+	base.Client.ServerURL = "ws://client.example/ws/client"
+	base.Agent.Transport.AllowInsecureTransport = true
+	base.Client.Transport.AllowInsecureTransport = true
+	if err := config.Validate(base); err != nil {
+		t.Fatalf("Validate(explicit insecure transport) error = %v", err)
+	}
+}
+
+func TestLoadTransportProxyConfiguration(t *testing.T) {
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{
+		Set: map[string]any{
+			"client.transport.proxy_mode":         config.ProxyModeHTTPConnect,
+			"client.transport.proxy_url":          "http://proxy.example:8080",
+			"client.transport.proxy_username":     "alice",
+			"client.transport.proxy_password_env": "TUNNELMESH_PROXY_PASSWORD",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Client.Transport; got.ProxyMode != config.ProxyModeHTTPConnect || got.ProxyURL != "http://proxy.example:8080" || got.ProxyUsername != "alice" || got.ProxyPasswordEnv != "TUNNELMESH_PROXY_PASSWORD" {
+		t.Fatalf("client transport = %+v", got)
+	}
+}
+
 func TestLoadAndValidateHTTPProxyTunnel(t *testing.T) {
 	valid := `mode: local
 client:

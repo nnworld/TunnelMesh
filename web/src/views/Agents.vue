@@ -15,16 +15,16 @@
       </el-form>
 
       <DataState :loading="loading" :error="error" :empty="!items.length" :error-label="t('common.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('common.empty')" @retry="load">
-        <el-table :data="items" :default-sort="{ prop: 'createdAt', order: 'descending' }">
+        <el-table :data="items" :default-sort="{ prop: 'createdAt', order: 'descending' }" @sort-change="onSortChange">
           <el-table-column prop="name" :label="t('agents.name')" />
           <el-table-column prop="id" label="ID" />
           <el-table-column :label="t('agents.status')">
             <template #default="scope"><StatusTag :kind="scope.row.status === 'online' ? 'success' : 'info'" :label="scope.row.status === 'online' ? t('agents.online') : t('agents.offline')" /></template>
           </el-table-column>
-          <el-table-column prop="createdAt" :label="t('agents.createdAt')" width="190" sortable :sort-method="byCreatedAt">
+          <el-table-column prop="createdAt" :label="t('agents.createdAt')" width="190" sortable="custom">
             <template #default="scope">{{ formatDate(scope.row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column prop="updatedAt" :label="t('agents.updatedAt')" width="190" sortable :sort-method="byUpdatedAt">
+          <el-table-column prop="updatedAt" :label="t('agents.updatedAt')" width="190" sortable="custom">
             <template #default="scope">{{ formatDate(scope.row.updatedAt) }}</template>
           </el-table-column>
           <el-table-column :label="t('agents.enabledColumn')">
@@ -41,6 +41,7 @@
           <el-button v-if="pageIndex > 0" :loading="loading" @click="previousPage">{{ t('agents.previousPage') }}</el-button>
           <span class="pager-label">{{ t('agents.page', { number: pageIndex + 1 }) }}</span>
           <el-button v-if="nextCursor" :loading="loading" @click="nextPage">{{ t('agents.nextPage') }}</el-button>
+          <el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" />
         </div>
       </DataState>
     </div>
@@ -100,7 +101,10 @@ const editEnabled = ref(true)
 const editing = ref<Agent | null>(null)
 const formatDate = useFormatDateTime()
 const pageSize = 20
+const selectedPageSize = ref(pageSize)
 const keyword = ref('')
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
 const nextCursor = ref('')
 // Cursor paging has no page number on the wire, so the view keeps the cursor it
 // used for each reachable page. That is what makes 上一页 an exact repeat of the
@@ -126,14 +130,18 @@ async function load() {
   loading.value = true; error.value = false
   // An absent filter or cursor is left out of the request rather than sent as an
   // empty value, so the server sees the same query it would see from the CLI.
-  const params: { limit: number; keyword?: string; cursor?: string } = { limit: pageSize }
+  const params: { limit: number; keyword?: string; cursor?: string; sort?: string; order?: 'asc' | 'desc' } = { limit: selectedPageSize.value, sort: sort.value, order: order.value }
   const trimmed = keyword.value.trim()
   if (trimmed) params.keyword = trimmed
   const cursor = pageCursors.value[pageIndex.value]
   if (cursor) params.cursor = cursor
   try {
     const page = await getAgents(params)
-    items.value = page.items
+    items.value = [...page.items].sort((left, right) => {
+      const leftValue = createdTimestamp(sort.value === 'updatedAt' ? left.updatedAt : left.createdAt)
+      const rightValue = createdTimestamp(sort.value === 'updatedAt' ? right.updatedAt : right.createdAt)
+      return order.value === 'asc' ? leftValue - rightValue : rightValue - leftValue
+    })
     nextCursor.value = page.nextCursor || ''
   } catch {
     error.value = true
@@ -165,6 +173,17 @@ function query() {
 
 function reset() {
   keyword.value = ''
+  query()
+}
+
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) {
+  sort.value = payload.prop === 'updatedAt' ? 'updatedAt' : 'createdAt'
+  order.value = payload.order === 'ascending' ? 'asc' : 'desc'
+  query()
+}
+
+function changePageSize(size: number) {
+  selectedPageSize.value = size
   query()
 }
 

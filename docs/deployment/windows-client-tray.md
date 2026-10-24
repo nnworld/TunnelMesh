@@ -107,6 +107,15 @@ NOTICE
 `notarized: false`。绿色归档的 `installerLayout` 为 `false`、安装包为 `true`，因此
 「这个发行里到底有没有安装包」是一个可被读出来的事实，而不是靠人记住的约定。
 
+## 配置目录与服务共存
+
+托盘是 per-user 程序，默认使用 `%LOCALAPPDATA%\\TunnelMesh\\client.yaml`，身份文件也写在该目录；
+Windows 服务安装器默认使用 `%ProgramData%\\TunnelMesh\\client.yaml`，身份文件写在服务目录。
+两者是有意隔离的安全边界，不会自动复制 token 或隧道配置。设置页和关于页会同时显示托盘目录与服务目录。
+
+需要让托盘接管服务配置时，启动托盘时显式指定 `--config-dir %ProgramData%\\TunnelMesh`，并先确认当前用户
+对该目录有最小必要的读写 ACL；不建议为了省事放宽整个 `ProgramData` 的权限。
+
 ## 图标与 exe 资源
 
 Windows 没有 `Info.plist` 这样的旁路元数据：图标、版本信息和应用清单必须**编进** exe。

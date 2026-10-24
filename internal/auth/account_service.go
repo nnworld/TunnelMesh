@@ -107,6 +107,22 @@ func (s *AccountService) ListChildren(ctx context.Context, status, cursor string
 	return s.users.ListChildren(ctx, accountStatus, cursor, limit)
 }
 
+func (s *AccountService) ListChildrenSorted(ctx context.Context, status, keyword string, roles []string, sort storage.SortSpec, cursor string, limit int) (storage.Page[storage.User], error) {
+	if s == nil || s.users == nil {
+		return storage.Page[storage.User]{}, errors.New("account user repository is required")
+	}
+	accountStatus := storage.AccountStatus(strings.ToLower(strings.TrimSpace(status)))
+	switch accountStatus {
+	case "", storage.AccountStatusActive, storage.AccountStatusDeleted, storage.AccountStatusAll:
+	default:
+		return storage.Page[storage.User]{}, ErrAccountStatusInvalid
+	}
+	if sorted, ok := s.users.(storage.SortedAccountUserRepository); ok {
+		return sorted.ListChildrenSorted(ctx, accountStatus, keyword, roles, sort, cursor, limit)
+	}
+	return s.users.ListChildren(ctx, accountStatus, cursor, limit)
+}
+
 func (s *AccountService) SetDisabled(ctx context.Context, actorUserID, userID string, disabled bool) (storage.User, error) {
 	return s.mutateChild(ctx, actorUserID, userID, func(repos storage.AccountRepositories, user *storage.User) (string, error) {
 		if user.DeletedAt != nil {
