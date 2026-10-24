@@ -16,12 +16,17 @@ mode: local
 
 client:
   server_url: wss://tunnel.example.com/ws/client
+  transport:
+    # direct 保持原有行为；system 使用 HTTP_PROXY/HTTPS_PROXY/NO_PROXY。
+    proxy_mode: direct
+    # 非本地 ws:// 默认拒绝；仅本地开发或明确启用时使用。
+    allow_insecure_transport: false
   # 可省略。run 首次启动会生成小写 client-<32hex> 并持久化。
   instance_id: client-0123456789abcdef0123456789abcdef
   # 可自定义状态文件。默认：
   # Linux: /var/lib/tunnelmesh-client/client-instance-id
   # macOS: ~/Library/Application Support/TunnelMesh/client-instance-id
-  # Windows: %ProgramData%\TunnelMesh\client-instance-id
+  # Windows 托盘：%LOCALAPPDATA%\TunnelMesh\client-instance-id；Windows 服务：%ProgramData%\TunnelMesh\client-instance-id
   instance_id_path: /var/lib/tunnelmesh-client/client-instance-id
   connections:
     min: 1
@@ -87,6 +92,19 @@ Client service token 通过环境变量注入，不写入 YAML：
 TUNNELMESH_CLIENT_TOKEN='replace-with-client-service-token'
 TUNNELMESH_CLIENT_REGION='cn-north'
 ```
+
+企业网络需要代理时，不要把密码写进 YAML。可使用显式配置和环境变量：
+
+```yaml
+client:
+  transport:
+    proxy_mode: http_connect
+    proxy_url: http://proxy.example:8080
+    proxy_username: tunnelmesh
+    proxy_password_env: TUNNELMESH_PROXY_PASSWORD
+```
+
+SOCKS5 使用 `proxy_mode: socks5` 与 `socks5://host:port`；`proxy_password_file` 必须是仅当前用户可读的文件。
 
 远程 SOCKS5 与远程 HTTP 代理必须显式开启远程监听，并使用本地入口认证。凭据同样通过环境变量注入：
 

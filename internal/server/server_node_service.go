@@ -72,6 +72,27 @@ func (s *ServerNodeService) List(ctx context.Context, cursor string, limit int) 
 	if err != nil {
 		return ServerNodePage{}, err
 	}
+	return s.pageView(ctx, page)
+}
+
+func (s *ServerNodeService) ListSorted(ctx context.Context, sort storage.SortSpec, cursor string, limit int) (ServerNodePage, error) {
+	if s == nil || s.nodes == nil {
+		return ServerNodePage{}, sql.ErrConnDone
+	}
+	var page storage.Page[storage.ServerNode]
+	var err error
+	if sorted, ok := s.nodes.(storage.SortedNodeRepository); ok {
+		page, err = sorted.ListSorted(ctx, sort, cursor, limit)
+	} else {
+		page, err = s.nodes.List(ctx, cursor, limit)
+	}
+	if err != nil {
+		return ServerNodePage{}, err
+	}
+	return s.pageView(ctx, page)
+}
+
+func (s *ServerNodeService) pageView(ctx context.Context, page storage.Page[storage.ServerNode]) (ServerNodePage, error) {
 	ids := make([]string, 0, len(page.Items))
 	for _, node := range page.Items {
 		ids = append(ids, node.ID)

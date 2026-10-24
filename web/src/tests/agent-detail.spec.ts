@@ -277,7 +277,7 @@ describe('agent detail cluster connections', () => {
   it('shows agent policies with wildcard and unrestricted semantics', async () => {
     const { container, unmount } = await mountAgentDetail()
     try {
-      expect(listAgentPolicies).toHaveBeenCalledWith('agent-1')
+      expect(listAgentPolicies).toHaveBeenCalledWith('agent-1', { status: 'active', limit: 20, cursor: undefined })
       expect(container.textContent).toContain('Any host')
       expect(container.textContent).toContain('Any port')
       expect(container.textContent).toContain('Unrestricted')
@@ -331,7 +331,7 @@ describe('agent detail cluster connections', () => {
     try {
       await click('[data-test="policy-status-deleted"]', container)
 
-      expect(listAgentPolicies).toHaveBeenLastCalledWith('agent-1', { status: 'deleted' })
+      expect(listAgentPolicies).toHaveBeenLastCalledWith('agent-1', { status: 'deleted', limit: 20, cursor: undefined })
       expect(container.textContent).toContain(i18n.global.t('agentDetail.policyStatusDeleted'))
       expect(container.querySelector('[data-test="restore-agent-policy-policy-deleted"]')).not.toBeNull()
       expect(container.querySelector('[data-test="edit-agent-policy-policy-deleted"]')).toBeNull()

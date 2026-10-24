@@ -5,6 +5,10 @@
     </PageHeader>
 
     <div class="tm-card">
+	  <div class="toolbar">
+	    <el-input v-model="keyword" class="keyword-input" clearable :placeholder="t('routes.domain')" @keyup.enter="reload" @clear="reload" />
+	    <el-button :loading="loading" @click="reload">{{ t('common.query') }}</el-button>
+	  </div>
       <DataState
         :loading="loading"
         :error="error"
@@ -14,8 +18,8 @@
         :empty-label="t('routes.empty')"
         @retry="load"
       >
-        <el-table :data="items" row-key="id">
-          <el-table-column prop="domain" :label="t('routes.domain')" min-width="220" />
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="domain" :label="t('routes.domain')" min-width="220" sortable="custom" />
           <el-table-column prop="pathPrefix" :label="t('routes.path')" width="120" />
           <el-table-column prop="agentId" :label="t('routes.agent')" min-width="180" />
           <el-table-column prop="protocol" :label="t('routes.protocol')" width="110" />
@@ -40,6 +44,7 @@
           <el-table-column :label="t('routes.target')" min-width="180">
             <template #default="{ row }">{{ formatTarget(row) }}</template>
           </el-table-column>
+          <el-table-column prop="createdAt" :label="t('common.createdAt')" width="180" sortable="custom"><template #default="{ row }">{{ row.createdAt ? new Date(row.createdAt).toLocaleString() : '—' }}</template></el-table-column>
           <el-table-column prop="status" :label="t('routes.status')" width="110" />
           <el-table-column :label="t('routes.actions')" width="170" fixed="right">
             <template #default="{ row }">
@@ -48,6 +53,7 @@
             </template>
           </el-table-column>
         </el-table>
+        <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
     </div>
 
@@ -230,6 +236,13 @@ const { t } = useI18n()
 const auth = useAuthStore()
 const router = useRouter()
 const items = ref<ManagedRoute[]>([])
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const nextCursor = ref('')
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
+const keyword = ref('')
 const loading = ref(false)
 const error = ref(false)
 const createOpen = ref(false)
@@ -337,13 +350,20 @@ async function load() {
   loading.value = true
   error.value = false
   try {
-    items.value = (await listRoutes({ limit: 500 })).items
+		const result = await listRoutes({ keyword: keyword.value.trim() || undefined, limit: pageSize.value, cursor: cursors.value[pageIndex.value] || undefined, sort: sort.value, order: order.value })
+    items.value = result.items
+    nextCursor.value = result.nextCursor || ''
   } catch {
     error.value = true
   } finally {
     loading.value = false
   }
 }
+
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'domain' ? 'domain' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 async function loadAgents() {
   agentsLoading.value = true

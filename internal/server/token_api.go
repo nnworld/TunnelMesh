@@ -141,9 +141,23 @@ func (a *API) updateToken(w http.ResponseWriter, r *http.Request, principal auth
 
 // listTokens fixes non-admin filtering to the caller before repository paging.
 func (a *API) listTokens(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	tokenType := storage.TokenType(strings.TrimSpace(r.URL.Query().Get("type")))
-	if tokenType != "" && !validManagementTokenType(tokenType) {
-		writeAPIError(w, http.StatusBadRequest, "invalid token type")
+	sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at", "updatedAt": "updated_at", "id": "id"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
+	types, typeErr := queryMulti(r, "type", map[string]string{"agent": "agent", "client": "client", "server_node": "server_node"})
+	if typeErr != nil {
+		typeErr.write(w)
+		return
+	}
+	tokenType := storage.TokenType("")
+	if len(types) == 1 {
+		tokenType = storage.TokenType(types[0])
+	}
+	statuses, statusErr := queryMulti(r, "status", map[string]string{"active": "active", "revoked": "revoked", "expired": "expired"})
+	if statusErr != nil {
+		statusErr.write(w)
 		return
 	}
 	owner := strings.TrimSpace(r.URL.Query().Get("owner"))
@@ -155,7 +169,12 @@ func (a *API) listTokens(w http.ResponseWriter, r *http.Request, principal auth.
 		}
 		owner = principal.UserID
 	}
-	page, err := a.tokenService.List(r.Context(), storage.ServiceTokenFilter{OwnerUserID: owner, Type: tokenType}, r.URL.Query().Get("cursor"), queryLimit(r))
+	filter := storage.ServiceTokenFilter{OwnerUserID: owner, Type: tokenType, Status: strings.TrimSpace(r.URL.Query().Get("status")), Keyword: strings.TrimSpace(r.URL.Query().Get("keyword")), Sort: sort.Spec()}
+	for _, value := range types {
+		filter.Types = append(filter.Types, storage.TokenType(value))
+	}
+	filter.Statuses = statuses
+	page, err := a.tokenService.List(r.Context(), filter, r.URL.Query().Get("cursor"), queryLimit(r))
 	if err != nil {
 		writeTokenError(w, err)
 		return

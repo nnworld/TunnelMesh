@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -507,6 +508,31 @@ func TestAppRuntimeLifecycleAndStats(t *testing.T) {
 	if err := app.StartRuntime(ctx); err != nil {
 		t.Fatalf("the lock must be released by StopRuntime: %v", err)
 	}
+}
+
+func TestAppRestartsRuntimeAfterUnexpectedFailure(t *testing.T) {
+	var runs atomic.Int32
+	app, _ := newTestApp(t, func(options *AppOptions) {
+		options.Runner = func(ctx context.Context, _, _ string, _ func(*client.Session) error, _ client.WebSocketRunOptions) error {
+			if runs.Add(1) == 1 {
+				return errors.New("transport dropped")
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	writeClientConfig(t, app, loopbackTunnel(22))
+	if err := app.StartRuntime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.Stats(context.Background()).RuntimeRestarts > 0 && app.RuntimeRunning() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("runtime was not restarted; runs=%d stats=%+v", runs.Load(), app.Stats(context.Background()))
 }
 
 func TestAppStartRuntimeReportsIncompleteConfiguration(t *testing.T) {

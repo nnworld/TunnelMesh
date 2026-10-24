@@ -157,6 +157,32 @@ func TestOIDCProviderListEnabledPublicFiltersBothFlags(t *testing.T) {
 	}
 }
 
+func TestOIDCProviderSortedListFiltersKeywordBeforePaging(t *testing.T) {
+	db := newIdentityTestDB(t)
+	ctx := context.Background()
+	finance := newTestProvider("finance")
+	finance.DisplayName = "Finance Login"
+	other := newTestProvider("other")
+	other.DisplayName = "Operations Login"
+	for _, provider := range []OIDCProvider{finance, other} {
+		if _, err := db.OIDCProviders().Create(ctx, provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sorted, ok := db.OIDCProviders().(FilteredSortedOIDCProviderRepository)
+	if !ok {
+		t.Fatal("OIDC provider repository does not support filtered sorting")
+	}
+	page, err := sorted.ListSortedFiltered(ctx, OIDCProviderListFilter{Keyword: "finance"}, SortSpec{Column: "updated_at", Descending: true, Composite: true}, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Name != "finance" {
+		t.Fatalf("filtered providers = %#v", page.Items)
+	}
+}
+
 func TestUserIdentityUniqueSubjectPerProvider(t *testing.T) {
 	db := newIdentityTestDB(t)
 	ctx := context.Background()

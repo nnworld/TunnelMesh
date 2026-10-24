@@ -464,10 +464,14 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
+        - {$ref: '#/components/parameters/ListKeyword'}
       responses:
         '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/OIDCProviderPageEnvelope'}}}}
         '401': {description: Unauthenticated}
         '403': {description: Administrator required}
+        '422': {description: Invalid sort or filter value}
         '405': {description: Method not allowed}
         '503': {description: identity_services_unavailable}
     post:
@@ -606,8 +610,12 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
+        - {$ref: '#/components/parameters/ListKeyword'}
+        - {$ref: '#/components/parameters/ListRoleFilter'}
         - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}}
-      responses: {'200': {description: Cursor page}, '401': {description: Unauthenticated}, '403': {description: Administrator required}}
+      responses: {'200': {description: Cursor page}, '401': {description: Unauthenticated}, '403': {description: Administrator required}, '422': {description: Invalid sort or filter value}}
     post:
       summary: Create an ordinary child account and return its temporary password once
       security: [{ bearerAuth: [] }]
@@ -783,8 +791,10 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
         - {name: keyword, in: query, required: false, schema: {type: string, maxLength: 128}, description: Substring of the agent name or id; longer input is truncated to 128 bytes}
-      responses: {'200': {description: Cursor page}}
+      responses: {'200': {description: Cursor page}, '422': {description: Invalid sort or filter value}}
     post:
       security: [{ bearerAuth: [] }]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
@@ -865,6 +875,8 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
         - {name: ownerUserId, in: query, schema: {type: string}, description: Administrator-only owner filter}
         - {name: tokenId, in: query, schema: {type: string}}
         - {name: serverNodeId, in: query, schema: {type: string}}
@@ -882,6 +894,7 @@ paths:
       responses:
         '200': {description: Cursor page plus whole-population summary, content: {application/json: {schema: {$ref: '#/components/schemas/ClientPageEnvelope'}}}}
         '400': {description: Invalid status or metadataState filter}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Unauthenticated}
         '403': {description: Non-administrator requested another owner}
   /api/v1/clients/{clientInstanceId}:
@@ -1016,7 +1029,10 @@ paths:
         '403': {description: Administrator required}
         '404': {description: Policy is not deleted}
   /api/v1/routes:
-    get: {security: [{bearerAuth: []}], responses: {'200': {description: Managed routes}}}
+    get:
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/ListSort'}, {$ref: '#/components/parameters/ListOrder'}, {$ref: '#/components/parameters/ListKeyword'}]
+      responses: {'200': {description: Managed routes}, '422': {description: Invalid sort or filter}}
     post:
       security: [{bearerAuth: []}]
       description: Creates a managed reverse-proxy route, or a whole-host HTTP proxy entry when `protocol` is `http-proxy`. Replaying the same `Idempotency-Key` returns the stored 201 response instead of a 409.
@@ -1036,12 +1052,15 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
-        - {name: type, in: query, schema: {type: string, enum: [ssh_public_key, password, proxy_basic]}}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
+        - {$ref: '#/components/parameters/ListKeyword'}
+        - {name: type, in: query, description: Comma-separated credential types., schema: {type: string, enum: [ssh_public_key, password, proxy_basic]}}
         - {name: status, in: query, schema: {type: string, enum: [active, deleted, all], default: active}}
-        - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
       responses:
         '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/CredentialPageEnvelope'}}}}
         '400': {description: Invalid filter}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Unauthenticated}
     post:
       summary: Create an SSH credential (public key or password)
@@ -1110,12 +1129,15 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
+        - {$ref: '#/components/parameters/ListKeyword'}
         - {name: agentId, in: query, schema: {type: string}}
         - {name: status, in: query, schema: {type: string, enum: [enabled, disabled, deleted, all], default: enabled}}
-        - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
       responses:
         '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/RemoteServerPageEnvelope'}}}}
         '400': {description: Invalid filter}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Unauthenticated}
     post:
       summary: Create a managed remote server record
@@ -1215,7 +1237,10 @@ paths:
       responses: {'200': {description: Updated route}, '400': {description: 'Invalid field, or a protocol switch to or from http-proxy'}, '403': {description: Caller cannot manage the current or target Agent}, '409': {description: 'Duplicate domain and path. An http-proxy route claims its whole tp-* domain, so renaming another route onto it conflicts.'}}
     delete: {security: [{bearerAuth: []}], responses: {'200': {description: Deleted}}}
   /api/v1/tunnels:
-    get: {security: [{bearerAuth: []}], responses: {'200': {description: Tunnels}}}
+    get:
+      security: [{bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/ListSort'}, {$ref: '#/components/parameters/ListOrder'}, {$ref: '#/components/parameters/ListKeyword'}]
+      responses: {'200': {description: Cursor page of tunnels}, '422': {description: Invalid sort or filter value}}
     post: {security: [{bearerAuth: []}], parameters: [{$ref: '#/components/parameters/IdempotencyKey'}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TunnelRequest'}}}}, responses: {'201': {description: Created}}}
   /api/v1/tunnels/{tunnelId}:
     parameters: [{name: tunnelId, in: path, required: true, schema: {type: string}}]
@@ -1228,13 +1253,17 @@ paths:
       description: Admins may filter all Tokens by owner and type. Non-admin callers can list only Tokens they own. Stored hashes and issued secrets are never returned. Status is derived from lifecycle timestamps and current owner/resource availability.
       security: [{bearerAuth: []}]
       parameters:
-        - {$ref: '#/components/parameters/TokenTypeFilter'}
+        - {$ref: '#/components/parameters/ListMultiTokenTypeFilter'}
         - {$ref: '#/components/parameters/TokenOwnerFilter'}
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
+        - {$ref: '#/components/parameters/ListMultiStatusFilter'}
       responses:
         '200': {description: Cursor page of redacted Token metadata, content: {application/json: {schema: {$ref: '#/components/schemas/TokenPageEnvelope'}}}}
         '400': {description: Invalid Token type or pagination input}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Missing or invalid management bearer Token}
         '403': {description: A non-admin requested another owner's Tokens}
     post:
@@ -1264,8 +1293,11 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
       responses:
         '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/ServerNodePageEnvelope'}}}}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Missing or invalid management bearer Token}
         '403': {description: Administrator required}
   /api/v1/server-nodes/{nodeId}:
@@ -1390,6 +1422,8 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
         - {name: actorUserId, in: query, schema: {type: string, maxLength: 255}, description: Exact actor user ID}
         - {name: action, in: query, schema: {type: string, maxLength: 255}, description: Exact audit action}
         - {name: resourceType, in: query, schema: {type: string, maxLength: 255}, description: Exact resource type}
@@ -1399,6 +1433,7 @@ paths:
       responses:
         '200': {description: Cursor page of audit records, content: {application/json: {schema: {$ref: '#/components/schemas/AuditLogPageEnvelope'}}}}
         '400': {description: Invalid time filter}
+        '422': {description: Invalid sort or filter value}
         '403': {description: Admin permission required}
   /api/v1/downloads:
     get:
@@ -1424,12 +1459,15 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/Cursor'}
         - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/ListSort'}
+        - {$ref: '#/components/parameters/ListOrder'}
         - {name: status, in: query, schema: {type: string, enum: [active, disabled, revoked]}}
         - {name: nodeId, in: query, schema: {type: string}}
         - {name: agentId, in: query, schema: {type: string}}
         - {name: keyword, in: query, schema: {type: string, maxLength: 128}}
       responses:
         '200': {description: Cursor page, content: {application/json: {schema: {$ref: '#/components/schemas/VPNPeerPageEnvelope'}}}}
+        '422': {description: Invalid sort or filter value}
         '401': {description: Unauthenticated}
         '503': {description: The peer service is not assembled on this server}
     post:
@@ -1619,9 +1657,14 @@ components:
   parameters:
     Cursor: {name: cursor, in: query, schema: {type: string}}
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+    ListSort: {name: sort, in: query, description: Allowlisted column name; pair with order. The default is the endpoint's business timestamp descending., schema: {type: string}}
+    ListOrder: {name: order, in: query, description: Sort direction., schema: {type: string, enum: [asc, desc], default: desc}}
+    ListKeyword: {name: keyword, in: query, schema: {type: string, maxLength: 128}}
+    ListRoleFilter: {name: role, in: query, description: Comma-separated role values; repeated values are deduplicated., schema: {type: string, enum: [user]}}
+    ListMultiTokenTypeFilter: {name: type, in: query, description: Comma-separated token types., schema: {type: string, enum: [agent, client, server_node]}}
+    ListMultiStatusFilter: {name: status, in: query, description: Comma-separated lifecycle values; accepted values depend on the endpoint., schema: {type: string}}
     IncludeStale: {name: includeStale, in: query, description: Include an expired or explicitly stale snapshot, schema: {type: boolean, default: false}}
     IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 255}}
-    TokenTypeFilter: {name: type, in: query, schema: {type: string, enum: [agent, client, server_node]}}
     TokenOwnerFilter: {name: owner, in: query, description: Owner user ID; admin-only when it differs from the current user, schema: {type: string}}
   schemas:
     Envelope: {type: object, required: [code, msg, data], properties: {code: {type: integer}, msg: {type: string}, data: {type: object}}}

@@ -545,6 +545,35 @@ func (s *OIDCProviderService) List(ctx context.Context, cursor string, limit int
 	return storage.Page[ProviderView]{Items: views, NextCursor: page.NextCursor, HasMore: page.HasMore}, nil
 }
 
+func (s *OIDCProviderService) ListSorted(ctx context.Context, sort storage.SortSpec, cursor string, limit int) (storage.Page[ProviderView], error) {
+	return s.ListSortedFiltered(ctx, storage.OIDCProviderListFilter{}, sort, cursor, limit)
+}
+
+func (s *OIDCProviderService) ListSortedFiltered(ctx context.Context, filter storage.OIDCProviderListFilter, sort storage.SortSpec, cursor string, limit int) (storage.Page[ProviderView], error) {
+	var page storage.Page[storage.OIDCProvider]
+	err := s.store.IdentityRead(ctx, func(repos storage.IdentityRepositories) error {
+		found, err := repos.Providers.List(ctx, cursor, limit)
+		if filtered, ok := repos.Providers.(storage.FilteredSortedOIDCProviderRepository); ok {
+			found, err = filtered.ListSortedFiltered(ctx, filter, sort, cursor, limit)
+			page = found
+			return err
+		}
+		if sorted, ok := repos.Providers.(storage.SortedOIDCProviderRepository); ok {
+			found, err = sorted.ListSorted(ctx, sort, cursor, limit)
+		}
+		page = found
+		return err
+	})
+	if err != nil {
+		return storage.Page[ProviderView]{}, err
+	}
+	views := make([]ProviderView, 0, len(page.Items))
+	for _, row := range page.Items {
+		views = append(views, providerView(row))
+	}
+	return storage.Page[ProviderView]{Items: views, NextCursor: page.NextCursor, HasMore: page.HasMore}, nil
+}
+
 // ListPublic returns the providers an unauthenticated login page may show.
 func (s *OIDCProviderService) ListPublic(ctx context.Context) ([]PublicProviderView, error) {
 	var rows []storage.OIDCProvider

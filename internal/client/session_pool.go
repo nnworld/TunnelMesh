@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 var ErrAgentSessionUnavailable = errors.New("client: agent session unavailable")
@@ -37,6 +38,7 @@ type SessionPoolManagerOptions struct {
 	Runner    SessionPoolRunner
 	WebSocket WebSocketRunOptions
 	Metadata  ClientMetadataOptions
+	Dialer    *sharedtransport.Dialer
 }
 
 type SessionPoolManager struct {
@@ -288,6 +290,7 @@ func (p *agentSessionPool) startSlot(ctx context.Context) {
 		runner = RunWebSocketWithOptions
 	}
 	runOptions := p.options.WebSocket
+	runOptions.Dialer = p.options.Dialer
 	if p.options.Metadata.InstanceID != "" {
 		metadata := cloneClientMetadataOptions(p.options.Metadata)
 		metadata.ConnectionSlot = slotID + 1

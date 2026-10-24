@@ -168,16 +168,29 @@ func (r *vpnPeerRepo) SetStatus(ctx context.Context, id string, status VPNPeerSt
 
 func (r *vpnPeerRepo) List(ctx context.Context, filter VPNPeerFilter, cursor string, limit int) (Page[VPNPeer], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		// Preserve the legacy repository order for callers that do not opt into
+		// the admin API's explicit business-time sort.
+		spec = SortSpec{Column: "id"}
+	}
 	conditions, args := vpnPeerConditions(filter)
-	if id := decodeCursor(cursor); id != "" {
-		conditions = append(conditions, `id>?`)
-		args = append(args, id)
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if created, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(created, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
 	}
 	query := `SELECT ` + vpnPeerColumns + ` FROM vpn_peers`
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY id LIMIT ?`
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -198,7 +211,12 @@ func (r *vpnPeerRepo) List(ctx context.Context, filter VPNPeerFilter, cursor str
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
 		page.HasMore = true
-		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.CreatedAt), last.ID)
+		}
 	}
 	return page, nil
 }
@@ -269,15 +287,26 @@ func vpnPeerConditions(filter VPNPeerFilter) ([]string, []any) {
 		conditions = append(conditions, `agent_id=?`)
 		args = append(args, filter.AgentID)
 	}
-	switch filter.Status {
-	case VPNPeerStatusActive, VPNPeerStatusDisabled, VPNPeerStatusRevoked:
-		conditions = append(conditions, `status=?`)
-		args = append(args, string(filter.Status))
-	case "":
-	default:
-		// An unknown status narrows to nothing rather than to everything, so a
-		// typo in a filter value cannot widen a scoped query into a full read.
-		conditions = append(conditions, `1=0`)
+	if len(filter.Statuses) > 0 {
+		placeholders := make([]string, len(filter.Statuses))
+		for index := range placeholders {
+			placeholders[index] = "?"
+		}
+		conditions = append(conditions, `status IN (`+strings.Join(placeholders, ",")+`)`)
+		for _, value := range filter.Statuses {
+			args = append(args, string(value))
+		}
+	} else {
+		switch filter.Status {
+		case VPNPeerStatusActive, VPNPeerStatusDisabled, VPNPeerStatusRevoked:
+			conditions = append(conditions, `status=?`)
+			args = append(args, string(filter.Status))
+		case "":
+		default:
+			// An unknown status narrows to nothing rather than to everything, so a
+			// typo in a filter value cannot widen a scoped query into a full read.
+			conditions = append(conditions, `1=0`)
+		}
 	}
 	if filter.Keyword != "" {
 		keyword := boundedAgentFilter(filter.Keyword)

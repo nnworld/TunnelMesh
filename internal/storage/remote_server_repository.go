@@ -65,16 +65,27 @@ func (r *remoteServerRepo) Restore(ctx context.Context, id string) error {
 
 func (r *remoteServerRepo) List(ctx context.Context, filter RemoteServerFilter, cursor string, limit int) (Page[RemoteServer], error) {
 	cursor, limit = pageArgs(cursor, limit)
+	spec := filter.Sort
+	if spec.Column == "" {
+		spec = SortSpec{Column: "updated_at", Descending: true, Composite: true}
+	}
 	conditions, args := remoteServerConditions(filter)
-	if id := decodeCursor(cursor); id != "" {
-		conditions = append(conditions, `id>?`)
-		args = append(args, id)
+	if spec.Column == "id" {
+		if id := decodeCursor(cursor); id != "" {
+			predicate, cursorArgs := spec.CursorCondition("", id)
+			conditions = append(conditions, predicate)
+			args = append(args, cursorArgs...)
+		}
+	} else if updated, id, ok := decodeCompositeCursor(cursor); ok {
+		predicate, cursorArgs := spec.CursorCondition(updated, id)
+		conditions = append(conditions, predicate)
+		args = append(args, cursorArgs...)
 	}
 	query := `SELECT ` + remoteServerColumns + ` FROM remote_servers`
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY id LIMIT ?`
+	query += ` ORDER BY ` + spec.OrderBy() + ` LIMIT ?`
 	args = append(args, limit+1)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -95,7 +106,12 @@ func (r *remoteServerRepo) List(ctx context.Context, filter RemoteServerFilter, 
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
 		page.HasMore = true
-		page.NextCursor = encodeCursor(page.Items[len(page.Items)-1].ID)
+		last := page.Items[len(page.Items)-1]
+		if spec.Column == "id" {
+			page.NextCursor = spec.NextCursor("", last.ID)
+		} else {
+			page.NextCursor = spec.NextCursor(tm(last.UpdatedAt), last.ID)
+		}
 	}
 	return page, nil
 }
@@ -128,17 +144,28 @@ func remoteServerConditions(filter RemoteServerFilter) ([]string, []any) {
 		conditions = append(conditions, `agent_id=?`)
 		args = append(args, filter.AgentID)
 	}
-	switch filter.Status {
-	case RemoteServerStatusEnabled:
-		conditions = append(conditions, `deleted_at IS NULL`, `enabled=1`)
-	case RemoteServerStatusDisabled:
-		conditions = append(conditions, `deleted_at IS NULL`, `enabled=0`)
-	case RemoteServerStatusDeleted:
-		conditions = append(conditions, `deleted_at IS NOT NULL`)
-	case RemoteServerStatusAll, "":
-		conditions = append(conditions, `deleted_at IS NULL`)
-	default:
-		conditions = append(conditions, `1=0`)
+	if len(filter.Statuses) > 0 {
+		placeholders := make([]string, len(filter.Statuses))
+		for index := range placeholders {
+			placeholders[index] = "?"
+		}
+		conditions = append(conditions, `CASE WHEN deleted_at IS NOT NULL THEN 'deleted' WHEN enabled=1 THEN 'enabled' ELSE 'disabled' END IN (`+strings.Join(placeholders, ",")+`)`)
+		for _, value := range filter.Statuses {
+			args = append(args, string(value))
+		}
+	} else {
+		switch filter.Status {
+		case RemoteServerStatusEnabled:
+			conditions = append(conditions, `deleted_at IS NULL`, `enabled=1`)
+		case RemoteServerStatusDisabled:
+			conditions = append(conditions, `deleted_at IS NULL`, `enabled=0`)
+		case RemoteServerStatusDeleted:
+			conditions = append(conditions, `deleted_at IS NOT NULL`)
+		case RemoteServerStatusAll, "":
+			conditions = append(conditions, `deleted_at IS NULL`)
+		default:
+			conditions = append(conditions, `1=0`)
+		}
 	}
 	if filter.Keyword != "" {
 		keyword := boundedAgentFilter(filter.Keyword)

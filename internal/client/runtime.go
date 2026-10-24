@@ -15,6 +15,7 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
 	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 // Forward is one local ingress started by a Runtime.
@@ -94,8 +95,10 @@ type runtimeForward struct {
 	forward     Forward
 	description string
 	tunnel      config.TunnelConfig
+	opener      StreamOpener
 	state       string
 	lastError   string
+	restarting  bool
 }
 
 // RuntimeStats is the runtime snapshot the tray renders. Every field is derived
@@ -146,13 +149,17 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 	if len(cfg.Client.Tunnels) == 0 {
 		return nil, errors.New("client run requires at least one client.tunnels entry")
 	}
-	meta, err := RuntimeMetadata(ctx, cfg, opts.InstanceID)
+	meta, err := RuntimeMetadata(ctx, cfg, opts.InstanceID, opts.ConfigPath)
 	if err != nil {
 		return nil, err
 	}
 	runner := opts.Runner
 	if runner == nil {
 		runner = RunWebSocketWithOptions
+	}
+	dialer, err := sharedtransport.FromConfig(cfg.Client.Transport)
+	if err != nil {
+		return nil, fmt.Errorf("configure client transport: %w", err)
 	}
 	r := &Runtime{cfg: cfg, opts: opts, attempts: make(map[int]int)}
 	// The manager is assigned after r exists because the reconnect counter wraps the
@@ -169,6 +176,7 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 			Cooldown:           cfg.Client.Connections.Cooldown,
 		},
 		Metadata: meta,
+		Dialer:   dialer,
 		Runner:   r.countingRunner(runner),
 		WebSocket: WebSocketRunOptions{
 			InboundBufferBytes: cfg.Client.Stream.InboundBufferBytes,
@@ -176,12 +184,13 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 		},
 	})
 	for _, tunnel := range cfg.Client.Tunnels {
-		forward, description, err := NewConfiguredForward(r.manager.Opener(tunnel.AgentID), cfg.Client, tunnel)
+		opener := r.manager.Opener(tunnel.AgentID)
+		forward, description, err := NewConfiguredForward(opener, cfg.Client, tunnel)
 		if err != nil {
 			return nil, err
 		}
 		r.forwards = append(r.forwards, &runtimeForward{
-			forward: forward, description: description, tunnel: tunnel, state: TunnelStateStarting,
+			forward: forward, description: description, tunnel: tunnel, opener: opener, state: TunnelStateStarting,
 		})
 	}
 	return r, nil
@@ -253,17 +262,19 @@ func (r *Runtime) Start(ctx context.Context) error {
 		// One failure channel, two consumers: the supervisor needs it to end the run
 		// and Stats needs it to explain why a tunnel is no longer listening.
 		streams := broadcastErr(runCtx, entry.forward.Err(), 2)
-		watcher.Watch(runCtx, entry.description, cancel, streams[0])
+		watcher.Watch(runCtx, entry.description, func() { go r.restartForward(runCtx, entry) }, streams[0])
 		go r.recordFailure(runCtx, entry, streams[1])
 	}
 
 	go func() {
 		err := SuperviseRun(func() error { return r.manager.Run(runCtx) }, watcher)
+		cancel()
 		r.mu.Lock()
 		r.runErr = err
 		r.stoppedAt = time.Now().UTC()
 		r.started = false
 		r.mu.Unlock()
+		r.closeForwards()
 		r.markStopped()
 		_ = r.releaseLock()
 		close(done)
@@ -399,8 +410,16 @@ func (r *Runtime) releaseLock() error {
 }
 
 func (r *Runtime) closeForwards() {
+	r.mu.Lock()
+	forwards := make([]Forward, 0, len(r.forwards))
 	for i := len(r.forwards) - 1; i >= 0; i-- {
-		_ = r.forwards[i].forward.Close()
+		forwards = append(forwards, r.forwards[i].forward)
+	}
+	r.mu.Unlock()
+	for _, forward := range forwards {
+		if forward != nil {
+			_ = forward.Close()
+		}
 	}
 }
 
@@ -421,6 +440,67 @@ func (r *Runtime) recordFailure(ctx context.Context, entry *runtimeForward, errs
 			return
 		}
 		r.setTunnelState(entry, TunnelStateFailed, reported.Error())
+	}
+}
+
+// restartForward rebuilds only the listener that reported a terminal error. The
+// shared Agent session pool stays alive, so one bad local port does not disconnect
+// unrelated tunnels.
+func (r *Runtime) restartForward(ctx context.Context, entry *runtimeForward) {
+	r.mu.Lock()
+	if entry.restarting || !r.started || entry.state == TunnelStateStopped {
+		r.mu.Unlock()
+		return
+	}
+	entry.restarting = true
+	old := entry.forward
+	entry.state = TunnelStateFailed
+	r.mu.Unlock()
+	_ = old.Close()
+
+	defer func() {
+		r.mu.Lock()
+		entry.restarting = false
+		r.mu.Unlock()
+	}()
+
+	backoff := 100 * time.Millisecond
+	for {
+		forward, description, err := NewConfiguredForward(entry.opener, r.cfg.Client, entry.tunnel)
+		if err == nil {
+			err = forward.Start(ctx)
+		}
+		if err == nil {
+			r.mu.Lock()
+			if !r.started || ctx.Err() != nil {
+				r.mu.Unlock()
+				_ = forward.Close()
+				return
+			}
+			entry.forward = forward
+			entry.description = description
+			entry.state = TunnelStateListening
+			entry.lastError = ""
+			r.mu.Unlock()
+			streams := broadcastErr(ctx, forward.Err(), 2)
+			r.watcher.Watch(ctx, entry.description, func() { go r.restartForward(ctx, entry) }, streams[0])
+			go r.recordFailure(ctx, entry, streams[1])
+			return
+		}
+		r.setTunnelState(entry, TunnelStateFailed, err.Error())
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if backoff < 10*time.Second {
+			backoff *= 2
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+		}
 	}
 }
 
@@ -509,7 +589,7 @@ func TunnelDisplayName(t config.TunnelConfig) string {
 // RuntimeMetadata builds the shared observability snapshot for every physical
 // WebSocket. The instance identity is persisted before listeners start so reconnects
 // and per-Agent pools aggregate under one Client resource.
-func RuntimeMetadata(ctx context.Context, cfg config.Config, instanceIDOverride string) (ClientMetadataOptions, error) {
+func RuntimeMetadata(ctx context.Context, cfg config.Config, instanceIDOverride, configPath string) (ClientMetadataOptions, error) {
 	instanceID := strings.TrimSpace(instanceIDOverride)
 	if instanceID == "" {
 		instanceID = strings.TrimSpace(cfg.Client.InstanceID)
@@ -517,7 +597,7 @@ func RuntimeMetadata(ctx context.Context, cfg config.Config, instanceIDOverride 
 	if instanceID == "" {
 		identityPath := strings.TrimSpace(cfg.Client.InstanceIDPath)
 		if identityPath == "" {
-			identityPath = DefaultClientInstanceIDPath()
+			identityPath = DefaultClientInstanceIDPathForConfig(configPath)
 		}
 		generated, err := EnsureClientInstanceID(identityPath)
 		if err != nil {

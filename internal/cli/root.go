@@ -22,6 +22,7 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/server"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
+	sharedtransport "github.com/tunnelmesh/tunnelmesh/internal/transport"
 )
 
 // NewServerRoot constructs the server command tree.
@@ -346,12 +347,17 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			if echoer != nil {
 				defer func() { _ = echoer.Close() }()
 			}
+			dialer, err := sharedtransport.FromConfig(cfg.Agent.Transport)
+			if err != nil {
+				return fmt.Errorf("configure agent transport: %w", err)
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
 			return agent.RunConnectionPool(cmd.Context(), agent.WebSocketPoolOptions{
 				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
 				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
 				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
+				Dialer:    dialer,
 				Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
 				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
 				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,

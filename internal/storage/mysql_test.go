@@ -65,8 +65,8 @@ func TestMySQLV10ToV11ClientObservabilityMigrationUsesCompatibleDDL(t *testing.T
 }
 
 func TestMySQLV11ToV12WebSSHMigrationsAreAdjacent(t *testing.T) {
-	if SchemaVersion != 16 {
-		t.Fatalf("SchemaVersion = %d, want 16", SchemaVersion)
+	if SchemaVersion != 17 {
+		t.Fatalf("SchemaVersion = %d, want 17", SchemaVersion)
 	}
 	if !strings.Contains(migrations.V11ToV12SQLite, "CREATE TABLE IF NOT EXISTS credentials") {
 		t.Fatal("SQLite migration lacks credentials")
@@ -529,6 +529,34 @@ func TestMySQLV15ToV16VPNMigrationsAreAdjacentAndDialectSafe(t *testing.T) {
 	}
 }
 
+func TestMySQLV16ToV17IndexesAvoidTextKeyColumns(t *testing.T) {
+	mysqlScript := migrations.V16ToV17MySQL
+	for _, index := range []string{
+		"idx_agents_created ON agents(created_at(32), id)",
+		"idx_users_created ON users(created_at(32), id)",
+		"idx_service_tokens_created ON service_tokens(created_at(32), id)",
+		"idx_tunnels_created ON tunnels(created_at(32), id)",
+		"idx_server_nodes_created ON server_nodes(created_at(32), id)",
+		"idx_agent_policies_created ON agent_policies(created_at(32), id)",
+		"idx_credentials_updated ON credentials(updated_at(32), id)",
+	} {
+		if !strings.Contains(mysqlScript, index) {
+			t.Fatalf("v17 MySQL migration lacks TEXT-safe index definition %q", index)
+		}
+	}
+	if strings.Contains(mysqlScript, "CREATE INDEX idx_agents_created ON agents(created_at, id)") {
+		t.Fatal("v17 MySQL migration must prefix-index legacy TEXT timestamps")
+	}
+	for _, fragment := range []string{
+		"created_at VARCHAR(32) NOT NULL",
+		"updated_at VARCHAR(32) NOT NULL",
+	} {
+		if !strings.Contains(migrations.DDL, fragment) {
+			t.Fatalf("full DDL lacks MySQL-safe timestamp type %q", fragment)
+		}
+	}
+}
+
 // assertNoCommentOnlyChunks guards the statement splitter in
 // internal/storage/db.go: it splits a script on ';' and executes every non-empty
 // chunk, so a chunk holding only '--' comments would reach the server and fail.
@@ -835,8 +863,8 @@ func TestMySQLV15ToV16VPNMigration(t *testing.T) {
 // INTEGER/BIGINT mismatch between migrations/ddl.sql and v0006_to_v0007
 // survived unnoticed.
 func TestMySQLV14ToV15WidensConnectionEpoch(t *testing.T) {
-	if SchemaVersion != 16 {
-		t.Fatalf("SchemaVersion = %d, want 16", SchemaVersion)
+	if SchemaVersion != 17 {
+		t.Fatalf("SchemaVersion = %d, want 17", SchemaVersion)
 	}
 	script := migrations.V14ToV15MySQL
 	upper := strings.ToUpper(script)

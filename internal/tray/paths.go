@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
@@ -50,7 +51,8 @@ type Paths struct {
 	Lock string
 }
 
-// DefaultConfigDir returns the documented default, ~/.config/tunnelmesh.
+// DefaultConfigDir returns the per-user tray configuration directory. Windows
+// uses LOCALAPPDATA so a per-user install never needs to write ProgramData.
 //
 // XDG_CONFIG_HOME is honoured when set because that is the convention the path
 // follows, but os.UserConfigDir is deliberately not used: on macOS it returns
@@ -60,11 +62,35 @@ func DefaultConfigDir() (string, error) {
 	if base := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); base != "" {
 		return filepath.Join(base, ConfigDirName), nil
 	}
+	if runtime.GOOS == "windows" {
+		base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+		if base == "" {
+			if home, err := homeDir(); err == nil {
+				base = filepath.Join(home, "AppData", "Local")
+			}
+		}
+		if base != "" {
+			return filepath.Join(base, ConfigDirName), nil
+		}
+	}
 	home, err := homeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, ".config", ConfigDirName), nil
+}
+
+// WindowsServiceConfigDir reports the machine-level service directory so the UI
+// can make the two Windows configuration scopes explicit. It is empty elsewhere.
+func WindowsServiceConfigDir() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	base := strings.TrimSpace(os.Getenv("ProgramData"))
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, ConfigDirName)
 }
 
 // DefaultPaths resolves every location against the default configuration directory.

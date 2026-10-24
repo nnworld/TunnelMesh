@@ -107,7 +107,7 @@
         <el-button size="small" :loading="devicesLoading" @click="loadDevices">{{ t('security.devices.refresh') }}</el-button>
       </div>
       <DataState :loading="devicesLoading" :error="devicesLoadError" :empty="!devices.length" :error-label="t('security.devices.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('security.devices.empty')" @retry="loadDevices">
-        <el-table :data="devices" row-key="id">
+        <el-table :data="devicePageItems" row-key="id">
           <el-table-column :label="t('security.devices.name')" min-width="200">
             <template #default="{ row }">
               <el-input v-if="renamingId === row.id" v-model="renameValue" size="small" maxlength="128" :data-test="`device-name-${row.id}`" />
@@ -115,10 +115,10 @@
               <StatusTag v-if="row.current" class="current-tag" kind="success" :label="t('security.devices.current')" :data-test="`device-current-${row.id}`" />
             </template>
           </el-table-column>
-          <el-table-column prop="ip" :label="t('security.devices.ip')" width="150" />
+          <el-table-column prop="ip" :label="t('security.devices.ip')" width="150" sortable="true" />
           <el-table-column :label="t('security.devices.userAgent')" min-width="200"><template #default="{ row }"><span class="ellipsis" :title="row.userAgent">{{ row.userAgent }}</span></template></el-table-column>
-          <el-table-column :label="t('security.devices.lastSeenAt')" min-width="170"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
-          <el-table-column :label="t('security.devices.expiresAt')" min-width="170"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
+          <el-table-column prop="lastSeenAt" :label="t('security.devices.lastSeenAt')" min-width="170" sortable="true"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
+          <el-table-column prop="expiresAt" :label="t('security.devices.expiresAt')" min-width="170" sortable="true"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
           <el-table-column :label="t('users.actions')" width="200" fixed="right">
             <template #default="{ row }">
               <template v-if="renamingId === row.id">
@@ -132,6 +132,7 @@
             </template>
           </el-table-column>
         </el-table>
+        <div class="list-pager"><el-button :disabled="devicePageIndex === 0" @click="devicePageIndex--">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: devicePageIndex + 1 }) }}</span><el-button :disabled="!deviceHasNext" @click="devicePageIndex++">{{ t('common.nextPage') }}</el-button><el-select v-model="devicePageSize" class="page-size" @change="devicePageIndex = 0"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
       <el-alert v-if="deviceError" class="notice" type="error" :title="deviceError" show-icon :closable="false" data-test="device-error" />
     </div>
@@ -141,16 +142,17 @@
         <div><h2>{{ t('security.identities.title') }}</h2><p class="hint">{{ t('security.identities.description') }}</p></div>
       </div>
       <DataState :loading="identitiesLoading" :error="identitiesLoadError" :empty="!identities.length" :error-label="t('security.identities.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('security.identities.empty')" @retry="loadIdentities">
-        <el-table :data="identities" row-key="id">
+        <el-table :data="identityPageItems" row-key="id">
           <el-table-column prop="providerName" :label="t('security.identities.provider')" min-width="150" />
           <el-table-column :label="t('security.identities.account')" min-width="220"><template #default="{ row }">{{ row.displayName || row.username || row.email || '—' }}<span v-if="row.email" class="muted"> {{ row.email }}</span></template></el-table-column>
           <el-table-column :label="t('security.identities.subject')" min-width="170"><template #default="{ row }"><span class="ellipsis" :title="row.subject">{{ row.subject }}</span></template></el-table-column>
-          <el-table-column :label="t('security.identities.linkedAt')" min-width="170"><template #default="{ row }">{{ formatDate(row.linkedAt) }}</template></el-table-column>
-          <el-table-column :label="t('security.identities.lastLoginAt')" min-width="170"><template #default="{ row }">{{ formatDate(row.lastLoginAt) }}</template></el-table-column>
+          <el-table-column prop="linkedAt" :label="t('security.identities.linkedAt')" min-width="170" sortable="true"><template #default="{ row }">{{ formatDate(row.linkedAt) }}</template></el-table-column>
+          <el-table-column prop="lastLoginAt" :label="t('security.identities.lastLoginAt')" min-width="170" sortable="true"><template #default="{ row }">{{ formatDate(row.lastLoginAt) }}</template></el-table-column>
           <el-table-column :label="t('users.actions')" width="130" fixed="right">
             <template #default="{ row }"><el-button link type="danger" :data-test="`identity-unlink-${row.id}`" @click="unlink(row)">{{ t('security.identities.unlink') }}</el-button></template>
           </el-table-column>
         </el-table>
+        <div class="list-pager"><el-button :disabled="identityPageIndex === 0" @click="identityPageIndex--">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: identityPageIndex + 1 }) }}</span><el-button :disabled="!identityHasNext" @click="identityPageIndex++">{{ t('common.nextPage') }}</el-button><el-select v-model="identityPageSize" class="page-size" @change="identityPageIndex = 0"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
       <el-alert v-if="identityError" class="notice" type="error" :title="identityError" show-icon :closable="false" data-test="identity-error" />
     </div>
@@ -199,15 +201,23 @@ const devicesLoadError = ref(false)
 const deviceError = ref('')
 const renamingId = ref('')
 const renameValue = ref('')
+const devicePageIndex = ref(0)
+const devicePageSize = ref(20)
 
 const identities = ref<LinkedIdentity[]>([])
 const identitiesLoading = ref(false)
 const identitiesLoadError = ref(false)
 const identityError = ref('')
+const identityPageIndex = ref(0)
+const identityPageSize = ref(20)
 
 const statusLabel = computed(() => t(statusKey(mfa.value?.status)))
 const statusKind = computed(() => mfa.value?.status === 'enabled' ? 'success' : mfa.value?.status === 'pending' ? 'warning' : 'info')
 const policyLabel = computed(() => t(policyKey(mfa.value?.policy.mode)))
+const devicePageItems = computed(() => devices.value.slice(devicePageIndex.value * devicePageSize.value, (devicePageIndex.value + 1) * devicePageSize.value))
+const deviceHasNext = computed(() => (devicePageIndex.value + 1) * devicePageSize.value < devices.value.length)
+const identityPageItems = computed(() => identities.value.slice(identityPageIndex.value * identityPageSize.value, (identityPageIndex.value + 1) * identityPageSize.value))
+const identityHasNext = computed(() => (identityPageIndex.value + 1) * identityPageSize.value < identities.value.length)
 
 function statusKey(status?: string) {
   return status === 'enabled' ? 'security.mfa.statusEnabled' : status === 'pending' ? 'security.mfa.statusPending' : 'security.mfa.statusNone'
@@ -299,7 +309,7 @@ async function loadDevices() {
   devicesLoading.value = true; devicesLoadError.value = false
   // max_trusted_devices is capped at 100 by policy, so one page covers every
   // device the account can hold and the list never needs a pager.
-  try { devices.value = (await listDevices({ limit: 100 })).items }
+  try { devices.value = (await listDevices({ limit: 100 })).items; devicePageIndex.value = 0 }
   catch { devicesLoadError.value = true }
   finally { devicesLoading.value = false; renamingId.value = '' }
 }
@@ -332,7 +342,7 @@ function deviceErrorMessage(error: unknown) {
 
 async function loadIdentities() {
   identitiesLoading.value = true; identitiesLoadError.value = false
-  try { identities.value = await listIdentities() }
+  try { identities.value = await listIdentities(); identityPageIndex.value = 0 }
   catch { identitiesLoadError.value = true }
   finally { identitiesLoading.value = false }
 }
@@ -370,4 +380,4 @@ onMounted(() => { void loadMFA(); void loadDevices(); void loadIdentities() })
 .enrollment { margin-top: 18px; }
 .current-tag { margin-left: 8px; }
 .ellipsis { display: block; overflow: hidden; max-width: 260px; text-overflow: ellipsis; white-space: nowrap; }
-:deep(.el-table) { --el-table-border-color: #edf1f7; }</style>
+:deep(.el-table) { --el-table-border-color: #edf1f7; }.list-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:14px 0 0}.page-size{width:100px}</style>

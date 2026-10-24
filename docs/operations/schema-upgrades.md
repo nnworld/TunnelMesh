@@ -1,5 +1,38 @@
 # Schema Upgrade Guide
 
+## v16 to v17
+
+Schema v17 adds business-time composite indexes used by cursor list queries. It
+does not change existing table columns or data semantics, so the migration is
+additive and safe to roll forward without a data backfill. Fresh databases use
+`VARCHAR(32)` for indexed timestamp columns in the full DDL; existing MySQL
+databases retain their historical `TEXT` columns and the MySQL migration uses
+32-character index prefixes for those columns.
+
+New indexes cover the common management list paths: users, service tokens,
+credentials, remote servers, VPN peers, OIDC providers, routes and server
+nodes. Every index ends with `id` as the deterministic tie-breaker. The API
+accepts only allowlisted `sort` values and `asc`/`desc`; cursors are opaque and
+must be reused with the same filter and sort order.
+
+### Before upgrading
+
+1. Back up the database and verify restoreability.
+2. Confirm `schema_meta.version=16` and both `v0016_to_v0017` scripts are present.
+3. Confirm the database account can create indexes and update `schema_meta`.
+4. Plan a rolling restart only after the first node passes list, filter and
+   cursor smoke tests; old binaries cannot open a database stamped v17.
+
+### Verify and rollback
+
+Check `schema_meta.version=17` and inspect the business-time indexes in
+`sqlite_master` or `SHOW INDEX`. If an index build fails, stop the rollout and
+restore the pre-upgrade backup; never edit `schema_meta.version` by hand.
+The five-minute stop-loss is to halt new deployments, keep the existing binary
+fleet serving, and restore the backup if the database upgrade itself is at
+fault. Application-only regressions should be fixed forward without dropping
+the additive indexes.
+
 ## v15 to v16
 
 Schema v16 is the storage foundation for the embedded VPN gateway approved in

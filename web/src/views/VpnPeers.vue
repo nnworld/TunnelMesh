@@ -29,8 +29,8 @@
         <el-button :loading="loading" @click="reload">{{ t('vpn.refresh') }}</el-button>
       </div>
       <DataState :loading="loading" :error="loadError" :empty="!items.length" :error-label="t('vpn.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('vpn.empty')" @retry="reload">
-        <el-table :data="items" row-key="id">
-          <el-table-column prop="name" :label="t('vpn.name')" min-width="140" />
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="name" :label="t('vpn.name')" min-width="140" sortable="custom" />
           <el-table-column :label="t('vpn.status')" width="110">
             <template #default="{ row }"><StatusTag :kind="statusKind(row.status)" :label="statusLabel(row.status)" /></template>
           </el-table-column>
@@ -46,7 +46,7 @@
           <el-table-column :label="t('vpn.icmp')" width="90">
             <template #default="{ row }"><StatusTag :kind="row.icmpEnabled ? 'success' : 'info'" :label="row.icmpEnabled ? t('common.yes') : t('common.no')" /></template>
           </el-table-column>
-          <el-table-column :label="t('vpn.expiresAt')" width="180">
+          <el-table-column prop="expiresAt" :label="t('vpn.expiresAt')" width="180" sortable="custom">
             <template #default="{ row }">{{ row.expiresAt ? formatDate(row.expiresAt) : t('vpn.never') }}</template>
           </el-table-column>
           <el-table-column :label="t('vpn.actions')" width="360" fixed="right">
@@ -61,7 +61,7 @@
           </el-table-column>
         </el-table>
       </DataState>
-      <div v-if="page.nextCursor" class="load-more"><el-button :loading="loadingMore" :disabled="!page.hasMore" @click="loadMore">{{ t('vpn.loadMore') }}</el-button></div>
+      <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!page.nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
     </div>
 
     <el-dialog v-model="formVisible" :title="editingPeer ? t('vpn.edit') : t('vpn.create')" width="min(680px,94vw)" @closed="resetForm">
@@ -264,6 +264,11 @@ const page = ref<{ items: VpnPeer[]; nextCursor?: string; hasMore?: boolean }>({
 const items = computed(() => page.value.items)
 const loading = ref(false)
 const loadingMore = ref(false)
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
 const loadError = ref(false)
 const keyword = ref('')
 const filterStatus = ref<StatusFilter>('active')
@@ -399,23 +404,21 @@ async function loadPool() {
   }
 }
 
-async function load(cursor?: string) {
-  const appending = Boolean(cursor)
-  if (appending) loadingMore.value = true
-  else loading.value = true
-  if (!appending) loadError.value = false
+async function load() {
+  loading.value = true
+  loadError.value = false
   try {
     const result = await listVpnPeers({
       keyword: keyword.value.trim() || undefined,
       status: filterStatus.value,
-      cursor,
-      limit: 20,
+      cursor: cursors.value[pageIndex.value] || undefined,
+      limit: pageSize.value,
+      sort: sort.value,
+      order: order.value,
     })
-    page.value = appending
-      ? { items: [...page.value.items, ...result.items], nextCursor: result.nextCursor, hasMore: result.hasMore }
-      : { items: result.items ?? [], nextCursor: result.nextCursor, hasMore: result.hasMore }
+    page.value = { items: result.items ?? [], nextCursor: result.nextCursor, hasMore: result.hasMore }
   } catch {
-    if (!appending) loadError.value = true
+    loadError.value = true
   } finally {
     loading.value = false
     loadingMore.value = false
@@ -434,8 +437,10 @@ async function loadAgents() {
   }
 }
 
-function reload() { void load(); void loadPool() }
-function loadMore() { void load(page.value.nextCursor) }
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load(); void loadPool() }
+function next() { if (!page.value.nextCursor) return; cursors.value[pageIndex.value + 1] = page.value.nextCursor; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'expiresAt' ? 'expiresAt' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 // One key per dialog session, minted when the form is (re)opened. A save that
 // fails on a lost response is retried in place, and a retry carrying a fresh

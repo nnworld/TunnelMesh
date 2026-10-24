@@ -41,8 +41,8 @@
         :empty-label="t('common.empty')"
         @retry="load"
       >
-        <el-table :data="items" row-key="id">
-          <el-table-column :label="t('audits.time')" width="220">
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+          <el-table-column prop="createdAt" :label="t('audits.time')" width="220" sortable="custom">
             <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
           </el-table-column>
           <!-- The stored actor is an identifier; the name is resolved server-side
@@ -71,6 +71,12 @@
             </template>
           </el-table-column>
         </el-table>
+        <div class="pager">
+          <el-button :disabled="pageIndex === 0 || loading" @click="previousPage">{{ t('common.previousPage') }}</el-button>
+          <span class="pager-label">{{ t('common.page', { number: pageIndex + 1 }) }}</span>
+          <el-button :disabled="!nextCursor || loading" @click="nextPage">{{ t('common.nextPage') }}</el-button>
+          <el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" />
+        </div>
       </DataState>
     </div>
 
@@ -120,12 +126,20 @@ const filters = reactive({
   resourceType: '',
   resourceId: '',
 })
+const pageSize = ref(20)
+const pageIndex = ref(0)
+const pageCursors = ref([''])
+const nextCursor = ref('')
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
 
 async function load() {
   loading.value = true
   error.value = false
   try {
-    items.value = (await listAuditLogs({ ...auditFilter(), limit: 200 })).items
+    const page = await listAuditLogs({ ...auditFilter(), limit: pageSize.value, cursor: pageCursors.value[pageIndex.value], sort: sort.value, order: order.value })
+    items.value = page.items
+    nextCursor.value = page.nextCursor || ''
   } catch {
     error.value = true
   } finally {
@@ -145,7 +159,32 @@ function auditFilter() {
 }
 
 function search() {
+  pageCursors.value = ['']
+  pageIndex.value = 0
   void load()
+}
+
+function nextPage() {
+  if (!nextCursor.value) return
+  pageCursors.value[pageIndex.value + 1] = nextCursor.value
+  pageIndex.value += 1
+  void load()
+}
+
+function previousPage() {
+  if (pageIndex.value === 0) return
+  pageIndex.value -= 1
+  void load()
+}
+
+function changePageSize(size: number) {
+  pageSize.value = size
+  search()
+}
+
+function onSortChange(payload: { order?: 'ascending' | 'descending' | null }) {
+  order.value = payload.order === 'ascending' ? 'asc' : 'desc'
+  search()
 }
 
 function resetFilters() {
@@ -189,6 +228,19 @@ onMounted(load)
   display: flex;
   justify-content: flex-end;
   gap: 12px;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 18px 0 4px;
+}
+
+.pager-label {
+  color: var(--tm-muted);
+  font-size: 13px;
 }
 
 .actor-name {

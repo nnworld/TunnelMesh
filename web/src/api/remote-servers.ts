@@ -36,6 +36,8 @@ export type RemoteServerListParams = {
   keyword?: string
   cursor?: string
   limit?: number
+  sort?: string
+  order?: 'asc' | 'desc'
 }
 export type RemoteServerInput = {
   name: string
@@ -54,6 +56,8 @@ export function listRemoteServers(params: RemoteServerListParams = {}) {
   if (params.keyword) query.set('keyword', params.keyword)
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   return api<RemoteServerPage>(`/remote-servers${query.size ? `?${query}` : ''}`)
 }
 

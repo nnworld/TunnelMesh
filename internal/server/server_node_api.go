@@ -22,7 +22,14 @@ func (a *API) handleServerNodes(w http.ResponseWriter, r *http.Request, principa
 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		page, err := a.serverNodes.List(r.Context(), r.URL.Query().Get("cursor"), queryLimit(r))
+		sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at", "updatedAt": "updated_at", "lastSeenAt": "last_seen_at", "id": "id"}, "created_at")
+		if sortErr != nil {
+			sortErr.write(w)
+			return
+		}
+		var page ServerNodePage
+		var err error
+		page, err = a.serverNodes.ListSorted(r.Context(), sort.Spec(), r.URL.Query().Get("cursor"), queryLimit(r))
 		if err != nil {
 			writeServerNodeError(w, err)
 			return

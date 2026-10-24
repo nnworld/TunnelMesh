@@ -53,7 +53,7 @@
         :empty-label="t('servers.empty')"
         @retry="load"
       >
-        <el-table :data="items" row-key="id">
+        <el-table :data="items" row-key="id" @sort-change="onSortChange">
           <el-table-column prop="name" :label="t('servers.name')" min-width="140" />
           <el-table-column prop="id" :label="t('servers.id')" min-width="190" />
           <el-table-column prop="address" :label="t('servers.address')" min-width="160" />
@@ -64,7 +64,7 @@
           <el-table-column prop="activeConnections" :label="t('servers.activeConnections')" width="120" />
           <el-table-column prop="activeStreams" :label="t('servers.activeStreams')" width="110" />
           <el-table-column prop="healthScore" :label="t('servers.healthScore')" width="110" />
-          <el-table-column :label="t('servers.lastSeen')" width="180"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
+          <el-table-column prop="lastSeenAt" :label="t('servers.lastSeen')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.lastSeenAt) }}</template></el-table-column>
           <el-table-column :label="t('servers.leaseExpires')" width="180"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
           <el-table-column :label="t('servers.actions')" width="250" fixed="right">
             <template #default="{ row }">
@@ -84,7 +84,7 @@
             </template>
           </el-table-column>
         </el-table>
-        <div v-if="nextCursor" class="pager"><el-button :loading="loading" @click="loadMore">{{ t('servers.loadMore') }}</el-button></div>
+        <div class="pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
       </DataState>
     </div>
 
@@ -136,6 +136,11 @@ const items = ref<ServerNode[]>([])
 const loading = ref(false)
 const error = ref(false)
 const nextCursor = ref('')
+const pageIndex = ref(0)
+const pageSize = ref(20)
+const cursors = ref<string[]>([''])
+const sort = ref('createdAt')
+const order = ref<'asc' | 'desc'>('desc')
 const busy = ref(false)
 const detailVisible = ref(false)
 const detailLoading = ref(false)
@@ -153,7 +158,7 @@ const formatDate = useFormatDateTime()
 async function load() {
   loading.value = true; error.value = false
   try {
-    const page = await getServerNodes({ limit: 100 })
+    const page = await getServerNodes({ cursor: cursors.value[pageIndex.value] || undefined, limit: pageSize.value, sort: sort.value, order: order.value })
     items.value = page.items
     nextCursor.value = page.nextCursor || ''
   } catch {
@@ -163,19 +168,10 @@ async function load() {
   }
 }
 
-async function loadMore() {
-  if (!nextCursor.value) return
-  loading.value = true; error.value = false
-  try {
-    const page = await getServerNodes({ cursor: nextCursor.value, limit: 100 })
-    items.value.push(...page.items)
-    nextCursor.value = page.nextCursor || ''
-  } catch {
-    error.value = true
-  } finally {
-    loading.value = false
-  }
-}
+function reload() { pageIndex.value = 0; cursors.value = ['']; void load() }
+function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void load() }
+function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
+function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'lastSeenAt' ? 'lastSeenAt' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
 async function setEnabled(row: ServerNode) {
   busy.value = true

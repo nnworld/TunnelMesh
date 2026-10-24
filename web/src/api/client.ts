@@ -239,26 +239,35 @@ export type ClientListParams = {
   keyword?: string
   cursor?: string
   limit?: number
+  sort?: string
+  order?: 'asc' | 'desc'
 }
 
 let token = localStorage.getItem('tunnelmesh_token') || ''
 export function setToken(value: string) { token = value; value ? localStorage.setItem('tunnelmesh_token', value) : localStorage.removeItem('tunnelmesh_token') }
 export function getToken() { return token }
 
-export function getAgents(params: { cursor?: string; limit?: number; keyword?: string } = {}) {
+export function getAgents(params: { cursor?: string; limit?: number; keyword?: string; sort?: string; order?: 'asc' | 'desc'; enabled?: string; status?: string } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   if (params.keyword) query.set('keyword', params.keyword)
+  if (params.enabled) query.set('enabled', params.enabled)
+  if (params.status) query.set('status', params.status)
   return api<{items: Agent[]; nextCursor?: string}>(`/agents${query.size ? `?${query}` : ''}`)
 }
 export function createAgent(input: AgentCreateInput) { return api<Agent>('/agents', { method: 'POST', body: JSON.stringify(input) }) }
 export function updateAgent(id: string, input: Partial<AgentCreateInput>) { return api<Agent>(`/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }) }
-export function listAgentPolicies(agentId: string, params: { cursor?: string; limit?: number; status?: 'active' | 'deleted' | 'all' } = {}) {
+export function listAgentPolicies(agentId: string, params: { cursor?: string; limit?: number; status?: string; sort?: string; order?: 'asc' | 'desc'; protocol?: string } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
   if (params.status) query.set('status', params.status)
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
+  if (params.protocol) query.set('protocol', params.protocol)
   const suffix = query.toString() ? `?${query}` : ''
   return api<AgentPolicyPage>(`/agents/${encodeURIComponent(agentId)}/policies${suffix}`)
 }
@@ -285,12 +294,28 @@ export function restoreAgentPolicy(agentId: string, policyId: string) {
     method: 'POST',
   })
 }
-export function listRoutes(params: { cursor?: string; limit?: number } = {}) {
+export function listRoutes(params: { cursor?: string; limit?: number; keyword?: string; sort?: string; order?: 'asc' | 'desc'; protocol?: string; status?: string; authMode?: string } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.keyword) query.set('keyword', params.keyword)
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
+  if (params.protocol) query.set('protocol', params.protocol)
+  if (params.status) query.set('status', params.status)
+  if (params.authMode) query.set('authMode', params.authMode)
   const suffix = query.toString() ? `?${query}` : ''
   return api<ManagedRoutePage>(`/routes${suffix}`)
+}
+export function listTunnels(params: { cursor?: string; limit?: number; keyword?: string; sort?: string; order?: 'asc' | 'desc' } = {}) {
+  const query = new URLSearchParams()
+  if (params.cursor) query.set('cursor', params.cursor)
+  if (params.limit) query.set('limit', String(params.limit))
+  if (params.keyword) query.set('keyword', params.keyword)
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
+  const suffix = query.toString() ? `?${query}` : ''
+  return api<ManagedRoutePage>(`/tunnels${suffix}`)
 }
 export function createRoute(input: ManagedRouteCreateInput, idempotencyKey: string) {
   return api<ManagedRoute>('/routes', {
@@ -302,7 +327,7 @@ export function createRoute(input: ManagedRouteCreateInput, idempotencyKey: stri
 export function updateRoute(id: string, input: ManagedRouteUpdateInput) {
   return api<ManagedRoute>(`/routes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) })
 }
-export function listAuditLogs(params: AuditLogFilter & { cursor?: string; limit?: number } = {}) {
+export function listAuditLogs(params: AuditLogFilter & { cursor?: string; limit?: number; sort?: string; order?: 'asc' | 'desc' } = {}) {
   const query = new URLSearchParams()
   if (params.actorUserId) query.set('actorUserId', params.actorUserId)
   if (params.action) query.set('action', params.action)
@@ -312,12 +337,21 @@ export function listAuditLogs(params: AuditLogFilter & { cursor?: string; limit?
   if (params.createdTo) query.set('createdTo', params.createdTo)
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   return api<AuditLogPage>(`/audit-logs${query.size ? `?${query}` : ''}`)
 }
-export function listTokens(params: { type?: TokenType; cursor?: string } = {}) {
+export function listTokens(params: { type?: string; owner?: string; agentId?: string; nodeId?: string; status?: string; cursor?: string; limit?: number; sort?: string; order?: 'asc' | 'desc' } = {}) {
   const query = new URLSearchParams()
   if (params.type) query.set('type', params.type)
   if (params.cursor) query.set('cursor', params.cursor)
+  if (params.owner) query.set('owner', params.owner)
+  if (params.agentId) query.set('agentId', params.agentId)
+  if (params.nodeId) query.set('nodeId', params.nodeId)
+  if (params.status) query.set('status', params.status)
+  if (params.limit) query.set('limit', String(params.limit))
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   const suffix = query.toString() ? `?${query.toString()}` : ''
   return api<TokenPage>(`/tokens${suffix}`)
 }
@@ -359,11 +393,16 @@ export function closeAgentConnection(agentId: string, connectionId: string, conn
     { method: 'DELETE' },
   )
 }
-export function listUsers(params: { status?: 'active'|'deleted'|'all'; cursor?: string; limit?: number } = {}) {
+export function listUsers(params: { status?: string; role?: string; keyword?: string; cursor?: string; limit?: number; sort?: string; order?: 'asc' | 'desc'; mfaRequired?: string } = {}) {
   const query = new URLSearchParams()
   if (params.status) query.set('status', params.status)
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.role) query.set('role', params.role)
+  if (params.keyword) query.set('keyword', params.keyword)
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
+  if (params.mfaRequired) query.set('mfaRequired', params.mfaRequired)
   return api<UserPage>(`/users${query.size ? `?${query}` : ''}`)
 }
 export function createUser(username: string) { return api<TemporaryPasswordResult>('/users', { method: 'POST', body: JSON.stringify({ username }) }) }
@@ -377,10 +416,14 @@ export function restoreUser(id: string) { return api<UserAccount>(`/users/${enco
 export function changePassword(currentPassword: string, newPassword: string) { return api<UserAccount>('/auth/password', { method: 'PUT', body: JSON.stringify({ currentPassword, newPassword }) }) }
 export function getDashboardSummary() { return api<DashboardSummary>('/dashboard/summary') }
 
-export function getServerNodes(params: { cursor?: string; limit?: number } = {}) {
+export function getServerNodes(params: { cursor?: string; limit?: number; keyword?: string; status?: string; sort?: string; order?: 'asc' | 'desc' } = {}) {
   const query = new URLSearchParams()
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.keyword) query.set('keyword', params.keyword)
+  if (params.status) query.set('status', params.status)
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   const suffix = query.toString() ? `?${query}` : ''
   return api<ServerNodePage>(`/server-nodes${suffix}`)
 }
@@ -404,6 +447,8 @@ export function listClients(params: ClientListParams = {}) {
   if (params.keyword) query.set('keyword', params.keyword)
   if (params.cursor) query.set('cursor', params.cursor)
   if (params.limit) query.set('limit', String(params.limit))
+  if (params.sort) query.set('sort', params.sort)
+  if (params.order) query.set('order', params.order)
   const suffix = query.toString() ? `?${query}` : ''
   return api<ClientPage>(`/clients${suffix}`)
 }

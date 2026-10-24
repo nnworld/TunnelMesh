@@ -397,6 +397,7 @@ type AgentConfig struct {
 	ID          string                `mapstructure:"id" json:"id" yaml:"id"`
 	InstanceID  string                `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
 	Token       string                `mapstructure:"token" json:"-" yaml:"-"`
+	Transport   TransportConfig       `mapstructure:"transport" json:"transport" yaml:"transport"`
 	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Streams     AgentStreamConfig     `mapstructure:"streams" json:"streams" yaml:"streams"`
 	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
@@ -446,6 +447,7 @@ type ClientConfig struct {
 	InstanceID       string                 `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
 	InstanceIDPath   string                 `mapstructure:"instance_id_path" json:"instance_id_path" yaml:"instance_id_path"`
 	Token            string                 `mapstructure:"token" json:"-" yaml:"-"`
+	Transport        TransportConfig        `mapstructure:"transport" json:"transport" yaml:"transport"`
 	Tunnels          []TunnelConfig         `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
 	Connections      ClientConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
@@ -453,6 +455,21 @@ type ClientConfig struct {
 	Metadata         []MetadataSource       `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
 }
 
+const (
+	ProxyModeDirect      = "direct"
+	ProxyModeHTTPConnect = "http_connect"
+	ProxyModeSOCKS5      = "socks5"
+	ProxyModeSystem      = "system"
+)
+
+type TransportConfig struct {
+	ProxyMode              string `mapstructure:"proxy_mode" json:"proxy_mode" yaml:"proxy_mode"`
+	ProxyURL               string `mapstructure:"proxy_url" json:"proxy_url" yaml:"proxy_url"`
+	ProxyUsername          string `mapstructure:"proxy_username" json:"proxy_username" yaml:"proxy_username"`
+	ProxyPasswordEnv       string `mapstructure:"proxy_password_env" json:"proxy_password_env" yaml:"proxy_password_env"`
+	ProxyPasswordFile      string `mapstructure:"proxy_password_file" json:"proxy_password_file" yaml:"proxy_password_file"`
+	AllowInsecureTransport bool   `mapstructure:"allow_insecure_transport" json:"allow_insecure_transport" yaml:"allow_insecure_transport"`
+}
 type ClientConnectionConfig struct {
 	Min                int           `mapstructure:"min" json:"min" yaml:"min"`
 	Max                int           `mapstructure:"max" json:"max" yaml:"max"`
@@ -742,6 +759,8 @@ func setDefaults(v *viper.Viper) {
 		"agent.streams.icmp_bind_address":                    "0.0.0.0",
 		"agent.streams.icmp_timeout":                         5 * time.Second,
 		"agent.streams.icmp_max_concurrent":                  64,
+		"agent.transport.proxy_mode":                         ProxyModeDirect,
+		"agent.transport.allow_insecure_transport":           false,
 		"client.connections.min":                             1,
 		"client.connections.max":                             1,
 		"client.connections.high_watermark":                  16,
@@ -754,6 +773,8 @@ func setDefaults(v *viper.Viper) {
 		"client.remote_validation.negative_ttl":              2 * time.Second,
 		"client.remote_validation.timeout":                   3 * time.Second,
 		"client.remote_validation.max_entries":               10000,
+		"client.transport.proxy_mode":                        ProxyModeDirect,
+		"client.transport.allow_insecure_transport":          false,
 		"downloads.github_repository":                        DefaultGitHubRepository,
 	}
 	// The identity block is declared in auth.go next to its validation so the
@@ -775,6 +796,8 @@ func bindEnvironment(v *viper.Viper) {
 		"storage.mysql.dsn", "storage.mysql.tls", "storage.mysql.ca", "storage.mysql.cert", "storage.mysql.key",
 		"registry.type", "registry.endpoints", "node.id", "server.http_addr", "server.https_addr",
 		"server.agent_ws_addr", "server.client_ws_addr", "server.dynamic_suffix", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
+		"agent.transport.proxy_mode", "agent.transport.proxy_url", "agent.transport.proxy_username", "agent.transport.proxy_password_env", "agent.transport.proxy_password_file", "agent.transport.allow_insecure_transport",
+		"client.transport.proxy_mode", "client.transport.proxy_url", "client.transport.proxy_username", "client.transport.proxy_password_env", "client.transport.proxy_password_file", "client.transport.allow_insecure_transport",
 		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
 		"server.relay.enabled", "server.relay.listen", "server.relay.endpoint", "server.relay.ca", "server.relay.cert", "server.relay.key", "server.relay.server_name", "server.relay.node_token",
@@ -835,6 +858,11 @@ func Validate(cfg Config) error {
 	if cfg.Agent.ServerURL != "" && !validWebSocketURL(cfg.Agent.ServerURL) {
 		problems = append(problems, "agent server URL must be an absolute ws:// or wss:// URL")
 	}
+	problems = append(problems, validateTransport("agent", cfg.Agent.Transport)...)
+	problems = append(problems, validateTransport("client", cfg.Client.Transport)...)
+	if cfg.Agent.ServerURL != "" && insecureWebSocketDisallowed(cfg.Agent.ServerURL, cfg.Agent.Transport.AllowInsecureTransport) {
+		problems = append(problems, "agent server URL must use wss:// unless allow_insecure_transport is enabled")
+	}
 	if cfg.Agent.ServerURL != "" {
 		problems = append(problems, validateAgentConnections(cfg.Agent.Connections)...)
 	}
@@ -843,6 +871,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Client.ServerURL != "" && !validWebSocketURL(cfg.Client.ServerURL) {
 		problems = append(problems, "client server URL must be an absolute ws:// or wss:// URL")
+	}
+	if cfg.Client.ServerURL != "" && insecureWebSocketDisallowed(cfg.Client.ServerURL, cfg.Client.Transport.AllowInsecureTransport) {
+		problems = append(problems, "client server URL must use wss:// unless allow_insecure_transport is enabled")
 	}
 	switch cfg.Mode {
 	case ModeLocal:
@@ -1672,6 +1703,45 @@ func validWebSocketURL(raw string) bool {
 		return false
 	}
 	return u.IsAbs()
+}
+
+func insecureWebSocketDisallowed(raw string, allowed bool) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && u.Scheme == "ws" && !allowed && !isLoopbackWebSocketHost(u.Hostname())
+}
+
+func isLoopbackWebSocketHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validateTransport(role string, cfg TransportConfig) []string {
+	var problems []string
+	mode := strings.ToLower(strings.TrimSpace(cfg.ProxyMode))
+	if mode == "" {
+		mode = ProxyModeDirect
+	}
+	switch mode {
+	case ProxyModeDirect, ProxyModeSystem:
+		if strings.TrimSpace(cfg.ProxyURL) != "" {
+			problems = append(problems, role+" transport proxy_url requires a configured proxy mode")
+		}
+	case ProxyModeHTTPConnect, ProxyModeSOCKS5:
+		if strings.TrimSpace(cfg.ProxyURL) == "" {
+			problems = append(problems, role+" transport proxy_url is required for "+mode)
+		} else if u, err := url.Parse(strings.TrimSpace(cfg.ProxyURL)); err != nil || u.Host == "" || u.User != nil {
+			problems = append(problems, role+" transport proxy_url must be an absolute URL without credentials")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("%s transport proxy_mode %q is invalid", role, cfg.ProxyMode))
+	}
+	if strings.TrimSpace(cfg.ProxyPasswordEnv) != "" && strings.TrimSpace(cfg.ProxyPasswordFile) != "" {
+		problems = append(problems, role+" transport proxy password must use either proxy_password_env or proxy_password_file")
+	}
+	return problems
 }
 
 // InferRelayEndpoint derives the address other Server nodes should use from

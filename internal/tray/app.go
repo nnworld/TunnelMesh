@@ -92,18 +92,21 @@ type App struct {
 	runCtx    context.Context
 	runCancel context.CancelFunc
 
-	mu            sync.Mutex
-	runtimeOps    sync.Mutex
-	prefs         *PrefsStore
-	paths         Paths
-	config        *ConfigStore
-	validator     *Validator
-	runtime       *client.Runtime
-	runtimeErr    error
-	lockBlocked   bool
-	autostartErr  string
-	probe         serverProbeState
-	quitRequested bool
+	mu                       sync.Mutex
+	runtimeOps               sync.Mutex
+	prefs                    *PrefsStore
+	paths                    Paths
+	config                   *ConfigStore
+	validator                *Validator
+	runtime                  *client.Runtime
+	runtimeErr               error
+	lockBlocked              bool
+	runtimeStopRequested     bool
+	runtimeSupervisorRunning bool
+	runtimeRestartCount      int
+	autostartErr             string
+	probe                    serverProbeState
+	quitRequested            bool
 }
 
 // AppOptions configures an App. Every field is optional.
@@ -233,6 +236,7 @@ type SettingsView struct {
 	Theme            string `json:"theme"`
 	ConfigDir        string `json:"configDir"`
 	ClientConfigPath string `json:"clientConfigPath"`
+	ServiceConfigDir string `json:"serviceConfigDir,omitempty"`
 	PrefsPath        string `json:"prefsPath"`
 	LockPath         string `json:"lockPath"`
 	LaunchAtLogin    bool   `json:"launchAtLogin"`
@@ -285,6 +289,7 @@ func (a *App) Settings(ctx context.Context) (SettingsView, error) {
 		Theme:                  prefs.Theme,
 		ConfigDir:              paths.ConfigDir,
 		ClientConfigPath:       paths.ClientYAML,
+		ServiceConfigDir:       WindowsServiceConfigDir(),
 		PrefsPath:              paths.Prefs,
 		LockPath:               paths.Lock,
 		LaunchAtLogin:          prefs.LaunchAtLoginEnabled(),
@@ -689,6 +694,7 @@ type StatsView struct {
 	Connected       bool         `json:"connected"`
 	LockBlocked     bool         `json:"lockBlocked"`
 	RuntimeError    string       `json:"runtimeError,omitempty"`
+	RuntimeRestarts int          `json:"runtimeRestarts"`
 	Tunnels         []TunnelStat `json:"tunnels"`
 	Agents          []AgentStat  `json:"agents"`
 	Totals          StatTotals   `json:"totals"`
@@ -703,6 +709,7 @@ func (a *App) Stats(ctx context.Context) StatsView {
 
 	a.mu.Lock()
 	rt, runtimeErr, lockBlocked := a.runtime, a.runtimeErr, a.lockBlocked
+	runtimeRestarts := a.runtimeRestartCount
 	store := a.config
 	a.mu.Unlock()
 
@@ -748,6 +755,7 @@ func (a *App) Stats(ctx context.Context) StatsView {
 		view.RuntimeError = runtimeErr.Error()
 	}
 	view.LockBlocked = lockBlocked
+	view.RuntimeRestarts = runtimeRestarts
 
 	view.Totals.Tunnels = len(view.Tunnels)
 	for _, tunnel := range view.Tunnels {
@@ -872,6 +880,9 @@ func (a *App) RuntimeRunning() bool {
 func (a *App) StartRuntime(ctx context.Context) error {
 	a.runtimeOps.Lock()
 	defer a.runtimeOps.Unlock()
+	a.mu.Lock()
+	a.runtimeStopRequested = false
+	a.mu.Unlock()
 	return a.startRuntime(ctx)
 }
 
@@ -930,13 +941,68 @@ func (a *App) startRuntime(ctx context.Context) error {
 func (a *App) watchRuntime(rt *client.Runtime) {
 	err := rt.Wait(a.runCtx)
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.runtime != rt {
+		a.mu.Unlock()
 		return
 	}
 	a.runtime = nil
 	if err != nil && !errors.Is(err, context.Canceled) {
 		a.runtimeErr = err
+	}
+	shouldRestart := err != nil && !errors.Is(err, context.Canceled) && !a.runtimeStopRequested && !a.lockBlocked && !errors.Is(err, ErrConfigUnusable)
+	a.mu.Unlock()
+	if shouldRestart {
+		go a.superviseRuntime()
+	}
+}
+
+func (a *App) superviseRuntime() {
+	a.mu.Lock()
+	if a.runtimeSupervisorRunning {
+		a.mu.Unlock()
+		return
+	}
+	a.runtimeSupervisorRunning = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.runtimeSupervisorRunning = false
+		a.mu.Unlock()
+	}()
+
+	backoff := 250 * time.Millisecond
+	for {
+		a.mu.Lock()
+		stop := a.runtimeStopRequested
+		a.mu.Unlock()
+		if stop {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-a.runCtx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		a.runtimeOps.Lock()
+		err := a.startRuntime(context.Background())
+		a.runtimeOps.Unlock()
+		if err == nil {
+			a.mu.Lock()
+			a.runtimeRestartCount++
+			a.mu.Unlock()
+			return
+		}
+		if errors.Is(err, ErrConfigUnusable) || errors.Is(err, client.ErrRuntimeAlreadyRunning) {
+			return
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
 	}
 }
 
@@ -958,6 +1024,9 @@ func (a *App) StopRuntime() error {
 
 func (a *App) stopRuntime() error {
 	a.mu.Lock()
+	a.runtimeStopRequested = true
+	a.mu.Unlock()
+	a.mu.Lock()
 	rt := a.runtime
 	a.runtime = nil
 	a.mu.Unlock()
@@ -974,6 +1043,9 @@ func (a *App) RestartRuntime(ctx context.Context) error {
 	if err := a.stopRuntime(); err != nil {
 		return err
 	}
+	a.mu.Lock()
+	a.runtimeStopRequested = false
+	a.mu.Unlock()
 	return a.startRuntime(ctx)
 }
 
@@ -1004,6 +1076,7 @@ type AboutView struct {
 
 	ConfigDir        string `json:"configDir"`
 	ClientConfigPath string `json:"clientConfigPath"`
+	ServiceConfigDir string `json:"serviceConfigDir,omitempty"`
 	PrefsPath        string `json:"prefsPath"`
 	LockPath         string `json:"lockPath"`
 	InstanceID       string `json:"instanceId,omitempty"`
@@ -1036,6 +1109,7 @@ func (a *App) About(ctx context.Context) AboutView {
 		System:           system,
 		ConfigDir:        paths.ConfigDir,
 		ClientConfigPath: paths.ClientYAML,
+		ServiceConfigDir: WindowsServiceConfigDir(),
 		PrefsPath:        paths.Prefs,
 		LockPath:         paths.Lock,
 		Mode:             config.ModeLocal,
@@ -1054,7 +1128,7 @@ func (a *App) About(ctx context.Context) AboutView {
 	store := a.config
 	a.mu.Unlock()
 	if cfg, cfgErr := store.BuildConfig(ctx, settings); cfgErr == nil {
-		view.InstanceID, view.InstanceIDPath = instanceIdentity(cfg)
+		view.InstanceID, view.InstanceIDPath = instanceIdentity(cfg, paths.ClientYAML)
 	}
 	// An injected identity wins: it is what the hosted runtime will report, and the
 	// about tab has to describe the running client rather than the file on disk.
@@ -1062,7 +1136,7 @@ func (a *App) About(ctx context.Context) AboutView {
 		view.InstanceID = override
 	}
 	if view.InstanceIDPath == "" {
-		view.InstanceIDPath = client.DefaultClientInstanceIDPath()
+		view.InstanceIDPath = client.DefaultClientInstanceIDPathForConfig(paths.ClientYAML)
 	}
 	return view
 }
@@ -1071,10 +1145,10 @@ func (a *App) About(ctx context.Context) AboutView {
 //
 // EnsureClientInstanceID writes the file, which is right at launch and wrong for a
 // display-only view: opening the about tab must not leave state behind.
-func instanceIdentity(cfg config.Config) (string, string) {
+func instanceIdentity(cfg config.Config, configPath string) (string, string) {
 	path := strings.TrimSpace(cfg.Client.InstanceIDPath)
 	if path == "" {
-		path = client.DefaultClientInstanceIDPath()
+		path = client.DefaultClientInstanceIDPathForConfig(configPath)
 	}
 	if id := strings.TrimSpace(cfg.Client.InstanceID); id != "" {
 		return id, path

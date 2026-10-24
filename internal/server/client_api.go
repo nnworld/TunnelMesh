@@ -151,11 +151,17 @@ func (a *API) handleClients(w http.ResponseWriter, r *http.Request, p auth.Princ
 }
 
 func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	sort, sortErr := parseListSort(r, map[string]string{"lastSeenAt": "last_seen_at", "id": "id"}, "last_seen_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
 	filter := storage.ClientInstanceFilter{
 		TokenID:      strings.TrimSpace(r.URL.Query().Get("tokenId")),
 		ServerNodeID: strings.TrimSpace(r.URL.Query().Get("serverNodeId")),
 		AgentID:      strings.TrimSpace(r.URL.Query().Get("agentId")),
 		Keyword:      strings.TrimSpace(r.URL.Query().Get("keyword")),
+		Sort:         sort.Spec(),
 	}
 	if owner := strings.TrimSpace(r.URL.Query().Get("ownerUserId")); owner != "" {
 		if !isAdmin(p) {

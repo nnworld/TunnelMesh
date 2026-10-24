@@ -282,6 +282,19 @@ func (s *apiService) GetTunnel(ctx context.Context, id string) (storage.Tunnel, 
 func (s *apiService) ListTunnels(ctx context.Context, cursor string, limit int) (storage.Page[storage.Tunnel], error) {
 	return s.tunnels.List(ctx, cursor, limit)
 }
+
+func (s *apiService) ListTunnelsSorted(ctx context.Context, sort storage.SortSpec, cursor string, limit int) (storage.Page[storage.Tunnel], error) {
+	return s.ListTunnelsSortedFiltered(ctx, storage.TunnelListFilter{}, sort, cursor, limit)
+}
+func (s *apiService) ListTunnelsSortedFiltered(ctx context.Context, filter storage.TunnelListFilter, sort storage.SortSpec, cursor string, limit int) (storage.Page[storage.Tunnel], error) {
+	if sorted, ok := s.tunnels.(storage.FilteredSortedTunnelRepository); ok {
+		return sorted.ListSortedFiltered(ctx, filter, sort, cursor, limit)
+	}
+	if sorted, ok := s.tunnels.(storage.SortedTunnelRepository); ok {
+		return sorted.ListSorted(ctx, "", sort, cursor, limit)
+	}
+	return s.tunnels.List(ctx, cursor, limit)
+}
 func (s *apiService) UpdateTunnel(ctx context.Context, v storage.Tunnel) error {
 	if err := routing.ValidateDomainPattern(v.Domain); err != nil {
 		return err
@@ -818,7 +831,12 @@ type agentRequest struct {
 
 func (a *API) listAgents(w http.ResponseWriter, r *http.Request, p auth.Principal) {
 	query := r.URL.Query()
-	page, err := a.listAgentsForOwner(r.Context(), p, query.Get("keyword"), query.Get("cursor"), queryLimit(r))
+	sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at", "updatedAt": "updated_at", "id": "id"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
+	page, err := a.listAgentsForOwner(r.Context(), p, query.Get("keyword"), query.Get("cursor"), queryLimit(r), sort.Spec())
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1128,7 +1146,12 @@ func (a *API) handleTunnels(w http.ResponseWriter, r *http.Request, p auth.Princ
 }
 
 func (a *API) listTunnels(w http.ResponseWriter, r *http.Request, p auth.Principal) {
-	page, err := a.listTunnelsForOwner(r.Context(), p, r.URL.Query().Get("cursor"), queryLimit(r))
+	sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at", "updatedAt": "updated_at", "domain": "domain", "id": "id"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
+	page, err := a.listTunnelsForOwner(r.Context(), p, strings.TrimSpace(r.URL.Query().Get("keyword")), r.URL.Query().Get("cursor"), queryLimit(r), sort.Spec())
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1702,11 +1725,17 @@ func (a *API) handleAudits(w http.ResponseWriter, r *http.Request, p auth.Princi
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	sort, sortErr := parseListSort(r, map[string]string{"createdAt": "created_at"}, "created_at")
+	if sortErr != nil {
+		sortErr.write(w)
+		return
+	}
 	filter, err := auditFilterFromQuery(r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	filter.Sort = sort.Spec()
 	page, err := a.service.ListAudits(r.Context(), filter, r.URL.Query().Get("cursor"), queryLimit(r))
 	if err != nil {
 		writeStorageError(w, err)
@@ -2153,28 +2182,29 @@ func (a *API) findTunnel(ctx context.Context, want storage.Tunnel) (storage.Tunn
 // rows at a time and discarded foreign rows in memory, so a non-admin's page
 // could both miss an agent past the fetched window and report a cursor that
 // repeated rows they could not see.
-func (a *API) listAgentsForOwner(ctx context.Context, p auth.Principal, keyword, cursor string, limit int) (storage.Page[storage.Agent], error) {
-	filter := storage.AgentListFilter{Keyword: keyword}
+func (a *API) listAgentsForOwner(ctx context.Context, p auth.Principal, keyword, cursor string, limit int, sort storage.SortSpec) (storage.Page[storage.Agent], error) {
+	filter := storage.AgentListFilter{Keyword: keyword, Sort: sort}
 	if !isAdmin(p) {
 		filter.OwnerUserID = p.UserID
 	}
 	return a.service.ListAgentsFiltered(ctx, filter, cursor, limit)
 }
 
-func (a *API) listTunnelsForOwner(ctx context.Context, p auth.Principal, cursor string, limit int) (storage.Page[storage.Tunnel], error) {
+func (a *API) listTunnelsForOwner(ctx context.Context, p auth.Principal, keyword, cursor string, limit int, sort storage.SortSpec) (storage.Page[storage.Tunnel], error) {
+	filter := storage.TunnelListFilter{Keyword: keyword}
 	if isAdmin(p) {
-		return a.service.ListTunnels(ctx, cursor, limit)
+		return a.service.ListTunnelsSortedFiltered(ctx, filter, sort, cursor, limit)
 	}
 	if limit <= 0 {
 		limit = 50
 	}
 	result := storage.Page[storage.Tunnel]{}
 	for {
-		page, err := a.service.ListTunnels(ctx, cursor, 500)
+		page, err := a.service.ListTunnelsSortedFiltered(ctx, filter, sort, cursor, 500)
 		if err != nil {
 			return result, err
 		}
-		for _, v := range page.Items {
+		for index, v := range page.Items {
 			ag, e := a.service.GetAgent(ctx, v.AgentID)
 			if e != nil && !errors.Is(e, sql.ErrNoRows) {
 				return result, e
@@ -2182,8 +2212,8 @@ func (a *API) listTunnelsForOwner(ctx context.Context, p auth.Principal, cursor 
 			if e == nil && ag.OwnerUserID == p.UserID {
 				result.Items = append(result.Items, v)
 				if len(result.Items) == limit {
-					result.HasMore = page.HasMore
-					result.NextCursor = v.ID
+					result.HasMore = page.HasMore || index+1 < len(page.Items)
+					result.NextCursor = sort.NextCursor(tunnelSortCursorValue(v, sort.Column), v.ID)
 					return result, nil
 				}
 			}

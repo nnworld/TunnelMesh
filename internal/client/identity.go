@@ -25,6 +25,40 @@ func DefaultClientInstanceIDPath() string {
 	return "/var/lib/tunnelmesh-client/client-instance-id"
 }
 
+// DefaultClientInstanceIDPathForConfig keeps machine-level service identities in
+// ProgramData while per-user tray configurations use a writable user directory.
+func DefaultClientInstanceIDPathForConfig(configPath string) string {
+	if runtime.GOOS != "windows" {
+		return DefaultClientInstanceIDPath()
+	}
+	configPath, err := filepath.Abs(strings.TrimSpace(configPath))
+	if err != nil || configPath == "" {
+		return defaultWindowsUserInstanceIDPath()
+	}
+	programData := strings.TrimSpace(os.Getenv("ProgramData"))
+	if programData != "" {
+		if root, rootErr := filepath.Abs(filepath.Join(programData, "TunnelMesh")); rootErr == nil && pathWithin(configPath, root) {
+			return filepath.Join(root, "client-instance-id")
+		}
+	}
+	return defaultWindowsUserInstanceIDPath()
+}
+
+func defaultWindowsUserInstanceIDPath() string {
+	base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, "AppData", "Local")
+		}
+	}
+	return filepath.Join(base, "TunnelMesh", "client-instance-id")
+}
+
+func pathWithin(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // EnsureClientInstanceID returns an existing identity or atomically creates
 // one. The file is the source of truth, so retries never replace the value.
 func EnsureClientInstanceID(path string) (string, error) {

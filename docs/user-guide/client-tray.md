@@ -64,6 +64,10 @@ SmartScreen 会显示“Windows 已保护你的电脑”，点“更多信息 �
 同一枚标记；macOS 的菜单栏版本是单色着色版），配置目录里还没有 `client.yaml`，因此隧道不会
 自动起来。按下一节填完路由配置并保存即可。
 
+Windows 托盘默认把配置和 instance ID 放在当前用户的 `%LOCALAPPDATA%\\TunnelMesh`；Windows 服务仍使用
+`%ProgramData%\\TunnelMesh`。两者不会自动同步，关于页会显示两个目录；如需共用，使用 `--config-dir`
+显式指定服务目录并检查 ACL。
+
 ## 3. 托盘菜单与主窗口
 
 点击菜单栏 / 通知区域图标（下表左键那一列）：

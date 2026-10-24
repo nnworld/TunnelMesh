@@ -68,7 +68,7 @@ func TestServerNodeAPIListDetailLifecycleAndAudit(t *testing.T) {
 	if err := json.Unmarshal(page.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Data.Items) != 1 || list.Data.Items[0]["id"] != "server-a" || !list.Data.HasMore || list.Data.NextCursor == "" {
+	if len(list.Data.Items) != 1 || list.Data.Items[0]["id"] != "server-b" || !list.Data.HasMore || list.Data.NextCursor == "" {
 		t.Fatalf("first page = %s", page.Body.String())
 	}
 

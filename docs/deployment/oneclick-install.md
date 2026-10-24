@@ -93,7 +93,7 @@ notepad .\install-agent.ps1
 | 用途 | Linux user | Linux system | macOS | Windows |
 | --- | --- | --- | --- | --- |
 | 二进制 | `~/.local/bin` | `/usr/local/bin` | `~/.local/bin` | `C:\Program Files\TunnelMesh` |
-| 配置 YAML | `~/.config/tunnelmesh/<role>.yaml` | `/etc/tunnelmesh/<role>.yaml` | `~/.config/tunnelmesh/<role>.yaml` | `C:\ProgramData\TunnelMesh\<role>.yaml` |
+| 配置 YAML | `~/.config/tunnelmesh/<role>.yaml` | `/etc/tunnelmesh/<role>.yaml` | `~/.config/tunnelmesh/<role>.yaml` | `C:\ProgramData\TunnelMesh\<role>.yaml`（Windows 服务；托盘默认 `%LOCALAPPDATA%\\TunnelMesh`） |
 | 敏感值 env | `~/.config/tunnelmesh/<role>.env`（0600） | `/etc/tunnelmesh/<role>.env`（0640 `root:<运行组>`） | 渲染进 LaunchAgent plist（0600） | 渲染进 WinSW 服务 XML 的 `<env>`（ACL 收紧） |
 | 状态 | `~/.local/share/tunnelmesh` | `/var/lib/tunnelmesh`（server）/ `/var/lib/tunnelmesh-<role>` | `~/.local/share/tunnelmesh` | `C:\ProgramData\TunnelMesh` |
 | 服务定义 | `~/.config/systemd/user/tunnelmesh-<role>.service` | `/etc/systemd/system/tunnelmesh-<role>.service` | `~/Library/LaunchAgents/com.tunnelmesh.<role>.plist` | WinSW 服务 `tunnelmesh-<role>` |
