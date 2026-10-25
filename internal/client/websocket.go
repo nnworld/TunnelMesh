@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/reconnect"
 	"log/slog"
 	"math/rand"
 	"net/url"
@@ -64,13 +65,14 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 	if rng == nil {
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
-	attempt := 0
+	backoff := reconnect.New(base, max, rng)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		transport, err := dialWebSocketWithLegacyFallback(ctx, serverURL, token, options.Dialer)
-		if err == nil {
+		var delay time.Duration
+		transport, dialErr := dialWebSocketWithLegacyFallback(ctx, serverURL, token, options.Dialer)
+		if dialErr == nil {
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("client", "websocket", "started", "")
 			}
@@ -98,17 +100,20 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 					return readyErr
 				}
 			}
-			err = session.Wait(ctx)
+			sessionStarted := time.Now()
+			_ = session.Wait(ctx)
 			_ = session.Close()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-		} else if options.Metrics != nil {
-			options.Metrics.ObserveConnection("client", "websocket", "failed", observability.NormalizeErrorClass(err))
-			options.Metrics.ObserveStage("client", "websocket_upgrade", "failure", observability.NormalizeErrorClass(err), 0)
+			delay = backoff.AfterSession(time.Since(sessionStarted))
+		} else {
+			if options.Metrics != nil {
+				options.Metrics.ObserveConnection("client", "websocket", "failed", observability.NormalizeErrorClass(dialErr))
+				options.Metrics.ObserveStage("client", "websocket_upgrade", "failure", observability.NormalizeErrorClass(dialErr), 0)
+			}
+			delay = backoff.AfterDialFailure(dialErr)
 		}
-		attempt++
-		delay := clientReconnectDelay(base, max, attempt, rng)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -245,21 +250,6 @@ func clientOriginFor(u *url.URL) string {
 	return (&url.URL{Scheme: scheme, Host: u.Host}).String()
 }
 
-func clientReconnectDelay(base, max time.Duration, attempt int, rng *rand.Rand) time.Duration {
-	delay := base
-	for i := 1; i < attempt && delay < max; i++ {
-		delay *= 2
-	}
-	if delay > max {
-		delay = max
-	}
-	delay = time.Duration(float64(delay) * (0.8 + rng.Float64()*0.4))
-	if delay > max {
-		return max
-	}
-	return delay
-}
-
 type clientWebSocketTransport struct {
 	conn        *websocket.Conn
 	subprotocol string
@@ -283,7 +273,14 @@ func (t *clientWebSocketTransport) Send(frame protocol.Frame) error {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return websocket.Message.Send(t.conn, payload.Bytes())
+	_ = t.conn.SetWriteDeadline(time.Now().Add(sharedtransport.WriteTimeout))
+	if err := websocket.Message.Send(t.conn, payload.Bytes()); err != nil {
+		// See the Agent transport: a failed write corrupts the frame stream, and
+		// closing wakes the read loop so the session reconnects.
+		_ = t.conn.Close()
+		return err
+	}
+	return nil
 }
 
 func (t *clientWebSocketTransport) Receive() (protocol.Frame, error) {

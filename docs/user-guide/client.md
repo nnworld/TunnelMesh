@@ -15,6 +15,20 @@ client:
   server_url: wss://tunnel.example.com/ws/client
 ```
 
+如果希望 Client 同时作为一个 Agent 提供本机网络访问，可配置 `client.agent_id`，并继续复用同一个
+`client.token`：
+
+```yaml
+client:
+  server_url: wss://tunnel.example.com/ws/client
+  token: <client-service-token>
+  agent_id: office-client
+```
+
+首次连接时，如果该 ID 尚不存在，Server 会为当前 token 所属用户自动创建同名 Agent；如果留空则只运行
+`client.tunnels`。因此 `client.tunnels` 可以为空，但 `client.agent_id` 与隧道都为空时 `run` 会拒绝启动。
+Client Agent 连接使用独立的 Agent WebSocket，仍受 client token 的 `scope.agentIds` 限制。
+
 使用配置文件执行登录命令时会自动加载并校验配置：
 
 ```bash

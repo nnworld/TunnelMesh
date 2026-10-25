@@ -33,6 +33,7 @@ func TestConfigStoreRoundTrip(t *testing.T) {
 	want := ClientSettings{
 		Mode:      config.ModeLocal,
 		ServerURL: "wss://server.example/ws/client",
+		AgentID:   "office-client-agent",
 		Token:     "super-secret-token",
 		Tunnels: []config.TunnelConfig{
 			{Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:8080", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 80},
@@ -50,7 +51,7 @@ func TestConfigStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != want.Mode || got.ServerURL != want.ServerURL || got.Token != want.Token {
+	if got.Mode != want.Mode || got.ServerURL != want.ServerURL || got.AgentID != want.AgentID || got.Token != want.Token {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 	if len(got.Tunnels) != 2 {

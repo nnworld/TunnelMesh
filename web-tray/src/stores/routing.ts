@@ -43,6 +43,7 @@ export const useRoutingStore = defineStore('routing', {
     validating: false,
     error: '' as string,
     serverUrl: '',
+    agentId: '',
     mode: 'local' as RoutingView['mode'],
     tokenPresent: false,
     tokenEdit: '',
@@ -71,6 +72,7 @@ export const useRoutingStore = defineStore('routing', {
     adopt(view: RoutingView) {
       this.view = view
       this.serverUrl = view.serverUrl
+      this.agentId = view.agentId || ''
       this.mode = view.mode
       this.tokenPresent = view.tokenPresent
       this.tokenEdit = ''
@@ -103,6 +105,7 @@ export const useRoutingStore = defineStore('routing', {
       return {
         mode: this.mode,
         serverUrl: this.serverUrl,
+        agentId: this.agentId,
         token,
         tunnels: this.tunnels.map((tunnel) => ({ ...tunnel })),
       }

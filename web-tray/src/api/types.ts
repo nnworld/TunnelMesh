@@ -51,6 +51,7 @@ export interface TunnelView {
 export interface RoutingView {
   mode: ClientMode
   serverUrl: string
+  agentId?: string
   tokenPresent: boolean
   tunnels: TunnelView[]
   configPath: string
@@ -61,6 +62,7 @@ export interface RoutingView {
 export interface RoutingUpdate {
   mode: ClientMode | ''
   serverUrl: string
+  agentId?: string
   /** null keeps the stored token, '' clears it, anything else replaces it. */
   token: string | null
   tunnels: TunnelView[]
@@ -127,6 +129,7 @@ export interface StatTotals {
 
 export interface StatsView {
   running: boolean
+  agentRole?: boolean
   startedAt?: string
   uptimeSeconds: number
   serverUrl?: string

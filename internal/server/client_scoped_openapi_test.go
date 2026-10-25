@@ -22,6 +22,7 @@ const clientScopedOpenAPIDoc = "../../docs/api/openapi.yaml"
 // documented both fail the build. The same guard already covers the vpn surface.
 var clientScopedServedOperations = []string{
 	"get /api/v1/client/agents",
+	"get /api/v1/agent/self",
 }
 
 // clientScopedDocumentedResponses are the statuses the namespace answers with. 503 is in
@@ -61,7 +62,7 @@ func TestClientScopedOpenAPIMatchesTheServedSurface(t *testing.T) {
 		// The plural admin namespace is a different surface with different credentials;
 		// matching it here would hide the very confusion the singular prefix exists to
 		// prevent.
-		if !strings.HasPrefix(path, "/api/v1/client/") {
+		if !strings.HasPrefix(path, "/api/v1/client/") && path != "/api/v1/agent/self" {
 			continue
 		}
 		operations, ok := item.(map[string]any)
@@ -122,6 +123,24 @@ func TestClientScopedAgentsOperationDocumentsItsCredential(t *testing.T) {
 	sort.Strings(expected)
 	if strings.Join(documented, ",") != strings.Join(expected, ",") {
 		t.Errorf("GET /api/v1/client/agents documents responses %v, want %v", documented, expected)
+	}
+}
+
+func TestAgentSelfOpenAPIOperationDocumentsAgentToken(t *testing.T) {
+	item, ok := clientScopedPaths(t)["/api/v1/agent/self"].(map[string]any)
+	if !ok {
+		t.Fatal("/api/v1/agent/self is not documented")
+	}
+	operation, ok := item["get"].(map[string]any)
+	if !ok {
+		t.Fatal("/api/v1/agent/self does not document GET")
+	}
+	encoded, err := yaml.Marshal(operation["security"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "agentTokenAuth") || strings.Contains(string(encoded), "clientTokenAuth") {
+		t.Fatalf("unexpected security scheme: %s", strings.TrimSpace(string(encoded)))
 	}
 }
 

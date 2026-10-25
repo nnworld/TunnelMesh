@@ -205,6 +205,7 @@ export const fixtures = {
     return {
       mode: 'local',
       serverUrl: 'wss://mesh.example.com/ws/client',
+      agentId: '',
       tokenPresent: true,
       configPath: '/Users/tester/.config/tunnelmesh/client.yaml',
       running: false,

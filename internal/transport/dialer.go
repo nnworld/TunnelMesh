@@ -19,6 +19,11 @@ import (
 	xproxy "golang.org/x/net/proxy"
 )
 
+// WriteTimeout bounds one WebSocket message write. A peer that stops reading
+// while its TCP connection stays up would otherwise block the writer forever,
+// and nothing else notices because reads on the same link may still succeed.
+const WriteTimeout = 30 * time.Second
+
 const (
 	ProxyModeDirect      = "direct"
 	ProxyModeHTTPConnect = "http_connect"

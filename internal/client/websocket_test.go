@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/tunnelmesh/tunnelmesh/internal/reconnect"
 	"math/rand"
 	"net"
 	"net/http"
@@ -189,8 +190,8 @@ func TestClientWSReconnectBackoffGrowsAcrossRepeatedDisconnects(t *testing.T) {
 func TestClientWSReconnectJitterNeverExceedsMaxBackoff(t *testing.T) {
 	rng := rand.New(maximumRandSource{})
 	const maximum = 100 * time.Millisecond
-	if got := clientReconnectDelay(maximum, maximum, 1, rng); got > maximum {
-		t.Fatalf("clientReconnectDelay() = %v, want <= %v", got, maximum)
+	if got := reconnect.Delay(maximum, maximum, 1, rng); got > maximum {
+		t.Fatalf("reconnect.Delay() = %v, want <= %v", got, maximum)
 	}
 }
 

@@ -15,6 +15,11 @@ const summary = computed(() => {
       label: t('stats.summary.state'),
       value: view?.running ? t('app.status.running') : t('app.status.stopped'),
     },
+    {
+      key: 'agentRole',
+      label: t('stats.summary.agentRole'),
+      value: view?.agentRole ? t('common.enabled') : t('common.disabled'),
+    },
     { key: 'uptime', label: t('stats.summary.uptime'), value: formatUptime(view?.uptimeSeconds ?? 0) },
     { key: 'server', label: t('stats.summary.server'), value: serverText.value },
     {
@@ -113,6 +118,7 @@ function stateLabel(state: string) {
     <el-descriptions :column="3" border size="small" data-test="summary">
       <el-descriptions-item v-for="item in summary" :key="item.key" :label="item.label">
         <el-tag v-if="item.key === 'server'" :type="serverTagType" size="small" effect="plain">{{ item.value }}</el-tag>
+        <el-tag v-else-if="item.key === 'agentRole'" :type="stats.view?.agentRole ? 'success' : 'info'" size="small" effect="plain" data-test="agent-role">{{ item.value }}</el-tag>
         <template v-else>{{ item.value }}</template>
       </el-descriptions-item>
     </el-descriptions>

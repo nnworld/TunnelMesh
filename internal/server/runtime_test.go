@@ -920,13 +920,27 @@ func TestAgentTokenAuthenticationBoundaries(t *testing.T) {
 	}{
 		{name: "missing token", agentID: "agent-token-valid"},
 		{name: "management token", token: management.Token, agentID: "agent-token-valid"},
-		{name: "client token", token: clientToken.Secret, agentID: "agent-token-valid"},
 		{name: "wrong agent binding", token: other.Secret, agentID: "agent-token-valid"},
 		{name: "disabled agent", token: disabled.Secret, agentID: "agent-token-disabled"},
 		{name: "revoked token", token: revoked.Secret, agentID: "agent-token-revoked"},
 		{name: "expired token", token: expired.Secret, agentID: "agent-token-expired"},
 		{name: "query token", agentID: "agent-token-valid", queryToken: valid.Secret},
 		{name: "cookie token", agentID: "agent-token-valid", cookie: "token=" + valid.Secret},
+	}
+	if !agentWebSocketAccepted(t, listener.Addr().String(), clientToken.Secret, "agent-token-client", 99, "", "") {
+		t.Fatal("client token should auto-register and authenticate its configured Agent role")
+	}
+	createdClientAgent, err := db.Agents().Get(ctx, "agent-token-client")
+	if err != nil || createdClientAgent.OwnerUserID != owner.ID || !createdClientAgent.Enabled {
+		t.Fatalf("auto-registered Agent = %+v, err = %v", createdClientAgent, err)
+	}
+	select {
+	case registration := <-registrations:
+		if registration.TokenID != clientToken.TokenID || registration.AgentID != "agent-token-client" {
+			t.Fatalf("client registration = %+v", registration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client Agent registration was not observed")
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -972,10 +986,6 @@ func TestAgentInvalidCredentialRejectedBeforeUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientToken, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: owner.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
 	revokedToken, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeAgent, OwnerUserID: owner.ID, AgentID: "preupgrade-agent"})
 	if err != nil {
 		t.Fatal(err)
@@ -1009,7 +1019,6 @@ func TestAgentInvalidCredentialRejectedBeforeUpgrade(t *testing.T) {
 		token string
 	}{
 		{name: "arbitrary token", token: "not-a-valid-token"},
-		{name: "client token", token: clientToken.Secret},
 		{name: "revoked Agent token", token: revokedToken.Secret},
 		{name: "management token with legacy disabled", token: management.Token},
 	} {
@@ -1561,4 +1570,44 @@ func frameBytes(t *testing.T, typ protocol.FrameType, payload []byte) []byte {
 		t.Fatal(err)
 	}
 	return frame.Bytes()
+}
+
+func TestAutoRegisterAgentEnforcesOwnerQuota(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-auto-register-quota?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "quota-owner", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := authService.CreateUser(ctx, "quota-other", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const limit = 2
+	for _, id := range []string{"quota-a", "quota-b"} {
+		if _, err := autoRegisterAgent(ctx, db, owner.ID, id, limit); err != nil {
+			t.Fatalf("autoRegisterAgent(%s) error = %v", id, err)
+		}
+	}
+	if _, err := autoRegisterAgent(ctx, db, owner.ID, "quota-c", limit); !errors.Is(err, ErrAgentQuotaExceeded) {
+		t.Fatalf("third registration error = %v, want ErrAgentQuotaExceeded", err)
+	}
+	if _, err := db.Agents().Get(ctx, "quota-c"); err == nil {
+		t.Fatal("agent beyond the quota was created")
+	}
+	// The quota is per owner: another user is unaffected by this owner's usage.
+	if _, err := autoRegisterAgent(ctx, db, other.ID, "quota-d", limit); err != nil {
+		t.Fatalf("other owner registration error = %v", err)
+	}
+	// A repeated registration of an existing ID is not a new Agent and must not
+	// trip over its own row.
+	again, err := autoRegisterAgent(ctx, db, other.ID, "quota-d", limit)
+	if err != nil || again.OwnerUserID != other.ID {
+		t.Fatalf("idempotent registration = %+v, err = %v", again, err)
+	}
 }

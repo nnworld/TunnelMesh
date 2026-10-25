@@ -44,8 +44,18 @@ func TestNewRuntimeFromConfigPreconditions(t *testing.T) {
 		t.Fatalf("missing token error = %v", err)
 	}
 
-	if _, err := NewRuntimeFromConfig(ctx, runtimeTestConfig(), RuntimeOptions{}); err == nil || err.Error() != "client run requires at least one client.tunnels entry" {
+	if _, err := NewRuntimeFromConfig(ctx, runtimeTestConfig(), RuntimeOptions{}); err == nil || err.Error() != "client run requires at least one client.tunnels or client.agent_id entry" {
 		t.Fatalf("no tunnels error = %v", err)
+	}
+
+	agentOnly := runtimeTestConfig()
+	agentOnly.Client.AgentID = "client-agent"
+	rt, err := NewRuntimeFromConfig(ctx, agentOnly, RuntimeOptions{})
+	if err != nil {
+		t.Fatalf("Agent-only client config rejected: %v", err)
+	}
+	if !rt.Stats().AgentRole {
+		t.Fatal("Agent-only client runtime did not report the embedded Agent role")
 	}
 
 	badProtocol := runtimeTestConfig(config.TunnelConfig{Name: "x", Protocol: "quic", ListenAddr: "127.0.0.1:0", AgentID: "agent-a"})

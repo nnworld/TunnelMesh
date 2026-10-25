@@ -973,6 +973,17 @@ paths:
         '401': {description: 'Bearer token missing, revoked, expired, or of a type other than client. The reason is not distinguished.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
         '405': {description: Any method other than GET on this path}
         '503': {description: 'The Server was started without a client token validator. This is a wiring fault rather than an authentication result, which is why it is not folded into 401.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/agent/self:
+    get:
+      summary: Read the Agent identity bound to the presented Agent token
+      description: Used by a standalone Agent whose local `agent.id` is empty. The server returns only the bound ID and display name; it never creates an Agent or returns token metadata.
+      security: [{ agentTokenAuth: [] }]
+      responses:
+        '200': {description: Bound Agent identity, content: {application/json: {schema: {$ref: '#/components/schemas/AgentSelfEnvelope'}}}}
+        '401': {description: Missing, invalid, revoked, expired or wrong-type token}
+        '403': {description: The token has no enabled Agent binding}
+        '404': {description: Unknown path or method}
+        '503': {description: Agent token validator unavailable}
   /api/v1/agents/{agentId}/trace:
     parameters: [{name: agentId, in: path, required: true, schema: {type: string}}]
     post:
@@ -1654,6 +1665,10 @@ components:
         `type: client`. A console token is rejected here with 401 and a client token is
         rejected by every `bearerAuth` endpoint, so neither surface can be reached with
         the other's credential.
+    agentTokenAuth:
+      type: http
+      scheme: bearer
+      description: An Agent service token bound to exactly one enabled Agent.
   parameters:
     Cursor: {name: cursor, in: query, schema: {type: string}}
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
@@ -2607,6 +2622,19 @@ components:
         - type: object
           properties:
             data: {$ref: '#/components/schemas/ClientAgentPage'}
+    AgentSelf:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id: {type: string}
+        name: {type: string}
+    AgentSelfEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            data: {$ref: '#/components/schemas/AgentSelf'}
     AgentMetadataItem:
       type: object
       required: [name, source, redacted]

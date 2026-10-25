@@ -110,6 +110,7 @@ export default {
     description: '托盘应用所承载客户端的实时状态。',
     summary: {
       state: '状态',
+      agentRole: 'Agent 角色',
       uptime: '运行时长',
       server: '服务端',
       connected: '会话',
@@ -174,6 +175,11 @@ export default {
       absent: '未设置',
       clear: '清除已保存的 token',
       edit: '替换已保存的 token',
+    },
+    agentId: {
+      label: 'Client Agent ID（可选）',
+      placeholder: '例如 office-client-agent',
+      hint: '填写后客户端会同时承担 Agent 角色，复用当前 client token；首次连接时若不存在会自动创建同名 Agent。留空则仅运行 client 隧道。',
     },
     tunnels: {
       label: '隧道配置',

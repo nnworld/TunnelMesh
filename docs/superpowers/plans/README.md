@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 71 份计划，按日期倒序排列。
+共 72 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-10-25 | [Client/Agent 角色融合与自动注册实施计划](2026-10-25-client-agent-role-auto-registration.md) | — | [PR：Client Agent 角色融合与自动注册](../../pull-requests/2026-10-25-client-agent-role.md) |
 | 2026-10-24 | [Client/Agent 便携性与容错加固实施计划](2026-10-24-client-agent-portability-resilience.md) | — | — |
 | 2026-10-24 | [Admin Console List Redesign Implementation Plan](2026-10-24-admin-console-redesign.md) | — | — |
 | 2026-10-07 | [TunnelMesh Client 系统托盘（Windows）](2026-10-07-client-system-tray-windows.md) | — | [PR：macOS 系统托盘 Client](../../pull-requests/2026-10-05-client-system-tray-macos.md)<br>[PR：任务栏快捷小窗与统一的菜单栏图标](../../pull-requests/2026-10-06-tray-quick-panel.md)<br>[PR：Windows 系统托盘客户端与 NSIS 发行打包](../../pull-requests/2026-10-07-client-system-tray-windows.md) |

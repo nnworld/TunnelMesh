@@ -513,3 +513,40 @@ func TestClientInboundBufferComesFromConfiguration(t *testing.T) {
 		t.Fatalf("datagram stream queue capacity = %d, want the configured 131072", got)
 	}
 }
+
+func TestSessionEndsWhenServerStopsAnsweringHeartbeats(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 16), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	session.livenessInterval = 10 * time.Millisecond
+	session.Start()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := session.Wait(waitCtx); !errors.Is(err, ErrPeerUnresponsive) {
+		t.Fatalf("Wait() = %v, want ErrPeerUnresponsive", err)
+	}
+}
+
+func TestSessionStaysUpWhileServerAnswersHeartbeats(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 64), recv: make(chan protocol.Frame, 64), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	session.livenessInterval = 20 * time.Millisecond
+	session.Start()
+	defer session.Close()
+	// Answer every heartbeat for well over the 3-interval liveness budget.
+	stop := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case frame := <-tr.sent:
+			if frame.Type == protocol.FramePing {
+				tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload}
+			}
+		case <-stop:
+			select {
+			case <-session.done:
+				t.Fatalf("session ended while the server was answering: %v", session.runErr)
+			default:
+			}
+			return
+		}
+	}
+}

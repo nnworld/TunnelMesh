@@ -111,6 +111,7 @@ export default {
     description: 'Live state of the client hosted by the tray.',
     summary: {
       state: 'State',
+      agentRole: 'Embedded Agent',
       uptime: 'Uptime',
       server: 'Server',
       connected: 'Session',
@@ -175,6 +176,11 @@ export default {
       absent: 'Not set',
       clear: 'Clear the stored token',
       edit: 'Replace the stored token',
+    },
+    agentId: {
+      label: 'Client Agent ID (optional)',
+      placeholder: 'for example office-client-agent',
+      hint: 'When set, the client also runs as an Agent using the current client token. A missing Agent is created with this name on first connection. Leave empty for client tunnels only.',
     },
     tunnels: {
       label: 'Tunnels',

@@ -5,10 +5,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -306,7 +306,7 @@ func doctorEndpointCommand(opts *rootOptions, component string) *cobra.Command {
 		if err != nil {
 			return fmt.Errorf("build health request: %w", err)
 		}
-		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+		response, err := (&http.Client{Timeout: agentSelfTimeout}).Do(request)
 		if err != nil {
 			return fmt.Errorf("server health check: %w", err)
 		}
@@ -330,8 +330,21 @@ func serverHealthURL(serverURL string) (string, error) {
 func agentCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh agent", func(cmd *cobra.Command, cfg config.Config) error {
-			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" || strings.TrimSpace(cfg.Agent.ID) == "" {
-				return fmt.Errorf("agent run requires agent.server_url, agent.token, and agent.id")
+			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" {
+				return fmt.Errorf("agent run requires agent.server_url and agent.token")
+			}
+			if strings.TrimSpace(cfg.Agent.ID) == "" {
+				id, err := fetchBoundAgentID(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token)
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(opts.configFile) == "" {
+					return errors.New("agent.id is missing and --config is required to persist the token-bound Agent ID")
+				}
+				if err := config.InitializeAgentID(opts.configFile, id); err != nil {
+					return fmt.Errorf("persist agent.id: %w", err)
+				}
+				cfg.Agent.ID = id
 			}
 			nodeID := cfg.Node.ID
 			if strings.TrimSpace(nodeID) == "" {
@@ -380,6 +393,42 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 	}
 }
 
+// agentSelfTimeout bounds the one-shot identity lookup so a dead server fails
+// `agent run` quickly instead of hanging startup.
+const agentSelfTimeout = 5 * time.Second
+
+func fetchBoundAgentID(ctx context.Context, serverURL, token string) (string, error) {
+	endpoint, err := client.HTTPURLFromWebSocket(serverURL, client.AgentSelfPath)
+	if err != nil {
+		return "", err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return "", fmt.Errorf("resolve agent.id from server: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("resolve agent.id from server: %s returned status %d (check that agent.token is a valid Agent token bound to an enabled Agent)", endpoint, response.StatusCode)
+	}
+	var envelope struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return "", fmt.Errorf("decode agent identity: %w", err)
+	}
+	if strings.TrimSpace(envelope.Data.ID) == "" {
+		return "", errors.New("resolve agent.id from server: response did not contain an Agent ID")
+	}
+	return strings.TrimSpace(envelope.Data.ID), nil
+}
+
 // agentEchoOpener is a variable so a test can reproduce the permission failure a
 // real host produces when net.ipv4.ping_group_range excludes the process gid.
 var agentEchoOpener = agent.OpenEchoer
@@ -405,23 +454,9 @@ func startAgentEchoer(streams config.AgentStreamConfig) (*agent.Echoer, error) {
 	return echoer, nil
 }
 
+// NewAgentDispatcherFactory is kept as the CLI-facing name for the shared factory.
 func NewAgentDispatcherFactory(streams config.AgentStreamConfig, echoer *agent.Echoer) agent.ConnectionSessionFactory {
-	return func(session *agent.Session, _ string) agent.SessionFrameHandler {
-		// Readiness is the engine, not the configuration: a host that refused the
-		// ping socket must not advertise a stream it cannot serve.
-		session.SetCapabilities(agent.AgentStreamCapabilities(streams, echoer != nil))
-		dispatcher := agent.NewStreamDispatcherWithConfig(agent.Dialer{ICMPEcho: echoer}, nil, session.Send, agent.DialExecutorConfig{
-			MaxConcurrent:  streams.MaxConcurrentDials,
-			MaxPending:     streams.MaxPendingDials,
-			ConnectTimeout: streams.ConnectTimeout,
-			OpenTimeout:    streams.OpenTimeout,
-		}, nil)
-		dispatcher.SetMaxActiveStreams(streams.MaxActive)
-		if err := dispatcher.SetInboundBufferBytes(streams.InboundBufferBytes); err != nil {
-			slog.Warn("agent inbound buffer rejected", "configured_bytes", streams.InboundBufferBytes, "error", err)
-		}
-		return dispatcher
-	}
+	return agent.NewStreamDispatcherFactory(streams, echoer)
 }
 
 func clientCommands(opts *rootOptions) []*cobra.Command {

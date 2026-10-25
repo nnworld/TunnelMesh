@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/viper"
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
@@ -444,6 +445,7 @@ const (
 
 type ClientConfig struct {
 	ServerURL        string                 `mapstructure:"server_url" json:"server_url" yaml:"server_url"`
+	AgentID          string                 `mapstructure:"agent_id" json:"agent_id" yaml:"agent_id"`
 	InstanceID       string                 `mapstructure:"instance_id" json:"instance_id" yaml:"instance_id"`
 	InstanceIDPath   string                 `mapstructure:"instance_id_path" json:"instance_id_path" yaml:"instance_id_path"`
 	Token            string                 `mapstructure:"token" json:"-" yaml:"-"`
@@ -817,7 +819,7 @@ func bindEnvironment(v *viper.Viper) {
 		"server.vpn.mtu", "server.vpn.max_peers", "server.vpn.max_flows_per_peer", "server.vpn.max_flows_total",
 		"server.vpn.packet_rate_per_peer", "server.vpn.connect_timeout", "server.vpn.idle_timeout", "server.vpn.shutdown_timeout",
 		"server.vpn.icmp_enabled", "server.vpn.icmp_timeout", "server.vpn.icmp_max_concurrent",
-		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.instance_id", "client.token",
+		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.agent_id", "client.instance_id", "client.token",
 		"downloads.github_repository",
 	}
 	keys = append(keys, authEnvKeys()...)
@@ -840,7 +842,7 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
-	if cfg.Client.ServerURL != "" || len(cfg.Client.Tunnels) > 0 {
+	if cfg.Client.ServerURL != "" || cfg.Client.AgentID != "" || len(cfg.Client.Tunnels) > 0 {
 		problems = append(problems, validateClientConnections(cfg.Client.Connections)...)
 		problems = append(problems, validateClientTunnels(cfg.Client.Tunnels)...)
 	}
@@ -874,6 +876,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Client.ServerURL != "" && insecureWebSocketDisallowed(cfg.Client.ServerURL, cfg.Client.Transport.AllowInsecureTransport) {
 		problems = append(problems, "client server URL must use wss:// unless allow_insecure_transport is enabled")
+	}
+	if problem := validateClientAgentID(cfg.Client.AgentID); problem != "" {
+		problems = append(problems, problem)
 	}
 	switch cfg.Mode {
 	case ModeLocal:
@@ -1583,6 +1588,106 @@ func InitializeNodeID(configPath, nodeIDPath string) (string, error) {
 		return "", err
 	}
 	return id, nil
+}
+
+// maxClientAgentIDLen bounds the ID that is sent to the server and may be
+// auto-registered there, so a typo or hostile config cannot create oversized rows.
+const maxClientAgentIDLen = 128
+
+// validateClientAgentID rejects whitespace, control characters and oversize IDs.
+// It stays permissive otherwise because existing Agent IDs are not format-bound.
+func validateClientAgentID(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return ""
+	}
+	if len(id) > maxClientAgentIDLen {
+		return fmt.Sprintf("client agent ID must be at most %d bytes", maxClientAgentIDLen)
+	}
+	for _, r := range id {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "client agent ID must not contain whitespace or control characters"
+		}
+	}
+	return ""
+}
+
+// InitializeAgentID reads the already-bound Agent identity from the caller and
+// atomically writes it into agent.id while preserving YAML comments and mode.
+func InitializeAgentID(configPath, id string) error {
+	configPath = strings.TrimSpace(configPath)
+	id = strings.TrimSpace(id)
+	if configPath == "" || id == "" {
+		return errors.New("config path and agent ID are required")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return fmt.Errorf("decode YAML config: %w", err)
+	}
+	root, err := yamlMappingRoot(&document)
+	if err != nil {
+		return err
+	}
+	agent := yamlMappingValue(root, "agent")
+	if agent == nil || agent.Kind != yaml.MappingNode {
+		agent = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "agent"}, agent,
+		)
+	}
+	if existing := yamlMappingValue(agent, "id"); existing != nil && strings.TrimSpace(existing.Value) != "" {
+		if strings.TrimSpace(existing.Value) != id {
+			return fmt.Errorf("configured agent.id %q does not match token-bound Agent %q", existing.Value, id)
+		}
+		return nil
+	}
+	if existing := yamlMappingValue(agent, "id"); existing != nil {
+		existing.Value = id
+		existing.Tag = "!!str"
+	} else {
+		agent.Content = append(agent.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "id"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id},
+		)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(configPath), ".tunnelmesh-config-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	encoder := yaml.NewEncoder(tmp)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&document); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := encoder.Close(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := preserveOwnership(tmpName, info); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, configPath)
 }
 
 func yamlMappingRoot(document *yaml.Node) (*yaml.Node, error) {

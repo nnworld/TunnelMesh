@@ -42,6 +42,14 @@ func (a *API) SetClientTokenValidator(validator ClientTokenValidator) {
 	a.clientTokens = validator
 }
 
+// SetAgentTokenValidator wires the service-token validator used by the standalone
+// Agent identity endpoint. It is separate from the server's SSH credential service.
+func (a *API) SetAgentTokenValidator(validator ClientTokenValidator) {
+	if a != nil {
+		a.agentTokens = validator
+	}
+}
+
 // handleClientScoped claims the client-token namespace before the console bearer
 // check runs.
 //

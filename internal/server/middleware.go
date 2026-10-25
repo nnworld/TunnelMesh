@@ -22,6 +22,7 @@ type agentConnectionAuthentication struct {
 	Identity  auth.TokenIdentity
 	Principal auth.Principal
 	Legacy    bool
+	Client    bool
 }
 
 func principalFromContext(ctx context.Context) (auth.Principal, bool) {
