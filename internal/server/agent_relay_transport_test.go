@@ -1119,3 +1119,59 @@ func TestAgentRelayRejectsWindowWithoutFrameHeadroom(t *testing.T) {
 		t.Fatalf("advertisedWindow = %d, want the cap for an unverifiable request", got)
 	}
 }
+
+// A pure upload (rz, scp, an HTTP POST body) has the Client talking and the
+// target silent. The only thing the Agent sends back is WINDOW_UPDATE, and the
+// relay forwards that credit to the Client from between Read calls. A Read that
+// is already blocked must therefore wake for it: otherwise the Client spends its
+// first window, never hears about the refill, and the upload stops after a
+// quarter of a megabyte until the target happens to send something.
+func TestAgentRelayStreamBlockedReadWakesForWindowUpdate(t *testing.T) {
+	manager := NewAgentSessionManager(AgentSessionConfig{})
+	agentTransport := newFakeTransport()
+	session, err := manager.Register(context.Background(), AgentRegistration{AgentID: "agent-upload", NodeID: "node", Epoch: 1}, agentTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := NewAgentRelayTransport(manager, AgentRelayWindowConfig{})
+	defer mux.Close()
+	stream, err := mux.OpenStream(context.Background(), relay.StreamRequest{
+		AgentID: "agent-upload", Protocol: "tcp", TargetHost: "10.0.0.8", TargetPort: 22, InitialWindow: 262144,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	open := receiveAgentRelayFrame(t, agentTransport)
+
+	type readResult struct {
+		n   int
+		err error
+	}
+	reading := make(chan readResult, 1)
+	go func() {
+		n, err := stream.Read(make([]byte, 4096))
+		reading <- readResult{n, err}
+	}()
+	// Let Read reach its blocking wait before the credit arrives.
+	time.Sleep(50 * time.Millisecond)
+
+	if err := mux.handleAgentFrameGeneration("agent-upload", session.serverGeneration, protocol.Frame{
+		Version: protocol.CurrentVersion, Type: protocol.FrameWindowUpdate, StreamID: open.StreamID, Window: 65536,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-reading:
+		if result.n != 0 || result.err != nil {
+			t.Fatalf("Read = (%d, %v), want a bare wake-up (0, nil)", result.n, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a blocked Read did not wake for the Agent's WINDOW_UPDATE, so the Client would never get its credit back")
+	}
+	controlReader := stream.(interface{ ReadControl() (protocol.Frame, bool) })
+	if control, ok := controlReader.ReadControl(); !ok || control.Window != 65536 {
+		t.Fatalf("control=%+v ok=%v, want the mirrored WINDOW_UPDATE", control, ok)
+	}
+}
