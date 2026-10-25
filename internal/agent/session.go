@@ -46,6 +46,11 @@ const (
 // succeeds, so a peer that respects its advertised window can never queue more
 // than the credit it was granted; a full inbound queue therefore reports a
 // protocol violation, never ordinary backpressure.
+// livenessIntervals is how many heartbeat periods of total inbound silence mark
+// the Server as gone. The Server answers every PING, so silence this long means a
+// half-open connection that TCP alone may not report for hours behind a NAT or proxy.
+const livenessIntervals = 3
+
 const defaultInboundQueueBytes = defaultAgentReceiveWindow
 
 // errInboundQueueFull reports a peer that sent more DATA than its advertised
@@ -936,6 +941,7 @@ type Session struct {
 	OnHeartbeatRTT          func(time.Duration)
 	heartbeatSentNanos      atomic.Int64
 	heartbeatRTTNanos       atomic.Int64
+	lastReceivedNanos       atomic.Int64
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -1109,6 +1115,7 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 	defer s.Close()
 	done := make(chan struct{})
 	defer close(done)
+	s.lastReceivedNanos.Store(time.Now().UnixNano())
 	if s.HeartbeatInterval > 0 {
 		ticker := time.NewTicker(s.HeartbeatInterval)
 		defer ticker.Stop()
@@ -1116,6 +1123,11 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 			for {
 				select {
 				case <-ticker.C:
+					if silent := time.Since(time.Unix(0, s.lastReceivedNanos.Load())); silent > livenessIntervals*s.HeartbeatInterval {
+						slog.Warn("agent connection silent, reconnecting", "silent_for", silent.Round(time.Second))
+						_ = s.Close()
+						return
+					}
 					s.heartbeatSentNanos.Store(time.Now().UnixNano())
 					_ = s.send(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing})
 				case <-done:
@@ -1147,6 +1159,7 @@ func (s *Session) Run(ctx context.Context, onFrame func(protocol.Frame) error) e
 			}
 			return err
 		}
+		s.lastReceivedNanos.Store(time.Now().UnixNano())
 		if f.Type == protocol.FrameGoAway {
 			return nil
 		}

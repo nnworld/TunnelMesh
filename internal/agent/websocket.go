@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/reconnect"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -96,18 +97,21 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 	if rng == nil {
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
-	attempt, currentEpoch := 0, epoch
+	backoff := reconnect.New(base, max, rng)
+	currentEpoch := epoch
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		stageStarted := time.Now()
-		transport, err := dialWebSocketWithDialer(ctx, serverURL, token, options.Dialer)
-		if err == nil {
+		var delay time.Duration
+		transport, dialErr := dialWebSocketWithDialer(ctx, serverURL, token, options.Dialer)
+		if dialErr == nil {
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("agent", "websocket", "started", "")
 				options.Metrics.ObserveStage("agent", "websocket_upgrade", "success", "", time.Since(stageStarted))
 			}
+			sessionStarted := time.Now()
 			session := NewSessionWithMetadata(transport, collector)
 			session.Metrics = options.Metrics
 			session.BaseBackoff, session.MaxBackoff, session.Rand = base, max, rng
@@ -118,34 +122,24 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 				session.SetMetadataConnectionIdentity(agentID, nodeID, instanceID, connectionID, currentEpoch)
 			}
 			if factory == nil {
-				err = session.Run(ctx, onFrame)
+				_ = session.Run(ctx, onFrame)
+			} else if handler := factory(session); handler == nil {
+				_ = session.Close()
 			} else {
-				handler := factory(session)
-				if handler == nil {
-					_ = session.Close()
-					err = ErrAgentSessionClosed
-				} else {
-					err = session.Run(ctx, handler.Handle)
-					err = errors.Join(err, handler.Close())
-				}
+				_ = errors.Join(session.Run(ctx, handler.Handle), handler.Close())
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			currentEpoch++
-		} else if options.Metrics != nil {
-			options.Metrics.ObserveConnection("agent", "websocket", "failed", observability.NormalizeErrorClass(err))
-			options.Metrics.ObserveStage("agent", "websocket_upgrade", "failure", observability.NormalizeErrorClass(err), time.Since(stageStarted))
+			delay = backoff.AfterSession(time.Since(sessionStarted))
+		} else {
+			if options.Metrics != nil {
+				options.Metrics.ObserveConnection("agent", "websocket", "failed", observability.NormalizeErrorClass(dialErr))
+				options.Metrics.ObserveStage("agent", "websocket_upgrade", "failure", observability.NormalizeErrorClass(dialErr), time.Since(stageStarted))
+			}
+			delay = backoff.AfterDialFailure(dialErr)
 		}
-		attempt++
-		delay := base
-		for i := 0; i < attempt-1 && delay < max; i++ {
-			delay *= 2
-		}
-		if delay > max {
-			delay = max
-		}
-		delay = time.Duration(float64(delay) * (0.8 + rng.Float64()*0.4))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -240,7 +234,15 @@ func (t *websocketFrameTransport) Send(frame protocol.Frame) error {
 	if err := protocol.NewEncoder(&payload).WriteFrame(frame); err != nil {
 		return err
 	}
-	return websocket.Message.Send(t.conn, payload.Bytes())
+	_ = t.conn.SetWriteDeadline(time.Now().Add(sharedtransport.WriteTimeout))
+	if err := websocket.Message.Send(t.conn, payload.Bytes()); err != nil {
+		// A timed-out or partial write leaves the frame stream corrupt, so the
+		// connection cannot be reused; closing it also wakes the read loop so the
+		// session ends and reconnects instead of limping.
+		_ = t.conn.Close()
+		return err
+	}
+	return nil
 }
 
 func (t *websocketFrameTransport) Receive() (protocol.Frame, error) {

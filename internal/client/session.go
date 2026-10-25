@@ -61,7 +61,15 @@ const (
 	// interval only guarantees a session shutdown is noticed even when the
 	// stream was already half-closed remotely and no further signal arrives.
 	windowWaitInterval = 100 * time.Millisecond
+	// defaultLivenessInterval matches the Agent heartbeat. The Server answers every
+	// PING, so livenessIntervals of silence means the link is dead even if TCP
+	// has not noticed yet.
+	defaultLivenessInterval = 30 * time.Second
+	livenessIntervals       = 3
 )
+
+// ErrPeerUnresponsive ends a session whose Server stopped answering heartbeats.
+var ErrPeerUnresponsive = errors.New("client: server stopped responding")
 
 type Session struct {
 	mu                    sync.RWMutex
@@ -84,6 +92,9 @@ type Session struct {
 	metadataCollector     *ClientMetadataCollector
 	metadataRevision      uint64
 	inboundBytes          int
+	lastReceivedNanos     atomic.Int64
+	// livenessInterval is the PING cadence of the dead-peer watchdog; tests shrink it.
+	livenessInterval time.Duration
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -131,6 +142,7 @@ func NewSessionWithOpenModeAndMetadata(tr FrameTransport, mode SessionOpenMode, 
 		pendingPings:      make(map[uint64]chan struct{}),
 		metadataCollector: collector,
 		inboundBytes:      defaultStreamWindow,
+		livenessInterval:  defaultLivenessInterval,
 	}
 	if tr != nil {
 		s.writer = streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
@@ -241,7 +253,39 @@ func (s *Session) Start() {
 		}
 		go s.reportClientMetadata()
 	}
-	s.recvOnce.Do(func() { go s.receiveLoop(tr) })
+	s.lastReceivedNanos.Store(time.Now().UnixNano())
+	s.recvOnce.Do(func() {
+		go s.receiveLoop(tr)
+		go s.watchLiveness()
+	})
+}
+
+// watchLiveness pings the Server and ends the session when nothing, not even a
+// PONG, arrives for livenessIntervals periods. Without it the Client learns of a
+// half-open connection only from the Server's own idle timeout or TCP keepalive,
+// which a proxy or NAT can defeat.
+func (s *Session) watchLiveness() {
+	interval := s.livenessInterval
+	if interval <= 0 {
+		interval = defaultLivenessInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+		}
+		if time.Since(time.Unix(0, s.lastReceivedNanos.Load())) > livenessIntervals*interval {
+			s.finishReceive(ErrPeerUnresponsive)
+			_ = s.Close()
+			return
+		}
+		// Fire-and-forget: the PONG is only needed to refresh lastReceivedNanos, and
+		// an unmatched correlation ID is ignored by finishPing.
+		_ = s.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: make([]byte, 8)})
+	}
 }
 
 func (s *Session) sendClientMetadata(frameType protocol.FrameType) error {
@@ -554,6 +598,9 @@ func (o SessionOpener) OpenDatagram(ctx context.Context, req StreamRequest) (Dat
 func (s *Session) receiveLoop(tr ReceiveTransport) {
 	for {
 		f, err := tr.Receive()
+		if err == nil {
+			s.lastReceivedNanos.Store(time.Now().UnixNano())
+		}
 		if err != nil {
 			s.mu.Lock()
 			for id, stream := range s.streams {

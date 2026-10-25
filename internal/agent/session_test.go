@@ -1912,3 +1912,21 @@ func TestAgentInboundBufferComesFromConfiguration(t *testing.T) {
 		t.Fatalf("inbound queue capacity = %d, want the configured %d", got, 2*protocol.MaxStreamFrame)
 	}
 }
+
+// A Server that never answers PING must end the session so the reconnect loop can
+// replace it, instead of the Agent waiting on a half-open connection.
+func TestSessionRunEndsWhenServerIsSilent(t *testing.T) {
+	tr := &blockingTransport{closed: make(chan struct{})}
+	s := NewSession(tr)
+	s.HeartbeatInterval = 10 * time.Millisecond
+	done := make(chan error, 1)
+	go func() { done <- s.Run(context.Background(), nil) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run returned nil, want the receive error from the closed connection")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not end after 3 silent heartbeat intervals")
+	}
+}
