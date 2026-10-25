@@ -31,36 +31,37 @@ const (
 )
 
 type latencyFixture struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	db           *storage.DB
-	nodeA        *server.ServerRuntime
-	nodeB        *server.ServerRuntime
-	httpA        net.Listener
-	httpB        net.Listener
-	serveA       chan error
-	serveB       chan error
-	agentCancel  context.CancelFunc
-	agentDone    chan error
-	legacyCancel context.CancelFunc
-	legacyDone   chan error
-	relayClient  *relay.GRPCNodeTransport
-	clientA      *client.Session
-	clientB      *client.Session
-	socksA       *client.SOCKS5Forward
-	socksB       *client.SOCKS5Forward
-	recordB      *recordingClientTransport
-	fastPort     int
-	bulkPort     int
-	refusedPort  int
-	blockedHost  string
-	blockedPort  int
-	clientToken  auth.CreatedToken
-	legacyToken  string
-	credentials  *auth.CredentialService
-	closed       bool
-	remoteRelay  *relay.RelayService
-	targets      []io.Closer
+	ctx           context.Context
+	cancel        context.CancelFunc
+	db            *storage.DB
+	nodeA         *server.ServerRuntime
+	nodeB         *server.ServerRuntime
+	httpA         net.Listener
+	httpB         net.Listener
+	serveA        chan error
+	serveB        chan error
+	agentCancel   context.CancelFunc
+	agentDone     chan error
+	legacyCancel  context.CancelFunc
+	legacyDone    chan error
+	relayClient   *relay.GRPCNodeTransport
+	clientA       *client.Session
+	clientB       *client.Session
+	socksA        *client.SOCKS5Forward
+	socksB        *client.SOCKS5Forward
+	recordB       *recordingClientTransport
+	fastPort      int
+	bulkPort      int
+	integrityPort int
+	refusedPort   int
+	blockedHost   string
+	blockedPort   int
+	clientToken   auth.CreatedToken
+	legacyToken   string
+	credentials   *auth.CredentialService
+	closed        bool
+	remoteRelay   *relay.RelayService
+	targets       []io.Closer
 }
 
 type recordingClientTransport struct {
@@ -448,6 +449,17 @@ func newLatencyFixture(t *testing.T) (*latencyFixture, error) {
 		fixture.closeWithError(t, err)
 		return nil, err
 	}
+	integrityListener, err := startIntegrityTarget()
+	if err != nil {
+		fixture.closeWithError(t, err)
+		return nil, err
+	}
+	fixture.targets = append(fixture.targets, integrityListener)
+	_, integrityPortText, _ := net.SplitHostPort(integrityListener.Addr().String())
+	if _, err := fmt.Sscanf(integrityPortText, "%d", &fixture.integrityPort); err != nil {
+		fixture.closeWithError(t, err)
+		return nil, err
+	}
 	refusedListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fixture.closeWithError(t, err)
@@ -486,6 +498,7 @@ func newLatencyFixture(t *testing.T) (*latencyFixture, error) {
 	policies := []storage.AgentPolicy{
 		{ID: "latency-fast", AgentID: latencyAgentID, TargetHost: "127.0.0.1", TargetPort: fixture.fastPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
 		{ID: "latency-bulk", AgentID: latencyAgentID, TargetHost: "127.0.0.1", TargetPort: fixture.bulkPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
+		{ID: "latency-integrity", AgentID: latencyAgentID, TargetHost: "127.0.0.1", TargetPort: fixture.integrityPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
 		{ID: "latency-refused", AgentID: latencyAgentID, TargetHost: "127.0.0.1", TargetPort: fixture.refusedPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
 		{ID: "latency-blocked", AgentID: latencyAgentID, TargetHost: fixture.blockedHost, TargetPort: fixture.blockedPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
 		{ID: "legacy-fast", AgentID: legacyAgentID, TargetHost: "127.0.0.1", TargetPort: fixture.fastPort, Protocol: "tcp", CreatedAt: now, UpdatedAt: now},
@@ -526,7 +539,7 @@ func newLatencyFixture(t *testing.T) (*latencyFixture, error) {
 			TargetCIDRs: []string{
 				"127.0.0.0/8", "10.255.255.0/24",
 			},
-			TargetPorts: []int{fixture.fastPort, fixture.bulkPort, fixture.refusedPort, fixture.blockedPort},
+			TargetPorts: []int{fixture.fastPort, fixture.bulkPort, fixture.integrityPort, fixture.refusedPort, fixture.blockedPort},
 		},
 	})
 	if err != nil {

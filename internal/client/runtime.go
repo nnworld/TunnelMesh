@@ -93,6 +93,14 @@ type Runtime struct {
 	// agentPool is built in NewRuntimeFromConfig so a bad Agent endpoint or transport
 	// fails before any listener binds, not after the tunnel role is already running.
 	agentPool *agent.WebSocketPoolOptions
+	// agentAck records the embedded Agent role's own acknowledgement from the
+	// Server. A client that runs only that role has no tunnel sessions, so this is
+	// its only proof of being connected.
+	agentAck struct {
+		mu            sync.Mutex
+		acked         bool
+		serverVersion string
+	}
 }
 
 // runtimeForward pairs one listener with the configuration it was built from, so
@@ -184,6 +192,7 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 			Min: cfg.Client.Connections.Min, Max: cfg.Client.Connections.Max,
 			HighWatermark: cfg.Client.Connections.HighWatermark, LowWatermark: cfg.Client.Connections.LowWatermark,
 			EvaluationInterval: cfg.Client.Connections.EvaluationInterval, Cooldown: cfg.Client.Connections.Cooldown,
+			OnReady: r.markAgentReady,
 		}
 	}
 	// The manager is assigned after r exists because the reconnect counter wraps the
@@ -349,6 +358,46 @@ func (r *Runtime) runRoles(ctx context.Context) error {
 
 func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// Readiness reports whether the client is connected and acknowledged, which is
+// what a supervisor waits for before it trusts a freshly started worker.
+type Readiness struct {
+	Ready bool
+	// ServerVersion is the Server's announced version, or "" while unknown.
+	ServerVersion string
+}
+
+func (r *Runtime) markAgentReady(serverVersion string) {
+	r.agentAck.mu.Lock()
+	defer r.agentAck.mu.Unlock()
+	r.agentAck.acked = true
+	if serverVersion != "" {
+		r.agentAck.serverVersion = serverVersion
+	}
+}
+
+// Readiness is ready once any tunnel session is registered or the embedded Agent
+// role was acknowledged. The version can arrive a moment after readiness, since
+// the ack follows the connection, so callers should keep polling for it.
+func (r *Runtime) Readiness() Readiness {
+	if r == nil {
+		return Readiness{}
+	}
+	var out Readiness
+	if r.Stats().Connected {
+		out.Ready = true
+		out.ServerVersion = r.manager.ServerVersion()
+	}
+	r.agentAck.mu.Lock()
+	if r.agentAck.acked {
+		out.Ready = true
+		if out.ServerVersion == "" {
+			out.ServerVersion = r.agentAck.serverVersion
+		}
+	}
+	r.agentAck.mu.Unlock()
+	return out
 }
 
 // Wait blocks until the run finishes and returns the supervised error.

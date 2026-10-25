@@ -56,6 +56,8 @@ type API struct {
 	// console credential (api_tokens) cannot validate a tunnel token.
 	clientTokens        ClientTokenValidator
 	agentTokens         ClientTokenValidator
+	updates             *UpdateService
+	serverVersion       string
 	remoteServerService *RemoteServerService
 	websshService       *WebSSHSessionService
 	websshCloser        WebSSHConnectionCloseService

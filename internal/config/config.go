@@ -144,6 +144,7 @@ type ServerConfig struct {
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
 	VPN                VPNConfig                `mapstructure:"vpn" json:"vpn" yaml:"vpn"`
+	Updates            ServerUpdatesConfig      `mapstructure:"updates" json:"updates" yaml:"updates"`
 	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
 	// header may be believed when resolving a management-API client IP. It is
 	// empty by default, which means the direct peer address is always used and a
@@ -402,6 +403,7 @@ type AgentConfig struct {
 	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Streams     AgentStreamConfig     `mapstructure:"streams" json:"streams" yaml:"streams"`
 	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+	Update      UpdateConfig          `mapstructure:"update" json:"update" yaml:"update"`
 }
 
 type AgentStreamConfig struct {
@@ -455,6 +457,60 @@ type ClientConfig struct {
 	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
 	RemoteValidation RemoteValidationConfig `mapstructure:"remote_validation" json:"remote_validation" yaml:"remote_validation"`
 	Metadata         []MetadataSource       `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+	Update           UpdateConfig           `mapstructure:"update" json:"update" yaml:"update"`
+}
+
+// ServerUpdatesConfig lets the Server distribute client and agent releases.
+type ServerUpdatesConfig struct {
+	// Dir is a directory laid out like a GitHub release: SHA256SUMS, manifest.json and
+	// the tunnelmesh-<version>-<os>-<arch> archives. Empty (the default) keeps
+	// distribution off, so clients use GitHub unless an operator opts in.
+	Dir string `mapstructure:"dir" json:"dir" yaml:"dir"`
+}
+
+// Update sources. The value picks where a client or agent looks for releases.
+const (
+	UpdateSourceGitHub = "github"
+	UpdateSourceServer = "server"
+)
+
+// UpdateConfig controls process supervision and self-upgrade for `client run` and
+// `agent run`. Both are on by default; the two switches are separate because
+// supervision is useful alone (crash restart with no outbound update traffic),
+// while upgrading cannot exist without the supervisor that performs it.
+type UpdateConfig struct {
+	// Enabled turns automatic upgrade and rollback on or off.
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	// Supervise runs the service as a child of a supervisor. Off means `run`
+	// behaves exactly as it did before this feature existed.
+	Supervise bool `mapstructure:"supervise" json:"supervise" yaml:"supervise"`
+	// Source is where releases come from: github or server.
+	Source string `mapstructure:"source" json:"source" yaml:"source"`
+	// CheckInterval is the time between release checks; a random jitter is added so
+	// a fleet that started together does not ask at the same instant.
+	CheckInterval time.Duration `mapstructure:"check_interval" json:"check_interval" yaml:"check_interval"`
+	// HealthTimeout is how long a freshly upgraded version may take to report ready.
+	HealthTimeout time.Duration `mapstructure:"health_timeout" json:"health_timeout" yaml:"health_timeout"`
+	// StableWindow is how long an upgraded version must keep running after it
+	// reported ready before the upgrade is committed.
+	StableWindow time.Duration `mapstructure:"stable_window" json:"stable_window" yaml:"stable_window"`
+	// BadVersionTTL is how long a version that failed an upgrade is not retried.
+	BadVersionTTL time.Duration `mapstructure:"bad_version_ttl" json:"bad_version_ttl" yaml:"bad_version_ttl"`
+	// KeepVersions is how many downloaded versions are kept for rollback.
+	KeepVersions int `mapstructure:"keep_versions" json:"keep_versions" yaml:"keep_versions"`
+	// StateDir overrides where upgraded binaries and update state are stored; empty
+	// means the directory of the instance id file.
+	StateDir string       `mapstructure:"state_dir" json:"state_dir" yaml:"state_dir"`
+	GitHub   UpdateGitHub `mapstructure:"github" json:"github" yaml:"github"`
+}
+
+// UpdateGitHub configures the GitHub release source.
+type UpdateGitHub struct {
+	// Repository defaults to downloads.github_repository.
+	Repository string `mapstructure:"repository" json:"repository" yaml:"repository"`
+	// MirrorBaseURL points at a GitHub-compatible mirror for networks that cannot
+	// reach github.com directly.
+	MirrorBaseURL string `mapstructure:"mirror_base_url" json:"mirror_base_url" yaml:"mirror_base_url"`
 }
 
 const (
@@ -775,6 +831,28 @@ func setDefaults(v *viper.Viper) {
 		"client.remote_validation.negative_ttl":              2 * time.Second,
 		"client.remote_validation.timeout":                   3 * time.Second,
 		"client.remote_validation.max_entries":               10000,
+		"agent.update.enabled":                               true,
+		"agent.update.supervise":                             true,
+		"agent.update.source":                                UpdateSourceGitHub,
+		"agent.update.check_interval":                        6 * time.Hour,
+		"agent.update.health_timeout":                        120 * time.Second,
+		"agent.update.stable_window":                         120 * time.Second,
+		"agent.update.bad_version_ttl":                       24 * time.Hour,
+		"agent.update.keep_versions":                         2,
+		"agent.update.state_dir":                             "",
+		"agent.update.github.repository":                     "",
+		"agent.update.github.mirror_base_url":                "",
+		"client.update.enabled":                              true,
+		"client.update.supervise":                            true,
+		"client.update.source":                               UpdateSourceGitHub,
+		"client.update.check_interval":                       6 * time.Hour,
+		"client.update.health_timeout":                       120 * time.Second,
+		"client.update.stable_window":                        120 * time.Second,
+		"client.update.bad_version_ttl":                      24 * time.Hour,
+		"client.update.keep_versions":                        2,
+		"client.update.state_dir":                            "",
+		"client.update.github.repository":                    "",
+		"client.update.github.mirror_base_url":               "",
 		"client.transport.proxy_mode":                        ProxyModeDirect,
 		"client.transport.allow_insecure_transport":          false,
 		"downloads.github_repository":                        DefaultGitHubRepository,
@@ -820,7 +898,8 @@ func bindEnvironment(v *viper.Viper) {
 		"server.vpn.packet_rate_per_peer", "server.vpn.connect_timeout", "server.vpn.idle_timeout", "server.vpn.shutdown_timeout",
 		"server.vpn.icmp_enabled", "server.vpn.icmp_timeout", "server.vpn.icmp_max_concurrent",
 		"agent.server_url", "agent.id", "agent.instance_id", "agent.token", "client.server_url", "client.agent_id", "client.instance_id", "client.token",
-		"downloads.github_repository",
+		"downloads.github_repository", "server.updates.dir",
+		"agent.update.enabled", "agent.update.supervise", "agent.update.source", "agent.update.check_interval", "agent.update.health_timeout", "agent.update.stable_window", "agent.update.bad_version_ttl", "agent.update.keep_versions", "agent.update.state_dir", "agent.update.github.repository", "agent.update.github.mirror_base_url", "client.update.enabled", "client.update.supervise", "client.update.source", "client.update.check_interval", "client.update.health_timeout", "client.update.stable_window", "client.update.bad_version_ttl", "client.update.keep_versions", "client.update.state_dir", "client.update.github.repository", "client.update.github.mirror_base_url",
 	}
 	keys = append(keys, authEnvKeys()...)
 	for _, key := range keys {
@@ -842,6 +921,11 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
+	if dir := strings.TrimSpace(cfg.Server.Updates.Dir); dir != "" && !filepath.IsAbs(dir) {
+		problems = append(problems, "server.updates.dir must be an absolute path")
+	}
+	problems = append(problems, validateUpdate("client", cfg.Client.Update, cfg.Client.ServerURL != "")...)
+	problems = append(problems, validateUpdate("agent", cfg.Agent.Update, cfg.Agent.ServerURL != "")...)
 	if cfg.Client.ServerURL != "" || cfg.Client.AgentID != "" || len(cfg.Client.Tunnels) > 0 {
 		problems = append(problems, validateClientConnections(cfg.Client.Connections)...)
 		problems = append(problems, validateClientTunnels(cfg.Client.Tunnels)...)
@@ -2047,4 +2131,60 @@ func ConfigFileExists(path string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// validateUpdate checks one role's update block. role is "client" or "agent" and
+// prefixes every message so an operator can tell which block to fix.
+func validateUpdate(role string, u UpdateConfig, hasServerURL bool) []string {
+	// Config.Load always fills the defaults, so an all-zero block can only be a
+	// Config assembled by hand (tests, embedding code) that never configured
+	// updates. There is nothing to validate, and treating zero as invalid would make
+	// every such Config unusable.
+	if u == (UpdateConfig{}) {
+		return nil
+	}
+	prefix := role + ".update."
+	var problems []string
+	// Upgrades are performed by the supervisor, so this combination would silently
+	// do nothing. It is rejected instead of being corrected behind the operator's back.
+	if u.Enabled && !u.Supervise {
+		problems = append(problems, prefix+"enabled requires "+prefix+"supervise (upgrades are performed by the supervisor)")
+	}
+	switch u.Source {
+	case UpdateSourceGitHub:
+	case UpdateSourceServer:
+		if u.Enabled && !hasServerURL {
+			problems = append(problems, prefix+"source=server requires "+role+".server_url")
+		}
+	default:
+		problems = append(problems, prefix+"source must be one of "+UpdateSourceGitHub+", "+UpdateSourceServer)
+	}
+	if u.CheckInterval < 5*time.Minute {
+		problems = append(problems, prefix+"check_interval must be at least 5m")
+	}
+	if u.HealthTimeout < 10*time.Second || u.HealthTimeout > 30*time.Minute {
+		problems = append(problems, prefix+"health_timeout must be between 10s and 30m")
+	}
+	if u.StableWindow < 0 || u.StableWindow > 30*time.Minute {
+		problems = append(problems, prefix+"stable_window must be between 0 and 30m")
+	}
+	if u.BadVersionTTL < time.Minute {
+		problems = append(problems, prefix+"bad_version_ttl must be at least 1m")
+	}
+	if u.KeepVersions < 1 {
+		problems = append(problems, prefix+"keep_versions must be at least 1")
+	}
+	if u.StateDir != "" && !filepath.IsAbs(u.StateDir) {
+		problems = append(problems, prefix+"state_dir must be an absolute path")
+	}
+	if mirror := strings.TrimSpace(u.GitHub.MirrorBaseURL); mirror != "" {
+		parsed, err := url.Parse(mirror)
+		switch {
+		case err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "":
+			problems = append(problems, prefix+"github.mirror_base_url must be an http or https URL")
+		case parsed.User != nil:
+			problems = append(problems, prefix+"github.mirror_base_url must not contain credentials")
+		}
+	}
+	return problems
 }

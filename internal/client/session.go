@@ -93,6 +93,9 @@ type Session struct {
 	metadataRevision      uint64
 	inboundBytes          int
 	lastReceivedNanos     atomic.Int64
+	// serverVersion is the Server's version from its last accepted metadata ack, or
+	// empty when the Server has not announced one (an older Server, or no ack yet).
+	serverVersion atomic.Pointer[string]
 	// livenessInterval is the PING cadence of the dead-peer watchdog; tests shrink it.
 	livenessInterval time.Duration
 }
@@ -622,6 +625,10 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			}
 			continue
 		}
+		if f.Type == protocol.FrameClientMetadataAck {
+			s.recordMetadataAck(f)
+			continue
+		}
 		if f.Type == protocol.FramePong {
 			if len(f.Payload) >= 8 {
 				s.finishPing(binary.BigEndian.Uint64(f.Payload[:8]))
@@ -697,6 +704,30 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			}
 		}
 	}
+}
+
+// recordMetadataAck keeps the Server version from an accepted ack. A rejected ack
+// carries no trustworthy version, and an empty one must not erase a version an
+// earlier ack provided.
+func (s *Session) recordMetadataAck(f protocol.Frame) {
+	ack, err := protocol.DecodeClientMetadataAckPayload(f.Payload)
+	if err != nil || !ack.Accepted || ack.ServerVersion == "" {
+		return
+	}
+	version := ack.ServerVersion
+	s.serverVersion.Store(&version)
+}
+
+// ServerVersion is the Server's release version as last announced in a metadata
+// ack, or "" if it has not announced one. A client uses it to bound self-upgrade.
+func (s *Session) ServerVersion() string {
+	if s == nil {
+		return ""
+	}
+	if v := s.serverVersion.Load(); v != nil {
+		return *v
+	}
+	return ""
 }
 
 func (s *Session) finishReceive(err error) {

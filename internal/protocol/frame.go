@@ -161,6 +161,10 @@ type AgentMetadataAckPayload struct {
 	MaxConnectionsPerAgent  int                  `json:"max_connections_per_agent,omitempty"`
 	Errors                  []AgentMetadataError `json:"errors,omitempty"`
 	Capabilities            []string             `json:"capabilities,omitempty"`
+	// ServerVersion is the Server's release version. It bounds a client or agent's
+	// self-upgrade, so it is optional: an older Server omits it and the peer then
+	// treats the version as unknown and does not upgrade.
+	ServerVersion string `json:"server_version,omitempty"`
 }
 
 func EncodeAgentMetadataPayload(payload AgentMetadataPayload) ([]byte, error) {
@@ -257,6 +261,8 @@ type ClientMetadataAckPayload struct {
 	Accepted         bool                  `json:"accepted"`
 	Idempotent       bool                  `json:"idempotent,omitempty"`
 	Errors           []ClientMetadataError `json:"errors,omitempty"`
+	// ServerVersion is the Server's release version; see AgentMetadataAckPayload.
+	ServerVersion string `json:"server_version,omitempty"`
 }
 
 func EncodeClientMetadataPayload(payload ClientMetadataPayload) ([]byte, error) {

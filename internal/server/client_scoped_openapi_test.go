@@ -23,6 +23,10 @@ const clientScopedOpenAPIDoc = "../../docs/api/openapi.yaml"
 var clientScopedServedOperations = []string{
 	"get /api/v1/client/agents",
 	"get /api/v1/agent/self",
+	"get /api/v1/client/updates/latest",
+	"get /api/v1/client/updates/files/{name}",
+	"get /api/v1/agent/updates/latest",
+	"get /api/v1/agent/updates/files/{name}",
 }
 
 // clientScopedDocumentedResponses are the statuses the namespace answers with. 503 is in
@@ -62,7 +66,9 @@ func TestClientScopedOpenAPIMatchesTheServedSurface(t *testing.T) {
 		// The plural admin namespace is a different surface with different credentials;
 		// matching it here would hide the very confusion the singular prefix exists to
 		// prevent.
-		if !strings.HasPrefix(path, "/api/v1/client/") && path != "/api/v1/agent/self" {
+		// The singular agent namespace holds the Agent token's own surface; the plural
+		// /api/v1/agents/ is the admin one and is deliberately not matched.
+		if !strings.HasPrefix(path, "/api/v1/client/") && !strings.HasPrefix(path, "/api/v1/agent/") {
 			continue
 		}
 		operations, ok := item.(map[string]any)

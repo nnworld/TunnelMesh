@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -528,4 +529,149 @@ func (t *poolTestTransport) Receive() (protocol.Frame, error) {
 func (t *poolTestTransport) Close() error {
 	t.closeOnce.Do(func() { close(t.done) })
 	return nil
+}
+
+// pingAwareTransport answers PING like a live Server, or swallows every frame
+// like a connection that died silently behind a NAT or proxy: the TCP socket is
+// still open, so nothing ever errors, yet no byte comes back.
+type pingAwareTransport struct {
+	answers   bool
+	opens     atomic.Int32
+	recv      chan protocol.Frame
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newPingAwareTransport(answers bool) *pingAwareTransport {
+	return &pingAwareTransport{answers: answers, recv: make(chan protocol.Frame, 64), done: make(chan struct{})}
+}
+
+func (t *pingAwareTransport) Send(frame protocol.Frame) error {
+	switch frame.Type {
+	case protocol.FrameOpenStream:
+		t.opens.Add(1)
+		if t.answers {
+			payload, err := protocol.EncodeOpenResultPayload(protocol.OpenResultPayload{
+				Accepted: true, Stage: protocol.OpenResultStageConnect, Code: protocol.OpenResultCodeOK,
+			})
+			if err != nil {
+				return err
+			}
+			t.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameOpenResult, StreamID: frame.StreamID, Payload: payload}
+		}
+	case protocol.FramePing:
+		if t.answers {
+			// A little latency so a real RTT is recorded, as on a real link.
+			go func() {
+				time.Sleep(2 * time.Millisecond)
+				select {
+				case t.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: frame.Payload}:
+				case <-t.done:
+				}
+			}()
+		}
+	}
+	return nil
+}
+
+func (t *pingAwareTransport) Receive() (protocol.Frame, error) {
+	select {
+	case frame := <-t.recv:
+		return frame, nil
+	case <-t.done:
+		return protocol.Frame{}, io.EOF
+	}
+}
+
+func (t *pingAwareTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.done) })
+	return nil
+}
+
+// startMixedHealthPool runs a two-session pool whose first session is silently
+// dead and whose second is healthy.
+func startMixedHealthPool(t *testing.T) (opener StreamOpener, dead, alive *pingAwareTransport, stop func()) {
+	t.Helper()
+	dead, alive = newPingAwareTransport(false), newPingAwareTransport(true)
+	transports := []*pingAwareTransport{dead, alive}
+	var next atomic.Int32
+	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error, _ WebSocketRunOptions) error {
+		index := int(next.Add(1)) - 1
+		tr := newPingAwareTransport(true)
+		if index < len(transports) {
+			tr = transports[index]
+		}
+		session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+		session.Start()
+		if err := onReady(session); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+		case <-tr.done:
+		}
+		_ = tr.Close()
+		return nil
+	}
+	manager := NewSessionPoolManager(SessionPoolManagerOptions{
+		ServerURL: "ws://server.example/ws/client", Token: "client-secret",
+		Config: SessionPoolConfig{Min: 2, Max: 2, EvaluationInterval: 20 * time.Millisecond},
+		Runner: runner,
+	})
+	// The pool for an Agent is created by the first Opener call, so it must
+	// exist before Run starts its slots.
+	opener = manager.Opener("agent-a")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = manager.Run(ctx) }()
+	waitForCondition(t, 2*time.Second, func() bool { return manager.ReadyCount("agent-a") == 2 })
+	return opener, dead, alive, cancel
+}
+
+// Reproduces the "works for a while, then new connections hang until the client
+// is restarted" failure: a session that died silently looks idle (every stream
+// on it fails, so its active count stays 0) and has no RTT sample, which makes it
+// the pool's favourite for every new connection.
+func TestSessionPoolStopsRoutingToSilentlyDeadSession(t *testing.T) {
+	opener, dead, _, stop := startMixedHealthPool(t)
+	defer stop()
+	// Several evaluation ticks, so the dead session has missed its heartbeats.
+	time.Sleep(150 * time.Millisecond)
+	if dead.opens.Load() != 0 {
+		t.Fatalf("setup: %d opens reached the dead session before any traffic", dead.opens.Load())
+	}
+
+	for i := 0; i < 6; i++ {
+		// A forwarded connection's open is bounded by ConnectTimeout; an open that
+		// is waiting on a dead session only ever ends by timing out.
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		stream, err := opener.OpenStream(ctx, StreamRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 3000 + i})
+		cancel()
+		if err != nil {
+			t.Errorf("open %d failed: %v", i, err)
+			continue
+		}
+		// Closed at once: a failed connection leaves the session looking idle.
+		_ = stream.Close()
+	}
+
+	if got := dead.opens.Load(); got != 0 {
+		t.Fatalf("%d of 6 new connections were routed to the session that stopped answering heartbeats", got)
+	}
+}
+
+// A session that misses several heartbeats in a row is closed so its slot
+// reconnects, instead of staying registered until the client process restarts.
+func TestSessionPoolClosesSessionThatStopsAnsweringHeartbeats(t *testing.T) {
+	_, dead, alive, stop := startMixedHealthPool(t)
+	defer stop()
+	select {
+	case <-dead.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a session that never answers heartbeats stayed in the pool")
+	}
+	select {
+	case <-alive.done:
+		t.Fatal("the healthy session was closed")
+	default:
+	}
 }

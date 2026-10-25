@@ -11,6 +11,8 @@ ExecStartPre=__BINARY__ --config __CONFIG__ check-config
 ExecStart=__BINARY__ --config __CONFIG__ run
 Restart=on-failure
 RestartSec=5s
+# 78 是配置错误，77 是凭据被永久拒绝：重启修不好它们，不应被 systemd 无限拉起。
+RestartPreventExitStatus=78 77
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

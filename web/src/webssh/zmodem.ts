@@ -13,6 +13,23 @@ const ZMODEM_CHUNK_BYTES = 8192
 const progressByteThreshold = 64 * 1024
 const progressIntervalMs = 500
 
+// A ZMODEM sender streams without waiting for ACKs, so an upload must be paced
+// by the SSH channel itself. Bytes handed to the channel stay bounded by this
+// mark; anything above it makes the sender wait. Without the bound, a whole
+// file is queued behind the channel's serialized writes: progress then means
+// "read from disk", a cancel's CAN bytes wait behind the backlog, and once the
+// remote rz is gone the shell echoes the leftover binary back as garbage.
+const OUTBOX_HIGH_WATER = 256 * 1024
+const SEND_SLICE_BYTES = 64 * 1024
+
+// After a transfer is cut short the remote keeps streaming whatever was already
+// in flight (bandwidth x RTT) until the CAN bytes reach it. A fresh Sentry sees
+// that tail as shell output, so it is swallowed instead of printed. The window
+// closes on the first plain-text chunk, after a quiet period, or at the cap.
+const DEFAULT_DRAIN_QUIET_MS = 400
+const DRAIN_MAX_MS = 30_000
+const ZDLE = 0x18
+
 // lrzsz ends a transfer by printing "OO" (over and out). It is a protocol
 // artifact rather than shell output, so it is stripped from the first terminal
 // write after a receive session ends; anything else the peer sends with it is
@@ -30,6 +47,34 @@ function concatenate(chunks: Uint8Array[]): Uint8Array {
   return out
 }
 
+// looksLikeZmodemData tells in-flight protocol bytes from shell text. ZDLE
+// (CAN, 0x18) terminates every subpacket and escapes control bytes, and shell
+// output virtually never contains it; for a chunk that happens to carry none,
+// the share of non-whitespace control bytes separates random binary (~11%) from
+// text (~0%). High bytes are not counted because UTF-8 text is full of them.
+function looksLikeZmodemData(octets: number[]): boolean {
+  if (octets.includes(ZDLE)) return true
+  if (octets.length < 32) return false
+  let control = 0
+  for (const byte of octets) {
+    if ((byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x1b && byte !== 0x08) || byte === 0x7f) control++
+  }
+  return control / octets.length > 0.05
+}
+
+// readSlice avoids Blob.arrayBuffer() only where it is missing (older engines
+// and jsdom); real browsers take the first branch.
+function readSlice(file: File, start: number, end: number): Promise<Uint8Array> {
+  const blob = file.slice(start, end)
+  if (typeof blob.arrayBuffer === 'function') return blob.arrayBuffer().then(buffer => new Uint8Array(buffer))
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error ?? new Error('file read failed'))
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer))
+    reader.readAsArrayBuffer(blob)
+  })
+}
+
 export type ZmodemRole = ZmodemSessionType
 
 export type ZmodemEvent =
@@ -42,13 +87,20 @@ export type ZmodemEvent =
   // send only reports the name because the bytes already live on the remote host.
   | { type: 'completed'; name: string; data?: Uint8Array }
   | { type: 'aborted' }
+  // The stream left over from a cut-short transfer has gone quiet and its tail,
+  // possibly including the shell prompt, was swallowed. The view should nudge the
+  // shell so a fresh prompt is drawn.
+  | { type: 'drained' }
   | { type: 'ended' }
   | { type: 'error'; message: string }
 
 export interface ZmodemBridgeOptions {
   toTerminal: (bytes: Uint8Array) => void
-  toPeer: (bytes: Uint8Array) => void
+  // May return a promise that settles once the channel accepted the bytes; the
+  // bridge uses it to pace uploads and never has more than one write in flight.
+  toPeer: (bytes: Uint8Array) => Promise<void> | void
   onEvent: (event: ZmodemEvent) => void
+  drainQuietMs?: number
 }
 
 export interface ZmodemBridge {
@@ -85,6 +137,100 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
   let suppressed: number[] | null = null
   let stripNextOverAndOut = false
 
+  // Outbound pacing. `outbox` holds chunks not yet handed to the channel;
+  // `inflightBytes` is the one chunk currently being written.
+  const outbox: Uint8Array[] = []
+  let queuedBytes = 0
+  let inflightBytes = 0
+  let pumping = false
+  const backpressureWaiters: Array<() => void> = []
+  const pendingPeerBytes = () => queuedBytes + inflightBytes
+  const wakeBackpressureWaiters = () => { for (const wake of backpressureWaiters.splice(0)) wake() }
+  const dropOutbox = () => { outbox.length = 0; queuedBytes = 0; wakeBackpressureWaiters() }
+
+  const pump = async () => {
+    if (pumping) return
+    pumping = true
+    try {
+      while (outbox.length) {
+        const next = outbox.shift()!
+        queuedBytes -= next.length
+        inflightBytes = next.length
+        try {
+          // A synchronous peer is not awaited, which keeps ordering and the
+          // "answered before consumeFromRemote returns" behaviour of a plain
+          // callback; only a real promise yields.
+          const result = options.toPeer(next)
+          if (result && typeof (result as Promise<void>).then === 'function') await result
+        } catch {
+          // The view reports a failed channel write itself; what is left
+          // cannot be delivered either.
+          dropOutbox()
+        } finally {
+          inflightBytes = 0
+          wakeBackpressureWaiters()
+        }
+      }
+    } finally {
+      pumping = false
+    }
+  }
+
+  const queueToPeer = (octets: number[]) => {
+    const bytes = Uint8Array.from(octets)
+    outbox.push(bytes)
+    queuedBytes += bytes.length
+    void pump()
+  }
+
+  const waitForChannel = async (owner: ZmodemSession) => {
+    while (pendingPeerBytes() > OUTBOX_HIGH_WATER && session === owner && !disposed) {
+      await new Promise<void>(resolve => backpressureWaiters.push(resolve))
+    }
+  }
+
+  // Drain window after a transfer was cut short; see DEFAULT_DRAIN_QUIET_MS.
+  const drainQuietMs = options.drainQuietMs ?? DEFAULT_DRAIN_QUIET_MS
+  let draining = false
+  let drainedBytes = 0
+  let drainDeadline = 0
+  let drainTimer: ReturnType<typeof setTimeout> | null = null
+  const clearDrainTimer = () => { if (drainTimer) { clearTimeout(drainTimer); drainTimer = null } }
+  const endDrain = (announce: boolean) => {
+    clearDrainTimer()
+    if (!draining) return
+    draining = false
+    const swallowed = drainedBytes
+    drainedBytes = 0
+    if (announce && swallowed > 0) emit({ type: 'drained' })
+  }
+  const armDrainTimer = () => {
+    clearDrainTimer()
+    drainTimer = setTimeout(() => endDrain(true), drainQuietMs)
+  }
+  const beginDrain = () => {
+    draining = true
+    drainedBytes = 0
+    drainDeadline = Date.now() + DRAIN_MAX_MS
+    armDrainTimer()
+  }
+
+  // writeToTerminal is the only path to the screen, so the drain filter cannot be
+  // bypassed by the replay and retract paths below.
+  const writeToTerminal = (octets: number[]) => {
+    if (!octets.length) return
+    if (draining) {
+      if (Date.now() < drainDeadline && looksLikeZmodemData(octets)) {
+        drainedBytes += octets.length
+        armDrainTimer()
+        return
+      }
+      // Plain text: the leftover stream is over and this text is the redraw.
+      endDrain(false)
+    }
+    options.toTerminal(Uint8Array.from(octets))
+  }
+
   const emit = (event: ZmodemEvent) => { if (!disposed) options.onEvent(event) }
 
   const toTerminal = (octets: number[]) => {
@@ -102,11 +248,10 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
         visible = visible.slice(2)
       }
     }
-    if (!visible.length) return
-    options.toTerminal(Uint8Array.from(visible))
+    writeToTerminal(visible)
   }
 
-  const toPeer = (octets: number[]) => { options.toPeer(Uint8Array.from(octets)) }
+  const toPeer = queueToPeer
 
   const reportError = (error: unknown) => {
     emit({ type: 'error', message: error instanceof Error ? error.message : String(error) })
@@ -198,7 +343,7 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
     on_retract: () => {
       // A retracted detection means the bytes were ordinary shell output after
       // all, so they go back to the screen and the bridge returns to idle.
-      if (suppressed && suppressed.length) options.toTerminal(Uint8Array.from(suppressed))
+      if (suppressed && suppressed.length) writeToTerminal(suppressed)
       suppressed = null
       session = null
       role = null
@@ -230,7 +375,12 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
         // invites a retry of a file that is already on disk.
         const finishedBeforeThrow = !!dead?._got_ZFIN
         if (finishedBeforeThrow) stripNextOverAndOut = true
-        else reportError(error)
+        else {
+          reportError(error)
+          // The peer may still be streaming; see DEFAULT_DRAIN_QUIET_MS.
+          dropOutbox()
+          beginDrain()
+        }
         session = null
         role = null
         suppressed = null
@@ -247,7 +397,7 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
         for (let next = offset + ZMODEM_CHUNK_BYTES; next < bytes.length; next += ZMODEM_CHUNK_BYTES) {
           replay.push(...bytes.subarray(next, Math.min(next + ZMODEM_CHUNK_BYTES, bytes.length)))
         }
-        if (replay.length) options.toTerminal(Uint8Array.from(replay))
+        writeToTerminal(replay)
         // Reported after the replay so the progress panel only disappears once
         // the prompt the user is waiting for is actually on screen.
         if (finishedBeforeThrow) emit({ type: 'ended' })
@@ -261,22 +411,63 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
         emit({ type: 'error', message: error.message })
         throw error
       }
+      // A cancelled or ended session must stop the read loop at its next step.
+      const ensureActive = () => {
+        if (session !== current || disposed) throw new Error('ZMODEM transfer ended')
+      }
       try {
-        if (files.length) {
-          await Zmodem.Browser.send_files(current, files, {
-            on_progress: (file, transfer) => {
-              emit({ type: 'progress', name: file.name, transferred: transfer.get_offset(), total: file.size })
-            },
-            on_file_complete: file => emit({ type: 'completed', name: file.name }),
+        let bytesRemaining = files.reduce((sum, file) => sum + file.size, 0)
+        for (let index = 0; index < files.length; index++) {
+          const file = files[index]
+          const transfer = await current.send_offer({
+            name: file.name, size: file.size, mtime: new Date(file.lastModified),
+            files_remaining: files.length - index, bytes_remaining: bytesRemaining,
           })
+          ensureActive()
+          bytesRemaining -= file.size
+          // The receiver skipped this file (for example it already exists).
+          if (!transfer) continue
+          // Reported before any data moves, so the panel shows the file name and
+          // size instead of "waiting" while the first slices are read.
+          emit({ type: 'progress', name: file.name, transferred: 0, total: file.size })
+          let lastReported = 0
+          let lastReportedAt = Date.now()
+          for (;;) {
+            // Pace the read by the channel, not by the disk: see OUTBOX_HIGH_WATER.
+            await waitForChannel(current)
+            ensureActive()
+            const offset = transfer.get_offset()
+            const end = Math.min(offset + SEND_SLICE_BYTES, file.size)
+            const piece = await readSlice(file, offset, end)
+            ensureActive()
+            if (end >= file.size) {
+              // end() resolves once the receiver acknowledged the whole file.
+              await transfer.end(piece)
+              break
+            }
+            transfer.send(piece)
+            // Bytes still queued for the channel are not "sent" yet.
+            const sent = Math.max(0, end - pendingPeerBytes())
+            const now = Date.now()
+            if (sent - lastReported >= progressByteThreshold || now - lastReportedAt >= progressIntervalMs) {
+              lastReported = sent
+              lastReportedAt = now
+              emit({ type: 'progress', name: file.name, transferred: sent, total: file.size })
+            }
+          }
+          emit({ type: 'progress', name: file.name, transferred: file.size, total: file.size })
+          emit({ type: 'completed', name: file.name })
         }
         // Closing sends ZFIN so the remote rz exits and the shell prompt comes
         // back; an empty selection is a valid "never mind" that still closes.
+        ensureActive()
         await current.close()
       } catch (error) {
-        if (!abortedByUser) reportError(error)
-        session = null
-        role = null
+        if (!abortedByUser && session === current) reportError(error)
+        if (session === current) {
+          session = null
+          role = null
+        }
         return
       }
       finish('ended')
@@ -289,6 +480,11 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
       session = null
       role = null
       suppressed = null
+      // Unsent upload data must not delay (or follow) the abort sequence: with
+      // the backlog still queued the peer would see the CAN bytes only after the
+      // whole file, and a shell that already took over would echo that file.
+      dropOutbox()
+      beginDrain()
       try {
         current.abort()
       } catch {
@@ -308,6 +504,8 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
       session = null
       role = null
       suppressed = null
+      dropOutbox()
+      beginDrain()
       // Nothing is sent to the peer here, so the session never ends on its own
       // and the Sentry would keep parsing shell output as ZMODEM.
       sentry = makeSentry()
@@ -321,6 +519,8 @@ export function createZmodemBridge(options: ZmodemBridgeOptions): ZmodemBridge {
       session = null
       role = null
       suppressed = null
+      clearDrainTimer()
+      dropOutbox()
       // Abort silently: the view is going away, but the remote rz/sz must not
       // be left waiting for a peer that will never answer.
       if (current) {

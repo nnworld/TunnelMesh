@@ -36,6 +36,10 @@
             {{ transfer.role === 'send' ? t('webssh.zmodem.sending') : t('webssh.zmodem.receiving') }}
           </el-tag>
           <span class="transfer-name">{{ transfer.name || t('webssh.zmodem.waiting') }}</span>
+          <!-- Browsers only open a file dialog from a user gesture, and an rz that
+               starts seconds after Enter (slow link, jump host) has lost it, so
+               the panel offers an explicit way to pick the file. -->
+          <el-button v-if="transfer.awaitingFile" size="small" type="primary" @click="fileInput?.click()">{{ t('webssh.zmodem.chooseFile') }}</el-button>
           <el-button size="small" type="danger" plain @click="cancelTransfer">{{ t('webssh.zmodem.cancel') }}</el-button>
         </div>
         <el-progress :percentage="transferPercent" :stroke-width="8" :show-text="false" />
@@ -118,7 +122,7 @@ let closeGuard = false
 let zmodem: ZmodemBridge | null = null
 
 const fileInput = ref<HTMLInputElement>()
-const transfer = ref<{ role: 'send' | 'receive'; name: string; transferred: number; total: number } | null>(null)
+const transfer = ref<{ role: 'send' | 'receive'; name: string; transferred: number; total: number; awaitingFile?: boolean } | null>(null)
 const transferPercent = computed(() => {
   const current = transfer.value
   if (!current || !current.total) return 0
@@ -255,7 +259,9 @@ async function connect() {
         // kill a healthy 153 MiB download, so these writes wait for window
         // credit indefinitely. Teardown stays bounded because close() no longer
         // queues behind them.
-        void channel?.write(bytes, { stallLimitMs: 0 }).catch((error) => {
+        // Returned so the bridge paces an upload by what the channel accepted
+        // instead of queueing the whole file behind its serialized writes.
+        return channel?.write(bytes, { stallLimitMs: 0 }).catch((error) => {
           const bridge = zmodem
           if (bridge?.active) {
             // A stalled or rejected protocol write ends the transfer, not the
@@ -328,7 +334,14 @@ function handleZmodemEvent(event: ZmodemEvent) {
       break
     case 'send-required':
       // The remote ran `rz`: it is waiting for an offer, so ask for files now.
+      // The click is best effort; the panel's button covers a blocked dialog.
+      if (transfer.value) transfer.value = { ...transfer.value, awaitingFile: true }
       fileInput.value?.click()
+      break
+    case 'drained':
+      // A cut-short transfer's leftover stream was swallowed together with the
+      // prompt that followed it; Enter makes the shell draw a fresh one.
+      void channel?.write(new TextEncoder().encode('\r')).catch(() => undefined)
       break
     case 'receive-offer':
       transfer.value = { role: 'receive', name: event.name, transferred: 0, total: event.size }
@@ -362,6 +375,7 @@ async function onFilesPicked(event: Event) {
   input.value = ''
   const bridge = zmodem
   if (!bridge) return
+  if (transfer.value) transfer.value = { ...transfer.value, awaitingFile: false }
   if (!files.length) {
     // Nothing chosen means the remote rz would wait forever, so cancel it.
     bridge.abort()

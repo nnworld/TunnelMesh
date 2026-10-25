@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -165,7 +166,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, TrustedProxies: cfg.Server.TrustedProxies})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, Updates: cfg.Server.Updates, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, TrustedProxies: cfg.Server.TrustedProxies})
 			if err != nil {
 				return err
 			}
@@ -331,50 +332,13 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh agent", func(cmd *cobra.Command, cfg config.Config) error {
 			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" {
-				return fmt.Errorf("agent run requires agent.server_url and agent.token")
+				return configError(fmt.Errorf("agent run requires agent.server_url and agent.token"))
 			}
-			if strings.TrimSpace(cfg.Agent.ID) == "" {
-				id, err := fetchBoundAgentID(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token)
-				if err != nil {
-					return err
-				}
-				if strings.TrimSpace(opts.configFile) == "" {
-					return errors.New("agent.id is missing and --config is required to persist the token-bound Agent ID")
-				}
-				if err := config.InitializeAgentID(opts.configFile, id); err != nil {
-					return fmt.Errorf("persist agent.id: %w", err)
-				}
-				cfg.Agent.ID = id
-			}
-			nodeID := cfg.Node.ID
-			if strings.TrimSpace(nodeID) == "" {
-				nodeID = cfg.Agent.ID
-			}
-			echoer, echoErr := startAgentEchoer(cfg.Agent.Streams)
-			if echoErr != nil {
-				// Non-fatal on purpose. The agent still serves every tunnel it
-				// already had, and the missing capability makes the server refuse
-				// to sign ICMP peers, which is where an operator looks next.
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agent icmp echo is unavailable and will not be advertised: %v\n", echoErr)
-			}
-			if echoer != nil {
-				defer func() { _ = echoer.Close() }()
-			}
-			dialer, err := sharedtransport.FromConfig(cfg.Agent.Transport)
-			if err != nil {
-				return fmt.Errorf("configure agent transport: %w", err)
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
-			return agent.RunConnectionPool(cmd.Context(), agent.WebSocketPoolOptions{
-				ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
-				NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
-				Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
-				Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
-				Dialer:    dialer,
-				Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
-				HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
-				EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
-				Cooldown:           cfg.Agent.Connections.Cooldown,
+			return runManaged(cmd, managedRole{
+				name: "agent", update: cfg.Agent.Update, stateDir: filepath.Dir(config.DefaultAgentInstanceIDPath),
+				transport: cfg.Agent.Transport, serverURL: cfg.Agent.ServerURL, token: cfg.Agent.Token, defaultRepository: cfg.Downloads.GitHubRepository,
+			}, func(ctx context.Context, report func(string)) error {
+				return runAgent(ctx, cmd, opts, cfg, report)
 			})
 		}),
 		configCommand(opts, "register", "register this agent", func(cmd *cobra.Command, cfg config.Config) error {
@@ -391,6 +355,56 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			return nil
 		}),
 	}
+}
+
+// runAgent is the body of `agent run`: resolve the Agent identity, then keep the
+// connection pool to the Server running until ctx ends. report is called each time
+// the Server accepts a connection, which a supervisor reads as "this version works".
+func runAgent(ctx context.Context, cmd *cobra.Command, opts *rootOptions, cfg config.Config, report func(string)) error {
+	if strings.TrimSpace(cfg.Agent.ID) == "" {
+		id, err := fetchBoundAgentID(ctx, cfg.Agent.ServerURL, cfg.Agent.Token)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(opts.configFile) == "" {
+			return errors.New("agent.id is missing and --config is required to persist the token-bound Agent ID")
+		}
+		if err := config.InitializeAgentID(opts.configFile, id); err != nil {
+			return fmt.Errorf("persist agent.id: %w", err)
+		}
+		cfg.Agent.ID = id
+	}
+	nodeID := cfg.Node.ID
+	if strings.TrimSpace(nodeID) == "" {
+		nodeID = cfg.Agent.ID
+	}
+	echoer, echoErr := startAgentEchoer(cfg.Agent.Streams)
+	if echoErr != nil {
+		// Non-fatal on purpose. The agent still serves every tunnel it
+		// already had, and the missing capability makes the server refuse
+		// to sign ICMP peers, which is where an operator looks next.
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agent icmp echo is unavailable and will not be advertised: %v\n", echoErr)
+	}
+	if echoer != nil {
+		defer func() { _ = echoer.Close() }()
+	}
+	dialer, err := sharedtransport.FromConfig(cfg.Agent.Transport)
+	if err != nil {
+		return fmt.Errorf("configure agent transport: %w", err)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
+	return agent.RunConnectionPool(ctx, agent.WebSocketPoolOptions{
+		ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
+		NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
+		Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
+		Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
+		Dialer:    dialer,
+		OnReady:   report,
+		Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
+		HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
+		EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
+		Cooldown:           cfg.Agent.Connections.Cooldown,
+	})
 }
 
 // agentSelfTimeout bounds the one-shot identity lookup so a dead server fails
@@ -466,7 +480,12 @@ func clientCommands(opts *rootOptions) []*cobra.Command {
 			return nil
 		}),
 		configCommand(opts, "run", "start the configured client tunnels", func(cmd *cobra.Command, cfg config.Config) error {
-			return runClientTunnels(cmd, cfg, opts.configFile)
+			return runManaged(cmd, managedRole{
+				name: "client", update: cfg.Client.Update, stateDir: clientStateDir(cfg, opts.configFile),
+				transport: cfg.Client.Transport, serverURL: cfg.Client.ServerURL, token: cfg.Client.Token, defaultRepository: cfg.Downloads.GitHubRepository,
+			}, func(ctx context.Context, report func(string)) error {
+				return runClientTunnels(ctx, cmd, cfg, opts.configFile, report)
+			})
 		}),
 		configCommand(opts, "check-config", "validate configuration and exit", func(cmd *cobra.Command, _ config.Config) error {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configuration valid")
@@ -848,7 +867,7 @@ func configCommand(opts *rootOptions, name, short string, run func(*cobra.Comman
 				}(),
 			})
 			if err != nil {
-				return err
+				return configError(err)
 			}
 			return run(cmd, cfg)
 		},

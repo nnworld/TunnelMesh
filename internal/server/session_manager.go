@@ -68,6 +68,9 @@ type AgentSessionConfig struct {
 	Authenticate           func(context.Context, AgentRegistration) error
 	MetadataCallback       MetadataCallback
 	MetadataService        *AgentMetadataService
+	// ServerVersion is announced to Agents in their metadata acks; empty means the
+	// build's own version.
+	ServerVersion string
 }
 
 type AgentSession struct {
@@ -93,8 +96,10 @@ type AgentSession struct {
 	// maxConnectionsPerAgent is the ceiling that admitted this session, mirrored from
 	// the manager so the metadata ACK can report it without reaching back.
 	maxConnectionsPerAgent int
-	writer                 *streamsession.FairFrameWriter
-	closing                bool
+	// serverVersion is mirrored from AgentSessionConfig.ServerVersion.
+	serverVersion string
+	writer        *streamsession.FairFrameWriter
+	closing       bool
 }
 
 func (s *AgentSession) Supports(capability string) bool {
@@ -200,7 +205,7 @@ func (m *AgentSessionManager) Register(ctx context.Context, req AgentRegistratio
 	writer := streamsession.NewFairFrameWriter(tr.Send, streamsession.FairWriterConfig{
 		ControlQueueSize: m.cfg.QueueSize, StreamQueueBytes: 262144, QuantumBytes: 32768,
 	})
-	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, maxConnectionsPerAgent: m.cfg.MaxConnectionsPerAgent, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), writer: writer}
+	s := &AgentSession{AgentID: req.AgentID, NodeID: req.NodeID, Epoch: req.Epoch, InstanceID: instanceID, InstanceIDExplicit: instanceIDExplicit, ConnectionID: connectionID, ConnectionEpoch: connectionEpoch, registration: req, metadataCallback: m.cfg.MetadataCallback, metadataService: m.cfg.MetadataService, metadataTTL: m.cfg.MetadataTTL, maxConnectionsPerAgent: m.cfg.MaxConnectionsPerAgent, serverVersion: m.cfg.ServerVersion, Capabilities: neg, transport: tr, lastHeartbeat: time.Now().UTC(), writer: writer}
 	m.mu.Lock()
 	agentSessions := m.sessions[req.AgentID]
 	if agentSessions == nil {
@@ -258,7 +263,7 @@ func (s *AgentSession) HandleMetadata(ctx context.Context, payload protocol.Agen
 	ack := protocol.AgentMetadataAckPayload{
 		AgentID: s.AgentID, Epoch: s.Epoch, Revision: payload.Revision,
 		ConnectionPoolSupported: true, MaxConnectionsPerAgent: s.maxConnectionsPerAgent,
-		Capabilities: s.Capabilities,
+		Capabilities: s.Capabilities, ServerVersion: resolveServerVersion(s.serverVersion),
 	}
 	digest := metadataDigest(payload)
 	s.metadataMu.Lock()

@@ -12,15 +12,19 @@ import (
 // WebSocketPoolOptions contains the single Server URL and identity shared by
 // every physical connection. Multiple server_urls are intentionally absent.
 type WebSocketPoolOptions struct {
-	ServerURL          string
-	Token              string
-	AgentID            string
-	NodeID             string
-	InstanceID         string
-	Epoch              int64
-	Collector          *MetadataCollector
-	Factory            ConnectionSessionFactory
-	WebSocket          WebSocketRunOptions
+	ServerURL  string
+	Token      string
+	AgentID    string
+	NodeID     string
+	InstanceID string
+	Epoch      int64
+	Collector  *MetadataCollector
+	Factory    ConnectionSessionFactory
+	WebSocket  WebSocketRunOptions
+	// OnReady is called each time the Server accepts a connection's metadata, with
+	// the Server version it announced ("" for a Server that does not announce one).
+	// A supervisor uses it as the proof that this Agent is connected and known.
+	OnReady            func(serverVersion string)
 	Dialer             *sharedtransport.Dialer
 	Min                int
 	Max                int
@@ -54,6 +58,7 @@ func RunConnectionPool(ctx context.Context, options WebSocketPoolOptions) error 
 						controller: controller, connectionID: connectionID,
 						session: session, inner: inner,
 						agentID: options.AgentID, configuredMax: options.Max,
+						onReady: options.OnReady,
 					}
 					if dispatcher, ok := inner.(*StreamDispatcher); ok {
 						handler.dispatcher = dispatcher
@@ -82,6 +87,8 @@ type connectionPoolHandler struct {
 	// ceilingWarned dedupes per distinct ceiling, because metadata acks repeat on
 	// every report and this is a configuration finding, not a runtime event.
 	ceilingWarned int
+	// onReady is WebSocketPoolOptions.OnReady.
+	onReady func(serverVersion string)
 }
 
 func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
@@ -89,6 +96,9 @@ func (h *connectionPoolHandler) Handle(frame protocol.Frame) error {
 		if ack, err := protocol.DecodeAgentMetadataAckPayload(frame.Payload); err == nil {
 			h.supported = ack.ConnectionPoolSupported
 			h.checkServerCeiling(ack.MaxConnectionsPerAgent)
+			if ack.Accepted && h.onReady != nil {
+				h.onReady(ack.ServerVersion)
+			}
 			if h.dispatcher != nil {
 				strictOpen := false
 				icmpEcho := false

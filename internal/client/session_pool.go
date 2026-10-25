@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -142,6 +143,35 @@ func (m *SessionPoolManager) ReadyCount(agentID string) int {
 	return pool.readyCount()
 }
 
+// ServerVersion is the Server version announced to any registered session, or ""
+// when no session has received one. Every session of one client talks to the same
+// Server, so the first non-empty answer is the answer.
+func (m *SessionPoolManager) ServerVersion() string {
+	m.mu.RLock()
+	pools := make([]*agentSessionPool, 0, len(m.pools))
+	for _, pool := range m.pools {
+		pools = append(pools, pool)
+	}
+	m.mu.RUnlock()
+	for _, pool := range pools {
+		if v := pool.serverVersion(); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (p *agentSessionPool) serverVersion() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, entry := range p.sessions {
+		if v := entry.session.ServerVersion(); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // AgentIDs returns every Agent the manager holds a pool for, sorted so callers that
 // render or diff the list see a stable order.
 func (m *SessionPoolManager) AgentIDs() []string {
@@ -166,12 +196,27 @@ type sessionPoolSlot struct {
 	cancel context.CancelFunc
 }
 
+// A session that has missed unhealthyAfterMissedPings consecutive heartbeats is
+// skipped when a stream is placed, and one that has missed evictAfterMissedPings
+// is closed so its slot reconnects. Both are counted in evaluation intervals, so
+// a single lost PONG never costs a healthy connection.
+const (
+	unhealthyAfterMissedPings = 2
+	evictAfterMissedPings     = 3
+)
+
 type pooledSession struct {
 	slotID  int
 	session *Session
 	active  int64
 	lastRTT atomic.Int64
+	// missedPings counts heartbeats in a row that got no PONG. A connection that
+	// died silently (NAT or proxy timeout, a host that vanished) never errors, so
+	// this is the only signal that it is gone.
+	missedPings atomic.Int32
 }
+
+func (s *pooledSession) healthy() bool { return s.missedPings.Load() < unhealthyAfterMissedPings }
 
 type agentSessionPool struct {
 	agentID string
@@ -260,8 +305,22 @@ func (p *agentSessionPool) sampleRTT(ctx context.Context) {
 		wg.Add(1)
 		go func(entry *pooledSession) {
 			defer wg.Done()
-			if rtt, err := entry.session.Ping(pingCtx); err == nil {
+			rtt, err := entry.session.Ping(pingCtx)
+			if err == nil {
 				entry.lastRTT.Store(rtt.Nanoseconds())
+				entry.missedPings.Store(0)
+				return
+			}
+			// Shutdown and an already-closed session are not a dead peer.
+			if ctx.Err() != nil || errors.Is(err, ErrSessionClosed) {
+				return
+			}
+			if missed := entry.missedPings.Add(1); missed >= evictAfterMissedPings {
+				slog.Warn("client session stopped answering heartbeats; closing it so the slot reconnects",
+					"agent_id", p.agentID, "slot", entry.slotID, "missed_pings", missed, "error", err)
+				// Closing ends Wait, which the slot's runner treats as a dropped
+				// connection and re-dials.
+				_ = entry.session.Close()
 			}
 		}(entry)
 	}
@@ -457,6 +516,12 @@ func (p *agentSessionPool) acquire(request StreamRequest) (*pooledSession, error
 	defer p.mu.Unlock()
 	var selected *pooledSession
 	for _, session := range p.sessions {
+		// A silently dead session looks idle (every stream on it fails, so its
+		// active count stays 0) and has no fresh RTT, which would make it the
+		// favourite for every new connection.
+		if !session.healthy() {
+			continue
+		}
 		if selected == nil || session.active < selected.active ||
 			(session.active == selected.active && session.lastRTT.Load() < selected.lastRTT.Load()) {
 			selected = session

@@ -40,7 +40,11 @@ COPY --from=go-build /out/tunnelmesh /usr/local/bin/tunnelmesh
 ENV TUNNELMESH_MODE=local \
     TUNNELMESH_STORAGE_DRIVER=sqlite \
     TUNNELMESH_STORAGE_SQLITE_PATH=/var/lib/tunnelmesh/tunnelmesh.db \
-    TUNNELMESH_STORAGE_AUTO_INIT=true
+    TUNNELMESH_STORAGE_AUTO_INIT=true \
+    TUNNELMESH_CLIENT_UPDATE_ENABLED=false \
+    TUNNELMESH_CLIENT_UPDATE_SUPERVISE=false \
+    TUNNELMESH_AGENT_UPDATE_ENABLED=false \
+    TUNNELMESH_AGENT_UPDATE_SUPERVISE=false
 
 VOLUME ["/var/lib/tunnelmesh"]
 EXPOSE 80 443

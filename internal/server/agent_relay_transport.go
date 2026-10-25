@@ -560,6 +560,13 @@ func (s *agentRelayStream) Read(buffer []byte) (int, error) {
 		}
 		select {
 		case <-s.dataSignal:
+		case <-s.controlSignal:
+			// The Agent's WINDOW_UPDATE is the Client's upload credit and is
+			// forwarded between Read calls. A target that sends nothing back
+			// (rz, scp, an HTTP POST body) would otherwise leave this Read
+			// parked forever, so the credit is never forwarded and the upload
+			// stalls after its first window.
+			return 0, nil
 		case <-s.done:
 		}
 	}

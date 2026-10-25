@@ -2,14 +2,11 @@
 package main
 
 import (
-	"context"
-	"log"
+	"os"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/cli"
 )
 
 func main() {
-	if err := cli.Execute(context.Background(), cli.NewClientRoot()); err != nil {
-		log.Fatal(err)
-	}
+	os.Exit(cli.Main(cli.NewClientRoot()))
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1872,5 +1873,149 @@ func TestValidateRejectsMalformedClientAgentID(t *testing.T) {
 		if err = config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "client agent ID") {
 			t.Fatalf("Validate(agent_id=%q) error = %v, want client agent ID problem", id, err)
 		}
+	}
+}
+
+func loadDefaults(t *testing.T) config.Config {
+	t.Helper()
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	return cfg
+}
+
+// Self-update and supervision are on unless an operator turns them off, so the
+// defaults are the feature's contract and are pinned whole.
+func TestLoadUpdateDefaults(t *testing.T) {
+	cfg := loadDefaults(t)
+	want := config.UpdateConfig{
+		Enabled: true, Supervise: true, Source: config.UpdateSourceGitHub,
+		CheckInterval: 6 * time.Hour, HealthTimeout: 120 * time.Second, StableWindow: 120 * time.Second,
+		BadVersionTTL: 24 * time.Hour, KeepVersions: 2,
+	}
+	if !reflect.DeepEqual(cfg.Client.Update, want) {
+		t.Fatalf("client.update = %+v, want %+v", cfg.Client.Update, want)
+	}
+	if !reflect.DeepEqual(cfg.Agent.Update, want) {
+		t.Fatalf("agent.update = %+v, want %+v", cfg.Agent.Update, want)
+	}
+}
+
+func TestLoadUpdateFileAndEnvironmentOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	contents := "client:\n  update:\n    enabled: false\n    supervise: false\n    github:\n      mirror_base_url: https://mirror.example/github\nagent:\n  update:\n    check_interval: 12h\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TUNNELMESH_AGENT_UPDATE_ENABLED", "false")
+	t.Setenv("TUNNELMESH_AGENT_UPDATE_SUPERVISE", "false")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	t.Setenv("TUNNELMESH_AGENT_UPDATE_STATE_DIR", stateDir)
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Client.Update.Enabled || cfg.Client.Update.Supervise || cfg.Client.Update.GitHub.MirrorBaseURL != "https://mirror.example/github" {
+		t.Fatalf("client.update from file = %+v", cfg.Client.Update)
+	}
+	if cfg.Agent.Update.Enabled || cfg.Agent.Update.Supervise || cfg.Agent.Update.StateDir != stateDir {
+		t.Fatalf("agent.update from environment = %+v", cfg.Agent.Update)
+	}
+	if cfg.Agent.Update.CheckInterval != 12*time.Hour {
+		t.Fatalf("agent.update.check_interval = %v, want 12h from the file", cfg.Agent.Update.CheckInterval)
+	}
+}
+
+func TestValidateUpdate(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*config.UpdateConfig)
+		want string // empty means valid
+	}{
+		{name: "defaults", edit: func(*config.UpdateConfig) {}},
+		{name: "everything off", edit: func(u *config.UpdateConfig) { u.Enabled, u.Supervise = false, false }},
+		{name: "supervision only", edit: func(u *config.UpdateConfig) { u.Enabled = false }},
+		{name: "upgrades without a supervisor", edit: func(u *config.UpdateConfig) { u.Supervise = false }, want: "update.enabled requires"},
+		{name: "unknown source", edit: func(u *config.UpdateConfig) { u.Source = "ftp" }, want: "update.source must be one of"},
+		{name: "check interval too short", edit: func(u *config.UpdateConfig) { u.CheckInterval = time.Minute }, want: "update.check_interval must be at least 5m"},
+		{name: "health timeout too short", edit: func(u *config.UpdateConfig) { u.HealthTimeout = time.Second }, want: "update.health_timeout must be between 10s and 30m"},
+		{name: "health timeout too long", edit: func(u *config.UpdateConfig) { u.HealthTimeout = time.Hour }, want: "update.health_timeout must be between 10s and 30m"},
+		{name: "stable window too long", edit: func(u *config.UpdateConfig) { u.StableWindow = time.Hour }, want: "update.stable_window must be between 0 and 30m"},
+		{name: "negative stable window", edit: func(u *config.UpdateConfig) { u.StableWindow = -time.Second }, want: "update.stable_window must be between 0 and 30m"},
+		{name: "keep no versions", edit: func(u *config.UpdateConfig) { u.KeepVersions = 0 }, want: "update.keep_versions must be at least 1"},
+		{name: "bad version ttl", edit: func(u *config.UpdateConfig) { u.BadVersionTTL = time.Second }, want: "update.bad_version_ttl must be at least 1m"},
+		{name: "relative state dir", edit: func(u *config.UpdateConfig) { u.StateDir = "relative/dir" }, want: "update.state_dir must be an absolute path"},
+		{name: "mirror with credentials", edit: func(u *config.UpdateConfig) { u.GitHub.MirrorBaseURL = "https://user:pw@mirror.example" }, want: "update.github.mirror_base_url must not contain credentials"},
+		{name: "mirror not http", edit: func(u *config.UpdateConfig) { u.GitHub.MirrorBaseURL = "ftp://mirror.example" }, want: "update.github.mirror_base_url must be an http or https URL"},
+		{name: "mirror is fine", edit: func(u *config.UpdateConfig) { u.GitHub.MirrorBaseURL = "https://mirror.example/github" }},
+	}
+	for _, role := range []string{"client", "agent"} {
+		for _, tc := range cases {
+			t.Run(role+"/"+tc.name, func(t *testing.T) {
+				cfg := loadDefaults(t)
+				if role == "client" {
+					tc.edit(&cfg.Client.Update)
+				} else {
+					tc.edit(&cfg.Agent.Update)
+				}
+				err := config.Validate(cfg)
+				if tc.want == "" {
+					if err != nil {
+						t.Fatalf("Validate() error = %v, want nil", err)
+					}
+					return
+				}
+				if err == nil || !strings.Contains(err.Error(), role+"."+tc.want) {
+					t.Fatalf("Validate() error = %v, want it to contain %q", err, role+"."+tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestValidateUpdateServerSourceNeedsServerURL(t *testing.T) {
+	cfg := loadDefaults(t)
+	cfg.Client.Update.Source = config.UpdateSourceServer
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "client.update.source=server requires client.server_url") {
+		t.Fatalf("Validate() error = %v, want a missing server_url problem", err)
+	}
+	cfg.Client.ServerURL = "wss://server.example/ws/client"
+	cfg.Client.AgentID = "agent-1"
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want nil once server_url is set", err)
+	}
+	cfg.Agent.Update.Source = config.UpdateSourceServer
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "agent.update.source=server requires agent.server_url") {
+		t.Fatalf("Validate() error = %v, want the agent variant", err)
+	}
+}
+
+// Distribution from the Server is opt-in: trust in the Server grows with it, so
+// clients keep using GitHub unless an operator turns it on.
+func TestServerUpdatesDirDefaultsToOffAndMustBeAbsolute(t *testing.T) {
+	cfg := loadDefaults(t)
+	if cfg.Server.Updates.Dir != "" {
+		t.Fatalf("server.updates.dir = %q, want it off by default", cfg.Server.Updates.Dir)
+	}
+	cfg.Server.Updates.Dir = "relative/releases"
+	if err := config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "server.updates.dir must be an absolute path") {
+		t.Fatalf("Validate() error = %v, want a relative directory rejected", err)
+	}
+	cfg.Server.Updates.Dir = filepath.Join(t.TempDir(), "releases")
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want an absolute directory accepted", err)
+	}
+}
+
+func TestServerUpdatesDirComesFromTheEnvironment(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "releases")
+	t.Setenv("TUNNELMESH_SERVER_UPDATES_DIR", dir)
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.Updates.Dir != dir {
+		t.Fatalf("server.updates.dir = %q, want %q from the environment", cfg.Server.Updates.Dir, dir)
 	}
 }
