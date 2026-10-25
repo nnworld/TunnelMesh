@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
@@ -87,6 +88,7 @@ type Runtime struct {
 	runErr    error
 	attempts  map[int]int
 	watcher   *ForwardServeWatcher
+	agentRole bool
 }
 
 // runtimeForward pairs one listener with the configuration it was built from, so
@@ -105,6 +107,7 @@ type runtimeForward struct {
 // from state the Runtime already owns, so reading it cannot perturb the run.
 type RuntimeStats struct {
 	Running   bool
+	AgentRole bool
 	StartedAt time.Time
 	Uptime    time.Duration
 	ServerURL string
@@ -140,14 +143,14 @@ type TunnelStatus struct {
 //
 // Construction is separated from Start so a malformed tunnel is reported before any
 // port is bound, and so the caller can hold a Runtime while it acquires other
-// resources. The precondition errors are the ones `client run` has always produced,
-// verbatim, because operators and scripts match on them.
+// resources. Existing CLI precondition errors remain stable; the Agent-only case
+// names both accepted runtime roles so its failure is actionable.
 func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOptions) (*Runtime, error) {
 	if strings.TrimSpace(cfg.Client.ServerURL) == "" || strings.TrimSpace(cfg.Client.Token) == "" {
 		return nil, errors.New("client run requires client.server_url and client.token")
 	}
-	if len(cfg.Client.Tunnels) == 0 {
-		return nil, errors.New("client run requires at least one client.tunnels entry")
+	if len(cfg.Client.Tunnels) == 0 && strings.TrimSpace(cfg.Client.AgentID) == "" {
+		return nil, errors.New("client run requires at least one client.tunnels or client.agent_id entry")
 	}
 	meta, err := RuntimeMetadata(ctx, cfg, opts.InstanceID, opts.ConfigPath)
 	if err != nil {
@@ -162,6 +165,7 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 		return nil, fmt.Errorf("configure client transport: %w", err)
 	}
 	r := &Runtime{cfg: cfg, opts: opts, attempts: make(map[int]int)}
+	r.agentRole = strings.TrimSpace(cfg.Client.AgentID) != ""
 	// The manager is assigned after r exists because the reconnect counter wraps the
 	// runner, and a struct literal cannot reference the value it is initializing.
 	r.manager = NewSessionPoolManager(SessionPoolManagerOptions{
@@ -267,7 +271,7 @@ func (r *Runtime) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		err := SuperviseRun(func() error { return r.manager.Run(runCtx) }, watcher)
+		err := SuperviseRun(func() error { return r.runRoles(runCtx) }, watcher)
 		cancel()
 		r.mu.Lock()
 		r.runErr = err
@@ -280,6 +284,59 @@ func (r *Runtime) Start(ctx context.Context) error {
 		close(done)
 	}()
 	return nil
+}
+
+func (r *Runtime) runRoles(ctx context.Context) error {
+	roleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	roles := 0
+	results := make(chan error, 2)
+	if len(r.forwards) > 0 {
+		roles++
+		go func() { results <- r.manager.Run(roleCtx) }()
+	}
+	if r.agentRole {
+		roles++
+		meta, err := RuntimeMetadata(roleCtx, r.cfg, r.opts.InstanceID, r.opts.ConfigPath)
+		if err != nil {
+			return err
+		}
+		dialer, err := sharedtransport.FromConfig(r.cfg.Client.Transport)
+		if err != nil {
+			return err
+		}
+		agentServerURL, err := AgentWebSocketURLFromClient(r.cfg.Client.ServerURL)
+		if err != nil {
+			return err
+		}
+		go func() {
+			results <- agent.RunConnectionPool(roleCtx, agent.WebSocketPoolOptions{
+				ServerURL: agentServerURL, Token: r.cfg.Client.Token,
+				AgentID: strings.TrimSpace(r.cfg.Client.AgentID), NodeID: meta.InstanceID,
+				InstanceID: meta.InstanceID, Epoch: 1,
+				Collector: agent.NewMetadataCollector(r.cfg.Client.Metadata),
+				Factory:   agent.NewStreamDispatcherFactory(r.cfg.Agent.Streams), Dialer: dialer,
+				Min: r.cfg.Client.Connections.Min, Max: r.cfg.Client.Connections.Max,
+				HighWatermark: r.cfg.Client.Connections.HighWatermark, LowWatermark: r.cfg.Client.Connections.LowWatermark,
+				EvaluationInterval: r.cfg.Client.Connections.EvaluationInterval, Cooldown: r.cfg.Client.Connections.Cooldown,
+			})
+		}()
+	}
+	if roles == 0 {
+		return errors.New("client: no runtime roles configured")
+	}
+	var firstErr error
+	for i := 0; i < roles; i++ {
+		err := <-results
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 // Wait blocks until the run finishes and returns the supervised error.
@@ -332,6 +389,7 @@ func (r *Runtime) Stats() RuntimeStats {
 
 	stats := RuntimeStats{
 		Running:   isRunning,
+		AgentRole: r.agentRole,
 		StartedAt: startedAt,
 		ServerURL: r.cfg.Client.ServerURL,
 	}
@@ -631,6 +689,11 @@ func RuntimeMetadata(ctx context.Context, cfg config.Config, instanceIDOverride,
 			Protocol:      strings.ToLower(strings.TrimSpace(tunnel.Protocol)),
 			ListenAddress: tunnel.ListenAddr, AgentID: agentID, Enabled: true,
 		})
+	}
+	if agentID := strings.TrimSpace(cfg.Client.AgentID); agentID != "" {
+		if _, exists := seenAgents[agentID]; !exists {
+			agentIDs = append(agentIDs, agentID)
+		}
 	}
 	info := build.Current()
 	return ClientMetadataOptions{

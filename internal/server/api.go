@@ -55,6 +55,7 @@ type API struct {
 	// namespace. It is nil until the runtime installs it, because the management
 	// console credential (api_tokens) cannot validate a tunnel token.
 	clientTokens        ClientTokenValidator
+	agentTokens         ClientTokenValidator
 	remoteServerService *RemoteServerService
 	websshService       *WebSSHSessionService
 	websshCloser        WebSSHConnectionCloseService
@@ -365,6 +366,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// a session. Everything else under /auth/ falls through to the authenticated
 	// dispatch below.
 	if a.handlePublicAuth(w, r, path) {
+		return
+	}
+	if a.handleAgentScoped(w, r, path) {
 		return
 	}
 	// A Client calls with a service token, not a console session, so its namespace

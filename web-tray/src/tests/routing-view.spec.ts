@@ -43,6 +43,24 @@ describe('routing tab', () => {
     wrapper.unmount()
   })
 
+  it('renders and submits the optional Client Agent role', async () => {
+    const tray = installFakeTray({
+      'PUT /api/routing': () => fixtures.saveResult({ routing: fixtures.routing({ agentId: 'office-client-agent' }) }),
+    })
+    const { wrapper } = mountView(RoutingView, {
+      prepare: () => seed({ agentId: 'office-client-agent' }),
+    })
+    const field = wrapper.find('[data-test="client-agent-id"]')
+    expect(field.exists()).toBe(true)
+    expect((field.element as HTMLInputElement).value).toBe('office-client-agent')
+    await click(wrapper, '[data-test="save-routing"]')
+    const writes = tray.calls.filter((call) => call.path === '/api/routing')
+    expect(writes).toHaveLength(1)
+    expect((writes[0].body as { agentId: string }).agentId).toBe('office-client-agent')
+    tray.restore()
+    wrapper.unmount()
+  })
+
   it('offers every protocol the runtime supports', () => {
     const tray = installFakeTray()
     const { wrapper } = mountView(RoutingView, { prepare: () => seed() })

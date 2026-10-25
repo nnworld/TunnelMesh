@@ -33,8 +33,28 @@ func HTTPURLFromWebSocket(serverURL, path string) (string, error) {
 	return parsed.String(), nil
 }
 
+// AgentWebSocketURLFromClient rewrites the configured client WebSocket endpoint
+// to the sibling Agent endpoint used by an embedded Client Agent role.
+func AgentWebSocketURLFromClient(serverURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil || (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" {
+		return "", fmt.Errorf("client server URL must be an absolute ws:// or wss:// URL")
+	}
+	if strings.HasSuffix(parsed.Path, "/ws/client") {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/ws/client") + "/ws/agent"
+	} else {
+		parsed.Path = "/ws/agent"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
 // HealthReadyPath is the readiness endpoint both the CLI doctor and the tray check.
 const HealthReadyPath = "/health/ready"
 
 // ClientAgentsPath is the client-scoped Agent listing a client token may call.
 const ClientAgentsPath = "/api/v1/client/agents"
+
+// AgentSelfPath returns the identity bound to an Agent service token.
+const AgentSelfPath = "/api/v1/agent/self"

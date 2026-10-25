@@ -196,8 +196,10 @@ func (v *Validator) Validate(ctx context.Context, settings ClientSettings) Valid
 		}
 	}
 
-	if len(settings.Tunnels) == 0 {
-		add(CheckTunnelsPresent, StatusFailed, "at least one client.tunnels entry is required")
+	if len(settings.Tunnels) == 0 && strings.TrimSpace(settings.AgentID) == "" {
+		add(CheckTunnelsPresent, StatusFailed, "at least one client.tunnels entry or client.agent_id is required")
+	} else if len(settings.Tunnels) == 0 {
+		add(CheckTunnelsPresent, StatusPassed, "Agent-only client mode")
 	} else {
 		add(CheckTunnelsPresent, StatusPassed, fmt.Sprintf("%d tunnel(s) configured", len(settings.Tunnels)))
 	}

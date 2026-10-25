@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -330,8 +331,21 @@ func serverHealthURL(serverURL string) (string, error) {
 func agentCommands(opts *rootOptions) []*cobra.Command {
 	return []*cobra.Command{
 		configCommand(opts, "run", "start the TunnelMesh agent", func(cmd *cobra.Command, cfg config.Config) error {
-			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" || strings.TrimSpace(cfg.Agent.ID) == "" {
-				return fmt.Errorf("agent run requires agent.server_url, agent.token, and agent.id")
+			if strings.TrimSpace(cfg.Agent.ServerURL) == "" || strings.TrimSpace(cfg.Agent.Token) == "" {
+				return fmt.Errorf("agent run requires agent.server_url and agent.token")
+			}
+			if strings.TrimSpace(cfg.Agent.ID) == "" {
+				id, err := fetchBoundAgentID(cmd.Context(), cfg.Agent.ServerURL, cfg.Agent.Token)
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(opts.configFile) == "" {
+					return errors.New("agent.id is missing and --config is required to persist the token-bound Agent ID")
+				}
+				if err := config.InitializeAgentID(opts.configFile, id); err != nil {
+					return fmt.Errorf("persist agent.id: %w", err)
+				}
+				cfg.Agent.ID = id
 			}
 			nodeID := cfg.Node.ID
 			if strings.TrimSpace(nodeID) == "" {
@@ -378,6 +392,38 @@ func agentCommands(opts *rootOptions) []*cobra.Command {
 			return nil
 		}),
 	}
+}
+
+func fetchBoundAgentID(ctx context.Context, serverURL, token string) (string, error) {
+	endpoint, err := client.HTTPURLFromWebSocket(serverURL, client.AgentSelfPath)
+	if err != nil {
+		return "", err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return "", fmt.Errorf("resolve agent.id from server: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("resolve agent.id from server: unexpected status %d", response.StatusCode)
+	}
+	var envelope struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return "", fmt.Errorf("decode agent identity: %w", err)
+	}
+	if strings.TrimSpace(envelope.Data.ID) == "" {
+		return "", errors.New("resolve agent.id from server: response did not contain an Agent ID")
+	}
+	return strings.TrimSpace(envelope.Data.ID), nil
 }
 
 // agentEchoOpener is a variable so a test can reproduce the permission failure a

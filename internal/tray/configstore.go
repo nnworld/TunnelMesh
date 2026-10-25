@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
 	"gopkg.in/yaml.v3"
@@ -19,6 +20,7 @@ import (
 type ClientSettings struct {
 	Mode      string
 	ServerURL string
+	AgentID   string
 	Token     string
 	Tunnels   []config.TunnelConfig
 }
@@ -63,6 +65,7 @@ type documentYAML struct {
 	Mode   string `yaml:"mode"`
 	Client struct {
 		ServerURL string       `yaml:"server_url"`
+		AgentID   string       `yaml:"agent_id"`
 		Token     string       `yaml:"token"`
 		Tunnels   []tunnelYAML `yaml:"tunnels"`
 	} `yaml:"client"`
@@ -91,6 +94,7 @@ func (s *ConfigStore) Load() (ClientSettings, error) {
 		settings.Mode = config.ModeLocal
 	}
 	settings.ServerURL = document.Client.ServerURL
+	settings.AgentID = document.Client.AgentID
 	settings.Token = document.Client.Token
 	for _, tunnel := range document.Client.Tunnels {
 		settings.Tunnels = append(settings.Tunnels, config.TunnelConfig{
@@ -126,6 +130,9 @@ func (s *ConfigStore) Save(settings ClientSettings) error {
 	}
 	clientNode := ensureMappingNode(mapping, "client")
 	if err := setNodeValue(clientNode, "server_url", settings.ServerURL); err != nil {
+		return err
+	}
+	if err := setNodeValue(clientNode, "agent_id", settings.AgentID); err != nil {
 		return err
 	}
 	if err := setNodeValue(clientNode, "token", settings.Token); err != nil {
@@ -243,7 +250,14 @@ func (s *ConfigStore) LoadConfig(ctx context.Context) (config.Config, error) {
 	if !s.Exists() {
 		return config.Config{}, fmt.Errorf("client configuration %s does not exist", s.path)
 	}
-	return config.Load(ctx, config.ConfigOptions{ConfigFile: s.path})
+	cfg, err := config.Load(ctx, config.ConfigOptions{ConfigFile: s.path})
+	if err != nil {
+		return config.Config{}, err
+	}
+	if strings.TrimSpace(cfg.Client.ServerURL) != "" && strings.TrimSpace(cfg.Client.Token) != "" && len(cfg.Client.Tunnels) == 0 && strings.TrimSpace(cfg.Client.AgentID) == "" {
+		return config.Config{}, errors.New("client requires at least one client.tunnels entry or client.agent_id")
+	}
+	return cfg, nil
 }
 
 // loadDocument returns the document to marshal and the root mapping to edit, or a
@@ -368,9 +382,13 @@ func (s *ConfigStore) BuildConfig(ctx context.Context, settings ClientSettings) 
 	opts := config.ConfigOptions{Overrides: map[string]any{
 		"mode":              mode,
 		"client.server_url": settings.ServerURL,
+		"client.agent_id":   settings.AgentID,
 		"client.token":      settings.Token,
 		"client.tunnels":    settings.Tunnels,
 	}}
+	if strings.TrimSpace(settings.ServerURL) != "" && strings.TrimSpace(settings.Token) != "" && len(settings.Tunnels) == 0 && strings.TrimSpace(settings.AgentID) == "" {
+		return config.Config{}, errors.New("client requires at least one client.tunnels entry or client.agent_id")
+	}
 	// The stored file is the base so pool tuning and stream buffers the tray does not
 	// edit still take part in validation.
 	if s.Exists() {

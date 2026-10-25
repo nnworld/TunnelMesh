@@ -837,6 +837,46 @@ func TestInitializeNodeIDKeepsExplicitConfigIdentity(t *testing.T) {
 	}
 }
 
+func TestLoadClientAgentIDAndInitializeAgentID(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.yaml")
+	contents := "# preserve this comment\nmode: local\nclient:\n  server_url: wss://server.example/ws/client\n  agent_id: client-agent-config\n  token: client-secret\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.InitializeAgentID(configPath, "client-agent-1"); err != nil {
+		t.Fatalf("InitializeAgentID() error = %v", err)
+	}
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: configPath})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Client.AgentID != "client-agent-config" {
+		t.Fatalf("client.agent_id = %q, want client-agent-config", cfg.Client.AgentID)
+	}
+	if cfg.Agent.ID != "client-agent-1" {
+		t.Fatalf("agent.id = %q, want client-agent-1", cfg.Agent.ID)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "# preserve this comment") || !strings.Contains(string(data), "id: client-agent-1") {
+		t.Fatalf("InitializeAgentID() changed YAML unexpectedly: %s", data)
+	}
+	if info, err := os.Stat(configPath); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %o, want 600", info.Mode().Perm())
+	}
+	if err := config.InitializeAgentID(configPath, "client-agent-1"); err != nil {
+		t.Fatalf("InitializeAgentID() should be idempotent: %v", err)
+	}
+	if err := config.InitializeAgentID(configPath, "different-agent"); err == nil || !strings.Contains(err.Error(), "does not match token-bound Agent") {
+		t.Fatalf("mismatched agent ID error = %v", err)
+	}
+}
+
 func TestLoadPersistsGeneratedNodeIDOnlyWhenRequested(t *testing.T) {
 	writeConfig := func(t *testing.T) string {
 		t.Helper()

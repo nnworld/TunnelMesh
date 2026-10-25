@@ -246,6 +246,11 @@ watch(
         <p class="tm-hint">{{ t('routing.token.hint') }}</p>
       </el-form-item>
 
+      <el-form-item :label="t('routing.agentId.label')">
+        <el-input v-model="routing.agentId" :placeholder="t('routing.agentId.placeholder')" data-test="client-agent-id" v-bind="technicalInput" />
+        <p class="tm-hint">{{ t('routing.agentId.hint') }}</p>
+      </el-form-item>
+
       <el-form-item :label="t('routing.tunnels.label')">
         <p v-if="!routing.tunnels.length" class="tm-hint" data-test="tunnels-empty">
           {{ t('routing.tunnels.empty') }}

@@ -920,13 +920,27 @@ func TestAgentTokenAuthenticationBoundaries(t *testing.T) {
 	}{
 		{name: "missing token", agentID: "agent-token-valid"},
 		{name: "management token", token: management.Token, agentID: "agent-token-valid"},
-		{name: "client token", token: clientToken.Secret, agentID: "agent-token-valid"},
 		{name: "wrong agent binding", token: other.Secret, agentID: "agent-token-valid"},
 		{name: "disabled agent", token: disabled.Secret, agentID: "agent-token-disabled"},
 		{name: "revoked token", token: revoked.Secret, agentID: "agent-token-revoked"},
 		{name: "expired token", token: expired.Secret, agentID: "agent-token-expired"},
 		{name: "query token", agentID: "agent-token-valid", queryToken: valid.Secret},
 		{name: "cookie token", agentID: "agent-token-valid", cookie: "token=" + valid.Secret},
+	}
+	if !agentWebSocketAccepted(t, listener.Addr().String(), clientToken.Secret, "agent-token-client", 99, "", "") {
+		t.Fatal("client token should auto-register and authenticate its configured Agent role")
+	}
+	createdClientAgent, err := db.Agents().Get(ctx, "agent-token-client")
+	if err != nil || createdClientAgent.OwnerUserID != owner.ID || !createdClientAgent.Enabled {
+		t.Fatalf("auto-registered Agent = %+v, err = %v", createdClientAgent, err)
+	}
+	select {
+	case registration := <-registrations:
+		if registration.TokenID != clientToken.TokenID || registration.AgentID != "agent-token-client" {
+			t.Fatalf("client registration = %+v", registration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client Agent registration was not observed")
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -972,10 +986,6 @@ func TestAgentInvalidCredentialRejectedBeforeUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientToken, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeClient, OwnerUserID: owner.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
 	revokedToken, err := credentials.Create(ctx, auth.CreateTokenInput{Type: storage.TokenTypeAgent, OwnerUserID: owner.ID, AgentID: "preupgrade-agent"})
 	if err != nil {
 		t.Fatal(err)
@@ -1009,7 +1019,6 @@ func TestAgentInvalidCredentialRejectedBeforeUpgrade(t *testing.T) {
 		token string
 	}{
 		{name: "arbitrary token", token: "not-a-valid-token"},
-		{name: "client token", token: clientToken.Secret},
 		{name: "revoked Agent token", token: revokedToken.Secret},
 		{name: "management token with legacy disabled", token: management.Token},
 	} {

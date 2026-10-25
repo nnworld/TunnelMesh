@@ -448,6 +448,7 @@ func (v TunnelView) toConfig() config.TunnelConfig {
 type RoutingView struct {
 	Mode         string       `json:"mode"`
 	ServerURL    string       `json:"serverUrl"`
+	AgentID      string       `json:"agentId"`
 	TokenPresent bool         `json:"tokenPresent"`
 	Tunnels      []TunnelView `json:"tunnels"`
 	ConfigPath   string       `json:"configPath"`
@@ -459,6 +460,7 @@ type RoutingView struct {
 type RoutingUpdate struct {
 	Mode      string `json:"mode"`
 	ServerURL string `json:"serverUrl"`
+	AgentID   string `json:"agentId"`
 	// Token is tri-state: absent keeps the stored value, an empty string clears it and
 	// any other value replaces it. A pointer is the only encoding that can tell "the
 	// form never showed the secret" apart from "the operator deleted it".
@@ -485,6 +487,7 @@ func (a *App) Routing(ctx context.Context) (RoutingView, error) {
 	return RoutingView{
 		Mode:         settings.Mode,
 		ServerURL:    settings.ServerURL,
+		AgentID:      settings.AgentID,
 		TokenPresent: strings.TrimSpace(settings.Token) != "",
 		Tunnels:      tunnelViews(settings.Tunnels),
 		ConfigPath:   paths.ClientYAML,
@@ -567,6 +570,7 @@ func (a *App) candidateSettings(update RoutingUpdate) (ClientSettings, error) {
 	return ClientSettings{
 		Mode:      mode,
 		ServerURL: strings.TrimSpace(update.ServerURL),
+		AgentID:   strings.TrimSpace(update.AgentID),
 		Token:     token,
 		Tunnels:   tunnels,
 	}, nil
@@ -686,6 +690,7 @@ type StatTotals struct {
 // StatsView is the statistics tab.
 type StatsView struct {
 	Running         bool         `json:"running"`
+	AgentRole       bool         `json:"agentRole"`
 	StartedAt       time.Time    `json:"startedAt,omitempty"`
 	UptimeSeconds   int64        `json:"uptimeSeconds"`
 	ServerURL       string       `json:"serverUrl,omitempty"`
@@ -716,6 +721,7 @@ func (a *App) Stats(ctx context.Context) StatsView {
 	if rt != nil {
 		stats := rt.Stats()
 		view.Running = stats.Running
+		view.AgentRole = stats.AgentRole
 		view.StartedAt = stats.StartedAt
 		view.UptimeSeconds = int64(stats.Uptime.Seconds())
 		view.ServerURL = stats.ServerURL

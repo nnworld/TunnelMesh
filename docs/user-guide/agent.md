@@ -12,6 +12,10 @@ agent:
 # token is injected through the environment/Secret manager, not committed here
 ```
 
+`agent.id` 可以省略。运行 `tunnelmesh-agent run` 时，客户端会使用现有的 `agent.token` 调用
+`GET /api/v1/agent/self`，读取该 token 已绑定的 Agent ID，并以原子方式回写到配置文件；不会随机生成
+Agent，也不会创建新的 Agent。若文件中已有 `agent.id`，服务端返回的绑定 ID 必须一致，否则启动失败。
+
 也可以使用环境变量：
 
 ```bash

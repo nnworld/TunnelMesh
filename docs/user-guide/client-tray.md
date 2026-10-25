@@ -145,12 +145,13 @@ Windows 托盘默认把配置和 instance ID 放在当前用户的 `%LOCALAPPDAT
 
 ## 5. 路由配置
 
-对应 `client.yaml` 的 `client.server_url`、`client.token` 与 `client.tunnels`。
+对应 `client.yaml` 的 `client.server_url`、`client.token`、`client.agent_id` 与 `client.tunnels`。
 
 | 字段 | 对应配置 | 说明 |
 | --- | --- | --- |
 | 服务地址 | `client.server_url` | Server 的 `wss://` 地址 |
 | 授权 Token | `client.token` | **只写不读**：界面永远只显示“已配置/未配置”，不回显明文 |
+| Client Agent ID | `client.agent_id` | 可选。填写后 Client 同时作为 Agent，复用当前 client token；首次连接时缺失的 Agent 会按该 ID 自动创建。留空则仅运行 client 隧道 |
 | 隧道列表 | `client.tunnels` | 卡片式增删，条目之间用横杠分隔 |
 
 每条隧道：
@@ -183,6 +184,10 @@ Agent 下拉通过服务端新增的
 [`GET /api/v1/client/agents`](../api/openapi.yaml) 拉取，用的是**当前这份 client token**，
 因此只会列出这个 token 有权访问、且处于启用状态的 Agent，并带上 `online` 标记。接口不返回
 能力、metadata 或归属信息，只够渲染一个选择器。
+
+如果填写了尚未存在的 `client.agent_id`，不需要先离开托盘创建 Agent；保存后启动 Client，Server 会按
+client token 的属主和 scope 校验并幂等注册它。若 token scope 明确限制了 Agent，则 `client.agent_id` 必须在
+`scope.agentIds` 中。
 
 打开“路由配置”时，只要配置里已有 `server_url` 与 token，列表就**自动拉取一次**（每个窗口一次，
 不会因为你正在编辑地址而反复请求）；要重新拉一次点“从服务端拉取 Agent”。Agent 选择框下面那一行

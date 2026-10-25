@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -186,6 +187,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	// WebSocket handshake does, so it reuses this instance instead of building a
 	// second validator with its own background worker.
 	runtime.API.SetClientTokenValidator(credentialService)
+	runtime.API.SetAgentTokenValidator(credentialService)
 	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
 	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID, vpnNodePublicKey(runtimeConfig.VPN))
@@ -887,6 +889,9 @@ func (r *ServerRuntime) preauthenticateAgentConnection(ctx context.Context, raw 
 	if err == nil {
 		return agentConnectionAuthentication{Identity: identity}, nil
 	}
+	if clientIdentity, clientErr := r.Credentials.ValidateAs(ctx, raw, storage.TokenTypeClient); clientErr == nil {
+		return agentConnectionAuthentication{Identity: clientIdentity, Client: true}, nil
+	}
 	// Deprecated: management connection tokens are removed in v0.3.0. This
 	// migration path is disabled unless explicitly enabled in configuration.
 	if !r.config.Security.AllowLegacyConnectionTokens {
@@ -911,6 +916,30 @@ func (r *ServerRuntime) authenticateAgentConnection(ctx context.Context, authent
 		}
 	}()
 	if !authentication.Legacy {
+		if authentication.Client {
+			agentID = strings.TrimSpace(agentID)
+			if agentID == "" || (len(authentication.Identity.Scope.AgentIDs) > 0 && !containsString(authentication.Identity.Scope.AgentIDs, agentID)) {
+				return "", auth.ErrForbidden
+			}
+			existing, err := r.DB.Agents().Get(ctx, agentID)
+			if errors.Is(err, sql.ErrNoRows) {
+				created := false
+				existing = storage.Agent{ID: agentID, Name: agentID, OwnerUserID: authentication.Identity.OwnerUserID, Enabled: true}
+				if createErr := r.DB.Agents().Create(ctx, existing); createErr != nil {
+					existing, err = r.DB.Agents().Get(ctx, agentID)
+				} else {
+					err = nil
+					created = true
+				}
+				if created {
+					_ = r.DB.Audits().Create(ctx, storage.AuditLog{ActorUserID: authentication.Identity.OwnerUserID, Action: "agent.auto_registered", ResourceType: "agent", ResourceID: agentID, Details: `{"source":"client"}`})
+				}
+			}
+			if err != nil || existing.OwnerUserID != authentication.Identity.OwnerUserID || !existing.Enabled {
+				return "", auth.ErrForbidden
+			}
+			return authentication.Identity.TokenID, nil
+		}
 		if authentication.Identity.TokenID == "" || authentication.Identity.AgentID != agentID {
 			return "", auth.ErrUnauthenticated
 		}
@@ -931,6 +960,15 @@ func (r *ServerRuntime) authenticateAgentConnection(ctx context.Context, authent
 	}
 	slog.WarnContext(ctx, "deprecated_connection_token", "agent_id", agentID, "user_id", authentication.Principal.UserID, "removal_version", "v0.3.0")
 	return "", nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Serve binds a TCP listener on addr and blocks until ctx cancellation or a

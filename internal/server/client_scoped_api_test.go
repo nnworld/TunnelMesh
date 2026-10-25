@@ -33,6 +33,7 @@ func newClientScopedFixture(t *testing.T) *clientScopedFixture {
 	credentials := auth.NewCredentialService(api.DB)
 	t.Cleanup(func() { _ = credentials.Close() })
 	api.SetClientTokenValidator(credentials)
+	api.SetAgentTokenValidator(credentials)
 
 	service := auth.NewAuthService(api.DB)
 	other, err := service.CreateUser(ctx, "client-scoped.other", "other-password-12", "user")
@@ -79,6 +80,32 @@ func newClientScopedFixture(t *testing.T) *clientScopedFixture {
 			Type: storage.TokenTypeAgent, OwnerUserID: owner.ID, AgentID: "csa-agent-online",
 		}),
 		consoleToken: apiToken(t, api, owner.Username, "alice-pass"),
+	}
+}
+
+func TestAgentSelfReturnsIdentityOnlyForAgentToken(t *testing.T) {
+	fixture := newClientScopedFixture(t)
+	response := apiJSON(t, fixture.api.Handler(), http.MethodGet, "/api/v1/agent/self", fixture.agentToken, "", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Data["id"] != "csa-agent-online" || envelope.Data["name"] != "online" {
+		t.Fatalf("identity = %+v", envelope.Data)
+	}
+	if len(envelope.Data) != 2 {
+		t.Fatalf("identity leaked fields: %+v", envelope.Data)
+	}
+	for name, token := range map[string]string{"client": fixture.ownerToken, "console": fixture.consoleToken} {
+		response := apiJSON(t, fixture.api.Handler(), http.MethodGet, "/api/v1/agent/self", token, "", nil)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("%s token status = %d, want 401", name, response.Code)
+		}
 	}
 }
 

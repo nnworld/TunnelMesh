@@ -40,6 +40,18 @@ describe('statistics tab', () => {
     wrapper.unmount()
   })
 
+  it('shows when the client is also hosting an Agent role', () => {
+    const tray = installFakeTray()
+    const { wrapper } = mountView(StatsView, {
+      locale: 'en-US',
+      prepare: () => seed(fixtures.stats({ agentRole: true })),
+    })
+    expect(wrapper.text()).toContain('Embedded Agent')
+    expect(wrapper.find('[data-test="agent-role"]').text()).toContain('Enabled')
+    tray.restore()
+    wrapper.unmount()
+  })
+
   it('explains a contested lock rather than only showing "stopped"', () => {
     const tray = installFakeTray()
     const { wrapper } = mountView(StatsView, {
