@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -89,6 +90,9 @@ type Runtime struct {
 	attempts  map[int]int
 	watcher   *ForwardServeWatcher
 	agentRole bool
+	// agentPool is built in NewRuntimeFromConfig so a bad Agent endpoint or transport
+	// fails before any listener binds, not after the tunnel role is already running.
+	agentPool *agent.WebSocketPoolOptions
 }
 
 // runtimeForward pairs one listener with the configuration it was built from, so
@@ -165,7 +169,23 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 		return nil, fmt.Errorf("configure client transport: %w", err)
 	}
 	r := &Runtime{cfg: cfg, opts: opts, attempts: make(map[int]int)}
-	r.agentRole = strings.TrimSpace(cfg.Client.AgentID) != ""
+	if agentID := strings.TrimSpace(cfg.Client.AgentID); agentID != "" {
+		agentServerURL, err := AgentWebSocketURLFromClient(cfg.Client.ServerURL)
+		if err != nil {
+			return nil, err
+		}
+		r.agentRole = true
+		r.agentPool = &agent.WebSocketPoolOptions{
+			ServerURL: agentServerURL, Token: cfg.Client.Token,
+			AgentID: agentID, NodeID: meta.InstanceID,
+			InstanceID: meta.InstanceID, Epoch: 1,
+			Collector: agent.NewMetadataCollector(cfg.Client.Metadata),
+			Factory:   agent.NewStreamDispatcherFactory(cfg.Agent.Streams, nil), Dialer: dialer,
+			Min: cfg.Client.Connections.Min, Max: cfg.Client.Connections.Max,
+			HighWatermark: cfg.Client.Connections.HighWatermark, LowWatermark: cfg.Client.Connections.LowWatermark,
+			EvaluationInterval: cfg.Client.Connections.EvaluationInterval, Cooldown: cfg.Client.Connections.Cooldown,
+		}
+	}
 	// The manager is assigned after r exists because the reconnect counter wraps the
 	// runner, and a struct literal cannot reference the value it is initializing.
 	r.manager = NewSessionPoolManager(SessionPoolManagerOptions{
@@ -295,31 +315,19 @@ func (r *Runtime) runRoles(ctx context.Context) error {
 		roles++
 		go func() { results <- r.manager.Run(roleCtx) }()
 	}
-	if r.agentRole {
+	if r.agentPool != nil {
 		roles++
-		meta, err := RuntimeMetadata(roleCtx, r.cfg, r.opts.InstanceID, r.opts.ConfigPath)
-		if err != nil {
-			return err
-		}
-		dialer, err := sharedtransport.FromConfig(r.cfg.Client.Transport)
-		if err != nil {
-			return err
-		}
-		agentServerURL, err := AgentWebSocketURLFromClient(r.cfg.Client.ServerURL)
-		if err != nil {
-			return err
-		}
+		tunnelsRunning := len(r.forwards) > 0
 		go func() {
-			results <- agent.RunConnectionPool(roleCtx, agent.WebSocketPoolOptions{
-				ServerURL: agentServerURL, Token: r.cfg.Client.Token,
-				AgentID: strings.TrimSpace(r.cfg.Client.AgentID), NodeID: meta.InstanceID,
-				InstanceID: meta.InstanceID, Epoch: 1,
-				Collector: agent.NewMetadataCollector(r.cfg.Client.Metadata),
-				Factory:   agent.NewStreamDispatcherFactory(r.cfg.Agent.Streams), Dialer: dialer,
-				Min: r.cfg.Client.Connections.Min, Max: r.cfg.Client.Connections.Max,
-				HighWatermark: r.cfg.Client.Connections.HighWatermark, LowWatermark: r.cfg.Client.Connections.LowWatermark,
-				EvaluationInterval: r.cfg.Client.Connections.EvaluationInterval, Cooldown: r.cfg.Client.Connections.Cooldown,
-			})
+			err := agent.RunConnectionPool(roleCtx, *r.agentPool)
+			// The Agent role is an add-on to working tunnels: a bad Agent token or a
+			// refused agent_id must not tear down forwards that are serving traffic.
+			// Standalone (no tunnels) it is the whole job, so its error is returned.
+			if err != nil && tunnelsRunning && !isContextErr(err) {
+				slog.Error("embedded agent role stopped; tunnels keep running", "agent_id", r.agentPool.AgentID, "error", err)
+				err = nil
+			}
+			results <- err
 		}()
 	}
 	if roles == 0 {
@@ -328,7 +336,7 @@ func (r *Runtime) runRoles(ctx context.Context) error {
 	var firstErr error
 	for i := 0; i < roles; i++ {
 		err := <-results
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && firstErr == nil {
+		if err != nil && !isContextErr(err) && firstErr == nil {
 			firstErr = err
 			cancel()
 		}
@@ -337,6 +345,10 @@ func (r *Runtime) runRoles(ctx context.Context) error {
 		return firstErr
 	}
 	return ctx.Err()
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Wait blocks until the run finishes and returns the supervised error.

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -45,6 +46,9 @@ func (a *API) handleAgentScoped(w http.ResponseWriter, r *http.Request, path str
 		return true
 	}
 	if !agent.Enabled || agent.OwnerUserID != identity.OwnerUserID {
+		// The response stays generic so a token holder cannot probe other owners'
+		// Agents; the reason is logged for the operator.
+		slog.Warn("agent self lookup refused", "agent_id", agent.ID, "enabled", agent.Enabled, "owner_match", agent.OwnerUserID == identity.OwnerUserID)
 		writeAPIError(w, http.StatusForbidden, "agent is unavailable")
 		return true
 	}

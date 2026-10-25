@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1832,5 +1833,44 @@ func TestServerMetricsTokenPolicy(t *testing.T) {
 	}
 	if fromEnv.Server.Metrics.Token != "env-token-value-long-enough" {
 		t.Fatalf("token = %q, want the environment value", fromEnv.Server.Metrics.Token)
+	}
+}
+
+func TestInitializeAgentIDConcurrentCallsKeepConfigValid(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(configPath, []byte("mode: local\nagent:\n  server_url: wss://server.example/ws/agent\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Same ID from every caller: the write is idempotent and must never
+			// leave a truncated file behind.
+			_ = config.InitializeAgentID(configPath, "agent-1")
+		}()
+	}
+	wg.Wait()
+	cfg, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: configPath})
+	if err != nil {
+		t.Fatalf("Load() after concurrent InitializeAgentID error = %v", err)
+	}
+	if cfg.Agent.ID != "agent-1" {
+		t.Fatalf("agent.id = %q, want agent-1", cfg.Agent.ID)
+	}
+}
+
+func TestValidateRejectsMalformedClientAgentID(t *testing.T) {
+	for _, id := range []string{"has space", "tab\tid", "ctl\x01id", strings.Repeat("a", 129)} {
+		cfg, err := config.Load(context.Background(), config.ConfigOptions{})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		cfg.Client.ServerURL = "wss://server.example/ws/client"
+		cfg.Client.AgentID = id
+		if err = config.Validate(cfg); err == nil || !strings.Contains(err.Error(), "client agent ID") {
+			t.Fatalf("Validate(agent_id=%q) error = %v, want client agent ID problem", id, err)
+		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/viper"
 	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
@@ -876,8 +877,8 @@ func Validate(cfg Config) error {
 	if cfg.Client.ServerURL != "" && insecureWebSocketDisallowed(cfg.Client.ServerURL, cfg.Client.Transport.AllowInsecureTransport) {
 		problems = append(problems, "client server URL must use wss:// unless allow_insecure_transport is enabled")
 	}
-	if strings.TrimSpace(cfg.Client.AgentID) != "" && strings.ContainsAny(cfg.Client.AgentID, " \t\r\n") {
-		problems = append(problems, "client agent ID must not contain whitespace")
+	if problem := validateClientAgentID(cfg.Client.AgentID); problem != "" {
+		problems = append(problems, problem)
 	}
 	switch cfg.Mode {
 	case ModeLocal:
@@ -1587,6 +1588,27 @@ func InitializeNodeID(configPath, nodeIDPath string) (string, error) {
 		return "", err
 	}
 	return id, nil
+}
+
+// maxClientAgentIDLen bounds the ID that is sent to the server and may be
+// auto-registered there, so a typo or hostile config cannot create oversized rows.
+const maxClientAgentIDLen = 128
+
+// validateClientAgentID rejects whitespace, control characters and oversize IDs.
+// It stays permissive otherwise because existing Agent IDs are not format-bound.
+func validateClientAgentID(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return ""
+	}
+	if len(id) > maxClientAgentIDLen {
+		return fmt.Sprintf("client agent ID must be at most %d bytes", maxClientAgentIDLen)
+	}
+	for _, r := range id {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "client agent ID must not contain whitespace or control characters"
+		}
+	}
+	return ""
 }
 
 // InitializeAgentID reads the already-bound Agent identity from the caller and

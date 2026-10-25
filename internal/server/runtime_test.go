@@ -1571,3 +1571,43 @@ func frameBytes(t *testing.T, typ protocol.FrameType, payload []byte) []byte {
 	}
 	return frame.Bytes()
 }
+
+func TestAutoRegisterAgentEnforcesOwnerQuota(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.OpenSQLite(ctx, "file:runtime-auto-register-quota?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.NewAuthService(db)
+	owner, err := authService.CreateUser(ctx, "quota-owner", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := authService.CreateUser(ctx, "quota-other", "owner-pass", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const limit = 2
+	for _, id := range []string{"quota-a", "quota-b"} {
+		if _, err := autoRegisterAgent(ctx, db, owner.ID, id, limit); err != nil {
+			t.Fatalf("autoRegisterAgent(%s) error = %v", id, err)
+		}
+	}
+	if _, err := autoRegisterAgent(ctx, db, owner.ID, "quota-c", limit); !errors.Is(err, ErrAgentQuotaExceeded) {
+		t.Fatalf("third registration error = %v, want ErrAgentQuotaExceeded", err)
+	}
+	if _, err := db.Agents().Get(ctx, "quota-c"); err == nil {
+		t.Fatal("agent beyond the quota was created")
+	}
+	// The quota is per owner: another user is unaffected by this owner's usage.
+	if _, err := autoRegisterAgent(ctx, db, other.ID, "quota-d", limit); err != nil {
+		t.Fatalf("other owner registration error = %v", err)
+	}
+	// A repeated registration of an existing ID is not a new Agent and must not
+	// trip over its own row.
+	again, err := autoRegisterAgent(ctx, db, other.ID, "quota-d", limit)
+	if err != nil || again.OwnerUserID != other.ID {
+		t.Fatalf("idempotent registration = %+v, err = %v", again, err)
+	}
+}

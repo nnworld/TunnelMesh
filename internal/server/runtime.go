@@ -923,17 +923,7 @@ func (r *ServerRuntime) authenticateAgentConnection(ctx context.Context, authent
 			}
 			existing, err := r.DB.Agents().Get(ctx, agentID)
 			if errors.Is(err, sql.ErrNoRows) {
-				created := false
-				existing = storage.Agent{ID: agentID, Name: agentID, OwnerUserID: authentication.Identity.OwnerUserID, Enabled: true}
-				if createErr := r.DB.Agents().Create(ctx, existing); createErr != nil {
-					existing, err = r.DB.Agents().Get(ctx, agentID)
-				} else {
-					err = nil
-					created = true
-				}
-				if created {
-					_ = r.DB.Audits().Create(ctx, storage.AuditLog{ActorUserID: authentication.Identity.OwnerUserID, Action: "agent.auto_registered", ResourceType: "agent", ResourceID: agentID, Details: `{"source":"client"}`})
-				}
+				existing, err = autoRegisterAgent(ctx, r.DB, authentication.Identity.OwnerUserID, agentID, maxAutoRegisteredAgentsPerOwner)
 			}
 			if err != nil || existing.OwnerUserID != authentication.Identity.OwnerUserID || !existing.Enabled {
 				return "", auth.ErrForbidden
@@ -960,6 +950,40 @@ func (r *ServerRuntime) authenticateAgentConnection(ctx context.Context, authent
 	}
 	slog.WarnContext(ctx, "deprecated_connection_token", "agent_id", agentID, "user_id", authentication.Principal.UserID, "removal_version", "v0.3.0")
 	return "", nil
+}
+
+// maxAutoRegisteredAgentsPerOwner caps how many Agents one owner may hold before
+// a Client token can create another by connecting. Auto-registration widens what a
+// Client token can do (create, not just use), so without a bound a single token
+// could fill the agents table; operators who need more create Agents explicitly.
+const maxAutoRegisteredAgentsPerOwner = 64
+
+// ErrAgentQuotaExceeded is returned when auto-registration would exceed the cap.
+var ErrAgentQuotaExceeded = errors.New("agent quota exceeded")
+
+// autoRegisterAgent creates agentID for ownerID on a Client token's first
+// connection. A concurrent registration of the same ID is not an error: the
+// loser re-reads the winner's row and the caller then checks ownership.
+func autoRegisterAgent(ctx context.Context, db *storage.DB, ownerID, agentID string, limit int) (storage.Agent, error) {
+	// Fetching limit rows is enough to know the cap is reached, so no COUNT is needed.
+	owned, err := db.Agents().List(ctx, storage.AgentListFilter{OwnerUserID: ownerID}, "", limit)
+	if err != nil {
+		return storage.Agent{}, err
+	}
+	if len(owned.Items) >= limit {
+		slog.Warn("agent auto-registration refused: owner quota reached", "owner_user_id", ownerID, "agent_id", agentID, "limit", limit)
+		return storage.Agent{}, ErrAgentQuotaExceeded
+	}
+	agent := storage.Agent{ID: agentID, Name: agentID, OwnerUserID: ownerID, Enabled: true}
+	if err := db.Agents().Create(ctx, agent); err != nil {
+		return db.Agents().Get(ctx, agentID)
+	}
+	// The Agent already exists, so a failed audit write must not undo the
+	// registration; it is logged because a missing audit row is otherwise silent.
+	if err := db.Audits().Create(ctx, storage.AuditLog{ActorUserID: ownerID, Action: "agent.auto_registered", ResourceType: "agent", ResourceID: agentID, Details: `{"source":"client"}`}); err != nil {
+		slog.Warn("agent auto-registration audit write failed", "agent_id", agentID, "owner_user_id", ownerID, "error", err)
+	}
+	return agent, nil
 }
 
 func containsString(values []string, target string) bool {
