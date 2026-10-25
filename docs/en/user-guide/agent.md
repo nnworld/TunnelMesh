@@ -96,3 +96,16 @@ For production:
 - Store the Agent instance ID in writable state storage.
 - Monitor Agent online state and reconnect events.
 
+## Automatic upgrade and supervision
+
+`tunnelmesh-agent run` runs under a built-in supervisor by default: a crashed worker is restarted, new releases are checked for and installed on a schedule, and an upgrade whose new version rejects the existing configuration, fails to start or never becomes healthy is rolled back automatically. See the [configuration reference](../../operations/configuration.md#自动升级与进程守护) for details (Chinese).
+
+```yaml
+agent:
+  update:
+    enabled: false     # turn off automatic upgrade, keep crash restarts
+    supervise: false   # turn off supervision too; `run` behaves as before (enabled must be false as well)
+```
+
+An upgrade never goes beyond the version of the Server the node connects to, so upgrade the Server first. The official Docker images switch both off by default.
+

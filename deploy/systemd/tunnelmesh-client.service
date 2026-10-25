@@ -13,6 +13,8 @@ ExecStartPre=/usr/local/bin/tunnelmesh-client --config /etc/tunnelmesh/client.ya
 ExecStart=/usr/local/bin/tunnelmesh-client --config /etc/tunnelmesh/client.yaml run
 Restart=on-failure
 RestartSec=5s
+# 78 是配置错误，77 是凭据被永久拒绝：重启修不好它们，不应被 systemd 无限拉起。
+RestartPreventExitStatus=78 77
 TimeoutStopSec=15s
 KillSignal=SIGTERM
 NoNewPrivileges=true

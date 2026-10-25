@@ -394,6 +394,91 @@ agent:
 
 `max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
+## 自动升级与进程守护
+
+`client run` 与 `agent run` 默认带有**进程守护**和**自动升级**，两者都可以通过配置关闭。
+
+守护进程（supervisor）就是你启动的那个进程。它把真正干活的 worker 作为子进程拉起：worker 崩溃后按指数退避重启；worker 起不来或一直连不上 Server 时，supervisor 以退出码 70 退出，把后续处理交给 systemd、launchd、WinSW 或容器运行时。`client.lock`、`agent.id` 回写等行为都发生在 worker 里，和以前一致。
+
+```yaml
+client:                    # agent.update.* 的结构完全相同
+  update:
+    enabled: true          # 自动升级与失败回滚；false 时仍保留崩溃重启
+    supervise: true        # 父进程守护；false 时 run 的行为与引入该功能之前完全一致
+    source: github         # github | server
+    check_interval: 6h     # 不小于 5m；实际会随机加上最多 25% 的抖动
+    health_timeout: 120s   # 新版本必须在这段时间内报告就绪（10s–30m）
+    stable_window: 120s    # 就绪后还要稳定运行这么久才确认升级（0–30m）
+    bad_version_ttl: 24h   # 升级失败的版本在这段时间内不再重试
+    keep_versions: 2       # 保留多少个已下载版本用于回滚
+    state_dir: ""          # 默认是 instance id 文件所在目录
+    github:
+      repository: ""       # 默认取 downloads.github_repository
+      mirror_base_url: ""  # GitHub 镜像地址，例如 https://mirror.example/github
+```
+
+每个键都有对应的环境变量，例如 `TUNNELMESH_CLIENT_UPDATE_ENABLED`、`TUNNELMESH_AGENT_UPDATE_SUPERVISE`。GitHub 令牌只通过环境变量 `TUNNELMESH_GITHUB_TOKEN` 提供，用于提高 API 限额，不是必需的。
+
+**关闭方式**
+
+| 目的 | 配置 |
+|---|---|
+| 只关闭自动升级，保留崩溃重启 | `update.enabled: false` |
+| 完全关闭，`run` 与以前一致 | `update.enabled: false` 且 `update.supervise: false` |
+
+`enabled: true` 且 `supervise: false` 是非法组合（升级由 supervisor 执行），`check-config` 会报错，不会被悄悄纠正。
+
+**升级到哪个版本**
+
+目标版本是“最新 Release”与“Server 版本”中较小的一个：client 和 agent 永远不会比它们连接的 Server 更新，所以**升级顺序是先升级 Server**。另外：不降级；开发构建（版本为 `dev`）不参与；稳定版不会升级到 `-pre` 版本；Server 版本未知（例如 Server 太旧、没有在握手里报告版本）时不升级。
+
+**升级与回滚过程**
+
+1. worker 就绪后，supervisor 按 `check_interval` 检查新版本，下载发行包并用同一个发布里的 `SHA256SUMS` 校验。只会解出名为 `tunnelmesh-<role>` 的那一个文件。
+2. 预检：新二进制的 `--version` 必须与发布版本一致，并且 `check-config` 必须接受当前配置。失败的版本会被记入坏版本表，不会切换。
+3. 切换：新版本放在状态目录的 `updates/versions/<version>/`，**不会修改安装目录里的二进制**，所以只读安装目录（systemd `ProtectSystem=strict`）和 Windows 上正在运行的 exe 都不是问题。
+4. 试运行：新版本必须在 `health_timeout` 内就绪，并在就绪后稳定运行 `stable_window`，才算升级成功。期间崩溃、拒绝配置（退出码 78）、一直不就绪，都会自动回滚到升级前的版本，并把该版本记为坏版本 `bad_version_ttl`。
+5. supervisor 自己在试运行期间被杀掉也没关系：下次启动看到未确认的试运行，会直接回滚。
+
+回滚只处理“升级引起的失败”，不会改写你的配置文件。
+
+**退出码**
+
+| 退出码 | 含义 | systemd 是否重启 |
+|---|---|---|
+| 0 | 正常停止 | 否 |
+| 70 | supervisor 放弃（worker 反复崩溃且从未就绪） | 是 |
+| 75 | `client.lock` 被占用（重启时的正常现象，supervisor 会自行重试） | - |
+| 77 | 凭据被永久拒绝 | 否（`RestartPreventExitStatus`） |
+| 78 | 配置错误 | 否（`RestartPreventExitStatus`） |
+
+**状态目录**
+
+`<state_dir>/updates/` 下保存 `state.json`、已下载的版本和运行时临时目录。该目录不可写时服务不会启动失败：supervisor 降级为“只重启、不升级”，并在日志里说明原因。打包的 systemd 单元已经让 `/var/lib/tunnelmesh-<role>` 可写。
+
+**容器**
+
+官方镜像把 `update.enabled` 与 `update.supervise` 默认设为 `false`：容器本身由编排器守护，镜像标签也应当是不可变的。需要时用环境变量重新打开。
+
+**由 Server 分发（可选）**
+
+网络无法访问 GitHub 时，可以让 Server 分发发行包：
+
+```yaml
+server:
+  updates:
+    dir: /var/lib/tunnelmesh/releases   # 绝对路径；留空（默认）表示关闭
+client:
+  update:
+    source: server
+```
+
+`dir` 里放与 GitHub Release 相同布局的文件：`SHA256SUMS`、`manifest.json`（至少包含 `{"version": "vX.Y.Z"}`）和 `tunnelmesh-vX.Y.Z-<os>-<arch>.tar.gz|zip`。client/agent 用自己的服务令牌访问 `/api/v1/{client|agent}/updates/...`，下载受并发限制，只暴露这一个目录里符合发行命名的文件。
+
+**信任边界**
+
+`SHA256SUMS` 与压缩包来自同一个来源，所以它能防止损坏和截断，但**不能防止来源本身被篡改**。启用 `source: server` 意味着 Server 被攻破时，所有 client 和 agent 都可能收到恶意二进制，影响面比只走 GitHub 更大；因此分发默认关闭，需要 Server 管理员显式配置 `server.updates.dir`。决策背景见 [ADR 0003](../architecture/adr/0003-constrained-self-update-and-supervision.md)。
+
 ## Stream 延迟与授权缓存
 
 SOCKS5、HTTP 代理和 TCP 转发的打开行为由 capability 协商决定。旧版本链路继续使用 legacy 乐观打开；Client、Server 和 Agent 都支持 `stream_open_result.v1` 时，Agent 完成目标连接后才返回成功。

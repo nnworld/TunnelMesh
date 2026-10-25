@@ -18,6 +18,7 @@
 | 0001 | [Separate scoped service credentials from management sessions](0001-scoped-service-tokens.md) | Accepted | — |
 | 0002 | [数据面窗口与 credit 不变量](0002-dataplane-window-credit-invariants.md) | Accepted | [计划：Client receive-window credit timing fix p…](../../superpowers/plans/2026-09-24-client-receive-window-credit.md)<br>[计划：Client WINDOW_UPDATE 泄漏修复](../../superpowers/plans/2026-09-24-client-window-update-leak.md)<br>[计划：Agent / Server / Client 数据面流控与阻塞隔离加固](../../superpowers/plans/2026-09-24-dataplane-flow-control-hardening.md)<br>[PR：Client receive-window credit timing fix](../../pull-requests/2026-09-24-client-receive-window-credit.md)<br>[PR：Client WINDOW_UPDATE 泄漏修复](../../pull-requests/2026-09-24-client-window-update-leak.md)<br>[PR：Agent / Server / Client 数据面流控与阻塞隔离加固](../../pull-requests/2026-09-24-dataplane-flow-control-hardening.md) |
 | 0002 | [Open a public UDP ingress for an embedded VPN gateway](0002-public-ingress-and-embedded-vpn.md) | Accepted | [规格：内嵌 VPN 网关（WireGuard）](../../superpowers/specs/2026-09-19-embedded-vpn-gateway-design.md) |
+| 0003 | [Constrained self-update and process supervision for client and agent](0003-constrained-self-update-and-supervision.md) | Accepted | [计划：Client/Agent 自动升级、失败回滚与进程守护](../../superpowers/plans/2026-10-25-client-agent-auto-update.md)<br>[PR：Client/Agent 自动升级、失败回滚与进程守护](../../pull-requests/2026-10-25-client-agent-auto-update.md) |
 
 ## 新增 ADR 的步骤
 

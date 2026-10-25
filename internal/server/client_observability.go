@@ -37,11 +37,17 @@ type ClientObservabilityService struct {
 	manager      *ClientSessionManager
 	serverNodeID string
 	metadataTTL  time.Duration
+	// serverVersion is announced in every accepted ack; empty means the build's.
+	serverVersion string
 
 	mu          sync.Mutex
 	revisions   map[string]uint64
 	instanceIDs map[string]string
 }
+
+// SetServerVersion overrides the version announced to clients. It must be called
+// before the service handles connections.
+func (s *ClientObservabilityService) SetServerVersion(version string) { s.serverVersion = version }
 
 func NewClientObservabilityService(instances storage.ClientInstanceRepository, leases *ClientConnectionLeaseController, manager *ClientSessionManager, serverNodeID string, metadataTTL time.Duration) *ClientObservabilityService {
 	if metadataTTL <= 0 {
@@ -74,6 +80,7 @@ func (s *ClientObservabilityService) Hello(ctx context.Context, principal Client
 	return protocol.ClientMetadataAckPayload{
 		ClientInstanceID: instance.ID, InstanceID: payload.InstanceID,
 		ConnectionID: principal.ConnectionID, Revision: payload.Revision, Accepted: true,
+		ServerVersion: resolveServerVersion(s.serverVersion),
 	}, nil
 }
 
@@ -89,6 +96,7 @@ func (s *ClientObservabilityService) Update(ctx context.Context, principal Clien
 		return protocol.ClientMetadataAckPayload{
 			ClientInstanceID: record.ClientInstanceID, InstanceID: payload.InstanceID,
 			ConnectionID: principal.ConnectionID, Revision: current, Accepted: true, Idempotent: true,
+			ServerVersion: resolveServerVersion(s.serverVersion),
 		}, nil
 	}
 	instance, ack, err := s.persistMetadata(ctx, principal, payload)
@@ -101,6 +109,7 @@ func (s *ClientObservabilityService) Update(ctx context.Context, principal Clien
 	return protocol.ClientMetadataAckPayload{
 		ClientInstanceID: instance.ID, InstanceID: payload.InstanceID,
 		ConnectionID: principal.ConnectionID, Revision: payload.Revision, Accepted: true,
+		ServerVersion: resolveServerVersion(s.serverVersion),
 	}, nil
 }
 

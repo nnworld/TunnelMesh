@@ -380,3 +380,52 @@ func TestUDPAssociationPreservesDatagramBoundaries(t *testing.T) {
 		t.Fatalf("large datagram: %v", err)
 	}
 }
+
+// The Server announces its version in the metadata acks so clients and agents can
+// bound self-upgrade by it. The field is optional on the wire: an older Server
+// omits it, and an older client or agent ignores it.
+func TestMetadataAcksCarryTheServerVersion(t *testing.T) {
+	agent, err := EncodeAgentMetadataAckPayload(AgentMetadataAckPayload{AgentID: "a", Epoch: 1, Revision: 1, Accepted: true, ServerVersion: "v1.4.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotAgent, err := DecodeAgentMetadataAckPayload(agent)
+	if err != nil || gotAgent.ServerVersion != "v1.4.0" {
+		t.Fatalf("agent ack = %+v, %v, want server_version v1.4.0", gotAgent, err)
+	}
+	client, err := EncodeClientMetadataAckPayload(ClientMetadataAckPayload{ClientInstanceID: "c", Accepted: true, ServerVersion: "v1.4.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotClient, err := DecodeClientMetadataAckPayload(client)
+	if err != nil || gotClient.ServerVersion != "v1.4.0" {
+		t.Fatalf("client ack = %+v, %v, want server_version v1.4.0", gotClient, err)
+	}
+}
+
+func TestMetadataAcksFromAnOlderServerDecodeWithAnEmptyVersion(t *testing.T) {
+	agent, err := DecodeAgentMetadataAckPayload([]byte(`{"agent_id":"agent-a","epoch":1,"revision":1,"accepted":true}`))
+	if err != nil || agent.ServerVersion != "" {
+		t.Fatalf("agent ack = %+v, %v, want an empty server version", agent, err)
+	}
+	client, err := DecodeClientMetadataAckPayload([]byte(`{"client_instance_id":"c","accepted":true}`))
+	if err != nil || client.ServerVersion != "" {
+		t.Fatalf("client ack = %+v, %v, want an empty server version", client, err)
+	}
+	// An empty version must not appear on the wire at all.
+	encoded, err := EncodeAgentMetadataAckPayload(AgentMetadataAckPayload{AgentID: "a"})
+	if err != nil || strings.Contains(string(encoded), "server_version") {
+		t.Fatalf("encoded = %s, want server_version omitted when empty", encoded)
+	}
+}
+
+// Decoding is not strict, which is what lets a newer Server add fields without
+// breaking clients and agents that predate them.
+func TestMetadataAckDecodingIgnoresFieldsFromANewerServer(t *testing.T) {
+	if _, err := DecodeAgentMetadataAckPayload([]byte(`{"agent_id":"a","accepted":true,"server_version":"v9.9.9","from_the_future":{"x":1}}`)); err != nil {
+		t.Fatalf("agent ack: %v", err)
+	}
+	if _, err := DecodeClientMetadataAckPayload([]byte(`{"client_instance_id":"c","accepted":true,"from_the_future":[1]}`)); err != nil {
+		t.Fatalf("client ack: %v", err)
+	}
+}

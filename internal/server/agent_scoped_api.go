@@ -28,7 +28,12 @@ func (a *API) handleAgentScoped(w http.ResponseWriter, r *http.Request, path str
 		writeAPIError(w, http.StatusUnauthorized, "unauthenticated")
 		return true
 	}
-	if r.Method != http.MethodGet || strings.Trim(strings.TrimPrefix(path, agentScopedPrefix), "/") != "self" {
+	rest := strings.Trim(strings.TrimPrefix(path, agentScopedPrefix), "/")
+	if strings.HasPrefix(rest, "updates/") {
+		a.serveUpdates(w, r, identity, strings.TrimPrefix(rest, "updates/"))
+		return true
+	}
+	if r.Method != http.MethodGet || rest != "self" {
 		writeAPIError(w, http.StatusNotFound, "not found")
 		return true
 	}

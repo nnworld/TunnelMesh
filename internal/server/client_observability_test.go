@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -345,5 +346,33 @@ func TestPersistedClientHelloMetadataIsNeverEmptyObject(t *testing.T) {
 	}
 	if got := instances.upserts[len(instances.upserts)-1].Metadata; got != "{}" {
 		t.Fatalf("legacy metadata = %q, want {}", got)
+	}
+}
+
+// Every accepted metadata ack tells the client which Server version it is
+// talking to, because that version is the ceiling for the client's self-upgrade.
+func TestClientObservabilityAcksCarryTheServerVersion(t *testing.T) {
+	service, _, _, _ := newClientObservabilityFixture()
+	principal := ClientSessionPrincipal{
+		ConnectionID: "connection-1",
+		Identity:     auth.TokenIdentity{TokenID: "token-1", OwnerUserID: "owner-1", Type: storage.TokenTypeClient}, MetadataEnabled: true,
+	}
+	payload := protocol.ClientMetadataPayload{InstanceID: "client-0123456789abcdef", Revision: 1, ReportedAt: time.Now().UTC(), Version: "v1.2.3"}
+	want := build.Current().Version
+
+	hello, err := service.Hello(context.Background(), principal, payload)
+	if err != nil || hello.ServerVersion != want {
+		t.Fatalf("hello ack = %#v, %v, want ServerVersion %q", hello, err, want)
+	}
+	payload.Revision = 2
+	update, err := service.Update(context.Background(), principal, payload)
+	if err != nil || update.ServerVersion != want {
+		t.Fatalf("update ack = %#v, %v, want ServerVersion %q", update, err, want)
+	}
+	// A repeated revision is answered from the idempotent branch, which builds its
+	// own ack and must announce the version too.
+	repeated, err := service.Update(context.Background(), principal, payload)
+	if err != nil || !repeated.Idempotent || repeated.ServerVersion != want {
+		t.Fatalf("idempotent ack = %#v, %v, want ServerVersion %q", repeated, err, want)
 	}
 }

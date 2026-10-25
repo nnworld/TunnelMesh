@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/auth"
+	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 	"github.com/tunnelmesh/tunnelmesh/internal/storage"
 )
@@ -394,5 +395,20 @@ func TestServeAgentSessionHeartbeatRefreshesMetadataLease(t *testing.T) {
 	case <-serveDone:
 	case <-time.After(time.Second):
 		t.Fatal("server session did not stop")
+	}
+}
+
+func TestAgentMetadataAckCarriesTheServerVersion(t *testing.T) {
+	m := NewAgentSessionManager(AgentSessionConfig{})
+	session, err := m.Register(context.Background(), AgentRegistration{AgentID: "agent-1", NodeID: "node-1", Epoch: 4}, newFakeTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := session.HandleMetadata(context.Background(), protocol.AgentMetadataPayload{AgentID: "agent-1", Epoch: 4, Revision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := build.Current().Version; ack.ServerVersion != want {
+		t.Fatalf("ack.ServerVersion = %q, want %q", ack.ServerVersion, want)
 	}
 }

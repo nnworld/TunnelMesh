@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 // runtimeTestConfig builds the smallest configuration a run accepts. The instance
@@ -455,5 +456,79 @@ func TestRuntimeStopEndsWait(t *testing.T) {
 	}
 	if got := fmt.Sprint(rt.Stats().Running); got != "false" {
 		t.Fatalf("Running = %s after Stop", got)
+	}
+}
+
+// ackingRunner connects a session over a transport the test controls, so it can
+// deliver the Server's metadata ack at the moment it chooses.
+func ackingRunner(transports chan *pingAwareTransport) SessionPoolRunner {
+	return func(ctx context.Context, _, _ string, onReady func(*Session) error, _ WebSocketRunOptions) error {
+		tr := newPingAwareTransport(true)
+		session := NewSessionWithOpenMode(tr, SessionOpenMetadata)
+		session.Start()
+		if err := onReady(session); err != nil {
+			_ = tr.Close()
+			return err
+		}
+		transports <- tr
+		<-ctx.Done()
+		_ = tr.Close()
+		return ctx.Err()
+	}
+}
+
+// Readiness is what a supervisor trusts after an upgrade: connected, and the
+// Server's version when it announced one.
+func TestRuntimeReadinessFollowsTheServerAck(t *testing.T) {
+	transports := make(chan *pingAwareTransport, 2)
+	rt, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(
+		config.TunnelConfig{Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22},
+	), RuntimeOptions{Runner: ackingRunner(transports), SkipLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Readiness(); got.Ready || got.ServerVersion != "" {
+		t.Fatalf("Readiness() before Start = %+v, want not ready", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rt.Stop() }()
+
+	var tr *pingAwareTransport
+	select {
+	case tr = <-transports:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no session connected")
+	}
+	// Connected but not yet acknowledged: ready, with the version still unknown.
+	waitForCondition(t, 2*time.Second, func() bool { return rt.Readiness().Ready })
+	if got := rt.Readiness(); got.ServerVersion != "" {
+		t.Fatalf("Readiness() = %+v, want no version before the ack", got)
+	}
+	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: true, ServerVersion: "v1.4.0"})
+	waitForCondition(t, 2*time.Second, func() bool { return rt.Readiness().ServerVersion == "v1.4.0" })
+}
+
+// A client that only runs the Agent role has no tunnel sessions at all, so its
+// readiness must come from the embedded Agent's own acknowledgement.
+func TestRuntimeAgentOnlyReadinessComesFromTheAgentAck(t *testing.T) {
+	cfg := runtimeTestConfig()
+	cfg.Client.AgentID = "agent-embedded"
+	rt, err := NewRuntimeFromConfig(context.Background(), cfg, RuntimeOptions{SkipLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Readiness(); got.Ready {
+		t.Fatalf("Readiness() = %+v before the Agent role connected, want not ready", got)
+	}
+	if rt.agentPool == nil || rt.agentPool.OnReady == nil {
+		t.Fatal("the embedded Agent role does not report readiness")
+	}
+	rt.agentPool.OnReady("v1.5.0")
+	if got := rt.Readiness(); !got.Ready || got.ServerVersion != "v1.5.0" {
+		t.Fatalf("Readiness() = %+v, want ready with the Agent's Server version", got)
 	}
 }

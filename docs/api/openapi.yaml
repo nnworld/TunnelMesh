@@ -973,6 +973,72 @@ paths:
         '401': {description: 'Bearer token missing, revoked, expired, or of a type other than client. The reason is not distinguished.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
         '405': {description: Any method other than GET on this path}
         '503': {description: 'The Server was started without a client token validator. This is a wiring fault rather than an authentication result, which is why it is not folded into 401.', content: {application/json: {schema: {$ref: '#/components/schemas/ApiErrorEnvelope'}}}}
+  /api/v1/client/updates/latest:
+    get:
+      summary: Read the release version the Server distributes to clients
+      description: |
+        Used by a client that upgrades itself with `update.source: server`. Answers only the
+        published release version and the Server's own version, so a token learns nothing
+        else about the Server. Answers `404` until `server.updates.dir` is configured and
+        a release is published there.
+      security: [{ clientTokenAuth: [] }]
+      responses:
+        '200': {description: The published release version and the Server version, content: {application/json: {schema: {$ref: '#/components/schemas/UpdateLatestEnvelope'}}}}
+        '401': {description: 'Bearer token missing, revoked, expired, or of a type other than client. The reason is not distinguished.'}
+        '404': {description: Distribution is not configured or no release is published}
+        '405': {description: Any method other than GET or HEAD}
+        '500': {description: The release manifest is unreadable or names a version that is not a release}
+        '503': {description: The token validator is unavailable}
+  /api/v1/client/updates/files/{name}:
+    parameters: [{name: name, in: path, required: true, schema: {type: string}, description: 'One of SHA256SUMS, manifest.json or a tunnelmesh-vX.Y.Z-os-arch archive. Any other name answers 404.'}]
+    get:
+      summary: Download one release file
+      description: |
+        Serves the named file from `server.updates.dir` with Range support so an
+        interrupted download resumes. The name must be exactly one of the release layout's
+        files; nothing else in the directory is reachable, and a symlink that leads outside
+        the directory is refused. Downloads are limited per token and server-wide.
+      security: [{ clientTokenAuth: [] }]
+      responses:
+        '200': {description: The file, content: {application/octet-stream: {schema: {type: string, format: binary}}}}
+        '206': {description: The requested byte range}
+        '401': {description: 'Bearer token missing, revoked, expired, or of a type other than client.'}
+        '404': {description: Distribution is not configured, or the name or file does not exist}
+        '405': {description: Any method other than GET or HEAD}
+        '503': {description: Too many concurrent downloads (retry after the Retry-After delay) or the token validator is unavailable}
+  /api/v1/agent/updates/latest:
+    get:
+      summary: Read the release version the Server distributes to agents
+      description: |
+        Used by a agent that upgrades itself with `update.source: server`. Answers only the
+        published release version and the Server's own version, so a token learns nothing
+        else about the Server. Answers `404` until `server.updates.dir` is configured and
+        a release is published there.
+      security: [{ agentTokenAuth: [] }]
+      responses:
+        '200': {description: The published release version and the Server version, content: {application/json: {schema: {$ref: '#/components/schemas/UpdateLatestEnvelope'}}}}
+        '401': {description: 'Bearer token missing, revoked, expired, or of a type other than agent. The reason is not distinguished.'}
+        '404': {description: Distribution is not configured or no release is published}
+        '405': {description: Any method other than GET or HEAD}
+        '500': {description: The release manifest is unreadable or names a version that is not a release}
+        '503': {description: The token validator is unavailable}
+  /api/v1/agent/updates/files/{name}:
+    parameters: [{name: name, in: path, required: true, schema: {type: string}, description: 'One of SHA256SUMS, manifest.json or a tunnelmesh-vX.Y.Z-os-arch archive. Any other name answers 404.'}]
+    get:
+      summary: Download one release file
+      description: |
+        Serves the named file from `server.updates.dir` with Range support so an
+        interrupted download resumes. The name must be exactly one of the release layout's
+        files; nothing else in the directory is reachable, and a symlink that leads outside
+        the directory is refused. Downloads are limited per token and server-wide.
+      security: [{ agentTokenAuth: [] }]
+      responses:
+        '200': {description: The file, content: {application/octet-stream: {schema: {type: string, format: binary}}}}
+        '206': {description: The requested byte range}
+        '401': {description: 'Bearer token missing, revoked, expired, or of a type other than agent.'}
+        '404': {description: Distribution is not configured, or the name or file does not exist}
+        '405': {description: Any method other than GET or HEAD}
+        '503': {description: Too many concurrent downloads (retry after the Retry-After delay) or the token validator is unavailable}
   /api/v1/agent/self:
     get:
       summary: Read the Agent identity bound to the presented Agent token
@@ -2629,6 +2695,17 @@ components:
       properties:
         id: {type: string}
         name: {type: string}
+    UpdateLatestEnvelope:
+      type: object
+      properties:
+        code: {type: integer}
+        msg: {type: string}
+        data:
+          type: object
+          required: [version, server_version]
+          properties:
+            version: {type: string, description: The release version published in server.updates.dir, example: v1.4.0}
+            server_version: {type: string, description: The Server's own version; clients never upgrade past it, example: v1.4.0}
     AgentSelfEnvelope:
       allOf:
         - $ref: '#/components/schemas/Envelope'

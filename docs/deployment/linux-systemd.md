@@ -52,6 +52,12 @@ journalctl -u tunnelmesh-client.service -f
 
 卸载时先 `systemctl disable --now`，再移除 unit 和二进制。脚本不会删除 `/etc/tunnelmesh` 配置、`/etc/tunnelmesh/client.env` 或 `/var/lib/tunnelmesh*` 数据。
 
+## 自动升级与重启策略
+
+`client` 与 `agent` 的单元带有 `RestartPreventExitStatus=78 77`：配置错误（78）和凭据被永久拒绝（77）重启修不好，不应被 systemd 无限拉起；其余退出（包括 supervisor 放弃时的 70）仍按 `Restart=on-failure` 重启。
+
+自动升级把新版本写在状态目录（`/var/lib/tunnelmesh-<role>/updates/`），不修改 `/usr/local/bin`，因此 `ProtectSystem=strict` 与只读安装目录不受影响。注意 `ExecStartPre` 的 `check-config` 仍然由**已安装的**二进制执行，只校验基线版本；新版本对现有配置的校验由 supervisor 在切换前用新二进制自己完成。详见[配置参考](../operations/configuration.md#自动升级与进程守护)。
+
 ## 用户级安装
 
 没有 root、或希望服务跟随当前用户生命周期时，用 systemd **user** 单元。模板在

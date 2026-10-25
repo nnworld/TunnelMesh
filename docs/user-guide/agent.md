@@ -163,6 +163,19 @@ docker run --rm \
 
 Agent 容器通常不需要暴露端口。它只需要出站访问 Server 和目标内网服务；在 Kubernetes 或 Compose 中使用 Secret 注入证书、Token 等敏感配置。
 
+## 自动升级与进程守护
+
+`tunnelmesh-agent run` 默认由内置守护进程运行：崩溃自动重启，并按计划检查新版本、自动升级；升级后如果新版本拒绝现有配置、起不来或一直不健康，会自动回滚到旧版本。完整说明、退出码和排障见[配置参考](../operations/configuration.md#自动升级与进程守护)。
+
+```yaml
+agent:
+  update:
+    enabled: false     # 只关闭自动升级，保留崩溃重启
+    supervise: false   # 同时关闭守护，run 与以前完全一致（enabled 也必须为 false）
+```
+
+升级不会超过所连接 Server 的版本，请先升级 Server。官方 Docker 镜像默认关闭这两项。
+
 ## 8. 故障排查
 
 ### `check-config` 失败

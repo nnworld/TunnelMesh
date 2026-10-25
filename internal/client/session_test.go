@@ -550,3 +550,39 @@ func TestSessionStaysUpWhileServerAnswersHeartbeats(t *testing.T) {
 		}
 	}
 }
+
+func clientAckFrame(t *testing.T, ack protocol.ClientMetadataAckPayload) protocol.Frame {
+	t.Helper()
+	payload, err := protocol.EncodeClientMetadataAckPayload(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameClientMetadataAck, Payload: payload}
+}
+
+// The Server version in the metadata ack is the ceiling for the client's
+// self-upgrade, so the session has to keep it instead of dropping the frame.
+func TestSessionRecordsTheServerVersionFromTheMetadataAck(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 4), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenMetadata)
+	defer session.Close()
+	session.Start()
+	if got := session.ServerVersion(); got != "" {
+		t.Fatalf("ServerVersion() = %q before any ack, want empty", got)
+	}
+	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: true, ServerVersion: "v1.4.0"})
+	waitForCondition(t, time.Second, func() bool { return session.ServerVersion() == "v1.4.0" })
+}
+
+func TestSessionIgnoresTheVersionInARejectedOrVersionlessAck(t *testing.T) {
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 4), recv: make(chan protocol.Frame, 8), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenMetadata)
+	defer session.Close()
+	session.Start()
+	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: false, ServerVersion: "v9.9.9"})
+	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: true})
+	// A later accepted ack with a version still lands, which proves the earlier
+	// frames were processed rather than never read.
+	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: true, ServerVersion: "v1.2.0"})
+	waitForCondition(t, time.Second, func() bool { return session.ServerVersion() == "v1.2.0" })
+}

@@ -68,7 +68,12 @@ type RuntimeConfig struct {
 	Stream             config.ServerStreamConfig
 	AuthorizationCache config.AuthorizationCacheConfig
 	Downloads          config.DownloadsConfig
-	WebSSH             config.WebSSHConfig
+	Updates            config.ServerUpdatesConfig
+	// Version is the version announced to clients and agents; empty means the
+	// build's own. It is a parameter so a test can run a Server that claims a
+	// version without rewriting process-wide build variables.
+	Version string
+	WebSSH  config.WebSSHConfig
 	// VPN carries server.vpn.*. The management API assembles its peer service
 	// from it; the gateway listener itself belongs to a later phase, so an
 	// enabled section buys peer management and nothing that listens on UDP.
@@ -150,6 +155,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		runtimeConfig.Security.AllowedOrigins = append([]string(nil), runtimeConfig.Security.AllowedOrigins...)
 	}
 	cfg.ServerNodeID = runtimeConfig.NodeID
+	cfg.ServerVersion = runtimeConfig.Version
 	agentSessions := NewAgentSessionManagerWithMetadata(db.Metadata(), cfg)
 	// `server.stream.*` decides the credit this Server grants Agents, so a
 	// deployment that tunes it changes the data plane instead of a comment.
@@ -175,6 +181,7 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	clientSessions := NewClientSessionManager()
 	clientConnectionLeases := NewClientConnectionLeaseController(db.ClientConnections(), clientSessions, serverNodeID, DefaultClientConnectionLeaseTTL)
 	clientObservability := NewClientObservabilityService(db.ClientInstances(), clientConnectionLeases, clientSessions, serverNodeID, DefaultClientMetadataTTL)
+	clientObservability.SetServerVersion(runtimeConfig.Version)
 	clientTransport := relay.NodeTransport(localAgentRelay)
 	if _, ok := connectionSelector.(*AgentConnectionSelector); !ok || runtimeConfig.RemoteRelay != nil {
 		clientTransport = relay.NewSelectedTransport(connectionSelector, localAgentRelay, runtimeConfig.RemoteRelay)
@@ -190,6 +197,8 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	runtime.API.SetAgentTokenValidator(credentialService)
 	runtime.API.SetWebSSHLocalNodeID(serverNodeID)
 	runtime.API.SetDownloads(runtimeConfig.Downloads)
+	runtime.API.SetUpdates(runtimeConfig.Updates.Dir)
+	runtime.API.SetServerVersion(runtimeConfig.Version)
 	runtime.API.SetVPN(runtimeConfig.VPN, serverNodeID, vpnNodePublicKey(runtimeConfig.VPN))
 	var serverNodeLifecycle *ServerNodeLifecycle
 	var authorizationCacheCleanup func() error

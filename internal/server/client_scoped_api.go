@@ -74,7 +74,12 @@ func (a *API) handleClientScoped(w http.ResponseWriter, r *http.Request, path st
 		writeAPIError(w, http.StatusUnauthorized, "unauthenticated")
 		return true
 	}
-	switch strings.Trim(strings.TrimPrefix(path, clientScopedPrefix), "/") {
+	rest := strings.Trim(strings.TrimPrefix(path, clientScopedPrefix), "/")
+	if strings.HasPrefix(rest, "updates/") {
+		a.serveUpdates(w, r, identity, strings.TrimPrefix(rest, "updates/"))
+		return true
+	}
+	switch rest {
 	case "agents":
 		if r.Method != http.MethodGet {
 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")

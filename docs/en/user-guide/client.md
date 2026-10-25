@@ -97,3 +97,16 @@ A `tcp`, `udp`, or `http` entry whose `listen` address is not loopback requires 
 
 When any local listener's accept or read loop fails permanently - exhausted descriptors, a destroyed listening socket - `run` and single-command `forward` exit immediately with a non-zero status and write the error to stderr. A port that still looks healthy while serving nothing is the hardest failure to notice from outside, so letting systemd or Docker restart the process beats staying "online" on a broken listener. `Close` and an ordinary configured stop are not failures and never trigger an exit.
 
+## Automatic upgrade and supervision
+
+`tunnelmesh-client run` runs under a built-in supervisor by default: a crashed worker is restarted, new releases are checked for and installed on a schedule, and an upgrade whose new version rejects the existing configuration, fails to start or never becomes healthy is rolled back automatically. See the [configuration reference](../../operations/configuration.md#自动升级与进程守护) for details (Chinese).
+
+```yaml
+client:
+  update:
+    enabled: false     # turn off automatic upgrade, keep crash restarts
+    supervise: false   # turn off supervision too; `run` behaves as before (enabled must be false as well)
+```
+
+An upgrade never goes beyond the version of the Server the node connects to, so upgrade the Server first. The official Docker images switch both off by default.
+
