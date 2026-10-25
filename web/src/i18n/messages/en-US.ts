@@ -151,7 +151,7 @@ const messages: MessageSchema = {
   webssh: {
     title: 'WebSSH terminal', description: 'Open an SSH terminal in the browser; the Server relays encrypted bytes only',
     zmodem: {
-      sending: 'Uploading', receiving: 'Downloading', waiting: 'Waiting for files', cancel: 'Cancel transfer',
+      chooseFile: 'Choose files', sending: 'Uploading', receiving: 'Downloading', waiting: 'Waiting for files', cancel: 'Cancel transfer',
       inputBlocked: 'Keystrokes are not sent to the remote host while a transfer is running',
       failed: 'ZMODEM transfer failed: {message}',
     },

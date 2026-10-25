@@ -148,7 +148,7 @@ export default {
   },
   webssh: {
     zmodem: {
-      sending: '正在上传', receiving: '正在下载', waiting: '等待文件', cancel: '取消传输',
+      chooseFile: '选择文件', sending: '正在上传', receiving: '正在下载', waiting: '等待文件', cancel: '取消传输',
       inputBlocked: '传输期间键盘输入不会发送到远端',
       failed: 'ZMODEM 传输失败：{message}',
     },

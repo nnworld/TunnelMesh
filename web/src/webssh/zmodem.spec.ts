@@ -323,3 +323,172 @@ describe('createZmodemBridge', () => {
     expect(h.terminal.length).toBe(before)
   })
 })
+
+// A bridge whose peer writes complete only when the test says so, modelling an
+// SSH channel whose window is full: the real channel serializes writes and the
+// bridge must not pile a whole file behind them.
+function gatedHarness(options: { drainQuietMs?: number } = {}) {
+  const events: ZmodemEvent[] = []
+  const terminal: number[] = []
+  const peer: number[] = []
+  let remote: Remote | null = null
+  let open = false
+  // A real channel accepts small writes at once and only blocks when its window
+  // fills during bulk data, so the handshake must not be gated.
+  let freeBytes = 16 * 1024
+  const waiters: Array<() => void> = []
+  const bridge = createZmodemBridge({
+    toTerminal: (bytes) => terminal.push(...bytes),
+    toPeer: (bytes) => {
+      peer.push(...bytes)
+      remote?.consume([...bytes])
+      if (open || freeBytes >= bytes.length) {
+        freeBytes -= bytes.length
+        return Promise.resolve()
+      }
+      return new Promise<void>(resolve => waiters.push(resolve))
+    },
+    onEvent: (event) => events.push(event),
+    ...options,
+  })
+  return {
+    events, terminal, peer, bridge,
+    attachRemote(next: Remote) { remote = next },
+    release() { open = true; waiters.splice(0).forEach(resolve => resolve()) },
+  }
+}
+
+// Starts a remote `sz` and returns the sender side so a test can keep pushing
+// data after the browser gave up, which is what a real sz does until the CAN
+// bytes finish crossing the link.
+async function startRemoteSz(h: { bridge: ZmodemBridge; peer: number[]; attachRemote(r: Remote): void }, size: number) {
+  const before = h.peer.length
+  h.bridge.consumeFromRemote(Uint8Array.from(Zmodem.Header.build('ZRQINIT').to_hex()))
+  const zrinit = h.peer.slice(before)
+  const session = new Zmodem.Session.Send(Zmodem.Header.parse_hex(zrinit))
+  session.set_sender((bytes: number[]) => h.bridge.consumeFromRemote(Uint8Array.from(bytes)))
+  h.attachRemote({ consume: (bytes) => session.consume(bytes) })
+  const transfer = await session.send_offer({ name: 'big.bin', size, mtime: new Date(), files_remaining: 1, bytes_remaining: size })
+  if (!transfer) throw new Error('offer rejected')
+  return transfer
+}
+
+function noise(length: number): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(new ArrayBuffer(length))
+  for (let i = 0; i < length; i++) out[i] = (i * 131 + 7) & 0xff
+  return out
+}
+
+describe('createZmodemBridge after a transfer is cut short', () => {
+  it('keeps in-flight sz data off the terminal after the user aborts a download', async () => {
+    const h = gatedHarness()
+    h.release()
+    const transfer = await startRemoteSz(h, 1 << 20)
+    transfer.send(noise(40_000))
+    h.bridge.abort()
+    h.terminal.length = 0
+
+    // The remote has not seen the CAN yet and keeps streaming.
+    for (let i = 0; i < 20; i++) transfer.send(noise(30_000))
+
+    expect(h.terminal).toEqual([])
+  })
+
+  it('resumes ordinary output as soon as plain text arrives and asks the view to redraw the prompt otherwise', async () => {
+    const h = gatedHarness({ drainQuietMs: 20 })
+    h.release()
+    const transfer = await startRemoteSz(h, 1 << 20)
+    transfer.send(noise(40_000))
+    h.bridge.abort()
+    h.terminal.length = 0
+    transfer.send(noise(30_000))
+    expect(h.terminal).toEqual([])
+
+    // Silence after the burst: the stream is over, so the prompt that was
+    // swallowed with it has to be re-requested.
+    await waitFor(h as unknown as Harness, 'drained')
+
+    const text = new TextEncoder().encode('z@host:~$ ')
+    h.bridge.consumeFromRemote(text)
+    expect(h.terminal).toEqual([...text])
+  })
+
+  it('does not swallow plain text that follows an abort immediately', async () => {
+    const h = gatedHarness()
+    h.release()
+    const transfer = await startRemoteSz(h, 1 << 20)
+    transfer.send(noise(40_000))
+    h.bridge.abort()
+    h.terminal.length = 0
+
+    const text = new TextEncoder().encode('\r\nsz: Transfer incomplete\r\nz@host:~$ ')
+    h.bridge.consumeFromRemote(text)
+
+    expect(h.terminal).toEqual([...text])
+  })
+})
+
+describe('createZmodemBridge upload backpressure', () => {
+  const MIB = 1024 * 1024
+
+  it('does not read a whole file ahead of a channel that has not accepted its bytes', async () => {
+    const h = gatedHarness()
+    remoteReceiveFile(h as unknown as Harness)
+    await waitFor(h as unknown as Harness, 'send-required')
+    const file = new File([noise(4 * MIB)], 'big.bin')
+    const slice = vi.spyOn(file, 'slice')
+
+    void h.bridge.sendFiles([file]).catch(() => undefined)
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    const requested = slice.mock.calls.reduce((sum, [start, end]) => sum + ((end ?? file.size) - (start ?? 0)), 0)
+    expect(requested).toBeLessThan(MIB)
+    h.bridge.abort()
+  })
+
+  it('reports progress for bytes the channel accepted, not bytes merely read', async () => {
+    const h = gatedHarness()
+    remoteReceiveFile(h as unknown as Harness)
+    await waitFor(h as unknown as Harness, 'send-required')
+    const file = new File([noise(4 * MIB)], 'big.bin')
+
+    void h.bridge.sendFiles([file]).catch(() => undefined)
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    const progress = h.events.filter((event): event is Extract<ZmodemEvent, { type: 'progress' }> => event.type === 'progress')
+    expect(progress.length).toBeGreaterThan(0)
+    expect(Math.max(...progress.map(event => event.transferred))).toBeLessThan(MIB / 2)
+    expect(progress[0].total).toBe(4 * MIB)
+    h.bridge.abort()
+  })
+
+  it('drops the unsent backlog on abort so the peer sees the CAN, not the file', async () => {
+    const h = gatedHarness()
+    remoteReceiveFile(h as unknown as Harness)
+    await waitFor(h as unknown as Harness, 'send-required')
+    const file = new File([noise(4 * MIB)], 'big.bin')
+
+    void h.bridge.sendFiles([file]).catch(() => undefined)
+    await new Promise(resolve => setTimeout(resolve, 200))
+    h.bridge.abort()
+    h.release()
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    expect(h.peer.length).toBeLessThan(MIB)
+    expect(h.peer.filter(byte => byte === 0x18).length).toBeGreaterThan(0)
+  })
+
+  it('still delivers a whole file to the peer once the channel keeps up', async () => {
+    const h = gatedHarness()
+    h.release()
+    const remote = remoteReceiveFile(h as unknown as Harness)
+    await waitFor(h as unknown as Harness, 'send-required')
+    const payload = noise(MIB + 17)
+
+    await h.bridge.sendFiles([new File([payload], 'whole.bin')])
+
+    await vi.waitFor(() => expect(remote.received.length).toBe(1), { timeout: 25_000 })
+    expect(remote.received[0].bytes.length).toBe(payload.length)
+    expect(remote.received[0].bytes).toEqual(payload)
+  }, 30_000)
+})
