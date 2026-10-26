@@ -1,6 +1,6 @@
 # Visual assets
 
-All screenshots come from the TunnelMesh admin console running locally from commit `b235ec4` on `2026-09-17`, with the UI locale set to `en-US`.
+All screenshots come from the TunnelMesh admin console running locally from the `codex/admin-console-rack-redesign` branch on `2026-10-27`, with the UI locale set to `en-US`.
 
 | Asset | View | Dimensions | Redaction check |
 | --- | --- | --- | --- |

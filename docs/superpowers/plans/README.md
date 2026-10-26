@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 73 份计划，按日期倒序排列。
+共 74 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-10-26 | [管理后台界面重设计「机架 Rack」实施计划](2026-10-26-admin-console-rack-redesign.md) | — | [PR：管理后台界面重设计「机架 Rack」](../../pull-requests/2026-10-26-admin-console-rack-redesign.md) |
 | 2026-10-25 | [Client/Agent 角色融合与自动注册实施计划](2026-10-25-client-agent-role-auto-registration.md) | — | [PR：Client Agent 角色融合与自动注册](../../pull-requests/2026-10-25-client-agent-role.md) |
 | 2026-10-25 | [Client/Agent 自动升级、失败回滚与进程守护实施计划](2026-10-25-client-agent-auto-update.md) | — | [PR：Client/Agent 自动升级、失败回滚与进程守护](../../pull-requests/2026-10-25-client-agent-auto-update.md)<br>[ADR：Constrained self-update and process super…](../../architecture/adr/0003-constrained-self-update-and-supervision.md) |
 | 2026-10-24 | [Client/Agent 便携性与容错加固实施计划](2026-10-24-client-agent-portability-resilience.md) | — | — |
