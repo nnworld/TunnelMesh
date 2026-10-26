@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { flatNavigation } from '../layouts/navigation'
 import { readFileSync } from 'node:fs'
 import router from '../router'
 import zhCN from '../i18n/messages/zh-CN'
@@ -31,9 +32,10 @@ describe('vpn console navigation and copy', () => {
   })
 
   it('lists the vpn entry in the menu right after credentials', () => {
-    const source = readFileSync('src/layouts/AppShell.vue', 'utf8')
-    expect(source).toContain("['/vpn', 'navigation.vpn']")
-    expect(source.indexOf("['/credentials', 'navigation.credentials']")).toBeLessThan(source.indexOf("['/vpn', 'navigation.vpn']"))
+    const paths = flatNavigation(false).map(item => item.path)
+    expect(paths).toContain('/vpn')
+    expect(paths.indexOf('/credentials')).toBeLessThan(paths.indexOf('/vpn'))
+    expect(flatNavigation(false).find(item => item.path === '/vpn')?.labelKey).toBe('navigation.vpn')
   })
 
   it('names the vpn page in the breadcrumb', () => {

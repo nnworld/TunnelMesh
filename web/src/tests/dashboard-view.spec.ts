@@ -3,7 +3,7 @@ import { createApp, nextTick } from 'vue'
 import { createPinia } from 'pinia'
 import Dashboard from '../views/Dashboard.vue'
 import { i18n } from '../i18n'
-import { getDashboardSummary, type AuditLog, type DashboardSummary } from '../api/client'
+import { getAgents, getDashboardSummary, type AuditLog, type DashboardSummary } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const push = vi.fn()
@@ -14,7 +14,7 @@ vi.mock('vue-router', () => ({
 }))
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
-  return { ...actual, getDashboardSummary: vi.fn() }
+  return { ...actual, getDashboardSummary: vi.fn(), getAgents: vi.fn() }
 })
 
 async function flush() {
@@ -56,6 +56,7 @@ describe('dashboard recent events', () => {
     document.body.innerHTML = ''
     push.mockReset()
     vi.mocked(getDashboardSummary).mockReset()
+    vi.mocked(getAgents).mockReset().mockResolvedValue({ items: [], nextCursor: '' } as never)
   })
 
   it('shows actor, resource id and details for each event', async () => {
@@ -115,6 +116,23 @@ describe('dashboard recent events', () => {
       const text = container.querySelector('.event')!.textContent || ''
       expect(text).toContain('alice')
       expect(text).not.toContain('user-7')
+    } finally {
+      unmount()
+    }
+  })
+
+  // The agents list endpoint rejects sort=name with a 422, which silently emptied
+  // the patch panel; it must ask for the default order and sort in the browser.
+  it('requests the patch panel sample without an unsupported sort column', async () => {
+    vi.mocked(getDashboardSummary).mockResolvedValue(summary([]))
+    vi.mocked(getAgents).mockResolvedValue({ items: [
+      { id: 'a2', name: 'zeta', enabled: true, status: 'online' }, { id: 'a1', name: 'alpha', enabled: true, status: 'offline' },
+    ] } as never)
+    const { container, unmount } = await mountDashboard()
+    try {
+      expect(getAgents).toHaveBeenCalledWith({ limit: 32 })
+      const names = [...container.querySelectorAll('[data-test="port"] .port-name')].map(node => node.textContent)
+      expect(names).toEqual(['alpha', 'zeta'])
     } finally {
       unmount()
     }

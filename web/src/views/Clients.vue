@@ -365,7 +365,7 @@ onMounted(load)
 .filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
 .filter-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
 .summary-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
-.summary-card { display:flex; flex-direction:column; gap:6px; padding:16px; background:#f7fbff; border:1px solid var(--tm-border); border-radius:10px; }
+.summary-card { display:flex; flex-direction:column; gap:6px; padding:16px; background:var(--tm-sunken); border:1px solid var(--tm-border); border-radius:10px; }
 .summary-card span { color:var(--tm-muted); font-size:13px; }
 .summary-card strong { font-size:24px; line-height:1; }
 .detail-content { display:flex; flex-direction:column; gap:18px; }

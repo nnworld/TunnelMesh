@@ -13,25 +13,25 @@
       </div>
       <DataState :loading="loading" :error="loadError" :empty="!items.length" :error-label="t('common.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('tokens.empty')" @retry="reload">
         <el-table :data="items" row-key="id" @sort-change="onSortChange">
-          <el-table-column prop="prefix" :label="t('tokens.prefix')" width="130" />
+          <el-table-column prop="prefix" :label="t('tokens.prefix')" width="130"><template #default="{ row }"><span class="tm-mono">{{ row.prefix }}</span></template></el-table-column>
           <el-table-column prop="type" :label="t('tokens.type')" width="130" />
-          <el-table-column prop="ownerUserId" :label="t('tokens.owner')" min-width="150" />
-          <el-table-column :label="t('tokens.binding')" min-width="180"><template #default="{ row }">{{ tokenBinding(row) }}</template></el-table-column>
+          <el-table-column prop="ownerUserId" :label="t('tokens.owner')" min-width="150"><template #default="{ row }"><IdCell :value="row.ownerUserId" /></template></el-table-column>
+          <el-table-column :label="t('tokens.binding')" min-width="180"><template #default="{ row }"><span class="tm-mono binding" :title="tokenBinding(row)">{{ tokenBinding(row) }}</span></template></el-table-column>
           <el-table-column :label="t('tokens.state')" width="120"><template #default="{ row }"><StatusTag :kind="row.status === 'revoked' ? 'info' : row.status === 'active' ? 'success' : 'warning'" :label="row.status" /></template></el-table-column>
           <el-table-column prop="expiresAt" :label="t('tokens.expires')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
           <el-table-column prop="lastUsedAt" :label="t('tokens.lastUsed')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.lastUsedAt) }}</template></el-table-column>
-          <el-table-column :label="t('tokens.actions')" width="340" fixed="right">
-            <template #default="{ row }">
+          <el-table-column :label="t('tokens.actions')" width="430" fixed="right">
+            <template #default="{ row }"><span class="row-actions">
               <el-button link type="primary" @click="showDetail(row)">{{t('tokens.detail')}}</el-button>
               <el-button link type="primary" :disabled="row.status !== 'active'" @click="openExpiration(row)">{{t('tokens.expiration')}}</el-button>
               <el-button link type="primary" :disabled="row.status !== 'active'" @click="openScope(row)">{{t('tokens.scopeUpdate')}}</el-button>
-              <el-button v-if="auth.isAdmin" link type="warning" :disabled="row.status === 'revoked'" @click="reveal(row)">{{t('tokens.reveal')}}</el-button>
+              <el-button v-if="auth.isAdmin" link type="primary" :disabled="row.status === 'revoked'" @click="reveal(row)">{{t('tokens.reveal')}}</el-button>
               <el-button link type="primary" :disabled="row.status === 'revoked'" @click="rotate(row)">{{t('tokens.rotate')}}</el-button>
               <el-button link type="danger" :disabled="row.status === 'revoked'" @click="revoke(row)">{{t('tokens.revoke')}}</el-button>
-            </template>
+            </span></template>
           </el-table-column>
         </el-table>
-        <div class="pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+        <PagerBar :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="pageSize" :loading="loading" @previous="previous" @next="next" @size-change="changePageSize" />
       </DataState>
     </div>
 
@@ -150,6 +150,8 @@
 </template>
 
 <script setup lang="ts">
+import IdCell from '../components/IdCell.vue'
+import PagerBar from '../components/PagerBar.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { createToken, getAgents, getServerNodes, getTokenDetail, listTokens, revokeToken, rotateToken, revealToken, updateTokenExpiration, updateTokenScope, type Agent, type ServerNode, type ServiceToken, type TokenType } from '../api/client'
@@ -246,6 +248,7 @@ async function updateScope() {
 async function loadAgents() { agentsLoading.value = true; try { agents.value = await loadAgentsForSelection(getAgents) } finally { agentsLoading.value = false } }
 async function loadServerNodes() { serverNodesLoading.value = true; try { const page = await getServerNodes({ limit: 500 }); serverNodes.value = page.items } finally { serverNodesLoading.value = false } }
 async function reload() { pageIndex.value = 0; cursors.value = ['']; await loadPage() }
+function changePageSize(size: number) { pageSize.value = size; void reload() }
 async function loadPage() { loading.value = true; loadError.value = false; try { const page = await listTokens({ type: filterTypes.value.join(',') || undefined, cursor: cursors.value[pageIndex.value] || undefined, limit: pageSize.value, sort: sort.value, order: order.value }); items.value = page.items; nextCursor.value = page.nextCursor || '' } catch { loadError.value = true } finally { loading.value = false } }
 function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value + 1] = nextCursor.value; pageIndex.value += 1; void loadPage() }
 function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void loadPage() }
@@ -267,10 +270,12 @@ onMounted(() => { void reload(); void loadAgents(); if (auth.isAdmin) void loadS
 </script>
 
 <style scoped>
-.table-card { padding: 16px; }
-.toolbar { display: flex; gap: 12px; margin-bottom: 18px; }
-.pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 18px 0 4px; } .page-size { width: 100px; }
-.field-help { margin-top: 4px; color: var(--tm-muted); font-size: 12px; }
-.scope-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
-.scope-list span { display: inline-block; min-width: 120px; color: var(--tm-muted); }
+.table-card { padding: var(--tm-s-4); }
+.toolbar { display: flex; gap: var(--tm-s-3); margin-bottom: var(--tm-s-4); }
+.toolbar .el-select { flex: 1 1 260px; min-width: 0; }
+.binding { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--tm-fs-xs); color: var(--tm-ink-2); }
+.row-actions { display: inline-flex; flex-wrap: nowrap; gap: var(--tm-s-1); }
+.field-help { margin-top: var(--tm-s-1); color: var(--tm-ink-2); font-size: var(--tm-fs-xs); }
+.scope-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--tm-s-2); }
+.scope-list span { display: inline-block; min-width: 120px; color: var(--tm-ink-2); }
 </style>

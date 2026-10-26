@@ -1,8 +1,20 @@
 <template>
   <main class="login-page">
-    <div class="login-brand"><span class="mesh-dot" />TunnelMesh</div>
-    <el-card class="login">
-      <div class="locale"><el-button link @click="switchLocale">{{ preferences.locale === 'zh-CN' ? 'English' : '简体中文' }}</el-button></div>
+    <aside class="login-panel" aria-hidden="true">
+      <div class="login-brand"><svg viewBox="0 0 28 12" width="28" height="12" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3" cy="6" r="2.25" /><circle cx="14" cy="6" r="2.25" /><circle cx="25" cy="6" r="2.25" /><path d="M5.25 6h6.5M16.25 6h6.5" /></svg>TunnelMesh</div>
+      <!-- A static patch panel: decoration only, it shows no live data. -->
+      <svg class="login-rack" viewBox="0 0 360 200" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="1" y="1" width="358" height="62" rx="3" /><rect x="1" y="69" width="358" height="62" rx="3" /><rect x="1" y="137" width="358" height="62" rx="3" />
+        <g><rect v-for="n in 12" :key="'a' + n" :x="14 + (n - 1) * 28" y="20" width="18" height="24" rx="2" /></g>
+        <g><rect v-for="n in 12" :key="'b' + n" :x="14 + (n - 1) * 28" y="88" width="18" height="24" rx="2" /></g>
+        <g><rect v-for="n in 12" :key="'c' + n" :x="14 + (n - 1) * 28" y="156" width="18" height="24" rx="2" /></g>
+        <path d="M23 44c0 30 56 30 56 44M107 44c0 24 84 40 84 44M219 112c0 30-56 30-56 44M303 112c0 20-28 24-28 44" stroke-width="2" />
+      </svg>
+      <div class="login-copy"><h2>{{ t('auth.panelTitle') }}</h2><p>{{ t('auth.panelBody') }}</p></div>
+    </aside>
+    <section class="login">
+      <div class="login-tools"><ThemeToggle /><el-button link @click="switchLocale">{{ preferences.locale === 'zh-CN' ? 'English' : '简体中文' }}</el-button></div>
+      <div class="login-card">
       <template v-if="step === 'password'">
         <h1>{{ t('auth.welcome') }}</h1><p>{{ t('auth.description') }}</p>
         <el-form label-position="top" @submit.prevent="submit">
@@ -31,7 +43,8 @@
           <el-alert v-if="errorText" type="error" :title="errorText" show-icon :closable="false" data-test="mfa-error" />
         </el-form>
       </template>
-    </el-card>
+      </div>
+    </section>
   </main>
 </template>
 
@@ -46,6 +59,7 @@ import type { OIDCProviderSummary } from '../api/auth'
 import { useAuthStore } from '../stores/auth'
 import type { LoginResult } from '../stores/auth'
 import { usePreferencesStore } from '../stores/preferences'
+import ThemeToggle from '../components/ThemeToggle.vue'
 
 const { t } = useI18n(), route = useRoute(), router = useRouter(), auth = useAuthStore(), preferences = usePreferencesStore()
 const step = ref<'password' | 'mfa'>('password')
@@ -140,4 +154,29 @@ function startCountdown(seconds: number) {
 function backToPassword() { step.value = 'password'; code.value = ''; challengeId.value = ''; error.value = ''; throttled.value = false; throttleRemaining.value = 0 }
 </script>
 
-<style scoped>.login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 20% 10%,#e8f3ff 0,transparent 35%),var(--tm-bg)}.login-brand{position:fixed;top:28px;left:32px;font-weight:750}.mesh-dot{display:inline-block;width:10px;height:10px;margin-right:8px;border-radius:50%;background:var(--tm-primary);box-shadow:16px 0 0 #8dc5ff}.login{width:min(420px,100%);border:1px solid var(--tm-border);border-radius:10px}.login h1{margin:0;font-size:26px}.login p{margin:6px 0 24px;color:var(--tm-muted)}.locale{text-align:right}.submit{width:100%;margin:14px 0}.trust{margin-bottom:4px}.hint{margin:-8px 0 14px;color:var(--tm-muted);font-size:12px}.mfa-step .hint{margin-bottom:14px}.back{text-align:center}.sso{margin-top:4px}.sso-button{display:flex;width:100%;margin-bottom:10px;text-decoration:none}:deep(.el-divider__text){color:var(--tm-muted);font-size:12px}</style>
+<style scoped>
+.login-page { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); background: var(--tm-canvas); }
+.login-panel { display: flex; flex-direction: column; justify-content: space-between; gap: var(--tm-s-8); padding: var(--tm-s-10) var(--tm-s-12); background: var(--tm-brand-fill); color: var(--tm-on-brand); }
+.login-brand { display: flex; align-items: center; gap: var(--tm-s-3); font-size: var(--tm-fs-lg); font-weight: 600; letter-spacing: -0.01em; }
+.login-rack { width: 100%; max-width: 420px; height: auto; align-self: center; opacity: 0.55; }
+.login-copy h2 { margin: 0; max-width: 18ch; font-size: var(--tm-fs-2xl); line-height: var(--tm-lh-2xl); font-weight: 600; letter-spacing: -0.02em; }
+.login-copy p { margin: var(--tm-s-3) 0 0; max-width: 44ch; font-size: var(--tm-fs-sm); line-height: var(--tm-lh-md); opacity: 0.85; }
+.login { display: flex; flex-direction: column; padding: var(--tm-s-6) var(--tm-s-8); }
+.login-tools { display: flex; align-items: center; justify-content: flex-end; gap: var(--tm-s-3); }
+.login-card { width: min(400px, 100%); margin: auto; padding-bottom: var(--tm-s-10); }
+.login-card h1 { margin: 0; font-size: var(--tm-fs-2xl); line-height: var(--tm-lh-2xl); font-weight: 600; letter-spacing: -0.02em; }
+.login-card p { margin: var(--tm-s-2) 0 var(--tm-s-6); color: var(--tm-ink-2); font-size: var(--tm-fs-sm); }
+.submit { width: 100%; margin: var(--tm-s-4) 0; height: 40px; }
+.trust { margin-bottom: var(--tm-s-1); }
+.hint { margin: calc(var(--tm-s-2) * -1) 0 var(--tm-s-4); color: var(--tm-ink-2); font-size: var(--tm-fs-xs); }
+.back { text-align: center; margin-bottom: var(--tm-s-3); }
+.sso { margin-top: var(--tm-s-1); }
+.sso-button { display: flex; width: 100%; margin: 0 0 var(--tm-s-2); text-decoration: none; }
+:deep(.el-divider__text) { color: var(--tm-ink-3); font-size: var(--tm-fs-xs); background: var(--tm-canvas); }
+:deep(.el-input) { --el-input-height: 40px; }
+@media (max-width: 860px) {
+  .login-page { grid-template-columns: minmax(0, 1fr); }
+  .login-panel { display: none; }
+  .login { padding: var(--tm-s-4); min-height: 100vh; }
+}
+</style>

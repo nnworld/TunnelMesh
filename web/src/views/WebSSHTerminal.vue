@@ -69,7 +69,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { Terminal } from '@xterm/xterm'
@@ -89,6 +89,8 @@ import { useHostKeyVerifier } from '../webssh/host-key'
 import { connectSSH, type ShellExitInfo, type SSHConnection, type TerminalChannel } from '../webssh/ssh-client'
 import { createZmodemBridge, type ZmodemBridge, type ZmodemEvent } from '../webssh/zmodem'
 import { downloadBytes } from '../webssh/download'
+import { terminalTheme } from '../webssh/terminalTheme'
+import { usePreferencesStore } from '../stores/preferences'
 
 type WebSSHStatus = 'connecting' | 'connected' | 'error' | 'closed'
 
@@ -232,7 +234,7 @@ async function connect() {
       cursorBlink: true,
       fontSize: 13,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      theme: { background: '#0b1220' },
+      theme: terminalTheme(preferences.resolvedTheme),
     })
     fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
@@ -432,6 +434,10 @@ async function disconnectAndLeave() {
 }
 
 onMounted(connect)
+const preferences = usePreferencesStore()
+// The terminal follows the console theme, including a switch mid-session.
+watch(() => preferences.resolvedTheme, (theme) => { if (terminal) terminal.options.theme = terminalTheme(theme) })
+
 onBeforeUnmount(() => {
   if (unloadHandler) window.removeEventListener('beforeunload', unloadHandler)
   if (resizeHandler) window.removeEventListener('resize', resizeHandler)
@@ -464,7 +470,7 @@ onBeforeRouteLeave(async (to) => {
 .transfer-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--tm-muted); font-size: 12px; }
 .transfer-hint { overflow-wrap: anywhere; }
 .zmodem-file-input { display: none; }
-.terminal { min-height: 520px; padding: 12px; background: #0b1220; border-radius: 10px; overflow: hidden; }
+.terminal { min-height: 520px; padding: 12px; background: var(--tm-terminal-bg); border-radius: 10px; overflow: hidden; }
 .terminal.hidden { display: none; }
 .remote-ended { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .remote-ended-reason { color: var(--tm-muted); font-size: 13px; overflow-wrap: anywhere; }

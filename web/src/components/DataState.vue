@@ -1,18 +1,17 @@
 <template>
   <el-skeleton v-if="loading" :rows="rows" animated />
-  <el-alert v-else-if="error" type="error" :title="errorLabel" show-icon>
-    <el-button v-if="retryLabel" size="small" @click="$emit('retry')">{{ retryLabel }}</el-button>
-  </el-alert>
-  <el-empty v-else-if="empty" :description="emptyLabel" />
+  <ErrorState v-else-if="error" :label="errorLabel ?? ''" :retry-label="retryLabel" @retry="$emit('retry')" />
+  <EmptyState v-else-if="empty" :label="emptyLabel ?? ''" />
   <slot v-else />
 </template>
 <script setup lang="ts">
-import { ElAlert, ElButton, ElEmpty, ElSkeleton } from 'element-plus'
+import { ElSkeleton } from 'element-plus'
+import EmptyState from './EmptyState.vue'
+import ErrorState from './ErrorState.vue'
 // unplugin-vue-components only injects styles for components it resolves from
-// templates. These four are imported explicitly, so their style entries must be
-// imported here as well: without el-empty.css the empty-state SVG has no
-// 100px image box and no fill variables, and list pages render a page-sized
-// black shape instead of the illustration.
+// templates, so the skeleton is imported explicitly and its style entry must be
+// imported here too. The alert, button and empty entries stay for the views
+// that still render those components next to DataState.
 import 'element-plus/es/components/alert/style/css'
 import 'element-plus/es/components/button/style/css'
 import 'element-plus/es/components/empty/style/css'

@@ -7,7 +7,7 @@
       <h1>{{ title }}</h1>
       <p v-if="description">{{ description }}</p>
     </div>
-    <div><slot /></div>
+    <div class="page-actions"><slot /></div>
   </header>
 </template>
 
@@ -27,9 +27,10 @@ const breadcrumbs = computed(() => breadcrumbsFor(route.path))
 </script>
 
 <style scoped>
-.page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.page-header h1 { margin: 0; font-size: 22px; line-height: 32px; }
-.page-header p { margin: 4px 0 0; color: var(--tm-muted); font-size: 14px; }
-.page-header :deep(.el-breadcrumb) { margin-bottom: 8px; }
+.page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--tm-s-4); padding-bottom: var(--tm-s-2); }
+.page-header h1 { margin: 0; color: var(--tm-ink); font-size: var(--tm-fs-xl); font-weight: 600; line-height: var(--tm-lh-xl); letter-spacing: -0.015em; }
+.page-header p { margin: var(--tm-s-1) 0 0; max-width: 72ch; color: var(--tm-ink-2); font-size: var(--tm-fs-sm); line-height: var(--tm-lh-sm); }
+.page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--tm-s-2); }
+.page-header :deep(.el-breadcrumb) { margin-bottom: var(--tm-s-2); }
 @media (max-width: 600px) { .page-header { align-items: stretch; flex-direction: column; } }
 </style>

@@ -1,19 +1,169 @@
+/*
+ * Design tokens: "Rack". Raw values live only in this file; every other
+ * stylesheet and component refers to a role. Contrast of each pair in use is
+ * asserted by tests/tokens-contrast.spec.ts, so change a value and run the suite.
+ */
 :root {
-  --tm-primary: #1677ff;
-  --tm-bg: #f5f7fa;
-  --tm-surface: #ffffff;
-  --tm-text: #1f2329;
-  --tm-muted: #667085;
-  --tm-border: #d9e2f2;
+  /* Surfaces, from the page down to the work surface. */
+  --tm-canvas: #ECEEEA;
+  --tm-paper: #F7F8F5;
+  --tm-raised: #FFFFFF;
+  --tm-float: #FFFFFF;
+  --tm-sunken: #E3E6E1;
+
+  /* Text. ink-4 is decoration and disabled state only, never essential text. */
+  --tm-ink: #101B1A;
+  --tm-ink-2: #4E5D5B;
+  --tm-ink-3: #5F6D6A;
+  --tm-ink-4: #7E8B88;
+
+  /* Lines. line-control is the border of interactive controls (3:1 against the surface). */
+  --tm-line: #D6DBD6;
+  --tm-line-strong: #BCC5BF;
+  --tm-line-control: #7F8D88;
+
+  /* Brand: petrol teal. brand is for text and links, brand-fill for solid buttons. */
+  --tm-brand: #0A6C74;
+  --tm-brand-hover: #085A61;
+  --tm-brand-active: #064A50;
+  --tm-brand-fill: #0A6C74;
+  --tm-brand-fill-hover: #085A61;
+  --tm-brand-tint: #E1EFEE;
+  --tm-on-brand: #FFFFFF;
+
+  /* Status. The plain colour is a fill; the -ink colour is for text. */
+  --tm-ok: #1E9E6A;
+  --tm-ok-ink: #13734B;
+  --tm-ok-tint: #E3F3EB;
+  --tm-led-ok: #178A5C;
+  --tm-warn: #D9951B;
+  --tm-warn-ink: #85560A;
+  --tm-warn-tint: #FBF0D9;
+  --tm-danger: #C8372D;
+  --tm-danger-ink: #B02F26;
+  --tm-danger-tint: #F9E4E1;
+  --tm-danger-fill: #C8372D;
+  --tm-on-danger: #FFFFFF;
+
+  /* The terminal and code surfaces follow the theme. */
+  --tm-terminal-bg: #F4F6F2;
+
+  /* Elevation. Cards carry a line, not a shadow; shadows are for floating layers. */
+  --tm-shadow-float: 0 1px 2px rgb(16 27 26 / 0.06), 0 8px 24px -8px rgb(16 27 26 / 0.18);
+  --tm-shadow-overlay: 0 2px 4px rgb(16 27 26 / 0.08), 0 24px 48px -12px rgb(16 27 26 / 0.28);
+  --tm-shadow-inset: inset 0 1px 0 rgb(255 255 255 / 0.6);
+
+  /* Space (4px grid). */
+  --tm-s-1: 4px;
+  --tm-s-2: 8px;
+  --tm-s-3: 12px;
+  --tm-s-4: 16px;
+  --tm-s-5: 20px;
+  --tm-s-6: 24px;
+  --tm-s-8: 32px;
+  --tm-s-10: 40px;
+  --tm-s-12: 48px;
+
+  /* Radius. Rack equipment is rectilinear, so corners stay small. */
+  --tm-r-xs: 2px;
+  --tm-r-sm: 4px;
+  --tm-r-md: 6px;
+  --tm-r-lg: 10px;
+  --tm-r-pill: 999px;
+
+  /* Type. */
+  --tm-font-ui: "Instrument Sans", -apple-system, BlinkMacSystemFont, "PingFang SC", "HarmonyOS Sans SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --tm-font-mono: "Martian Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --tm-fs-xs: 12px;
+  --tm-lh-xs: 16px;
+  --tm-fs-sm: 13px;
+  --tm-lh-sm: 20px;
+  --tm-fs-md: 14px;
+  --tm-lh-md: 22px;
+  --tm-fs-lg: 16px;
+  --tm-lh-lg: 24px;
+  --tm-fs-xl: 20px;
+  --tm-lh-xl: 28px;
+  --tm-fs-2xl: 28px;
+  --tm-lh-2xl: 34px;
+  --tm-fs-display: 32px;
+  --tm-lh-display: 38px;
+
+  /* Motion. */
+  --tm-dur-fast: 80ms;
+  --tm-dur: 120ms;
+  --tm-dur-slow: 200ms;
+  --tm-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Layout. */
+  --tm-rail-w: 232px;
+  --tm-rail-w-collapsed: 56px;
+  --tm-topbar-h: 48px;
+  --tm-content-max: 1440px;
+
+  /* Names used by existing views. They point at the roles above and are removed once
+     the last view has moved over. */
+  --tm-primary: var(--tm-brand);
+  --tm-bg: var(--tm-canvas);
+  --tm-surface: var(--tm-paper);
+  --tm-text: var(--tm-ink);
+  --tm-muted: var(--tm-ink-2);
+  --tm-border: var(--tm-line);
   --tm-sidebar: 208px;
   --tm-header: 56px;
-  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  color: var(--tm-text);
-  background: var(--tm-bg);
+
+  color: var(--tm-ink);
+  background: var(--tm-canvas);
+  font-family: var(--tm-font-ui);
 }
-* { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; background: var(--tm-bg); }
-button, input { font: inherit; }
+
+/*
+ * Dark: slate-green, layered by lightness (canvas < paper < raised < float) rather
+ * than near-black with a bright accent. Status colours are the -ink colours, since
+ * contrast is already high on dark surfaces.
+ */
+:root[data-theme="dark"] {
+  --tm-canvas: #0D1211;
+  --tm-paper: #131A19;
+  --tm-raised: #1A2322;
+  --tm-float: #212C2B;
+  --tm-sunken: #0A0F0E;
+
+  --tm-ink: #E6EBE8;
+  --tm-ink-2: #A5B2AF;
+  --tm-ink-3: #7D8B88;
+  --tm-ink-4: #5C6A67;
+
+  --tm-line: #222D2B;
+  --tm-line-strong: #2E3C3A;
+  --tm-line-control: #61736F;
+
+  --tm-brand: #4FB3B8;
+  --tm-brand-hover: #6CC4C8;
+  --tm-brand-active: #8AD3D6;
+  --tm-brand-fill: #1F7C84;
+  --tm-brand-fill-hover: #278A92;
+  --tm-brand-tint: #14292B;
+  --tm-on-brand: #FFFFFF;
+
+  --tm-ok: #3DBB86;
+  --tm-ok-ink: #3DBB86;
+  --tm-ok-tint: #16342A;
+  --tm-led-ok: #3DBB86;
+  --tm-warn: #E0A83A;
+  --tm-warn-ink: #E0A83A;
+  --tm-warn-tint: #3A2E12;
+  --tm-danger: #EF6A5E;
+  --tm-danger-ink: #EF6A5E;
+  --tm-danger-tint: #3F1D1A;
+  --tm-danger-fill: #C9463B;
+  --tm-on-danger: #FFFFFF;
+
+  --tm-terminal-bg: #0F1716;
+
+  --tm-shadow-float: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px -8px rgb(0 0 0 / 0.55);
+  --tm-shadow-overlay: 0 2px 4px rgb(0 0 0 / 0.45), 0 24px 48px -12px rgb(0 0 0 / 0.6);
+  --tm-shadow-inset: none;
+}
+
 .tm-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
-.tm-card { background: var(--tm-surface); border: 1px solid var(--tm-border); border-radius: 8px; }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }

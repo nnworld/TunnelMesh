@@ -1,2 +1,21 @@
 <!doctype html>
-<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>TunnelMesh Admin</title></head><body><div id="app"></div><script type="module" src="/src/main.ts"></script></body></html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><meta name="color-scheme" content="light dark"/><title>TunnelMesh Admin</title>
+<!-- Sets the theme before first paint so a dark-theme user never sees a flash of the light page.
+     Keep the storage key in step with THEME_KEY in src/utils/theme.ts; tests/index-html.spec.ts checks it. -->
+<script>
+(function () {
+  var root = document.documentElement;
+  try {
+    var stored = localStorage.getItem('tunnelmesh_theme');
+    var dark = stored === 'dark' || (stored !== 'light' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    root.setAttribute('data-theme', dark ? 'dark' : 'light');
+    if (dark) root.classList.add('dark');
+    root.style.colorScheme = dark ? 'dark' : 'light';
+  } catch (error) {
+    root.setAttribute('data-theme', 'light');
+    root.style.colorScheme = 'light';
+  }
+})();
+</script>
+<style>html{background:#ECEEEA}html[data-theme=dark]{background:#0D1211}</style>
+</head><body><div id="app"></div><script type="module" src="/src/main.ts"></script></body></html>

@@ -21,8 +21,8 @@ describe('production bundle configuration', () => {
   })
 
   it('loads styles for menu components imported in render functions', () => {
-    const shell = readFileSync('src/layouts/AppShell.vue', 'utf8')
-    expect(shell).toContain("element-plus/es/components/menu/style/css")
+    const rail = readFileSync('src/layouts/NavRail.vue', 'utf8')
+    expect(rail).toContain("element-plus/es/components/menu/style/css")
   })
 
   it('loads styles for breadcrumb components imported in render functions', () => {
