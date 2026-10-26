@@ -57,7 +57,7 @@ export async function openTab({ cdpPort, origin, url, token, downloadsDir, scree
   await send('DOM.enable')
   // The admin SPA reads its bearer token from localStorage, so seed it before
   // the first document loads instead of driving the login form.
-  await send('Page.addScriptToEvaluateOnNewDocument', { source: `localStorage.setItem('tunnelmesh_token', ${JSON.stringify(token)})` })
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: `localStorage.setItem('tunnelmesh_token', ${JSON.stringify(token)})${process.env.TM_E2E_LOCALE ? `;localStorage.setItem('tunnelmesh_locale', ${JSON.stringify(process.env.TM_E2E_LOCALE)})` : ''}` })
   await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
   await send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadsDir, eventsEnabled: true })
   await send('Page.navigate', { url: origin + url })
@@ -120,7 +120,7 @@ export async function openTab({ cdpPort, origin, url, token, downloadsDir, scree
 }
 
 /** launchChrome starts a headless Chrome and waits for its debug endpoint. */
-export async function launchChrome({ binary, cdpPort, profileDir, width = 1521, height = 900 }) {
+export async function launchChrome({ binary, cdpPort, profileDir, width = 1521, height = 900, }) {
   const chrome = spawn(binary, [
     '--headless=new',
     `--remote-debugging-port=${cdpPort}`,

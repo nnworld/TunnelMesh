@@ -23,7 +23,7 @@ const UI = {
   sshButton: label('SSH 连接', 'SSH'),
   autoAuth: label('自动认证', 'Auto-auth'),
   hostKeyTitle: label('确认服务器指纹', 'Verify server fingerprint'),
-  hostKeyTrust: label('确认指纹', 'Trust fingerprint'),
+  hostKeyTrust: label('确认指纹', 'Trustfingerprint'),
   password: label('密码', 'Password'),
   disconnect: label('断开连接', 'Disconnect'),
   sftp: 'SFTP',
