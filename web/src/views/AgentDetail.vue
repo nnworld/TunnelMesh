@@ -490,21 +490,20 @@ onMounted(() => {
   margin-top: 18px;
   font-size: 14px;
   font-weight: 600;
-  color: #1f2937;
+  color: var(--tm-ink);
 }
 .connection-header {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px;
 }
 .connection-header .section-title { margin-top: 0; }
 .connection-error, .close-error { margin-top: 12px; }
-.close-error { color: #d93026; font-size: 13px; }
+.close-error { color: var(--tm-danger-ink); font-size: 13px; }
 .policy-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .policy-title { margin-top: 0; font-size: 16px; }
-.policy-description { margin-top: 4px; max-width: 720px; color: #6b7280; font-size: 13px; line-height: 1.5; }
+.policy-description { margin-top: 4px; max-width: 720px; color: var(--tm-ink-3); font-size: 13px; line-height: 1.5; }
 .policy-actions { display: flex; align-items: center; gap: 12px; }
 .policy-status-filter { display: flex; align-items: center; gap: 4px; }
 .list-pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px 0 0; }
-.page-size { width: 100px; }
-.policy-delete-warning { margin: 14px 0 0; color: #4b5563; font-size: 13px; line-height: 1.5; }
-.field-help { margin-top: 5px; color: #6b7280; font-size: 12px; line-height: 1.5; }
+.policy-delete-warning { margin: 14px 0 0; color: var(--tm-ink-2); font-size: 13px; line-height: 1.5; }
+.field-help { margin-top: 5px; color: var(--tm-ink-3); font-size: 12px; line-height: 1.5; }
 </style>

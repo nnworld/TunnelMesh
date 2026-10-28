@@ -141,4 +141,4 @@ function clearTemporaryPassword() { temporaryPassword.value = ''; temporaryOpen.
 onMounted(load); onBeforeUnmount(clearTemporaryPassword)
 </script>
 
-<style scoped>.panel { overflow: hidden; } .toolbar { display: flex; justify-content: flex-end; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); } .keyword-input { width: min(240px, 100%); } .list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:16px; } .page-size { width:100px; } :deep(.el-table) { --el-table-border-color: #edf1f7; }</style>
+<style scoped>.panel { overflow: hidden; } .toolbar { display: flex; justify-content: flex-end; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); } .keyword-input { width: min(240px, 100%); } .list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:16px; } :deep(.el-table) { --el-table-border-color: var(--tm-line); }</style>

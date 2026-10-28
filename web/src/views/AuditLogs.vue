@@ -2,7 +2,7 @@
   <section class="tm-page">
     <PageHeader :title="t('audits.title')" :description="t('audits.description')" />
     <div class="tm-card filter-card">
-      <el-form label-position="top" @submit.prevent="search">
+      <el-form class="filter-form" label-position="top" @submit.prevent="search">
         <div class="filter-grid">
           <el-form-item :label="t('audits.timeRange')">
             <el-date-picker
@@ -31,6 +31,9 @@
         </div>
       </el-form>
     </div>
+    <div v-if="activeFilters.length" class="applied-filters" data-test="applied-filters">
+      <el-tag v-for="chip in activeFilters" :key="chip.key" closable disable-transitions @close="removeFilter(chip.key)">{{ chip.label }}: {{ chip.value }}</el-tag>
+    </div>
     <div class="tm-card">
       <DataState
         :loading="loading"
@@ -41,7 +44,7 @@
         :empty-label="t('common.empty')"
         @retry="load"
       >
-        <el-table :data="items" row-key="id" @sort-change="onSortChange">
+        <el-table :data="items" row-key="id" class="audit-table" @sort-change="onSortChange" @row-click="showAuditDetail">
           <el-table-column prop="createdAt" :label="t('audits.time')" width="220" sortable="custom">
             <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
           </el-table-column>
@@ -53,9 +56,9 @@
               <div v-if="row.actorUserId" class="actor-id">{{ row.actorUserId }}</div>
             </template>
           </el-table-column>
-          <el-table-column prop="action" :label="t('audits.action')" min-width="180" />
+          <el-table-column prop="action" :label="t('audits.action')" min-width="240"><template #default="{ row }"><span class="tm-mono action">{{ row.action }}</span></template></el-table-column>
           <el-table-column prop="resourceType" :label="t('audits.resourceType')" min-width="150" />
-          <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200" />
+          <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200"><template #default="{ row }"><IdCell v-if="row.resourceId" :value="row.resourceId" /></template></el-table-column>
           <!-- What changed, without opening a dialog for every row: the facts an
                action recorded, summarized, with the whole payload on hover. -->
           <el-table-column :label="t('audits.summary')" min-width="260">
@@ -71,16 +74,11 @@
             </template>
           </el-table-column>
         </el-table>
-        <div class="pager">
-          <el-button :disabled="pageIndex === 0 || loading" @click="previousPage">{{ t('common.previousPage') }}</el-button>
-          <span class="pager-label">{{ t('common.page', { number: pageIndex + 1 }) }}</span>
-          <el-button :disabled="!nextCursor || loading" @click="nextPage">{{ t('common.nextPage') }}</el-button>
-          <el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" />
-        </div>
+        <PagerBar :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="pageSize" :loading="loading" @previous="previousPage" @next="nextPage" @size-change="changePageSize" />
       </DataState>
     </div>
 
-    <el-dialog v-model="detailVisible" :title="t('audits.detailTitle')" width="min(680px,94vw)">
+    <DetailDrawer v-model="detailVisible" :title="t('audits.detailTitle')">
       <el-descriptions v-if="detailAudit" :column="1" border>
         <el-descriptions-item :label="t('audits.time')">{{ formatDate(detailAudit.createdAt) }}</el-descriptions-item>
         <el-descriptions-item :label="t('audits.actor')">
@@ -93,18 +91,20 @@
         <!-- The id that joins this row to the structured logs of the same request. -->
         <el-descriptions-item :label="t('audits.traceId')">{{ auditTraceId(detailAudit.details) || t('audits.noTrace') }}</el-descriptions-item>
       </el-descriptions>
-      <div class="detail-json">
-        <pre>{{ formatDetails(detailAudit?.details) }}</pre>
-      </div>
-    </el-dialog>
+      <CodeBlock class="detail-json" :code="formatDetails(detailAudit?.details)" />
+    </DetailDrawer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
+import DetailDrawer from '../components/DetailDrawer.vue'
+import CodeBlock from '../components/CodeBlock.vue'
+import IdCell from '../components/IdCell.vue'
+import PagerBar from '../components/PagerBar.vue'
 import { listAuditLogs, type AuditLog } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle, auditTraceId } from '../utils/audit'
@@ -119,6 +119,9 @@ const error = ref(false)
 const detailVisible = ref(false)
 const detailAudit = ref<AuditLog | null>(null)
 const formatDate = useFormatDateTime()
+// Applied conditions are echoed back as removable chips so a filtered list is
+// never a mystery; removing one re-runs the search without it.
+const FILTER_LABELS = { actorUserId: 'audits.actor', action: 'audits.action', resourceType: 'audits.resourceType', resourceId: 'audits.resourceId' } as const
 const filters = reactive({
   createdRange: [] as string[],
   actorUserId: '',
@@ -133,9 +136,19 @@ const nextCursor = ref('')
 const sort = ref('createdAt')
 const order = ref<'asc' | 'desc'>('desc')
 
+const applied = ref<Partial<Record<keyof typeof FILTER_LABELS, string>>>({})
+const activeFilters = computed(() => (Object.keys(FILTER_LABELS) as Array<keyof typeof FILTER_LABELS>)
+  .filter(key => applied.value[key])
+  .map(key => ({ key, label: t(FILTER_LABELS[key]), value: applied.value[key] as string })))
+function removeFilter(key: keyof typeof FILTER_LABELS) {
+  filters[key] = ''
+  search()
+}
+
 async function load() {
   loading.value = true
   error.value = false
+  applied.value = { actorUserId: filters.actorUserId.trim(), action: filters.action.trim(), resourceType: filters.resourceType.trim(), resourceId: filters.resourceId.trim() }
   try {
     const page = await listAuditLogs({ ...auditFilter(), limit: pageSize.value, cursor: pageCursors.value[pageIndex.value], sort: sort.value, order: order.value })
     items.value = page.items
@@ -210,64 +223,14 @@ onMounted(load)
 </script>
 
 <style scoped>
-.filter-card {
-  margin-bottom: 16px;
-}
-
-.filter-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 4px 16px;
-}
-
-.filter-grid :deep(.el-date-editor) {
-  width: 100%;
-}
-
-.filter-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-}
-
-.pager {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 18px 0 4px;
-}
-
-.pager-label {
-  color: var(--tm-muted);
-  font-size: 13px;
-}
-
-.actor-name {
-  font-weight: 600;
-}
-
-.actor-id,
-.audit-summary {
-  color: var(--tm-muted);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.detail-json {
-  margin-top: 16px;
-  overflow: auto;
-  max-height: 360px;
-  padding: 12px;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
-  background: var(--el-fill-color-lighter);
-}
-
-.detail-json pre {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
+.filter-card { margin-bottom: var(--tm-s-4); }
+.filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--tm-s-1) var(--tm-s-4); }
+.filter-grid :deep(.el-date-editor) { width: 100%; }
+.filter-actions { display: flex; justify-content: flex-end; gap: var(--tm-s-3); }
+.applied-filters { display: flex; flex-wrap: wrap; gap: var(--tm-s-2); }
+.audit-table :deep(.el-table__row) { cursor: pointer; }
+.actor-name { font-weight: 500; }
+.action { font-size: var(--tm-fs-xs); color: var(--tm-ink); white-space: nowrap; }
+.actor-id, .audit-summary { color: var(--tm-ink-2); font-size: var(--tm-fs-xs); overflow-wrap: anywhere; }
+.detail-json { max-height: 50vh; overflow: auto; }
 </style>

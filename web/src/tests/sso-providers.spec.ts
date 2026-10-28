@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flatNavigation } from '../layouts/navigation'
 import { createApp } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { readFileSync } from 'node:fs'
@@ -251,7 +252,7 @@ describe('SSO provider administration', () => {
     const route = router.getRoutes().find(entry => entry.path === '/sso-providers')
     expect(route?.meta).toMatchObject({ auth: true, admin: true })
     expect(breadcrumbsFor('/sso-providers')).toEqual([{ key: 'shell.console' }, { key: 'sso.title' }])
-    expect(readFileSync('src/layouts/AppShell.vue', 'utf8')).toContain("['/sso-providers', 'navigation.sso']")
+    expect(flatNavigation(true).find(item => item.path === '/sso-providers')).toMatchObject({ labelKey: 'navigation.sso', admin: true })
     for (const file of ['src/i18n/messages/zh-CN.ts', 'src/i18n/messages/en-US.ts']) {
       expect(readFileSync(file, 'utf8')).toContain('sso:')
     }

@@ -1,0 +1,43 @@
+/* Reset and document defaults. */
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--tm-canvas);
+  color: var(--tm-ink);
+  font-family: var(--tm-font-ui);
+  font-size: var(--tm-fs-md);
+  line-height: var(--tm-lh-md);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+button, input, select, textarea { font: inherit; }
+[hidden] { display: none !important; }
+
+::selection { background: var(--tm-brand-tint); color: var(--tm-ink); }
+
+/* One focus ring for everything that can take focus. */
+:focus-visible {
+  outline: 2px solid var(--tm-brand);
+  outline-offset: 2px;
+}
+
+/* Quiet scrollbars that follow the theme. */
+* { scrollbar-width: thin; scrollbar-color: var(--tm-line-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--tm-line-strong); border-radius: var(--tm-r-pill); border: 2px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

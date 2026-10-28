@@ -3,8 +3,15 @@
     <PageHeader :title="t('dashboard.title')" :description="t('dashboard.description')" />
     <DataState :loading="loading" :error="error" :error-label="t('dashboard.unavailable')" :retry-label="t('dashboard.retry')" @retry="retry">
       <template v-if="summary">
-        <div class="stats">
-          <div v-for="item in stats" :key="item.label" class="tm-card stat"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></div>
+        <MetricStrip :items="stats" />
+        <div class="tm-card patch">
+          <div class="events-head">
+            <h3>{{ t('dashboard.patchTitle') }}</h3>
+            <el-button link type="primary" @click="router.push('/agents')">{{ t('dashboard.patchOpen') }}</el-button>
+          </div>
+          <ErrorState v-if="agentsFailed" :label="t('dashboard.patchFailed')" />
+          <EmptyState v-else-if="agentsLoaded && !agents.length" :label="t('dashboard.patchEmpty')" />
+          <PatchPanel v-else-if="agents.length" :agents="agents" :total="summary.agentsTotal" :online="summary.agentsOnline" />
         </div>
         <div class="tm-card events">
           <div class="events-head">
@@ -13,7 +20,7 @@
                  this page, so the link is only an exit for accounts that can use it. -->
             <el-button v-if="auth.isAdmin" link type="primary" @click="router.push('/audit-logs')">{{ t('dashboard.viewAudits') }}</el-button>
           </div>
-          <el-empty v-if="!summary.recentEvents.length" :description="t('dashboard.noEvents')" />
+          <EmptyState v-if="!summary.recentEvents.length" :label="t('dashboard.noEvents')" />
           <article v-for="event in summary.recentEvents" :key="event.id" class="event">
             <div class="event-main">
               <code class="event-action">{{ event.action }}</code>
@@ -37,7 +44,11 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
-import { getDashboardSummary, type DashboardSummary } from '../api/client'
+import MetricStrip from '../components/MetricStrip.vue'
+import PatchPanel from '../components/PatchPanel.vue'
+import EmptyState from '../components/EmptyState.vue'
+import ErrorState from '../components/ErrorState.vue'
+import { getAgents, getDashboardSummary, type Agent, type DashboardSummary } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle } from '../utils/audit'
 import { useAuthStore } from '../stores/auth'
@@ -49,12 +60,25 @@ const loading = ref(true)
 const error = ref(false)
 const summary = ref<DashboardSummary | null>(null)
 const formatDate = useFormatDateTime()
+// The patch panel is a sample of the fleet: the newest agents (the list endpoint
+// cannot sort by name), ordered by name for scanning. It loads on its own so a failure
+// here never hides the metrics or the event list.
+const PATCH_LIMIT = 32
+const agents = ref<Agent[]>([])
+const agentsLoaded = ref(false)
+const agentsFailed = ref(false)
+async function loadAgents() {
+  agentsFailed.value = false
+  try { agents.value = [...((await getAgents({ limit: PATCH_LIMIT })).items ?? [])].sort((a, b) => a.name.localeCompare(b.name)) }
+  catch { agentsFailed.value = true; agents.value = [] }
+  finally { agentsLoaded.value = true }
+}
 const stats = computed(() => summary.value ? [
-  { label: t('dashboard.agents'), value: summary.value.agentsTotal },
-  { label: t('dashboard.online'), value: summary.value.agentsOnline },
+  { label: t('dashboard.agents'), value: summary.value.agentsTotal, to: '/agents' },
+  { label: t('dashboard.online'), value: summary.value.agentsOnline, to: '/agents' },
   { label: t('dashboard.tunnels'), value: summary.value.activeTunnels },
-  { label: t('dashboard.routes'), value: summary.value.managedRoutes },
-  { label: t('dashboard.tokens'), value: summary.value.validServiceTokens },
+  { label: t('dashboard.routes'), value: summary.value.managedRoutes, to: '/routes' },
+  { label: t('dashboard.tokens'), value: summary.value.validServiceTokens, to: '/tokens' },
 ] : [])
 
 // The card has one line of room for the audit payload, so details are summarized
@@ -70,24 +94,22 @@ async function retry() {
   finally { loading.value = false }
 }
 
-onMounted(retry)
+onMounted(() => { void retry(); void loadAgents() })
 </script>
 
 <style scoped>
-.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
-.stat { padding: 18px; } .stat span { color: var(--tm-muted); font-size: 13px; } .stat strong { display: block; margin-top: 8px; font-size: 28px; }
-.events { padding: 18px; }
-.events-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; } .events-head h3 { margin: 0; }
+.patch, .events { padding: var(--tm-s-5); }
+.events-head { display: flex; align-items: center; justify-content: space-between; gap: var(--tm-s-3); margin-bottom: var(--tm-s-4); }
+.events-head h3 { margin: 0; font-size: var(--tm-fs-md); font-weight: 600; }
 /* minmax(0,1fr) keeps the row from being widened by a long resource id or details
    string, which is what used to push a page-level scrollbar. */
-.event { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; padding: 10px 0; border-top: 1px solid #edf1f7; }
-.event-main, .event-meta { display: flex; align-items: baseline; gap: 14px; min-width: 0; }
+.event { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--tm-s-1); padding: var(--tm-s-3) 0; border-top: 1px solid var(--tm-line); }
+.event-main, .event-meta { display: flex; align-items: baseline; gap: var(--tm-s-4); min-width: 0; }
 .event-main { justify-content: flex-start; }
-.event-main time { margin-left: auto; color: var(--tm-muted); white-space: nowrap; }
-.event-action { font-weight: 650; }
-.event-resource { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.event-actor { color: var(--tm-muted); font-size: 12px; white-space: nowrap; }
-.event-details { min-width: 0; color: var(--tm-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 520px) { .stats { grid-template-columns: 1fr; } .event-main, .event-meta { flex-wrap: wrap; } .event-main time { margin-left: 0; } }
+.event-main time { margin-left: auto; color: var(--tm-ink-3); font-size: var(--tm-fs-xs); white-space: nowrap; }
+.event-action { font-family: var(--tm-font-mono); font-size: var(--tm-fs-sm); font-weight: 500; color: var(--tm-ink); }
+.event-resource { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tm-ink-2); font-size: var(--tm-fs-sm); }
+.event-actor { color: var(--tm-ink-2); font-size: var(--tm-fs-xs); white-space: nowrap; }
+.event-details { min-width: 0; color: var(--tm-ink-3); font-family: var(--tm-font-mono); font-size: var(--tm-fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 520px) { .event-main, .event-meta { flex-wrap: wrap; } .event-main time { margin-left: 0; } }
 </style>

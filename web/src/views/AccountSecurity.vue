@@ -372,12 +372,12 @@ onMounted(() => { void loadMFA(); void loadDevices(); void loadIdentities() })
 .detail-list dt { color: var(--tm-muted); font-weight: 600; font-size: 13px; }
 .detail-list dd { margin: 0; font-size: 13px; word-break: break-all; }
 .secret-row { display: flex; gap: 10px; align-items: center; }
-.secret-row code { flex: 1; padding: 8px 10px; border: 1px solid var(--tm-border); border-radius: 6px; background: #f7f9fc; font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.secret-row code { flex: 1; padding: 8px 10px; border: 1px solid var(--tm-border); border-radius: 6px; background: var(--tm-sunken); font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .codes { margin-top: 18px; }
 .codes-title { margin: 12px 0 8px; font-weight: 650; }
 .code-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
-.code-list code { display: block; padding: 8px 10px; border: 1px solid var(--tm-border); border-radius: 6px; background: #f7f9fc; font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.code-list code { display: block; padding: 8px 10px; border: 1px solid var(--tm-border); border-radius: 6px; background: var(--tm-sunken); font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .enrollment { margin-top: 18px; }
 .current-tag { margin-left: 8px; }
 .ellipsis { display: block; overflow: hidden; max-width: 260px; text-overflow: ellipsis; white-space: nowrap; }
-:deep(.el-table) { --el-table-border-color: #edf1f7; }.list-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:14px 0 0}.page-size{width:100px}</style>
+:deep(.el-table) { --el-table-border-color: var(--tm-line); }.list-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:14px 0 0}</style>

@@ -65,4 +65,4 @@ function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descendin
 }
 onMounted(load)
 </script>
-<style scoped>.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--tm-border)}.keyword-input{width:min(260px,100%)}.list-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px}.page-size{width:100px}</style>
+<style scoped>.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--tm-border)}.keyword-input{width:min(260px,100%)}.list-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px}</style>

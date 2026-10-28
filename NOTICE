@@ -15,6 +15,14 @@ go.sum, and the admin console bundles third-party packages declared in
 web/package.json and web/package-lock.json. Each remains under its own
 license; nothing in this NOTICE alters those terms.
 
+The admin console bundles two typefaces under the SIL Open Font License 1.1.
+Their licence texts are kept beside the font files in
+web/src/assets/fonts/ and must accompany any redistribution:
+  - Instrument Sans, Copyright 2022 The Instrument Sans Project Authors
+    (https://github.com/Instrument/instrument-sans)
+  - Martian Mono, Copyright 2020 The Martian Mono Project Authors
+    (https://github.com/evilmartians/mono)
+
 The admin console also embeds browser-side SSH, SFTP, and ZMODEM protocol
 implementations. Those libraries run entirely in the user's browser; the
 server only forwards bytes and never stores or parses SSH credentials,

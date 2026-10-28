@@ -4,45 +4,46 @@
     <div class="tm-card">
       <el-form class="filter-form" label-position="top" @submit.prevent="query">
         <div class="filter-grid">
-          <el-form-item :label="t('agents.name')">
-            <el-input v-model="keyword" :placeholder="t('agents.keyword')" clearable @keyup.enter="query" @clear="query" />
-          </el-form-item>
-        </div>
-        <div class="filter-actions">
-          <el-button @click="reset">{{ t('agents.reset') }}</el-button>
-          <el-button type="primary" @click="query">{{ t('agents.query') }}</el-button>
+          <el-input v-model="keyword" class="filter-keyword" :placeholder="t('agents.keyword')" :aria-label="t('agents.name')" clearable @keyup.enter="query" @clear="query">
+            <template #prefix><TmIcon name="search" :size="16" /></template>
+          </el-input>
+          <div class="filter-actions">
+            <el-button @click="reset">{{ t('agents.reset') }}</el-button>
+            <el-button type="primary" @click="query">{{ t('agents.query') }}</el-button>
+          </div>
         </div>
       </el-form>
 
       <DataState :loading="loading" :error="error" :empty="!items.length" :error-label="t('common.loadFailed')" :retry-label="t('common.retry')" :empty-label="t('common.empty')" @retry="load">
         <el-table :data="items" :default-sort="{ prop: 'createdAt', order: 'descending' }" @sort-change="onSortChange">
-          <el-table-column prop="name" :label="t('agents.name')" />
-          <el-table-column prop="id" label="ID" />
-          <el-table-column :label="t('agents.status')">
+          <el-table-column prop="name" :label="t('agents.name')" min-width="160">
+            <template #default="scope"><span class="agent-name">{{ scope.row.name }}</span></template>
+          </el-table-column>
+          <el-table-column prop="id" label="ID" min-width="190">
+            <template #default="scope"><IdCell :value="scope.row.id" /></template>
+          </el-table-column>
+          <el-table-column :label="t('agents.status')" width="120">
             <template #default="scope"><StatusTag :kind="scope.row.status === 'online' ? 'success' : 'info'" :label="scope.row.status === 'online' ? t('agents.online') : t('agents.offline')" /></template>
           </el-table-column>
-          <el-table-column prop="createdAt" :label="t('agents.createdAt')" width="190" sortable="custom">
-            <template #default="scope">{{ formatDate(scope.row.createdAt) }}</template>
+          <el-table-column prop="createdAt" :label="t('agents.createdAt')" width="210" sortable="custom">
+            <template #default="scope"><span class="tm-muted tm-num">{{ formatDate(scope.row.createdAt) }}</span></template>
           </el-table-column>
-          <el-table-column prop="updatedAt" :label="t('agents.updatedAt')" width="190" sortable="custom">
-            <template #default="scope">{{ formatDate(scope.row.updatedAt) }}</template>
+          <el-table-column prop="updatedAt" :label="t('agents.updatedAt')" width="210" sortable="custom">
+            <template #default="scope"><span class="tm-muted tm-num">{{ formatDate(scope.row.updatedAt) }}</span></template>
           </el-table-column>
-          <el-table-column :label="t('agents.enabledColumn')">
+          <el-table-column :label="t('agents.enabledColumn')" width="120">
             <template #default="scope"><StatusTag :kind="scope.row.enabled ? 'success' : 'warning'" :label="scope.row.enabled ? t('agents.active') : t('agents.disabled')" /></template>
           </el-table-column>
-          <el-table-column :label="t('agents.actions')">
+          <el-table-column :label="t('agents.actions')" width="150" align="right">
             <template #default="scope">
-              <el-button link type="primary" @click="$router.push(`/agents/${scope.row.id}`)">{{ t('agents.details') }}</el-button>
-              <el-button v-if="auth.isAdmin" link type="primary" @click="openEdit(scope.row)">{{ t('agents.edit') }}</el-button>
+              <span class="row-actions">
+                <el-button link type="primary" @click="$router.push(`/agents/${scope.row.id}`)">{{ t('agents.details') }}</el-button>
+                <el-button v-if="auth.isAdmin" link type="primary" @click="openEdit(scope.row)">{{ t('agents.edit') }}</el-button>
+              </span>
             </template>
           </el-table-column>
         </el-table>
-        <div v-if="pageIndex > 0 || nextCursor" class="pager">
-          <el-button v-if="pageIndex > 0" :loading="loading" @click="previousPage">{{ t('agents.previousPage') }}</el-button>
-          <span class="pager-label">{{ t('agents.page', { number: pageIndex + 1 }) }}</span>
-          <el-button v-if="nextCursor" :loading="loading" @click="nextPage">{{ t('agents.nextPage') }}</el-button>
-          <el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" />
-        </div>
+        <PagerBar hide-unavailable :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="selectedPageSize" :loading="loading" @previous="previousPage" @next="nextPage" @size-change="changePageSize" />
       </DataState>
     </div>
   </section>
@@ -84,6 +85,9 @@ import { useAuthStore } from '../stores/auth'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
+import IdCell from '../components/IdCell.vue'
+import PagerBar from '../components/PagerBar.vue'
+import TmIcon from '../components/icons/TmIcon.vue'
 import { createAgent, getAgents, updateAgent, type Agent } from '../api/client'
 
 const { t } = useI18n()
@@ -257,10 +261,13 @@ onMounted(load)
 </script>
 
 <style scoped>
-.filter-form { margin-bottom: 18px; }
-.filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
-.filter-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
-.pager { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 18px 0 4px; }
-.pager-label { color: var(--tm-muted); font-size: 13px; }
-.hint { margin: 4px 0 0; color: var(--tm-muted); font-size: 12px; line-height: 1.5; flex-basis: 100%; }
+.filter-form { margin-bottom: var(--tm-s-4); }
+.filter-grid { display: flex; flex-wrap: wrap; align-items: center; gap: var(--tm-s-3); }
+.filter-keyword { flex: 1 1 260px; min-width: 0; }
+.filter-actions { display: flex; gap: var(--tm-s-2); margin-left: auto; }
+.agent-name { font-weight: 500; }
+.tm-num { white-space: nowrap; }
+/* Row actions stay visible: hiding them until hover hurts discoverability. */
+.row-actions { display: inline-flex; gap: var(--tm-s-1); }
+.hint { margin: var(--tm-s-1) 0 0; color: var(--tm-ink-2); font-size: var(--tm-fs-xs); line-height: var(--tm-lh-sm); flex-basis: 100%; }
 </style>

@@ -6,12 +6,13 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 56 份记录，按日期倒序排列。
+共 57 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
+| 2026-10-26 | [管理后台界面重设计「机架 Rack」](2026-10-26-admin-console-rack-redesign.md) | [计划：管理后台界面重设计「机架 Rack」](../superpowers/plans/2026-10-26-admin-console-rack-redesign.md) | — |
 | 2026-10-25 | [Client Agent 角色融合与自动注册](2026-10-25-client-agent-role.md) | — | — |
 | 2026-10-25 | [Client/Agent 自动升级、失败回滚与进程守护](2026-10-25-client-agent-auto-update.md) | [计划：Client/Agent 自动升级、失败回滚与进程守护](../superpowers/plans/2026-10-25-client-agent-auto-update.md) | [ADR：Constrained self-update and process super…](../architecture/adr/0003-constrained-self-update-and-supervision.md) |
 | 2026-10-24 | [后台管理列表体验与 Client/Agent 链路加固](2026-10-24-admin-console-client-resilience.md) | [计划：Admin Console List Redesign](../superpowers/plans/2026-10-24-admin-console-redesign.md)<br>[计划：Client/Agent 便携性与容错加固](../superpowers/plans/2026-10-24-client-agent-portability-resilience.md) | — |

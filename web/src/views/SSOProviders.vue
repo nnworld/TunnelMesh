@@ -357,7 +357,7 @@ void reload()
 .panel-head h2 { margin: 0; font-size: 17px; }
 .hint { margin: 4px 0 0; color: var(--tm-muted); font-size: 12px; line-height: 1.5; }
 .toolbar { display: flex; justify-content: flex-end; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--tm-border); }.keyword-input { width: min(240px, 100%); }
-.list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:14px; }.page-size { width:100px; }
+.list-pager { display:flex; align-items:center; justify-content:center; gap:12px; padding:14px; }
 .policy-form { max-width: 520px; padding-top: 16px; }
 .actions { display: flex; gap: 8px; align-items: center; }
 .notice { margin-top: 14px; }
@@ -370,7 +370,7 @@ void reload()
 .endpoints { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: 0; padding: 0; list-style: none; }
 .endpoints li { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; }
 .endpoints code { color: var(--tm-muted); font-size: 12px; }
-.form-error { margin-top: 12px; color: var(--el-color-danger, #d03050); font-size: 13px; }
+.form-error { margin-top: 12px; color: var(--el-color-danger, var(--tm-danger-ink)); font-size: 13px; }
 .confirm-text { margin: 0 0 8px; }
 .ellipsis { display: block; overflow: hidden; max-width: 300px; text-overflow: ellipsis; white-space: nowrap; }
-:deep(.el-table) { --el-table-border-color: #edf1f7; }</style>
+:deep(.el-table) { --el-table-border-color: var(--tm-line); }</style>

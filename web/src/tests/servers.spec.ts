@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flatNavigation } from '../layouts/navigation'
 import { readFileSync } from 'node:fs'
 import router from '../router'
 import { deleteServerNode, getServerNode, getServerNodes, restoreServerNode, updateServerNode } from '../api/client'
@@ -12,7 +13,7 @@ describe('server node management', () => {
   it('exposes an admin-only /servers route and navigation entry', () => {
     const route = router.getRoutes().find(item => item.path === '/servers')
     expect(route?.meta.admin).toBe(true)
-    expect(readFileSync('src/layouts/AppShell.vue', 'utf8')).toContain('navigation.servers')
+    expect(flatNavigation(true).find(item => item.path === '/servers')).toMatchObject({ labelKey: 'navigation.servers', admin: true })
   })
 
   it('calls the server-node resource API', async () => {

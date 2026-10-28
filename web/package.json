@@ -10,7 +10,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@element-plus/icons-vue": "^2.3.1",
     "@verdigris/libssh2.js": "^0.1.9",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
