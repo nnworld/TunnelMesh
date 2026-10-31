@@ -1,6 +1,8 @@
 package client
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -24,11 +26,35 @@ var ErrRuntimeAlreadyRunning = errors.New("client: another TunnelMesh client is 
 // configuration, and stay independent when an operator deliberately runs two clients
 // from two files. An empty path means there is no configuration file to coordinate
 // on, so no lock is taken.
+//
+// The lock lives in the client state directory, never beside the configuration: the
+// service unit mounts /etc read-only, and a lock there failed every start with EROFS.
 func LockPathForConfig(configPath string) string {
 	if strings.TrimSpace(configPath) == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(configPath), LockFileName)
+	return lockPathIn(clientStateRoot(configPath), configPath)
+}
+
+// clientStateRoot is the directory a client keeps its restart-surviving files in. It
+// is the directory of the default instance id, which the service unit and the
+// installer already make writable.
+func clientStateRoot(configPath string) string {
+	return filepath.Dir(DefaultClientInstanceIDPathForConfig(configPath))
+}
+
+// lockPathIn places one configuration's lock under a state root. The configuration
+// path is hashed so every configuration gets its own directory without the state
+// root having to know any file names; the absolute path is hashed so the same file
+// always maps to the same lock regardless of how it was spelled.
+func lockPathIn(stateRoot, configPath string) string {
+	trimmed := strings.TrimSpace(configPath)
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return filepath.Join(stateRoot, "locks", hex.EncodeToString(sum[:8]), LockFileName)
 }
 
 // runtimeLock is a held advisory lock. Release is idempotent because both an

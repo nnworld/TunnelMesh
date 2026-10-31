@@ -8,19 +8,41 @@ import (
 	"testing"
 )
 
-func TestLockPathForConfigDerivesFromConfigDir(t *testing.T) {
+func TestLockPathForConfigLivesInStateDirNotNextToConfig(t *testing.T) {
 	if got := LockPathForConfig(""); got != "" {
 		t.Fatalf("empty config path must not produce a lock path, got %q", got)
 	}
 	if got := LockPathForConfig("   "); got != "" {
 		t.Fatalf("blank config path must not produce a lock path, got %q", got)
 	}
-	got := LockPathForConfig(filepath.Join(t.TempDir(), "nested", "client.yaml"))
-	if want := filepath.Join(filepath.Dir(got), LockFileName); got != want {
-		t.Fatalf("lock path = %q, want %q", got, want)
+	// /etc/tunnelmesh is read-only under the service unit's ProtectSystem=strict, so a
+	// lock beside the configuration made every start fail with EROFS.
+	configPath := filepath.Join(t.TempDir(), "nested", "client.yaml")
+	got := LockPathForConfig(configPath)
+	if filepath.Dir(got) == filepath.Dir(configPath) {
+		t.Fatalf("lock path %q must not sit beside the configuration %q", got, configPath)
+	}
+	if !pathWithin(got, clientStateRoot(configPath)) {
+		t.Fatalf("lock path %q must live under the client state directory %q", got, clientStateRoot(configPath))
 	}
 	if filepath.Base(got) != LockFileName {
 		t.Fatalf("lock path = %q, want base %q", got, LockFileName)
+	}
+}
+
+func TestLockPathInIsStablePerConfig(t *testing.T) {
+	root := t.TempDir()
+	first := lockPathIn(root, filepath.Join(t.TempDir(), "client.yaml"))
+	second := lockPathIn(root, filepath.Join(t.TempDir(), "client.yaml"))
+	if first == second {
+		t.Fatalf("two configurations share one lock path %q", first)
+	}
+	config := filepath.Join(t.TempDir(), "client.yaml")
+	if lockPathIn(root, config) != lockPathIn(root, config) {
+		t.Fatalf("the same configuration must always map to the same lock path")
+	}
+	if !pathWithin(first, root) {
+		t.Fatalf("lock path %q escaped the state root %q", first, root)
 	}
 }
 
@@ -93,13 +115,13 @@ func TestAcquireRuntimeLockIsIndependentPerConfig(t *testing.T) {
 	firstPath := filepath.Join(dir, "a", "client.yaml")
 	secondPath := filepath.Join(dir, "b", "client.yaml")
 
-	first, err := acquireRuntimeLock(LockPathForConfig(firstPath))
+	first, err := acquireRuntimeLock(lockPathIn(dir, firstPath))
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	defer func() { _ = first.Release() }()
 
-	second, err := acquireRuntimeLock(LockPathForConfig(secondPath))
+	second, err := acquireRuntimeLock(lockPathIn(dir, secondPath))
 	if err != nil {
 		t.Fatalf("second config acquire: %v", err)
 	}
