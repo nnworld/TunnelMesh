@@ -31,7 +31,7 @@ describe('visual QA seed plan', () => {
   it('covers every page in both themes and both viewports', () => {
     const shots = SCREENSHOT_MATRIX as { page: string; theme: string; viewport: string }[]
     const pages = new Set(shots.map((s) => s.page))
-    expect([...pages].sort()).toEqual(['agents', 'audit-logs', 'dashboard', 'login', 'tokens'])
+    expect([...pages].sort()).toEqual(['agents', 'audit-logs', 'dashboard', 'login', 'security', 'tokens'])
     for (const page of pages) {
       const forPage = shots.filter((s) => s.page === page)
       expect(forPage).toHaveLength(4)

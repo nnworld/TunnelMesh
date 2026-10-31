@@ -135,7 +135,7 @@ function pageQuery(params: { cursor?: string; limit?: number; sort?: string; ord
 // 404 means the deployment does not publish its providers; the caller hides the
 // single sign-on section instead of showing an error.
 export function listOIDCProviders() {
-  return api<{ items: OIDCProviderSummary[] }>('/auth/oidc/providers').then(data => data.items)
+  return api<{ items: OIDCProviderSummary[] | null }>('/auth/oidc/providers').then(data => data.items ?? [])
 }
 
 // `ticket` is single-use and short-lived. It is only ever sent in this request
@@ -172,8 +172,10 @@ export function regenerateRecoveryCodes(code: string) {
 
 // --- self-service trusted devices ---
 
+// An empty list arrives as `null` (the server encodes a nil slice that way), so
+// every list helper normalises it here rather than leaking null into views.
 export function listDevices(params: { cursor?: string; limit?: number } = {}) {
-  return api<DevicePage>(`/auth/devices${pageQuery(params)}`)
+  return api<DevicePage>(`/auth/devices${pageQuery(params)}`).then(page => ({ ...page, items: page.items ?? [] }))
 }
 
 export function renameDevice(id: string, name: string) {
@@ -187,7 +189,7 @@ export function revokeDevice(id: string) {
 // --- self-service linked identities ---
 
 export function listIdentities() {
-  return api<{ items: LinkedIdentity[] }>('/auth/identities').then(data => data.items)
+  return api<{ items: LinkedIdentity[] | null }>('/auth/identities').then(data => data.items ?? [])
 }
 
 export function unlinkIdentity(id: string) {
