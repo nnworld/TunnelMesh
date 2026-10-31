@@ -75,7 +75,7 @@
             <template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">{{ t('clients.detail') }}</el-button></template>
           </el-table-column>
         </el-table>
-        <div class="pager"><el-button :disabled="pageIndex === 0 || loading" @click="previousPage">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="nextPage">{{ t('common.nextPage') }}</el-button><el-pagination layout="sizes" :page-size="pageSize" :page-sizes="[20, 50, 100]" @size-change="changePageSize" /></div>
+        <PagerBar :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="pageSize" :loading="loading" @previous="previousPage" @next="nextPage" @size-change="changePageSize($event)" />
       </DataState>
     </div>
 
@@ -109,6 +109,7 @@
             <el-descriptions-item :label="t('clients.activeStreams')">{{ detailClient.activeStreams }}</el-descriptions-item>
           </el-descriptions>
 
+          <SystemInventory :values="detailClient.metadata || {}" />
           <div class="section-title">{{ t('clients.metadata') }}</div>
           <el-table :data="metadataRows" class="section-table">
             <el-table-column prop="name" :label="t('clients.metadataName')" min-width="150" />
@@ -177,6 +178,9 @@
 </template>
 
 <script setup lang="ts">
+import PagerBar from '../components/PagerBar.vue'
+import SystemInventory from '../components/SystemInventory.vue'
+import { isInventoryName } from '../utils/inventory'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
@@ -230,7 +234,7 @@ const summaryCards = computed(() => [
   { label: t('clients.metadataUnavailable'), value: summary.value?.metadataUnavailable ?? 0 },
   { label: t('clients.metadataStale'), value: summary.value?.metadataStale ?? 0 },
 ])
-const metadataRows = computed(() => Object.entries(detailClient.value?.metadata || {}).map(([name, value]) => ({ name, value })))
+const metadataRows = computed(() => Object.entries(detailClient.value?.metadata || {}).filter(([name]) => !isInventoryName(name)).map(([name, value]) => ({ name, value })))
 
 async function load() {
   loading.value = true; error.value = false

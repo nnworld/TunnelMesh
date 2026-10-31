@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tunnelmesh/tunnelmesh/internal/metadata"
 	"regexp"
 	"strings"
 	"time"
@@ -59,7 +60,7 @@ func (s *AgentMetadataService) Upsert(ctx context.Context, in AgentMetadataInput
 		if !metadataNameRE.MatchString(item.Name) {
 			return storage.AgentRuntimeMetadata{}, fmt.Errorf("invalid metadata name %q", item.Name)
 		}
-		if item.Source != "file" && item.Source != "env" {
+		if item.Source != "file" && item.Source != "env" && item.Source != metadata.InventorySource {
 			return storage.AgentRuntimeMetadata{}, fmt.Errorf("invalid metadata source %q", item.Source)
 		}
 		if len([]byte(item.Value)) > maxMetadataItemBytes {

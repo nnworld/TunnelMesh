@@ -14,7 +14,13 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/inventory"
 )
+
+// InventorySource marks a value the agent or client collected itself. The server
+// accepts it alongside the operator's `file` and `env` sources.
+const InventorySource = "inventory"
 
 const (
 	MaxFields       = 32
@@ -104,6 +110,7 @@ func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
 		snapshot.Values[source.Name] = value
 		snapshot.Fields = append(snapshot.Fields, Field{Name: source.Name, Source: source.Source, Value: value})
 	}
+	mergeInventory(ctx, &snapshot, maxFields, maxFieldBytes, maxPayloadBytes)
 	sort.Slice(snapshot.Errors, func(i, j int) bool { return snapshot.Errors[i].Name < snapshot.Errors[j].Name })
 	if payload, err := json.Marshal(snapshot.Fields); err == nil {
 		snapshot.PayloadBytes = len(payload)
@@ -112,6 +119,32 @@ func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+// mergeInventory adds the built-in host facts after the operator's sources. It is
+// best effort: an operator-declared name is never replaced, and a fact that would
+// exceed the field count, the per-field limit or the payload limit is skipped rather
+// than failing the snapshot.
+func mergeInventory(ctx context.Context, snapshot *Snapshot, maxFields, maxFieldBytes, maxPayloadBytes int) {
+	builtin := inventory.Collect(ctx)
+	names := make([]string, 0, len(builtin))
+	for name := range builtin {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := builtin[name]
+		if _, taken := snapshot.Values[name]; taken || len(value) > maxFieldBytes || len(snapshot.Fields) >= maxFields {
+			continue
+		}
+		candidate := append(append([]Field(nil), snapshot.Fields...), Field{Name: name, Source: InventorySource, Value: value})
+		payload, err := json.Marshal(candidate)
+		if err != nil || len(payload) > maxPayloadBytes {
+			continue
+		}
+		snapshot.Values[name] = value
+		snapshot.Fields = candidate
+	}
 }
 
 func (c *Collector) limits() (int, int, int) {

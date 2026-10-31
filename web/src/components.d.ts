@@ -61,6 +61,7 @@ declare module 'vue' {
     SecretBlock: typeof import('./components/SecretBlock.vue')['default']
     StatusLed: typeof import('./components/StatusLed.vue')['default']
     StatusTag: typeof import('./components/StatusTag.vue')['default']
+    SystemInventory: typeof import('./components/SystemInventory.vue')['default']
     ThemeToggle: typeof import('./components/ThemeToggle.vue')['default']
     TmIcon: typeof import('./components/icons/TmIcon.vue')['default']
     TokenSecretDialog: typeof import('./components/TokenSecretDialog.vue')['default']
