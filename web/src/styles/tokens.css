@@ -42,6 +42,21 @@
   --tm-danger: #C8372D;
   --tm-danger-ink: #B02F26;
   --tm-danger-tint: #F9E4E1;
+  /* Accent hues. Each family is a solid (bars, dots), an ink (text that must pass
+     AA on paper and on its tint) and a tint (a quiet chip background). They exist so
+     categories read apart at a glance; status colours above keep their meaning. */
+  --tm-violet: #6B4FBB;
+  --tm-violet-ink: #5B3FAA;
+  --tm-violet-tint: #EEEAF8;
+  --tm-sky: #1D6FB8;
+  --tm-sky-ink: #1A5FA0;
+  --tm-sky-tint: #E4EFFA;
+  --tm-rose: #C8497A;
+  --tm-rose-ink: #A3305E;
+  --tm-rose-tint: #F9E7EE;
+  --tm-lime: #5E8E24;
+  --tm-lime-ink: #41681A;
+  --tm-lime-tint: #EBF4DF;
   --tm-danger-fill: #C8372D;
   --tm-on-danger: #FFFFFF;
 
@@ -156,6 +171,19 @@
   --tm-danger: #EF6A5E;
   --tm-danger-ink: #EF6A5E;
   --tm-danger-tint: #3F1D1A;
+  /* Accent hues, dark counterparts; see the light block for the roles. */
+  --tm-violet: #A98BEA;
+  --tm-violet-ink: #B9A2F0;
+  --tm-violet-tint: #26203A;
+  --tm-sky: #6AB0E8;
+  --tm-sky-ink: #8BC5F0;
+  --tm-sky-tint: #1B2A3A;
+  --tm-rose: #E8779B;
+  --tm-rose-ink: #F094B2;
+  --tm-rose-tint: #3A1F2A;
+  --tm-lime: #9CC96A;
+  --tm-lime-ink: #B1D886;
+  --tm-lime-tint: #243319;
   --tm-danger-fill: #C9463B;
   --tm-on-danger: #FFFFFF;
 

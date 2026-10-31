@@ -48,3 +48,13 @@
 
 /* Rows-per-page select shared by every list that pages with cursors. */
 .page-size { width: 100px; }
+
+/* Accent tones for chips: ink text on its tint, both pairs checked in tokens-contrast. */
+.tone-chip { display: inline-block; padding: 1px var(--tm-s-2); border-radius: var(--tm-r-xs); font-family: var(--tm-font-mono); font-size: var(--tm-fs-xs); font-weight: 500; line-height: var(--tm-lh-sm); }
+.tone-brand { color: var(--tm-brand); background: var(--tm-brand-tint); }
+.tone-violet { color: var(--tm-violet-ink); background: var(--tm-violet-tint); }
+.tone-lime { color: var(--tm-lime-ink); background: var(--tm-lime-tint); }
+.tone-warn { color: var(--tm-warn-ink); background: var(--tm-warn-tint); }
+.tone-sky { color: var(--tm-sky-ink); background: var(--tm-sky-tint); }
+.tone-rose { color: var(--tm-rose-ink); background: var(--tm-rose-tint); }
+.tone-neutral { color: var(--tm-ink-2); background: var(--tm-sunken); }
