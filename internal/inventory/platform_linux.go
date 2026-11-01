@@ -64,7 +64,7 @@ func disks() []Disk {
 		}
 		seen[entry.Device] = true
 		bsize := uint64(stat.Bsize)
-		out = append(out, Disk{Mount: entry.Mount, FS: entry.FS, TotalBytes: stat.Blocks * bsize, FreeBytes: stat.Bavail * bsize})
+		out = append(out, Disk{Mount: entry.Mount, FS: entry.FS, TotalBytes: stat.Blocks * bsize})
 		if len(out) == maxDisks {
 			break
 		}

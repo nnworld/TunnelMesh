@@ -3,7 +3,7 @@
 
 export type OSBlock = { name: string; kernel?: string; arch?: string; hostname?: string }
 export type CPUBlock = { model: string; logicalCpus: number }
-export type DiskBlock = { mount: string; fs: string; totalBytes: number; freeBytes: number }
+export type DiskBlock = { mount: string; fs: string; totalBytes: number }
 export type NICBlock = { name: string; mac?: string; addresses: string[] }
 export type Inventory = {
   os?: OSBlock
@@ -33,7 +33,7 @@ export function parseInventory(values: Record<string, string>): Inventory {
   const memory = block(values, 'system.memory', (raw) => (raw && raw.total_bytes ? { totalBytes: Number(raw.total_bytes) } : undefined))
   const gpus = block(values, 'system.gpu', (raw) => (Array.isArray(raw) ? raw.map(String) : undefined)) ?? []
   const disks = block(values, 'system.disks', (raw) => (Array.isArray(raw) ? raw.map((d): DiskBlock => ({
-    mount: String(d.mount), fs: String(d.fs), totalBytes: Number(d.total_bytes), freeBytes: Number(d.free_bytes),
+    mount: String(d.mount), fs: String(d.fs), totalBytes: Number(d.total_bytes),
   })) : undefined)) ?? []
   const nics = block(values, 'system.nics', (raw) => (Array.isArray(raw) ? raw.map((n): NICBlock => ({
     name: String(n.name), mac: n.mac || undefined, addresses: Array.isArray(n.addresses) ? n.addresses.map(String) : [],
