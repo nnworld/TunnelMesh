@@ -394,6 +394,76 @@ agent:
 
 `max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
+## 脚本执行
+
+管理员可以在管理后台的 Agent 列表上对在线 Agent 运行一段 shell 脚本，并查看输出。**默认开启**；按钮只出现在实际宣告 `agent_exec.v1` 的在线 Agent 上。权限、限制与风险见 [ADR 0005](../architecture/adr/0005-agent-script-execution.md)。
+
+```yaml
+server:
+  exec:
+    enabled: true                 # 关闭后拒绝新的脚本运行，即使 Agent 已宣告能力
+agent:
+  exec:
+    enabled: true                 # 关闭后不宣告 agent_exec.v1，也拒绝 exec 流
+    shell: ""                     # 空：Unix 为 /bin/sh，Windows 为 powershell.exe
+    default_timeout: 60s
+    max_timeout: 10m
+    max_output_bytes: 1048576     # stdout 与 stderr 合计上限，超出即截断并标记
+    max_script_bytes: 65536
+    max_concurrent: 2             # 超过则返回 busy，不排队
+```
+
+- 脚本以 Agent 进程所在账户运行，只继承 `PATH`、`HOME`、`LANG` 等少量变量，不继承 Agent 的环境变量（因此读不到 Agent 令牌）。
+- 超时与关闭会终止整个进程组。Windows 当前只终止 shell 进程本身，其子进程不会被一并结束；在 Windows 上启用前应确认这一点。
+- 审计与 Agent 本地日志只记录脚本的 SHA-256、长度、退出码和耗时，不记录脚本正文和输出。
+- 一次性票据只在签发它的 Server 节点上有效，因此多节点部署时，运行脚本的请求需要落到同一节点；管理后台的按钮也只依据本节点看到的在线会话显示。
+- 关闭 `agent.exec.enabled` 后需要重启 Agent，之后它不再宣告能力，列表中的按钮自动消失。
+
+## Agent 传输：WebSocket、TLS/TCP 与 QUIC
+
+`agent.server_url` 支持五种 scheme。WebSocket 仍是默认且唯一需要 HTTP 入口的方式；另外两种裸传输绕开 HTTP 栈，适合只放行 TCP 或 UDP 的网络。
+
+| scheme | 传输 | 加密 | 说明 |
+| --- | --- | --- | --- |
+| `wss://` | WebSocket over TLS | 是 | 默认 |
+| `ws://` | WebSocket | 否 | 仅回环，或 `agent.transport.allow_insecure_transport: true` |
+| `tls://host:port` | TCP + TLS 1.2 起 | 是 | 需要 Server 端开启 `server.agent_transports.tcp` |
+| `tcp://host:port` | TCP 明文 | 否 | 仅回环，或 `allow_insecure_transport: true`；令牌明文发送 |
+| `quic://host:port` | QUIC（UDP），TLS 1.3 | 是 | 需要 Server 端开启 `server.agent_transports.quic`；不能经过 HTTP CONNECT 或 SOCKS5 代理 |
+
+```yaml
+agent:
+  server_url: quic://tunnel.example.com:7443
+  transport:
+    proxy_mode: direct          # quic:// 只能是 direct
+    tls_ca_file: /etc/tunnelmesh/private-ca.pem   # 可选：tls:// 与 quic:// 使用的信任根
+```
+
+`tls_ca_file` 只影响 `tls://` 与 `quic://`，留空则使用系统根证书，与 `wss://` 相同。raw 传输的 URL 必须带端口，且不能有路径、查询或用户信息。
+
+Server 端的裸传输默认全部关闭，空的 `listen` 地址表示该监听不启用，因此升级本版本不会改变现有部署：
+
+```yaml
+server:
+  agent_transports:
+    tcp:
+      listen: 0.0.0.0:7000          # 空表示关闭
+      tls_cert_file: ""             # 留空则复用 tls.cert_file；都没有时只能绑定回环（明文）
+      tls_key_file: ""
+    quic:
+      listen: 0.0.0.0:7443          # 空表示关闭；必须有证书
+      tls_cert_file: /etc/tunnelmesh/server.crt
+      tls_key_file: /etc/tunnelmesh/server.key
+    max_unauth_total: 256           # 未认证连接总数上限
+    max_unauth_per_ip: 8            # 每个地址的未认证连接上限
+    preface_timeout: 3s             # 连接后必须在此时间内发出认证 preface
+```
+
+- 裸传输的监听地址不能与 `server.http_addr` 的端口相同。
+- 连续 10 次认证失败的地址会在一分钟内被拒绝接入，其他地址不受影响。
+- 证书只在启动时加载，更换证书需要重启 Server，与 HTTPS 入口一致。
+- 防火墙需要放行对应的 TCP 端口（`tcp`）或 UDP 端口（`quic`）。QUIC 无法穿过只转发 TCP 的负载均衡器，需要 L4 UDP 转发。
+
 ## 自动升级与进程守护
 
 `client run` 与 `agent run` 默认带有**进程守护**和**自动升级**，两者都可以通过配置关闭。

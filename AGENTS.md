@@ -155,7 +155,8 @@ HTTP/WebSocket Handler 只负责协议解析、认证授权和响应；业务编
 - `includeSensitive=true` 仅管理员可用；`includeSecrets=true` 不得通过 traceroute 返回，必须使用独立 reveal API。
 - Agent 上报 metadata 只能来自 allowlist 的文件/环境变量项；名称匹配敏感模式时必须清空值并标记 `redacted=true`。
 - 所有目标地址在 Agent 侧再次进行 SSRF、回环、私网、链路本地、CIDR 和端口策略校验。
-- 继续不实现：P2P NAT traversal、任意远程命令执行。SSH 支持仅限现有 stdio/WebSocket 代理链路，不能扩展为通用命令执行 API。
+- 继续不实现：P2P NAT traversal。SSH 支持仅限现有 stdio/WebSocket 代理链路。
+- 脚本执行（见 [ADR 0005](docs/architecture/adr/0005-agent-script-execution.md)）：管理员可通过管理后台在支持该能力且启用的 Agent 上运行 shell 脚本。仅管理员可用；Agent 必须通过能力协商宣告 `agent_exec.v1`；脚本不经命令行参数传递；子进程不继承 Agent 环境变量；超时、输出与并发受配置上限约束；开始与结束均写审计，默认不记录脚本正文与输出。默认开启，可通过 `agent.exec.enabled=false` 与服务端 `server.exec.enabled=false` 关闭。新增或修改该能力必须同步 ADR 0005。
 - 受限自更新不属于“任意远程命令执行”（见 [ADR 0003](docs/architecture/adr/0003-constrained-self-update-and-supervision.md)）：`client run` 与 `agent run` 只会拉取本角色、本平台的发布包；来源固定为配置的 GitHub 或 Server；校验 `SHA256SUMS`；目标版本不超过 Server 版本；只运行解出的 `tunnelmesh-<role>`；可用 `update.enabled=false` 关闭。任何对端或 Server 的消息都不能提供命令、URL 或参数，新增相关能力不得突破这些约束。
 - VPN 数据面按 [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) 实现：WireGuard 端点与内存态 TUN（gVisor netstack）运行在 `tunnelmesh-server` 进程内，不打开 `/dev/net/tun`、不要求 `CAP_NET_ADMIN`、不转发 L2 以太网帧；ICMP 只支持 echo（Agent 侧非特权 ping socket），Server 不主动构造其它 ICMP 类型；重依赖用 `//go:build vpn` 隔离，`server.vpn.enabled` 为 false 时不创建任何 VPN 资源。该能力分阶段实施，交付前活文档不得宣称可用。
 

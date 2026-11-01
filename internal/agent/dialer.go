@@ -35,6 +35,8 @@ type Dialer struct {
 	// fallback: the server negotiated the capability, so "unsupported protocol"
 	// would be a lie it cannot act on.
 	ICMPEcho *Echoer
+	// Exec runs script requests. Nil, or a disabled runner, refuses the exec protocol.
+	Exec *execRunner
 }
 
 func (d Dialer) check(ctx context.Context, proto, host string, port int) error {
@@ -120,6 +122,11 @@ func (d Dialer) dialStreamPayload(ctx context.Context, payload protocol.StreamOp
 		return d.DialUDP(ctx, payload.TargetHost, payload.TargetPort)
 	case protocol.StreamProtocolICMPEcho:
 		return d.dialICMPEchoStream(ctx, payload)
+	case protocol.StreamProtocolExec:
+		if d.Exec == nil || !d.Exec.Config().Enabled {
+			return nil, ErrExecDisabled
+		}
+		return newExecStream(d.Exec), nil
 	default:
 		return nil, errors.New("agent: unsupported stream protocol")
 	}

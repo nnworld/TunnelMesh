@@ -83,9 +83,32 @@ func Delay(base, max time.Duration, attempt int, rng *rand.Rand) time.Duration {
 	return half + time.Duration(rng.Float64()*float64(delay-half))
 }
 
-// IsRejected reports whether err is the Server answering the upgrade with a
-// non-101 status.
+// ErrRejected is the transport-neutral sentinel for "the Server refused this agent".
+// Raw transports wrap it through RejectedError; the WebSocket dialer keeps its own
+// check so existing behaviour does not change.
+var ErrRejected = errors.New("reconnect: server rejected the connection")
+
+// RejectedError carries the Server's refusal reason for a raw transport. Reason is a
+// short fixed code, never a token or any other secret.
+type RejectedError struct {
+	Reason string
+}
+
+func (e *RejectedError) Error() string {
+	if e.Reason == "" {
+		return ErrRejected.Error()
+	}
+	return ErrRejected.Error() + ": " + e.Reason
+}
+
+func (e *RejectedError) Is(target error) bool { return target == ErrRejected }
+
+// IsRejected reports whether err is the Server refusing the connection: either the
+// WebSocket upgrade answered with a non-101 status, or a transport-neutral rejection.
 func IsRejected(err error) bool {
+	if errors.Is(err, ErrRejected) {
+		return true
+	}
 	var dialErr *websocket.DialError
 	return errors.As(err, &dialErr) && errors.Is(dialErr.Err, websocket.ErrBadStatus)
 }

@@ -200,6 +200,9 @@ func validStreamTargetPort(proto string, port int) bool {
 	if strings.EqualFold(proto, protocol.StreamProtocolICMPEcho) {
 		return true
 	}
+	if strings.EqualFold(proto, protocol.StreamProtocolExec) {
+		return port == 0
+	}
 	return port >= 1
 }
 
@@ -213,7 +216,8 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if err != nil {
 			return err
 		}
-		if f.StreamID == 0 || p.TargetHost == "" || !validStreamTargetPort(p.Protocol, p.TargetPort) {
+		// A script run names no target; every other protocol must name one.
+		if f.StreamID == 0 || (!strings.EqualFold(p.Protocol, protocol.StreamProtocolExec) && p.TargetHost == "") || !validStreamTargetPort(p.Protocol, p.TargetPort) {
 			return errors.New("agent: invalid stream target")
 		}
 		strictOpen := d.openResult && f.Flags&protocol.FlagStrictOpen != 0
@@ -938,10 +942,13 @@ type Session struct {
 	HeartbeatInterval       time.Duration
 	Rand                    *rand.Rand
 	Metrics                 *observability.Metrics
-	OnHeartbeatRTT          func(time.Duration)
-	heartbeatSentNanos      atomic.Int64
-	heartbeatRTTNanos       atomic.Int64
-	lastReceivedNanos       atomic.Int64
+	// MetricsTransport labels connection metrics with the transport this session runs
+	// over. Empty means websocket.
+	MetricsTransport   string
+	OnHeartbeatRTT     func(time.Duration)
+	heartbeatSentNanos atomic.Int64
+	heartbeatRTTNanos  atomic.Int64
+	lastReceivedNanos  atomic.Int64
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -1211,12 +1218,22 @@ func (s *Session) WriterQueueWaitP95() time.Duration {
 	}
 	return s.writer.WriterQueueWaitP95()
 }
+
+// metricsTransportLabel names the transport in connection metrics. Sessions built
+// outside the connection loop keep the WebSocket label they always reported.
+func (s *Session) metricsTransportLabel() string {
+	if s.MetricsTransport != "" {
+		return s.MetricsTransport
+	}
+	return "websocket"
+}
+
 func (s *Session) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
 	if s.Metrics != nil {
-		s.Metrics.ObserveConnection("agent", "websocket", "closed", "")
+		s.Metrics.ObserveConnection("agent", s.metricsTransportLabel(), "closed", "")
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()

@@ -144,12 +144,37 @@ type ServerConfig struct {
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
 	VPN                VPNConfig                `mapstructure:"vpn" json:"vpn" yaml:"vpn"`
-	Updates            ServerUpdatesConfig      `mapstructure:"updates" json:"updates" yaml:"updates"`
+	// Exec is the server-wide switch for script runs. Turning it off refuses new runs
+	// even when an agent advertises the capability.
+	Exec ServerExecConfig `mapstructure:"exec" json:"exec" yaml:"exec"`
+	// AgentTransports opens raw TCP (TLS) and QUIC listeners for agents beside the HTTP
+	// port. Both listeners are off unless an address is configured.
+	AgentTransports ServerAgentTransportsConfig `mapstructure:"agent_transports" json:"agent_transports" yaml:"agent_transports"`
+	Updates         ServerUpdatesConfig         `mapstructure:"updates" json:"updates" yaml:"updates"`
 	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
 	// header may be believed when resolving a management-API client IP. It is
 	// empty by default, which means the direct peer address is always used and a
 	// spoofed header cannot influence login throttling or audit records.
 	TrustedProxies []string `mapstructure:"trusted_proxies" json:"trusted_proxies" yaml:"trusted_proxies"`
+}
+
+// ServerAgentTransportsConfig configures the raw agent listeners. An empty listen
+// address keeps that listener off, so existing deployments are unaffected.
+type ServerAgentTransportsConfig struct {
+	TCP            ServerAgentListenerConfig `mapstructure:"tcp" json:"tcp" yaml:"tcp"`
+	QUIC           ServerAgentListenerConfig `mapstructure:"quic" json:"quic" yaml:"quic"`
+	MaxUnauthTotal int                       `mapstructure:"max_unauth_total" json:"max_unauth_total" yaml:"max_unauth_total"`
+	MaxUnauthPerIP int                       `mapstructure:"max_unauth_per_ip" json:"max_unauth_per_ip" yaml:"max_unauth_per_ip"`
+	PrefaceTimeout time.Duration             `mapstructure:"preface_timeout" json:"preface_timeout" yaml:"preface_timeout"`
+}
+
+// ServerAgentListenerConfig is one raw listener. When the certificate files are empty
+// the server's native TLS certificate is used; with neither, a TCP listener is plaintext
+// and must bind loopback.
+type ServerAgentListenerConfig struct {
+	Listen      string `mapstructure:"listen" json:"listen" yaml:"listen"`
+	TLSCertFile string `mapstructure:"tls_cert_file" json:"tls_cert_file" yaml:"tls_cert_file"`
+	TLSKeyFile  string `mapstructure:"tls_key_file" json:"tls_key_file" yaml:"tls_key_file"`
 }
 
 // ProxyEntryConfig configures the internal plaintext listener that receives the
@@ -402,8 +427,11 @@ type AgentConfig struct {
 	Transport   TransportConfig       `mapstructure:"transport" json:"transport" yaml:"transport"`
 	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Streams     AgentStreamConfig     `mapstructure:"streams" json:"streams" yaml:"streams"`
-	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
-	Update      UpdateConfig          `mapstructure:"update" json:"update" yaml:"update"`
+	// Exec controls admin-initiated script execution. It is on by default; disabling it
+	// stops the agent advertising agent_exec.v1, so the console hides the action for it.
+	Exec     AgentExecConfig  `mapstructure:"exec" json:"exec" yaml:"exec"`
+	Metadata []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+	Update   UpdateConfig     `mapstructure:"update" json:"update" yaml:"update"`
 }
 
 type AgentStreamConfig struct {
@@ -521,7 +549,10 @@ const (
 )
 
 type TransportConfig struct {
-	ProxyMode              string `mapstructure:"proxy_mode" json:"proxy_mode" yaml:"proxy_mode"`
+	ProxyMode string `mapstructure:"proxy_mode" json:"proxy_mode" yaml:"proxy_mode"`
+	// TLSCAFile is a PEM bundle of trusted server CAs for tls:// agents. Empty means the
+	// system roots, the same trust wss:// uses.
+	TLSCAFile              string `mapstructure:"tls_ca_file" json:"tls_ca_file" yaml:"tls_ca_file"`
 	ProxyURL               string `mapstructure:"proxy_url" json:"proxy_url" yaml:"proxy_url"`
 	ProxyUsername          string `mapstructure:"proxy_username" json:"proxy_username" yaml:"proxy_username"`
 	ProxyPasswordEnv       string `mapstructure:"proxy_password_env" json:"proxy_password_env" yaml:"proxy_password_env"`
@@ -780,6 +811,10 @@ func setDefaults(v *viper.Viper) {
 		"server.proxy_entry.max_concurrent_tunnels":          512,
 		"server.proxy_entry.max_header_bytes":                16384,
 		"server.proxy_entry.auth_backoff_threshold":          5,
+		"server.exec.enabled":                                true,
+		"server.agent_transports.max_unauth_total":           256,
+		"server.agent_transports.max_unauth_per_ip":          8,
+		"server.agent_transports.preface_timeout":            3 * time.Second,
 		"server.vpn.enabled":                                 false,
 		"server.vpn.listen":                                  "0.0.0.0:51820",
 		"server.vpn.endpoint_host":                           "gw-1.mesh.example.com",
@@ -809,6 +844,13 @@ func setDefaults(v *viper.Viper) {
 		"agent.connections.cooldown":                         30 * time.Second,
 		"agent.streams.max_concurrent_dials":                 32,
 		"agent.streams.max_active":                           1024,
+		"agent.exec.enabled":                                 true,
+		"agent.exec.shell":                                   "",
+		"agent.exec.default_timeout":                         60 * time.Second,
+		"agent.exec.max_timeout":                             10 * time.Minute,
+		"agent.exec.max_output_bytes":                        1 << 20,
+		"agent.exec.max_script_bytes":                        64 << 10,
+		"agent.exec.max_concurrent":                          2,
 		"agent.streams.max_pending_dials":                    128,
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
@@ -918,7 +960,9 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateWebSSH(cfg.Server.WebSSH)...)
 	problems = append(problems, validateProxyEntry(cfg.Server.ProxyEntry)...)
 	problems = append(problems, validateVPN(cfg.Server.VPN)...)
+	problems = append(problems, validateAgentTransports(cfg.Server, cfg.TLS)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
+	problems = append(problems, validateAgentExec(cfg.Agent.Exec)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
 	if dir := strings.TrimSpace(cfg.Server.Updates.Dir); dir != "" && !filepath.IsAbs(dir) {
@@ -941,13 +985,16 @@ func Validate(cfg Config) error {
 	if suffix := strings.TrimSpace(cfg.Server.DynamicSuffix); suffix != "" && !validDynamicSuffix(suffix) {
 		problems = append(problems, fmt.Sprintf("dynamic route suffix %q must be a DNS domain without a wildcard", suffix))
 	}
-	if cfg.Agent.ServerURL != "" && !validWebSocketURL(cfg.Agent.ServerURL) {
-		problems = append(problems, "agent server URL must be an absolute ws:// or wss:// URL")
+	if cfg.Agent.ServerURL != "" && !validAgentServerURL(cfg.Agent.ServerURL) {
+		problems = append(problems, "agent server URL must be an absolute ws://, wss://, tls://, tcp:// or quic:// URL; raw transports need a host and port")
 	}
 	problems = append(problems, validateTransport("agent", cfg.Agent.Transport)...)
 	problems = append(problems, validateTransport("client", cfg.Client.Transport)...)
-	if cfg.Agent.ServerURL != "" && insecureWebSocketDisallowed(cfg.Agent.ServerURL, cfg.Agent.Transport.AllowInsecureTransport) {
-		problems = append(problems, "agent server URL must use wss:// unless allow_insecure_transport is enabled")
+	if cfg.Agent.ServerURL != "" && insecureTransportDisallowed(cfg.Agent.ServerURL, cfg.Agent.Transport.AllowInsecureTransport) {
+		problems = append(problems, "agent server URL must use wss://, tls:// or quic:// unless allow_insecure_transport is enabled")
+	}
+	if cfg.Agent.ServerURL != "" && quicThroughProxy(cfg.Agent.ServerURL, cfg.Agent.Transport) {
+		problems = append(problems, "agent server URL quic:// cannot traverse an HTTP or SOCKS5 proxy; use tls:// or wss://")
 	}
 	if cfg.Agent.ServerURL != "" {
 		problems = append(problems, validateAgentConnections(cfg.Agent.Connections)...)
@@ -1259,6 +1306,37 @@ func validateAuthorizationCache(cfg AuthorizationCacheConfig) []string {
 	}
 	if cfg.MaxEntries <= 0 {
 		problems = append(problems, "authorization cache max entries must be positive")
+	}
+	return problems
+}
+
+// ServerExecConfig is the server-side script execution switch.
+type ServerExecConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+}
+
+// AgentExecConfig bounds script execution on an agent. Zero numeric fields take the
+// agent defaults; negatives are rejected here.
+type AgentExecConfig struct {
+	Enabled        bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	Shell          string        `mapstructure:"shell" json:"shell" yaml:"shell"`
+	DefaultTimeout time.Duration `mapstructure:"default_timeout" json:"default_timeout" yaml:"default_timeout"`
+	MaxTimeout     time.Duration `mapstructure:"max_timeout" json:"max_timeout" yaml:"max_timeout"`
+	MaxOutputBytes int           `mapstructure:"max_output_bytes" json:"max_output_bytes" yaml:"max_output_bytes"`
+	MaxScriptBytes int           `mapstructure:"max_script_bytes" json:"max_script_bytes" yaml:"max_script_bytes"`
+	MaxConcurrent  int           `mapstructure:"max_concurrent" json:"max_concurrent" yaml:"max_concurrent"`
+}
+
+func validateAgentExec(cfg AgentExecConfig) []string {
+	var problems []string
+	if cfg.DefaultTimeout < 0 || cfg.MaxTimeout < 0 {
+		problems = append(problems, "agent exec timeouts must not be negative")
+	}
+	if cfg.DefaultTimeout > 0 && cfg.MaxTimeout > 0 && cfg.DefaultTimeout > cfg.MaxTimeout {
+		problems = append(problems, "agent exec default_timeout must not exceed max_timeout")
+	}
+	if cfg.MaxOutputBytes < 0 || cfg.MaxScriptBytes < 0 || cfg.MaxConcurrent < 0 {
+		problems = append(problems, "agent exec limits must not be negative")
 	}
 	return problems
 }
@@ -1897,6 +1975,96 @@ func validWebSocketURL(raw string) bool {
 func insecureWebSocketDisallowed(raw string, allowed bool) bool {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	return err == nil && u.Scheme == "ws" && !allowed && !isLoopbackWebSocketHost(u.Hostname())
+}
+
+// validAgentServerURL accepts the agent transports. Raw transports need an explicit
+// host and port because there is no HTTP path to infer one from.
+func validAgentServerURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	switch u.Scheme {
+	case "ws", "wss":
+		return true
+	case "tls", "tcp", "quic":
+		return u.Hostname() != "" && u.Port() != "" && u.Path == "" && u.RawQuery == ""
+	default:
+		return false
+	}
+}
+
+// insecureTransportDisallowed reports whether a plaintext agent transport is used
+// without the explicit opt-in. tls:// and quic:// are always encrypted; ws:// and
+// tcp:// are plaintext and need loopback or allow_insecure_transport.
+func insecureTransportDisallowed(raw string, allowed bool) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	plaintext := u.Scheme == "ws" || u.Scheme == "tcp"
+	return plaintext && !allowed && !isLoopbackWebSocketHost(u.Hostname())
+}
+
+// quicThroughProxy reports a quic:// agent URL configured with any proxy mode. QUIC is
+// UDP, and the HTTP CONNECT and SOCKS5 proxies the dialer supports are TCP-only.
+func quicThroughProxy(raw string, transport TransportConfig) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "quic" {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(transport.ProxyMode))
+	return mode != "" && mode != ProxyModeDirect
+}
+
+// validateAgentTransports checks the raw listeners only when one is enabled, so a
+// default configuration produces no new problems.
+func validateAgentTransports(server ServerConfig, native TLSConfig) []string {
+	t := server.AgentTransports
+	var problems []string
+	if t.MaxUnauthTotal < 0 || t.MaxUnauthPerIP < 0 {
+		problems = append(problems, "server agent transport unauthenticated limits must not be negative")
+	}
+	if t.PrefaceTimeout < 0 {
+		problems = append(problems, "server agent transport preface timeout must not be negative")
+	}
+	httpPort := portOf(server.HTTPAddr)
+	for _, listener := range []struct {
+		name string
+		cfg  ServerAgentListenerConfig
+		quic bool
+	}{{"tcp", t.TCP, false}, {"quic", t.QUIC, true}} {
+		listen := strings.TrimSpace(listener.cfg.Listen)
+		if listen == "" {
+			continue
+		}
+		host, port, err := net.SplitHostPort(listen)
+		if err != nil || port == "" {
+			problems = append(problems, fmt.Sprintf("server agent %s listen %q must be host:port", listener.name, listen))
+			continue
+		}
+		if port == httpPort && httpPort != "" {
+			problems = append(problems, fmt.Sprintf("server agent %s listen must not reuse the HTTP port %s", listener.name, httpPort))
+		}
+		certFile := strings.TrimSpace(listener.cfg.TLSCertFile)
+		hasCert := certFile != "" || (native.Enabled && strings.TrimSpace(native.CertFile) != "")
+		if listener.quic && !hasCert {
+			problems = append(problems, "server agent quic listener requires a TLS certificate: set tls_cert_file or enable native TLS")
+		}
+		if !listener.quic && !hasCert && !isLoopbackWebSocketHost(host) {
+			problems = append(problems, "server agent tcp listener without TLS must bind a loopback address")
+		}
+	}
+	return problems
+}
+
+// portOf returns the port of a host:port address, or empty when it has none.
+func portOf(addr string) string {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 func isLoopbackWebSocketHost(host string) bool {

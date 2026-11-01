@@ -70,7 +70,7 @@ echo "ssh exit=$?"
 
 - TunnelMesh 只传输 SSH 的 TCP 字节，不解析用户名、私钥或命令内容。
 - 不要把私钥、密码或完整 SSH 配置放入 Agent metadata；敏感 metadata 会被遮罩。
-- 任意命令执行不是本期能力；不要把 `proxy tcp` 当作绕过 `sshd` 的 shell 通道。
+- `proxy tcp` 不是 shell 通道，不能用来绕过 `sshd`。脚本执行是另一条独立能力（Agent 侧，管理员发起，见 [ADR 0005](../architecture/adr/0005-agent-script-execution.md)），与 SSH 代理链路无关。
 
 ## 约束
 

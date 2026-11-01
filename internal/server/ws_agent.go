@@ -46,7 +46,14 @@ func (t *WSFrameTransport) Receive() (protocol.Frame, error) {
 }
 func (t *WSFrameTransport) Close() error { return t.conn.Close() }
 
-func ServeAgentFrames(tr *WSFrameTransport, onFrame func(protocol.Frame) error) error {
+// agentFrameConn is the frame-level transport the agent serve loop needs. Keeping it
+// narrow lets a raw TCP or QUIC transport reuse the same loop as WebSocket.
+type agentFrameConn interface {
+	FrameTransport
+	Receive() (protocol.Frame, error)
+}
+
+func ServeAgentFrames(tr agentFrameConn, onFrame func(protocol.Frame) error) error {
 	for {
 		f, err := tr.Receive()
 		if err != nil {
@@ -69,7 +76,7 @@ func ServeAgentFrames(tr *WSFrameTransport, onFrame func(protocol.Frame) error) 
 // ServeAgentSession registers an authenticated Agent and routes metadata
 // control frames through the fenced session manager while preserving the
 // existing callback path for stream frames.
-func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error) error {
+func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr agentFrameConn, onFrame func(protocol.Frame) error) error {
 	return serveAgentSession(ctx, manager, registration, tr, nil, func(_ *AgentSession, frame protocol.Frame) error {
 		if onFrame == nil {
 			return nil
@@ -78,7 +85,7 @@ func ServeAgentSession(ctx context.Context, manager *AgentSessionManager, regist
 	}, nil)
 }
 
-func ServeAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, onFrame func(protocol.Frame) error, metrics *observability.Metrics) error {
+func ServeAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr agentFrameConn, onFrame func(protocol.Frame) error, metrics *observability.Metrics) error {
 	return serveAgentSessionWithMetrics(ctx, manager, registration, tr, nil, func(_ *AgentSession, frame protocol.Frame) error {
 		if onFrame == nil {
 			return nil
@@ -91,7 +98,7 @@ func ServeAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionMana
 // inspect the first hello frame to authenticate and derive the registration.
 // The frame is processed through the same metadata fencing path as all later
 // frames, then the session remains attached to the transport until EOF.
-func ServeAgentSessionWithInitialFrame(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial protocol.Frame, onFrame func(protocol.Frame) error) error {
+func ServeAgentSessionWithInitialFrame(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr agentFrameConn, initial protocol.Frame, onFrame func(protocol.Frame) error) error {
 	return serveAgentSession(ctx, manager, registration, tr, &initial, func(_ *AgentSession, frame protocol.Frame) error {
 		if onFrame == nil {
 			return nil
@@ -100,11 +107,11 @@ func ServeAgentSessionWithInitialFrame(ctx context.Context, manager *AgentSessio
 	}, nil)
 }
 
-func serveAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession)) error {
+func serveAgentSession(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr agentFrameConn, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession)) error {
 	return serveAgentSessionWithMetrics(ctx, manager, registration, tr, initial, onFrame, onClose, nil)
 }
 
-func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
+func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, tr agentFrameConn, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
 	if manager == nil || tr == nil {
 		return ErrSessionClosed
 	}
@@ -133,7 +140,7 @@ func serveAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionMana
 	return serveRegisteredAgentSessionWithMetrics(ctx, manager, registration, session, tr, initial, onFrame, onClose, metrics)
 }
 
-func serveRegisteredAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, session *AgentSession, tr *WSFrameTransport, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
+func serveRegisteredAgentSessionWithMetrics(ctx context.Context, manager *AgentSessionManager, registration AgentRegistration, session *AgentSession, tr agentFrameConn, initial *protocol.Frame, onFrame func(*AgentSession, protocol.Frame) error, onClose func(*AgentSession), metrics *observability.Metrics) error {
 	if manager == nil || tr == nil || session == nil {
 		return ErrSessionClosed
 	}

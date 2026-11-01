@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
@@ -75,5 +76,18 @@ func TestBuildNICsSkipsLoopbackAndDownInterfaces(t *testing.T) {
 	}
 	if strings.Join(nics[0].Addresses, ",") != "10.0.0.5,fe80::1" {
 		t.Fatalf("addresses = %v", nics[0].Addresses)
+	}
+}
+
+// Free space changes with every write on the host. Inventory is part of a versioned
+// metadata snapshot that only changes when the host's identity changes, so volatile
+// usage figures must not be reported here.
+func TestDiskInventoryCarriesCapacityOnly(t *testing.T) {
+	raw, err := json.Marshal(Disk{Mount: "/", FS: "ext4", TotalBytes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "free") {
+		t.Fatalf("disk inventory must not report free space: %s", raw)
 	}
 }

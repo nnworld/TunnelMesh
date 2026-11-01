@@ -31,13 +31,12 @@
         <h3>{{ t('inventory.disks') }}</h3>
         <div class="inv-table-wrap">
           <table class="inv-table">
-            <thead><tr><th>{{ t('inventory.mount') }}</th><th>{{ t('inventory.fs') }}</th><th>{{ t('inventory.capacity') }}</th><th>{{ t('inventory.free') }}</th></tr></thead>
+            <thead><tr><th>{{ t('inventory.mount') }}</th><th>{{ t('inventory.fs') }}</th><th>{{ t('inventory.capacity') }}</th></tr></thead>
             <tbody>
               <tr v-for="disk in inventory.disks" :key="disk.mount">
                 <td class="tm-mono">{{ disk.mount }}</td>
                 <td>{{ disk.fs }}</td>
                 <td class="tm-num">{{ formatBytes(disk.totalBytes) }}</td>
-                <td class="tm-num">{{ formatBytes(disk.freeBytes) }}</td>
               </tr>
             </tbody>
           </table>

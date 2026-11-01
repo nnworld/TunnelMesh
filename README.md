@@ -234,8 +234,7 @@ agent:
   server_url: ws://127.0.0.1:8080/ws/agent   # wss://tunnel.example.com/ws/agent in production
 ```
 
-Agents only read metadata from explicit `file` or `env` allowlist entries and never execute
-arbitrary commands. Target hosts, ports, and CIDRs are constrained by Server-side Agent policy
+Agents only read metadata from explicit `file` or `env` allowlist entries. Administrators can run a bounded shell script on an online Agent from the console; the Agent runs it under its own account and reports only what the script prints (see [ADR 0005](docs/architecture/adr/0005-agent-script-execution.md)). Target hosts, ports, and CIDRs are constrained by Server-side Agent policy
 and re-validated on the Agent before every dial.
 
 ### 3. Forward or publish
@@ -403,7 +402,7 @@ docker build --build-arg APP=client -t tunnelmesh:client .
 - Agent metadata comes only from allowlisted files or environment variables; names matching sensitive patterns are cleared and marked `redacted=true`.
 - Every target address is re-checked on the Agent for SSRF, loopback, private, link-local, CIDR, and port policy.
 - Logs, metrics, audit records, and normal traceroute output never contain secrets, passwords, private keys, full `Authorization` headers, or session bytes. Identity metric labels are a closed enumeration that excludes usernames, client IPs, provider ids, and device tokens.
-- Deliberately not implemented: P2P NAT traversal and arbitrary remote command execution. SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through the embedded WireGuard gateway is implemented in [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) `-tags vpn` builds and off by default; the release binaries and images do not carry that tag yet, and L2 frames are never forwarded.
+- Deliberately not implemented: P2P NAT traversal. Script execution is available to administrators only, on Agents that advertise `agent_exec.v1` (see ADR 0005). SSH support is limited to the existing stdio/WebSocket proxy path. ICMP echo through the embedded WireGuard gateway is implemented in [ADR 0002](docs/architecture/adr/0002-public-ingress-and-embedded-vpn.md) `-tags vpn` builds and off by default; the release binaries and images do not carry that tag yet, and L2 frames are never forwarded.
 
 ## Repository layout
 

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
 // NewStreamDispatcherFactory builds the standard Agent stream handler. It is the
@@ -14,9 +15,20 @@ import (
 // echoer keeps ICMP out of the advertisement instead of promising a stream the
 // host cannot serve.
 func NewStreamDispatcherFactory(streams config.AgentStreamConfig, echoer *Echoer) ConnectionSessionFactory {
+	return NewStreamDispatcherFactoryWithExec(streams, echoer, ExecConfig{})
+}
+
+// NewStreamDispatcherFactoryWithExec is the shared factory with script execution
+// configured. A zero ExecConfig leaves execution off and the capability unadvertised.
+func NewStreamDispatcherFactoryWithExec(streams config.AgentStreamConfig, echoer *Echoer, execConfig ExecConfig) ConnectionSessionFactory {
+	execRunner := newExecRunner(execConfig)
 	return func(session *Session, _ string) SessionFrameHandler {
-		session.SetCapabilities(AgentStreamCapabilities(streams, echoer != nil))
-		dispatcher := NewStreamDispatcherWithConfig(Dialer{ICMPEcho: echoer}, nil, session.Send, DialExecutorConfig{
+		capabilities := AgentStreamCapabilities(streams, echoer != nil)
+		if execRunner.Config().Enabled {
+			capabilities = append(capabilities, protocol.CapabilityAgentExec)
+		}
+		session.SetCapabilities(capabilities)
+		dispatcher := NewStreamDispatcherWithConfig(Dialer{ICMPEcho: echoer, Exec: execRunner}, nil, session.Send, DialExecutorConfig{
 			MaxConcurrent:  streams.MaxConcurrentDials,
 			MaxPending:     streams.MaxPendingDials,
 			ConnectTimeout: streams.ConnectTimeout,

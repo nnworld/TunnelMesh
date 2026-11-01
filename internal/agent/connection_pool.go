@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/x509"
 	"log/slog"
 	"time"
 
@@ -24,8 +25,10 @@ type WebSocketPoolOptions struct {
 	// OnReady is called each time the Server accepts a connection's metadata, with
 	// the Server version it announced ("" for a Server that does not announce one).
 	// A supervisor uses it as the proof that this Agent is connected and known.
-	OnReady            func(serverVersion string)
-	Dialer             *sharedtransport.Dialer
+	OnReady func(serverVersion string)
+	Dialer  *sharedtransport.Dialer
+	// TLSRootCAs is the trust store for tls:// agents. Nil means the system roots.
+	TLSRootCAs         *x509.CertPool
 	Min                int
 	Max                int
 	HighWatermark      int
@@ -46,6 +49,7 @@ func RunConnectionPool(ctx context.Context, options WebSocketPoolOptions) error 
 		Runner: func(connectionCtx context.Context, connectionID string, connectionEpoch int64) error {
 			webSocketOptions := options.WebSocket
 			webSocketOptions.Dialer = options.Dialer
+			webSocketOptions.TLSRootCAs = options.TLSRootCAs
 			return runWebSocketConnection(
 				connectionCtx, options.ServerURL, options.Token, options.AgentID, options.NodeID,
 				options.InstanceID, connectionID, max64(options.Epoch, connectionEpoch), options.Collector,

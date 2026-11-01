@@ -44,6 +44,8 @@ type API struct {
 	traceroute         *TracerouteService
 	probeService       *ProbeService
 	agentSessions      *AgentSessionManager
+	agentExec          *agentExecBroker
+	agentExecEnabled   bool
 	localAgentRelay    *AgentRelayTransport
 	clusterConnections AgentConnectionLister
 	connectionCloser   AgentConnectionCloseService
@@ -512,6 +514,10 @@ func (a *API) handleAgents(w http.ResponseWriter, r *http.Request, p auth.Princi
 		a.handlePolicies(w, r, p, id, parts[2:])
 		return
 	}
+	if len(parts) == 2 && parts[1] == "exec-sessions" {
+		a.handleAgentExec(w, r, p, id)
+		return
+	}
 	agent, err := a.service.GetAgent(r.Context(), id)
 	if err != nil {
 		writeStorageError(w, err)
@@ -854,7 +860,11 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request, p auth.Principa
 	}
 	items := make([]any, 0, len(page.Items))
 	for _, agent := range page.Items {
-		items = append(items, publicAgentWithStatus(agent, online[agent.ID]))
+		item := publicAgentWithStatus(agent, online[agent.ID])
+		// Live capability, not the administrator-entered field: the console only offers
+		// a script run where the connected agent has said it can serve one.
+		item["execCapable"] = liveSessionsSupportExec(a.agentSessions, agent.ID)
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, pageData(items, page.NextCursor, page.HasMore))
 }

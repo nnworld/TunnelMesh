@@ -8,12 +8,14 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 74 份计划，按日期倒序排列。
+共 76 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-11-02 | [管理后台运行脚本（Agent 原生执行）](2026-11-02-agent-script-execution.md) | — | [ADR：管理后台在 Agent 上运行脚本](../../architecture/adr/0005-agent-script-execution.md) |
+| 2026-11-01 | [Agent 与 Server 之间增加 TCP（TLS）与 QUIC 传输](2026-11-01-agent-raw-transports.md) | — | [ADR：Agent 与 Server 之间增加裸 TCP（TLS）与 QUIC 传输](../../architecture/adr/0004-agent-raw-tcp-and-quic-transports.md) |
 | 2026-10-26 | [管理后台界面重设计「机架 Rack」实施计划](2026-10-26-admin-console-rack-redesign.md) | — | [PR：管理后台界面重设计「机架 Rack」](../../pull-requests/2026-10-26-admin-console-rack-redesign.md) |
 | 2026-10-25 | [Client/Agent 角色融合与自动注册实施计划](2026-10-25-client-agent-role-auto-registration.md) | — | [PR：Client Agent 角色融合与自动注册](../../pull-requests/2026-10-25-client-agent-role.md) |
 | 2026-10-25 | [Client/Agent 自动升级、失败回滚与进程守护实施计划](2026-10-25-client-agent-auto-update.md) | — | [PR：Client/Agent 自动升级、失败回滚与进程守护](../../pull-requests/2026-10-25-client-agent-auto-update.md)<br>[ADR：Constrained self-update and process super…](../../architecture/adr/0003-constrained-self-update-and-supervision.md) |

@@ -55,7 +55,7 @@ func disks() []Disk {
 		fsType = append(fsType, byte(c))
 	}
 	bsize := uint64(stat.Bsize)
-	return []Disk{{Mount: "/", FS: string(fsType), TotalBytes: stat.Blocks * bsize, FreeBytes: stat.Bavail * bsize}}
+	return []Disk{{Mount: "/", FS: string(fsType), TotalBytes: stat.Blocks * bsize}}
 }
 
 func gpus(context.Context) []string { return nil }

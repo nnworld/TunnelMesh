@@ -6,7 +6,7 @@ const values = {
   'system.cpu': JSON.stringify({ model: 'Xeon 8375C', logical_cpus: 8 }),
   'system.memory': JSON.stringify({ total_bytes: 17179869184 }),
   'system.gpu': JSON.stringify(['Intel UHD Graphics 630']),
-  'system.disks': JSON.stringify([{ mount: '/', fs: 'ext4', total_bytes: 107374182400, free_bytes: 53687091200 }]),
+  'system.disks': JSON.stringify([{ mount: '/', fs: 'ext4', total_bytes: 107374182400 }]),
   'system.nics': JSON.stringify([{ name: 'eth0', mac: 'aa:bb:cc:dd:ee:ff', addresses: ['10.0.0.5'] }]),
   'region': 'cn-north',
 }

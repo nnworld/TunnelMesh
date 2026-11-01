@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,7 +94,12 @@ type agentRelayStreamKey struct {
 type agentRelayIDAllocator struct{ next uint64 }
 
 func (t *AgentRelayTransport) OpenStream(ctx context.Context, request relay.StreamRequest) (io.ReadWriteCloser, error) {
-	if t == nil || t.manager == nil || request.AgentID == "" || request.TargetHost == "" || request.TargetPort < 1 || request.TargetPort > 65535 {
+	if t == nil || t.manager == nil || request.AgentID == "" {
+		return nil, relay.ErrNodeDisconnected
+	}
+	// A script run names no target: the command travels inside the stream. Every other
+	// protocol must name one, as before.
+	if !strings.EqualFold(request.Protocol, protocol.StreamProtocolExec) && (request.TargetHost == "" || request.TargetPort < 1 || request.TargetPort > 65535) {
 		return nil, relay.ErrNodeDisconnected
 	}
 	if ctx == nil {

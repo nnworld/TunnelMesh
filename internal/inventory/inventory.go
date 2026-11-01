@@ -49,12 +49,13 @@ type CPUInfo struct {
 	LogicalCPUs int    `json:"logical_cpus"`
 }
 
-// Disk is one mounted real filesystem.
+// Disk is one mounted real filesystem. Only capacity is reported: free space changes
+// with every write, and this block is part of a snapshot that is revision-checked, so
+// volatile usage would turn each heartbeat into a metadata update.
 type Disk struct {
 	Mount      string `json:"mount"`
 	FS         string `json:"fs"`
 	TotalBytes uint64 `json:"total_bytes"`
-	FreeBytes  uint64 `json:"free_bytes"`
 }
 
 // NIC is one active network interface. MAC is always reported: the operator asked
