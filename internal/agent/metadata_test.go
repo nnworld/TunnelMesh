@@ -52,8 +52,16 @@ func TestMetadataCollectorReadsAllowlistedFileAndEnvInDeterministicOrder(t *test
 	if got := snapshot.Values["region"]; got != "ap-east" {
 		t.Fatalf("region = %q", got)
 	}
-	if len(snapshot.Fields) != 2 || snapshot.Fields[0].Name != "device_id" || snapshot.Fields[1].Name != "region" {
-		t.Fatalf("fields are not deterministic: %+v", snapshot.Fields)
+	// Operator fields keep their deterministic order; built-in inventory follows them
+	// and is checked by its own tests, so only the operator slice is compared here.
+	var operator []string
+	for _, field := range snapshot.Fields {
+		if field.Source != "inventory" {
+			operator = append(operator, field.Name)
+		}
+	}
+	if len(operator) != 2 || operator[0] != "device_id" || operator[1] != "region" {
+		t.Fatalf("operator fields are not deterministic: %+v", snapshot.Fields)
 	}
 }
 

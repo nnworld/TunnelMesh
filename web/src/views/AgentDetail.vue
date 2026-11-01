@@ -53,8 +53,9 @@
             </el-table-column>
           </el-table>
 
-          <el-empty v-if="!metadata.items.length" :description="t('agentDetail.empty')" />
-          <el-table v-else :data="metadata.items" class="metadata-table">
+          <SystemInventory :values="inventoryValues" />
+          <el-empty v-if="!operatorItems.length" :description="t('agentDetail.empty')" />
+          <el-table v-else :data="operatorItems" class="metadata-table">
             <el-table-column prop="name" :label="t('agentDetail.name')" />
             <el-table-column prop="source" :label="t('agentDetail.source')" />
             <el-table-column :label="t('agentDetail.value')"><template #default="scope"><StatusTag v-if="scope.row.redacted" kind="info" :label="t('agentDetail.redacted')" /><span v-else>{{ scope.row.value || '—' }}</span></template></el-table-column>
@@ -125,7 +126,7 @@
             </template>
           </el-table-column>
         </el-table>
-        <div class="list-pager"><el-button :disabled="policyPageIndex === 0 || policiesLoading" @click="previousPolicyPage">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: policyPageIndex + 1 }) }}</span><el-button :disabled="!policyNextCursor || policiesLoading" @click="nextPolicyPage">{{ t('common.nextPage') }}</el-button><el-select v-model="policyPageSize" class="page-size" @change="changePolicyPageSize"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+        <PagerBar :page-index="policyPageIndex" :has-previous="policyPageIndex > 0" :has-next="!!policyNextCursor" :page-size="policyPageSize" :loading="policiesLoading" @previous="previousPolicyPage" @next="nextPolicyPage" @size-change="changePolicyPageSize($event)" />
       </DataState>
     </div>
 
@@ -195,6 +196,9 @@
 </template>
 
 <script setup lang="ts">
+import PagerBar from '../components/PagerBar.vue'
+import { isInventoryName } from '../utils/inventory'
+import SystemInventory from '../components/SystemInventory.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -257,6 +261,12 @@ const connectionsByInstance = computed(() => {
   }
   return counts
 })
+// Built-in facts go to the inventory panel; the table keeps only what the operator
+// declared, so each value appears once.
+const inventoryValues = computed<Record<string, string>>(() => Object.fromEntries(
+  (metadata.value?.items || []).filter(item => isInventoryName(item.name) && item.value).map(item => [item.name, item.value]),
+))
+const operatorItems = computed(() => (metadata.value?.items || []).filter(item => !isInventoryName(item.name)))
 const latestReportedAt = computed(() => latestTimestamp((metadata.value?.instances || []).map(instance => instance.reportedAt), metadata.value?.reportedAt))
 const latestUpdatedAt = computed(() => latestTimestamp((metadata.value?.instances || []).map(instance => instance.updatedAt), metadata.value?.updatedAt))
 

@@ -298,8 +298,21 @@ client:
 		if len(metadata.Listeners) != 1 || metadata.Listeners[0].Protocol != "socks5" || metadata.Listeners[0].ListenAddress != listen || metadata.Listeners[0].AgentID != "agent-a" || !metadata.Listeners[0].Enabled {
 			t.Fatalf("metadata listeners = %#v", metadata.Listeners)
 		}
-		if len(metadata.Metadata) != 1 || metadata.Metadata[0].Name != "region" || metadata.Metadata[0].Value != "cn-north" {
-			t.Fatalf("metadata fields = %#v", metadata.Metadata)
+		// The operator's field is reported exactly as configured; built-in host facts
+		// ride along in the same snapshot and are checked by their own tests.
+		var region, system int
+		for _, field := range metadata.Metadata {
+			switch {
+			case field.Name == "region" && field.Source == "file" && field.Value == "cn-north":
+				region++
+			case strings.HasPrefix(field.Name, "system.") && field.Source == "inventory":
+				system++
+			default:
+				t.Fatalf("unexpected metadata field %#v", field)
+			}
+		}
+		if region != 1 || system == 0 {
+			t.Fatalf("metadata fields = %#v, want the region plus built-in inventory", metadata.Metadata)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("client run did not start the session pool")

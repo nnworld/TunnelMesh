@@ -8,7 +8,7 @@
     </router-link>
     <el-menu class="rail-menu" :router="true" :default-active="activePath" :collapse="collapsed" :collapse-transition="false">
       <template v-for="group in groups" :key="group.key">
-        <li class="rail-group" :class="{ 'is-rule': collapsed }" role="presentation">
+        <li class="rail-group" :class="[`group-${group.key}`, { 'is-rule': collapsed }]" role="presentation">
           <span v-if="!collapsed">{{ t(group.labelKey) }}</span>
         </li>
         <el-menu-item v-for="item in group.items" :key="item.path" :index="item.path" @click="emit('navigate')">
@@ -66,6 +66,14 @@ const activePath = computed(() => {
 .rail-menu { flex: 1; min-height: 0; overflow-y: auto; padding: var(--tm-s-2) var(--tm-s-3); --el-menu-item-height: 36px; }
 .rail-group { list-style: none; padding: var(--tm-s-5) var(--tm-s-3) var(--tm-s-2); color: var(--tm-ink-3); font-size: var(--tm-fs-xs); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
 .rail-group.is-rule { padding: var(--tm-s-2) var(--tm-s-3); }
+/* Each group keeps one hue, so the rail reads as sections rather than one list. */
+.rail-group { color: var(--group-ink, var(--tm-ink-3)); }
+.rail-group span::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: var(--tm-s-2); border-radius: 50%; background: var(--group-hue, var(--tm-ink-4)); vertical-align: middle; }
+.group-overview { --group-hue: var(--tm-brand); --group-ink: var(--tm-brand); }
+.group-network { --group-hue: var(--tm-sky); --group-ink: var(--tm-sky-ink); }
+.group-access { --group-hue: var(--tm-violet); --group-ink: var(--tm-violet-ink); }
+.group-platform { --group-hue: var(--tm-warn); --group-ink: var(--tm-warn-ink); }
+.group-operations { --group-hue: var(--tm-rose); --group-ink: var(--tm-rose-ink); }
 .rail-group.is-rule::after { content: ''; display: block; height: 1px; background: var(--tm-line); }
 .rail-menu :deep(.el-menu-item) { gap: var(--tm-s-3); height: 36px; padding: 0 var(--tm-s-3); margin-bottom: 1px; border-radius: var(--tm-r-sm); font-size: var(--tm-fs-sm); font-weight: 500; line-height: 36px; position: relative; }
 .rail-menu :deep(.el-menu-item.is-active) { background: var(--tm-brand-tint); color: var(--tm-brand); }

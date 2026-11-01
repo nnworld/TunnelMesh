@@ -56,7 +56,7 @@
               <div v-if="row.actorUserId" class="actor-id">{{ row.actorUserId }}</div>
             </template>
           </el-table-column>
-          <el-table-column prop="action" :label="t('audits.action')" min-width="240"><template #default="{ row }"><span class="tm-mono action">{{ row.action }}</span></template></el-table-column>
+          <el-table-column prop="action" :label="t('audits.action')" min-width="240"><template #default="{ row }"><span class="action tone-chip" :class="`tone-${actionHue(row.action)}`">{{ row.action }}</span></template></el-table-column>
           <el-table-column prop="resourceType" :label="t('audits.resourceType')" min-width="150" />
           <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200"><template #default="{ row }"><IdCell v-if="row.resourceId" :value="row.resourceId" /></template></el-table-column>
           <!-- What changed, without opening a dialog for every row: the facts an
@@ -108,6 +108,7 @@ import PagerBar from '../components/PagerBar.vue'
 import { listAuditLogs, type AuditLog } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle, auditTraceId } from '../utils/audit'
+import { actionHue } from '../utils/actionHue'
 
 // How many facts fit on a table row before the line is marked as truncated.
 const summaryPairLimit = 3
@@ -230,7 +231,7 @@ onMounted(load)
 .applied-filters { display: flex; flex-wrap: wrap; gap: var(--tm-s-2); }
 .audit-table :deep(.el-table__row) { cursor: pointer; }
 .actor-name { font-weight: 500; }
-.action { font-size: var(--tm-fs-xs); color: var(--tm-ink); white-space: nowrap; }
+.action { white-space: nowrap; }
 .actor-id, .audit-summary { color: var(--tm-ink-2); font-size: var(--tm-fs-xs); overflow-wrap: anywhere; }
 .detail-json { max-height: 50vh; overflow: auto; }
 </style>

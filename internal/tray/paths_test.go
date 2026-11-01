@@ -1,6 +1,7 @@
 package tray
 
 import (
+	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,8 +61,10 @@ func TestDefaultPathsSeparatesPreferencesFromConfiguration(t *testing.T) {
 	if paths.ClientYAML != filepath.Join(wantDir, ClientConfigFileName) {
 		t.Fatalf("ClientYAML = %q", paths.ClientYAML)
 	}
-	if paths.Lock != filepath.Join(wantDir, LockFileName) {
-		t.Fatalf("Lock = %q", paths.Lock)
+	// The lock is keyed by the configuration and kept in the state directory, so it
+	// must not sit beside client.yaml (see client.LockPathForConfig).
+	if paths.Lock != client.LockPathForConfig(paths.ClientYAML) {
+		t.Fatalf("Lock = %q, want the runtime's state-directory lock for %q", paths.Lock, paths.ClientYAML)
 	}
 	if !strings.HasSuffix(paths.Lock, "client.lock") {
 		t.Fatalf("Lock = %q, want the client.lock name the runtime derives", paths.Lock)

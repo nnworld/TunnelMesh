@@ -8,19 +8,68 @@ import (
 	"testing"
 )
 
-func TestLockPathForConfigDerivesFromConfigDir(t *testing.T) {
+func TestLockPathForConfigIsEmptyForBlankConfigAndNamedLockOtherwise(t *testing.T) {
 	if got := LockPathForConfig(""); got != "" {
 		t.Fatalf("empty config path must not produce a lock path, got %q", got)
 	}
 	if got := LockPathForConfig("   "); got != "" {
 		t.Fatalf("blank config path must not produce a lock path, got %q", got)
 	}
-	got := LockPathForConfig(filepath.Join(t.TempDir(), "nested", "client.yaml"))
-	if want := filepath.Join(filepath.Dir(got), LockFileName); got != want {
-		t.Fatalf("lock path = %q, want %q", got, want)
-	}
-	if filepath.Base(got) != LockFileName {
+	// Where the lock lands depends on whether the state directory is writable on this
+	// host, so only the shape is asserted here; placement is pinned by the tests below.
+	if got := LockPathForConfig(filepath.Join(t.TempDir(), "client.yaml")); filepath.Base(got) != LockFileName {
 		t.Fatalf("lock path = %q, want base %q", got, LockFileName)
+	}
+}
+
+// The state directory is used when it is writable, so the service keeps its lock off
+// the read-only /etc.
+func TestLockPathWithFallbackUsesWritableStateRoot(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "nested", "client.yaml")
+	got := lockPathWithFallback(root, configPath)
+	if !pathWithin(got, root) {
+		t.Fatalf("lock path %q must live under the writable state root %q", got, root)
+	}
+	if filepath.Dir(got) == filepath.Dir(configPath) {
+		t.Fatalf("lock path %q must not sit beside the configuration", got)
+	}
+}
+
+// A non-root user, or a test runner, cannot create /var/lib/tunnelmesh-client. The
+// lock then falls back to the configuration directory, as it did before the state
+// directory was introduced, so the client still starts.
+func TestLockPathWithFallbackFallsBackToConfigDirWhenStateRootIsUnusable(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "client.yaml")
+	got := lockPathWithFallback(blocker, configPath)
+	if want := filepath.Join(dir, LockFileName); got != want {
+		t.Fatalf("lock path = %q, want the configuration-directory fallback %q", got, want)
+	}
+	lock, err := acquireRuntimeLock(got)
+	if err != nil {
+		t.Fatalf("fallback lock must be acquirable: %v", err)
+	}
+	_ = lock.Release()
+}
+
+func TestLockPathInIsStablePerConfig(t *testing.T) {
+	root := t.TempDir()
+	first := lockPathIn(root, filepath.Join(t.TempDir(), "client.yaml"))
+	second := lockPathIn(root, filepath.Join(t.TempDir(), "client.yaml"))
+	if first == second {
+		t.Fatalf("two configurations share one lock path %q", first)
+	}
+	config := filepath.Join(t.TempDir(), "client.yaml")
+	if lockPathIn(root, config) != lockPathIn(root, config) {
+		t.Fatalf("the same configuration must always map to the same lock path")
+	}
+	if !pathWithin(first, root) {
+		t.Fatalf("lock path %q escaped the state root %q", first, root)
 	}
 }
 
@@ -93,13 +142,13 @@ func TestAcquireRuntimeLockIsIndependentPerConfig(t *testing.T) {
 	firstPath := filepath.Join(dir, "a", "client.yaml")
 	secondPath := filepath.Join(dir, "b", "client.yaml")
 
-	first, err := acquireRuntimeLock(LockPathForConfig(firstPath))
+	first, err := acquireRuntimeLock(lockPathIn(dir, firstPath))
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	defer func() { _ = first.Release() }()
 
-	second, err := acquireRuntimeLock(LockPathForConfig(secondPath))
+	second, err := acquireRuntimeLock(lockPathIn(dir, secondPath))
 	if err != nil {
 		t.Fatalf("second config acquire: %v", err)
 	}

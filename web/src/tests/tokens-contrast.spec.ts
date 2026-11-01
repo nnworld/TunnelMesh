@@ -45,6 +45,15 @@ function check(tokens: Record<string, string>, pairs: Pair[]) {
   }
 }
 
+describe('accent hues', () => {
+  const hues = ['violet', 'sky', 'rose', 'lime']
+  it('keeps every accent ink readable on paper and on its own tint, in both themes', () => {
+    for (const tokens of [light, dark]) {
+      check(tokens, hues.flatMap((h): Pair[] => [[`${h}-ink`, 'paper', 4.5], [`${h}-ink`, `${h}-tint`, 4.5]]))
+    }
+  })
+})
+
 describe('light theme contrast', () => {
   const surfaces = ['canvas', 'paper', 'raised']
 

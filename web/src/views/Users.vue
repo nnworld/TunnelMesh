@@ -23,7 +23,7 @@
             </template>
           </el-table-column>
         </el-table>
-        <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="search"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+        <PagerBar :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="pageSize" :loading="loading" @previous="previous" @next="next" @size-change="pageSize = $event; search()" />
       </DataState>
     </div>
     <el-dialog v-model="createOpen" :title="t('users.create')" width="min(440px,92vw)">
@@ -35,6 +35,7 @@
 </template>
 
 <script setup lang="ts">
+import PagerBar from '../components/PagerBar.vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'

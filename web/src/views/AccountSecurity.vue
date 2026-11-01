@@ -132,7 +132,7 @@
             </template>
           </el-table-column>
         </el-table>
-        <div class="list-pager"><el-button :disabled="devicePageIndex === 0" @click="devicePageIndex--">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: devicePageIndex + 1 }) }}</span><el-button :disabled="!deviceHasNext" @click="devicePageIndex++">{{ t('common.nextPage') }}</el-button><el-select v-model="devicePageSize" class="page-size" @change="devicePageIndex = 0"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+        <PagerBar :page-index="devicePageIndex" :has-previous="devicePageIndex > 0" :has-next="deviceHasNext" :page-size="devicePageSize" :loading="false" @previous="devicePageIndex--" @next="devicePageIndex++" @size-change="devicePageSize = $event; devicePageIndex = 0" />
       </DataState>
       <el-alert v-if="deviceError" class="notice" type="error" :title="deviceError" show-icon :closable="false" data-test="device-error" />
     </div>
@@ -152,7 +152,7 @@
             <template #default="{ row }"><el-button link type="danger" :data-test="`identity-unlink-${row.id}`" @click="unlink(row)">{{ t('security.identities.unlink') }}</el-button></template>
           </el-table-column>
         </el-table>
-        <div class="list-pager"><el-button :disabled="identityPageIndex === 0" @click="identityPageIndex--">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: identityPageIndex + 1 }) }}</span><el-button :disabled="!identityHasNext" @click="identityPageIndex++">{{ t('common.nextPage') }}</el-button><el-select v-model="identityPageSize" class="page-size" @change="identityPageIndex = 0"><el-option v-for="size in [20, 50, 100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+        <PagerBar :page-index="identityPageIndex" :has-previous="identityPageIndex > 0" :has-next="identityHasNext" :page-size="identityPageSize" :loading="false" @previous="identityPageIndex--" @next="identityPageIndex++" @size-change="identityPageSize = $event; identityPageIndex = 0" />
       </DataState>
       <el-alert v-if="identityError" class="notice" type="error" :title="identityError" show-icon :closable="false" data-test="identity-error" />
     </div>
@@ -160,6 +160,7 @@
 </template>
 
 <script setup lang="ts">
+import PagerBar from '../components/PagerBar.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'

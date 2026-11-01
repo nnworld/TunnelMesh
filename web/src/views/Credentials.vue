@@ -43,7 +43,7 @@
           </el-table-column>
         </el-table>
       </DataState>
-      <div class="list-pager"><el-button :disabled="pageIndex === 0 || loading" @click="previous">{{ t('common.previousPage') }}</el-button><span>{{ t('common.page', { number: pageIndex + 1 }) }}</span><el-button :disabled="!page.nextCursor || loading" @click="next">{{ t('common.nextPage') }}</el-button><el-select v-model="pageSize" class="page-size" @change="reload"><el-option v-for="size in [20,50,100]" :key="size" :label="String(size)" :value="size" /></el-select></div>
+      <PagerBar :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!page.nextCursor" :page-size="pageSize" :loading="loading" @previous="previous" @next="next" @size-change="pageSize = $event; reload()" />
     </div>
 
     <el-dialog v-model="formVisible" :title="editingCredential ? t('credentials.edit') : t('credentials.create')" width="min(680px,94vw)" @closed="clearSensitiveKeyInput">
@@ -118,6 +118,7 @@
 </template>
 
 <script setup lang="ts">
+import PagerBar from '../components/PagerBar.vue'
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useI18n } from 'vue-i18n'

@@ -23,7 +23,7 @@
           <EmptyState v-if="!summary.recentEvents.length" :label="t('dashboard.noEvents')" />
           <article v-for="event in summary.recentEvents" :key="event.id" class="event">
             <div class="event-main">
-              <code class="event-action">{{ event.action }}</code>
+              <code class="event-action tone-chip" :class="`tone-${actionHue(event.action)}`">{{ event.action }}</code>
               <span class="event-resource">{{ event.resourceType }}<template v-if="event.resourceId"> · {{ event.resourceId }}</template></span>
               <time>{{ formatDate(event.createdAt) }}</time>
             </div>
@@ -51,6 +51,7 @@ import ErrorState from '../components/ErrorState.vue'
 import { getAgents, getDashboardSummary, type Agent, type DashboardSummary } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle } from '../utils/audit'
+import { actionHue } from '../utils/actionHue'
 import { useAuthStore } from '../stores/auth'
 
 const { t } = useI18n()
@@ -74,11 +75,11 @@ async function loadAgents() {
   finally { agentsLoaded.value = true }
 }
 const stats = computed(() => summary.value ? [
-  { label: t('dashboard.agents'), value: summary.value.agentsTotal, to: '/agents' },
-  { label: t('dashboard.online'), value: summary.value.agentsOnline, to: '/agents' },
-  { label: t('dashboard.tunnels'), value: summary.value.activeTunnels },
-  { label: t('dashboard.routes'), value: summary.value.managedRoutes, to: '/routes' },
-  { label: t('dashboard.tokens'), value: summary.value.validServiceTokens, to: '/tokens' },
+  { label: t('dashboard.agents'), value: summary.value.agentsTotal, to: '/agents', hue: 'brand' as const },
+  { label: t('dashboard.online'), value: summary.value.agentsOnline, to: '/agents', hue: 'ok' as const },
+  { label: t('dashboard.tunnels'), value: summary.value.activeTunnels, hue: 'sky' as const },
+  { label: t('dashboard.routes'), value: summary.value.managedRoutes, to: '/routes', hue: 'violet' as const },
+  { label: t('dashboard.tokens'), value: summary.value.validServiceTokens, to: '/tokens', hue: 'warn' as const },
 ] : [])
 
 // The card has one line of room for the audit payload, so details are summarized
@@ -107,7 +108,7 @@ onMounted(() => { void retry(); void loadAgents() })
 .event-main, .event-meta { display: flex; align-items: baseline; gap: var(--tm-s-4); min-width: 0; }
 .event-main { justify-content: flex-start; }
 .event-main time { margin-left: auto; color: var(--tm-ink-3); font-size: var(--tm-fs-xs); white-space: nowrap; }
-.event-action { font-family: var(--tm-font-mono); font-size: var(--tm-fs-sm); font-weight: 500; color: var(--tm-ink); }
+.event-action { justify-self: start; font-size: var(--tm-fs-xs); }
 .event-resource { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tm-ink-2); font-size: var(--tm-fs-sm); }
 .event-actor { color: var(--tm-ink-2); font-size: var(--tm-fs-xs); white-space: nowrap; }
 .event-details { min-width: 0; color: var(--tm-ink-3); font-family: var(--tm-font-mono); font-size: var(--tm-fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

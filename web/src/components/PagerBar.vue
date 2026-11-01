@@ -19,6 +19,8 @@ const { t } = useI18n()
 </script>
 
 <style scoped>
-.pager-bar { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: var(--tm-s-3); padding: var(--tm-s-4) 0 0; }
+.pager-bar { display: flex; align-items: center; justify-content: center; gap: var(--tm-s-3); padding: var(--tm-s-4) 0 0; }
+/* Rows-per-page sits on the same line as the buttons, never wrapped below them. */
+.pager-bar :deep(.el-pagination) { flex: none; padding: 0; }
 .pager-label { color: var(--tm-ink-2); font-size: var(--tm-fs-sm); font-variant-numeric: tabular-nums; }
 </style>

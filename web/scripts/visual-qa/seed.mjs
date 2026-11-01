@@ -56,6 +56,7 @@ const PAGES = [
   { page: 'agents', path: '/agents', auth: true },
   { page: 'tokens', path: '/tokens', auth: true },
   { page: 'audit-logs', path: '/audit-logs', auth: true },
+  { page: 'security', path: '/account/security', auth: true },
 ]
 
 /** SCREENSHOT_MATRIX is every page in both themes and both viewports. */

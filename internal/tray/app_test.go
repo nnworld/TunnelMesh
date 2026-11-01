@@ -193,8 +193,8 @@ func TestAppSaveSettingsRepointsConfigDir(t *testing.T) {
 	if view.ConfigDir != other || view.ClientConfigPath != filepath.Join(other, ClientConfigFileName) {
 		t.Fatalf("view = %+v", view)
 	}
-	if app.Paths().Lock != filepath.Join(other, LockFileName) {
-		t.Fatalf("lock path = %q, want it derived from the new configuration directory", app.Paths().Lock)
+	if app.Paths().Lock != client.LockPathForConfig(filepath.Join(other, ClientConfigFileName)) {
+		t.Fatalf("lock path = %q, want the runtime's lock for the new configuration", app.Paths().Lock)
 	}
 	// A directory without client.yaml still has to produce an editable form.
 	routing, err := app.Routing(context.Background())
