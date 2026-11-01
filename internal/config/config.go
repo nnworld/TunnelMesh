@@ -144,6 +144,9 @@ type ServerConfig struct {
 	WebSSH             WebSSHConfig             `mapstructure:"webssh" json:"webssh" yaml:"webssh"`
 	ProxyEntry         ProxyEntryConfig         `mapstructure:"proxy_entry" json:"proxy_entry" yaml:"proxy_entry"`
 	VPN                VPNConfig                `mapstructure:"vpn" json:"vpn" yaml:"vpn"`
+	// Exec is the server-wide switch for script runs. Turning it off refuses new runs
+	// even when an agent advertises the capability.
+	Exec ServerExecConfig `mapstructure:"exec" json:"exec" yaml:"exec"`
 	// AgentTransports opens raw TCP (TLS) and QUIC listeners for agents beside the HTTP
 	// port. Both listeners are off unless an address is configured.
 	AgentTransports ServerAgentTransportsConfig `mapstructure:"agent_transports" json:"agent_transports" yaml:"agent_transports"`
@@ -424,8 +427,11 @@ type AgentConfig struct {
 	Transport   TransportConfig       `mapstructure:"transport" json:"transport" yaml:"transport"`
 	Connections AgentConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Streams     AgentStreamConfig     `mapstructure:"streams" json:"streams" yaml:"streams"`
-	Metadata    []MetadataSource      `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
-	Update      UpdateConfig          `mapstructure:"update" json:"update" yaml:"update"`
+	// Exec controls admin-initiated script execution. It is on by default; disabling it
+	// stops the agent advertising agent_exec.v1, so the console hides the action for it.
+	Exec     AgentExecConfig  `mapstructure:"exec" json:"exec" yaml:"exec"`
+	Metadata []MetadataSource `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
+	Update   UpdateConfig     `mapstructure:"update" json:"update" yaml:"update"`
 }
 
 type AgentStreamConfig struct {
@@ -805,6 +811,7 @@ func setDefaults(v *viper.Viper) {
 		"server.proxy_entry.max_concurrent_tunnels":          512,
 		"server.proxy_entry.max_header_bytes":                16384,
 		"server.proxy_entry.auth_backoff_threshold":          5,
+		"server.exec.enabled":                                true,
 		"server.agent_transports.max_unauth_total":           256,
 		"server.agent_transports.max_unauth_per_ip":          8,
 		"server.agent_transports.preface_timeout":            3 * time.Second,
@@ -837,6 +844,13 @@ func setDefaults(v *viper.Viper) {
 		"agent.connections.cooldown":                         30 * time.Second,
 		"agent.streams.max_concurrent_dials":                 32,
 		"agent.streams.max_active":                           1024,
+		"agent.exec.enabled":                                 true,
+		"agent.exec.shell":                                   "",
+		"agent.exec.default_timeout":                         60 * time.Second,
+		"agent.exec.max_timeout":                             10 * time.Minute,
+		"agent.exec.max_output_bytes":                        1 << 20,
+		"agent.exec.max_script_bytes":                        64 << 10,
+		"agent.exec.max_concurrent":                          2,
 		"agent.streams.max_pending_dials":                    128,
 		"agent.streams.connect_timeout":                      5 * time.Second,
 		"agent.streams.open_timeout":                         8 * time.Second,
@@ -948,6 +962,7 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateVPN(cfg.Server.VPN)...)
 	problems = append(problems, validateAgentTransports(cfg.Server, cfg.TLS)...)
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
+	problems = append(problems, validateAgentExec(cfg.Agent.Exec)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
 	if dir := strings.TrimSpace(cfg.Server.Updates.Dir); dir != "" && !filepath.IsAbs(dir) {
@@ -1291,6 +1306,37 @@ func validateAuthorizationCache(cfg AuthorizationCacheConfig) []string {
 	}
 	if cfg.MaxEntries <= 0 {
 		problems = append(problems, "authorization cache max entries must be positive")
+	}
+	return problems
+}
+
+// ServerExecConfig is the server-side script execution switch.
+type ServerExecConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+}
+
+// AgentExecConfig bounds script execution on an agent. Zero numeric fields take the
+// agent defaults; negatives are rejected here.
+type AgentExecConfig struct {
+	Enabled        bool          `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	Shell          string        `mapstructure:"shell" json:"shell" yaml:"shell"`
+	DefaultTimeout time.Duration `mapstructure:"default_timeout" json:"default_timeout" yaml:"default_timeout"`
+	MaxTimeout     time.Duration `mapstructure:"max_timeout" json:"max_timeout" yaml:"max_timeout"`
+	MaxOutputBytes int           `mapstructure:"max_output_bytes" json:"max_output_bytes" yaml:"max_output_bytes"`
+	MaxScriptBytes int           `mapstructure:"max_script_bytes" json:"max_script_bytes" yaml:"max_script_bytes"`
+	MaxConcurrent  int           `mapstructure:"max_concurrent" json:"max_concurrent" yaml:"max_concurrent"`
+}
+
+func validateAgentExec(cfg AgentExecConfig) []string {
+	var problems []string
+	if cfg.DefaultTimeout < 0 || cfg.MaxTimeout < 0 {
+		problems = append(problems, "agent exec timeouts must not be negative")
+	}
+	if cfg.DefaultTimeout > 0 && cfg.MaxTimeout > 0 && cfg.DefaultTimeout > cfg.MaxTimeout {
+		problems = append(problems, "agent exec default_timeout must not exceed max_timeout")
+	}
+	if cfg.MaxOutputBytes < 0 || cfg.MaxScriptBytes < 0 || cfg.MaxConcurrent < 0 {
+		problems = append(problems, "agent exec limits must not be negative")
 	}
 	return problems
 }
