@@ -535,7 +535,7 @@ ssh \
 
 Server policy 应只允许目标 Agent、目标地址和 TCP/22。SSH 连接失败时先检查 `authorized_keys`、`ssh-agent`、目标主机用户和 policy；TunnelMesh 不会把密码或私钥写入日志。
 
-`command-exec`（由 Server 直接执行任意命令）不属于当前协议，也没有隐藏入口。若未来需要该能力，必须另行设计命令白名单、RBAC、审批、PTY、超时、输出上限和审计。
+`command-exec`（由 Server 直接下发命令）不属于当前协议，也没有隐藏入口。Client 不执行脚本；脚本执行只存在于 Agent 侧，由管理员通过管理后台发起，见 [ADR 0005](../architecture/adr/0005-agent-script-execution.md)。
 
 ## 12. 停止和查看状态
 

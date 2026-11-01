@@ -394,6 +394,31 @@ agent:
 
 `max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
+## 脚本执行
+
+管理员可以在管理后台的 Agent 列表上对在线 Agent 运行一段 shell 脚本，并查看输出。**默认开启**；按钮只出现在实际宣告 `agent_exec.v1` 的在线 Agent 上。权限、限制与风险见 [ADR 0005](../architecture/adr/0005-agent-script-execution.md)。
+
+```yaml
+server:
+  exec:
+    enabled: true                 # 关闭后拒绝新的脚本运行，即使 Agent 已宣告能力
+agent:
+  exec:
+    enabled: true                 # 关闭后不宣告 agent_exec.v1，也拒绝 exec 流
+    shell: ""                     # 空：Unix 为 /bin/sh，Windows 为 powershell.exe
+    default_timeout: 60s
+    max_timeout: 10m
+    max_output_bytes: 1048576     # stdout 与 stderr 合计上限，超出即截断并标记
+    max_script_bytes: 65536
+    max_concurrent: 2             # 超过则返回 busy，不排队
+```
+
+- 脚本以 Agent 进程所在账户运行，只继承 `PATH`、`HOME`、`LANG` 等少量变量，不继承 Agent 的环境变量（因此读不到 Agent 令牌）。
+- 超时与关闭会终止整个进程组。Windows 当前只终止 shell 进程本身，其子进程不会被一并结束；在 Windows 上启用前应确认这一点。
+- 审计与 Agent 本地日志只记录脚本的 SHA-256、长度、退出码和耗时，不记录脚本正文和输出。
+- 一次性票据只在签发它的 Server 节点上有效，因此多节点部署时，运行脚本的请求需要落到同一节点；管理后台的按钮也只依据本节点看到的在线会话显示。
+- 关闭 `agent.exec.enabled` 后需要重启 Agent，之后它不再宣告能力，列表中的按钮自动消失。
+
 ## Agent 传输：WebSocket、TLS/TCP 与 QUIC
 
 `agent.server_url` 支持五种 scheme。WebSocket 仍是默认且唯一需要 HTTP 入口的方式；另外两种裸传输绕开 HTTP 栈，适合只放行 TCP 或 UDP 的网络。
