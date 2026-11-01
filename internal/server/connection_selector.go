@@ -107,6 +107,9 @@ func streamProtocolCapability(proto string) string {
 	if strings.EqualFold(proto, protocol.StreamProtocolICMPEcho) {
 		return protocol.CapabilityStreamICMPEcho
 	}
+	if strings.EqualFold(proto, protocol.StreamProtocolExec) {
+		return protocol.CapabilityAgentExec
+	}
 	return ""
 }
 

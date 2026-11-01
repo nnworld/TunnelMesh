@@ -82,6 +82,8 @@ type RuntimeConfig struct {
 	// tp-* managed HTTP proxy traffic to. Disabled means the listener is never
 	// created, so upgrading cannot open a new port by accident.
 	ProxyEntry config.ProxyEntryConfig
+	// Exec is the server-wide script execution switch.
+	Exec config.ServerExecConfig
 	// AgentTransports opens the raw TCP and QUIC agent listeners. Empty listen addresses
 	// leave them off.
 	AgentTransports config.ServerAgentTransportsConfig
@@ -119,6 +121,7 @@ type ServerRuntime struct {
 	// agentStreams are the raw agent listeners bound at construction, so a bind failure
 	// aborts startup the same way the proxy entry does.
 	agentStreams      []agentStreamBinding
+	agentExec         *agentExecBroker
 	proxyEntryService *ProxyEntry
 	// vpnGateway is the embedded WireGuard data plane, nil when server.vpn is
 	// disabled. It is typed as the untagged seam rather than as the gateway so this
@@ -251,6 +254,15 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		Security:        runtimeConfig.Security,
 		MaxMessageBytes: runtimeConfig.WebSSH.MaxMessageBytes,
 	})
+	runner := newAgentExecBroker(agentExecBrokerDeps{
+		Opener:         clientTransport,
+		Upgrade:        newXNetWebSSHUpgrader(runtimeConfig.Security, runtimeConfig.WebSSH.MaxMessageBytes),
+		Security:       runtimeConfig.Security,
+		MaxScriptBytes: agentExecMaxScriptBytes,
+		Audit:          runtime.writeAgentExecAudit,
+	})
+	runtime.agentExec = runner
+	runtime.API.SetAgentExec(runner, runtimeConfig.Exec.Enabled)
 	webSSHDialRelayNode := func(ctx context.Context, endpoint string, epoch int64) (WebSSHConnectionRelayClient, error) {
 		return runtime.DialRelayNode(ctx, endpoint, epoch)
 	}
@@ -664,7 +676,7 @@ func (r *ServerRuntime) Handler() http.Handler {
 	// deliberately untouched: an upgrade must be able to stay open for hours, which
 	// is exactly the traffic a per-request read deadline would kill.
 	api := withAPIBodyTimeout(r.API.Handler(), r.config.HTTP.WithSafeDefaults().BodyTimeout)
-	return NewWebHandlerWithManagedRoutes(api, r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, webSSH, r.managedRoutes)
+	return withAgentExecRoute(r.agentExec, NewWebHandlerWithManagedRoutes(api, r.agentWebSocketHandler(), r.clientWebSocketHandler(), health, webSSH, r.managedRoutes))
 }
 
 // Live reports process responsiveness and intentionally performs no I/O.

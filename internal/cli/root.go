@@ -167,7 +167,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, Updates: cfg.Server.Updates, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, AgentTransports: cfg.Server.AgentTransports, TrustedProxies: cfg.Server.TrustedProxies})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, Updates: cfg.Server.Updates, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, AgentTransports: cfg.Server.AgentTransports, Exec: cfg.Server.Exec, TrustedProxies: cfg.Server.TrustedProxies})
 			if err != nil {
 				return err
 			}
@@ -402,7 +402,7 @@ func runAgent(ctx context.Context, cmd *cobra.Command, opts *rootOptions, cfg co
 		ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 		NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
 		Collector:  agent.NewMetadataCollector(cfg.Agent.Metadata),
-		Factory:    NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
+		Factory:    agent.NewStreamDispatcherFactoryWithExec(cfg.Agent.Streams, echoer, agent.ExecConfigFromSettings(cfg.Agent.Exec)),
 		Dialer:     dialer,
 		TLSRootCAs: rootCAs,
 		OnReady:    report,
