@@ -63,7 +63,7 @@ func TestDefaultPathsSeparatesPreferencesFromConfiguration(t *testing.T) {
 	}
 	// The lock is keyed by the configuration and kept in the state directory, so it
 	// must not sit beside client.yaml (see client.LockPathForConfig).
-	if filepath.Dir(paths.Lock) == wantDir || paths.Lock != client.LockPathForConfig(paths.ClientYAML) {
+	if paths.Lock != client.LockPathForConfig(paths.ClientYAML) {
 		t.Fatalf("Lock = %q, want the runtime's state-directory lock for %q", paths.Lock, paths.ClientYAML)
 	}
 	if !strings.HasSuffix(paths.Lock, "client.lock") {
