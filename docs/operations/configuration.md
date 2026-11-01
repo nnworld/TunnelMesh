@@ -394,6 +394,51 @@ agent:
 
 `max` 大于 1 前必须完成所有入口 Server 的滚动升级。`max` 的可配置区间是 1–512（`config.Validate` 拒绝超过 `AgentConnectionsCeiling` 的值，这个上界是用来抓 "5120" 这类笔误，不是测量出来的性能墙），并且必须同时把 Server 侧 `server.agents.max_connections_per_agent` 抬到不低于它，否则会持续撞 `agent connection capacity reached`。多实例和多连接的发布、监控与回滚步骤见[逻辑 Agent 连接池运维指南](connection-pool.md)。
 
+## Agent 传输：WebSocket、TLS/TCP 与 QUIC
+
+`agent.server_url` 支持五种 scheme。WebSocket 仍是默认且唯一需要 HTTP 入口的方式；另外两种裸传输绕开 HTTP 栈，适合只放行 TCP 或 UDP 的网络。
+
+| scheme | 传输 | 加密 | 说明 |
+| --- | --- | --- | --- |
+| `wss://` | WebSocket over TLS | 是 | 默认 |
+| `ws://` | WebSocket | 否 | 仅回环，或 `agent.transport.allow_insecure_transport: true` |
+| `tls://host:port` | TCP + TLS 1.2 起 | 是 | 需要 Server 端开启 `server.agent_transports.tcp` |
+| `tcp://host:port` | TCP 明文 | 否 | 仅回环，或 `allow_insecure_transport: true`；令牌明文发送 |
+| `quic://host:port` | QUIC（UDP），TLS 1.3 | 是 | 需要 Server 端开启 `server.agent_transports.quic`；不能经过 HTTP CONNECT 或 SOCKS5 代理 |
+
+```yaml
+agent:
+  server_url: quic://tunnel.example.com:7443
+  transport:
+    proxy_mode: direct          # quic:// 只能是 direct
+    tls_ca_file: /etc/tunnelmesh/private-ca.pem   # 可选：tls:// 与 quic:// 使用的信任根
+```
+
+`tls_ca_file` 只影响 `tls://` 与 `quic://`，留空则使用系统根证书，与 `wss://` 相同。raw 传输的 URL 必须带端口，且不能有路径、查询或用户信息。
+
+Server 端的裸传输默认全部关闭，空的 `listen` 地址表示该监听不启用，因此升级本版本不会改变现有部署：
+
+```yaml
+server:
+  agent_transports:
+    tcp:
+      listen: 0.0.0.0:7000          # 空表示关闭
+      tls_cert_file: ""             # 留空则复用 tls.cert_file；都没有时只能绑定回环（明文）
+      tls_key_file: ""
+    quic:
+      listen: 0.0.0.0:7443          # 空表示关闭；必须有证书
+      tls_cert_file: /etc/tunnelmesh/server.crt
+      tls_key_file: /etc/tunnelmesh/server.key
+    max_unauth_total: 256           # 未认证连接总数上限
+    max_unauth_per_ip: 8            # 每个地址的未认证连接上限
+    preface_timeout: 3s             # 连接后必须在此时间内发出认证 preface
+```
+
+- 裸传输的监听地址不能与 `server.http_addr` 的端口相同。
+- 连续 10 次认证失败的地址会在一分钟内被拒绝接入，其他地址不受影响。
+- 证书只在启动时加载，更换证书需要重启 Server，与 HTTPS 入口一致。
+- 防火墙需要放行对应的 TCP 端口（`tcp`）或 UDP 端口（`quic`）。QUIC 无法穿过只转发 TCP 的负载均衡器，需要 L4 UDP 转发。
+
 ## 自动升级与进程守护
 
 `client run` 与 `agent run` 默认带有**进程守护**和**自动升级**，两者都可以通过配置关闭。

@@ -23,6 +23,10 @@ web/src/assets/fonts/ and must accompany any redistribution:
   - Martian Mono, Copyright 2020 The Martian Mono Project Authors
     (https://github.com/evilmartians/mono)
 
+The Go agent and server link github.com/quic-go/quic-go (MIT License,
+Copyright (c) 2016 the quic-go authors & Google, Inc.) for the optional QUIC agent
+transport. Its licence text ships with the module in the Go module cache.
+
 The admin console also embeds browser-side SSH, SFTP, and ZMODEM protocol
 implementations. Those libraries run entirely in the user's browser; the
 server only forwards bytes and never stores or parses SSH credentials,
