@@ -2,6 +2,7 @@ package reconnect
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -49,5 +50,21 @@ func TestRepeatedRejectionRaisesCeilingAndOtherErrorsLowerIt(t *testing.T) {
 	}
 	if got := b.AfterDialFailure(errors.New("connection refused")); got > 30*time.Second {
 		t.Fatalf("non-rejection delay = %v, want back under the normal ceiling", got)
+	}
+}
+
+func TestIsRejectedRecognisesTransportNeutralRejection(t *testing.T) {
+	rejected := fmt.Errorf("preface refused: %w", &RejectedError{Reason: "unauthorized"})
+	if !IsRejected(rejected) {
+		t.Fatal("a wrapped RejectedError must count as rejection")
+	}
+	if !errors.Is(rejected, ErrRejected) {
+		t.Fatal("RejectedError must match the ErrRejected sentinel")
+	}
+	if IsRejected(errors.New("connection reset by peer")) {
+		t.Fatal("an ordinary network error must not count as rejection")
+	}
+	if IsRejected(&RejectedError{}) != true {
+		t.Fatal("a bare RejectedError must count as rejection")
 	}
 }
