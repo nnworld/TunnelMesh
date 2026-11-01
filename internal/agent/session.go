@@ -200,6 +200,9 @@ func validStreamTargetPort(proto string, port int) bool {
 	if strings.EqualFold(proto, protocol.StreamProtocolICMPEcho) {
 		return true
 	}
+	if strings.EqualFold(proto, protocol.StreamProtocolExec) {
+		return port == 0
+	}
 	return port >= 1
 }
 
@@ -213,7 +216,8 @@ func (d *StreamDispatcher) Handle(f protocol.Frame) error {
 		if err != nil {
 			return err
 		}
-		if f.StreamID == 0 || p.TargetHost == "" || !validStreamTargetPort(p.Protocol, p.TargetPort) {
+		// A script run names no target; every other protocol must name one.
+		if f.StreamID == 0 || (!strings.EqualFold(p.Protocol, protocol.StreamProtocolExec) && p.TargetHost == "") || !validStreamTargetPort(p.Protocol, p.TargetPort) {
 			return errors.New("agent: invalid stream target")
 		}
 		strictOpen := d.openResult && f.Flags&protocol.FlagStrictOpen != 0

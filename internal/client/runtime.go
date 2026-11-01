@@ -188,7 +188,7 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 			AgentID: agentID, NodeID: meta.InstanceID,
 			InstanceID: meta.InstanceID, Epoch: 1,
 			Collector: agent.NewMetadataCollector(cfg.Client.Metadata),
-			Factory:   agent.NewStreamDispatcherFactory(cfg.Agent.Streams, nil), Dialer: dialer,
+			Factory:   agent.NewStreamDispatcherFactoryWithExec(cfg.Agent.Streams, nil, agent.ExecConfigFromSettings(cfg.Agent.Exec)), Dialer: dialer,
 			Min: cfg.Client.Connections.Min, Max: cfg.Client.Connections.Max,
 			HighWatermark: cfg.Client.Connections.HighWatermark, LowWatermark: cfg.Client.Connections.LowWatermark,
 			EvaluationInterval: cfg.Client.Connections.EvaluationInterval, Cooldown: cfg.Client.Connections.Cooldown,
