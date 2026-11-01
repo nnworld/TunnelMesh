@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -166,7 +167,7 @@ func serverCommands(opts *rootOptions) []*cobra.Command {
 				return err
 			}
 			defer db.Close()
-			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, Updates: cfg.Server.Updates, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, TrustedProxies: cfg.Server.TrustedProxies})
+			runtime, err := server.NewServerRuntime(db, server.AgentSessionConfig{MaxConnectionsPerAgent: cfg.Server.Agents.MaxConnectionsPerAgent}, server.RuntimeConfig{Security: cfg.Security, TLS: cfg.TLS, Relay: cfg.Server.Relay, Audit: cfg.Server.Audit, Metrics: cfg.Server.Metrics, NodeID: cfg.Node.ID, DynamicSuffix: cfg.Server.DynamicSuffix, HTTP: cfg.Server.HTTP, Stream: cfg.Server.Stream, AuthorizationCache: cfg.Server.AuthorizationCache, Downloads: cfg.Downloads, Updates: cfg.Server.Updates, WebSSH: cfg.Server.WebSSH, VPN: cfg.Server.VPN, ProxyEntry: cfg.Server.ProxyEntry, AgentTransports: cfg.Server.AgentTransports, TrustedProxies: cfg.Server.TrustedProxies})
 			if err != nil {
 				return err
 			}
@@ -392,15 +393,20 @@ func runAgent(ctx context.Context, cmd *cobra.Command, opts *rootOptions, cfg co
 	if err != nil {
 		return fmt.Errorf("configure agent transport: %w", err)
 	}
+	rootCAs, err := loadTLSRootCAs(cfg.Agent.Transport.TLSCAFile)
+	if err != nil {
+		return fmt.Errorf("load agent tls_ca_file: %w", err)
+	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "agent connecting to %s in %s mode\n", cfg.Agent.ServerURL, cfg.Mode)
 	return agent.RunConnectionPool(ctx, agent.WebSocketPoolOptions{
 		ServerURL: cfg.Agent.ServerURL, Token: cfg.Agent.Token, AgentID: cfg.Agent.ID,
 		NodeID: nodeID, InstanceID: cfg.Agent.InstanceID, Epoch: 1,
-		Collector: agent.NewMetadataCollector(cfg.Agent.Metadata),
-		Factory:   NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
-		Dialer:    dialer,
-		OnReady:   report,
-		Min:       cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
+		Collector:  agent.NewMetadataCollector(cfg.Agent.Metadata),
+		Factory:    NewAgentDispatcherFactory(cfg.Agent.Streams, echoer),
+		Dialer:     dialer,
+		TLSRootCAs: rootCAs,
+		OnReady:    report,
+		Min:        cfg.Agent.Connections.Min, Max: cfg.Agent.Connections.Max,
 		HighWatermark: cfg.Agent.Connections.HighWatermark, LowWatermark: cfg.Agent.Connections.LowWatermark,
 		EvaluationInterval: cfg.Agent.Connections.EvaluationInterval,
 		Cooldown:           cfg.Agent.Connections.Cooldown,
@@ -1015,3 +1021,20 @@ func effectiveAgentID(cfg config.Config) string {
 // Execute is a convenience for command binaries that want a context-aware
 // entrypoint while keeping main functions tiny.
 func Execute(ctx context.Context, root *cobra.Command) error { return root.ExecuteContext(ctx) }
+
+// loadTLSRootCAs reads the operator's trust bundle for tls:// agents. An empty path
+// means the system roots, which is the default and matches wss://.
+func loadTLSRootCAs(path string) (*x509.CertPool, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
+}

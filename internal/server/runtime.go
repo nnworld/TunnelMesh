@@ -82,6 +82,9 @@ type RuntimeConfig struct {
 	// tp-* managed HTTP proxy traffic to. Disabled means the listener is never
 	// created, so upgrading cannot open a new port by accident.
 	ProxyEntry config.ProxyEntryConfig
+	// AgentTransports opens the raw TCP and QUIC agent listeners. Empty listen addresses
+	// leave them off.
+	AgentTransports config.ServerAgentTransportsConfig
 	// TrustedProxies lists the reverse-proxy addresses whose X-Forwarded-For
 	// header may be believed when resolving a management-API client IP for login
 	// throttling and audit. Empty means the direct peer address is always used.
@@ -113,7 +116,10 @@ type ServerRuntime struct {
 	relayServer         *grpc.Server
 	relayListener       net.Listener
 	proxyEntry          *ProxyEntryListener
-	proxyEntryService   *ProxyEntry
+	// agentStreams are the raw agent listeners bound at construction, so a bind failure
+	// aborts startup the same way the proxy entry does.
+	agentStreams      []agentStreamBinding
+	proxyEntryService *ProxyEntry
 	// vpnGateway is the embedded WireGuard data plane, nil when server.vpn is
 	// disabled. It is typed as the untagged seam rather than as the gateway so this
 	// file compiles, and keeps compiling, in a build that contains no data plane.
@@ -356,6 +362,10 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 		))
 	}
 	runtime.Credentials = credentialService
+	if err := runtime.bindAgentStreams(runtimeConfig); err != nil {
+		closeStartup()
+		return nil, err
+	}
 	if runtimeConfig.ProxyEntry.Enabled {
 		// Construction happens here rather than in ServeListener so an invalid
 		// trusted_proxies value fails startup instead of silently leaving the
@@ -464,6 +474,7 @@ func (r *ServerRuntime) Close() error {
 		return nil
 	}
 	r.closed.Store(true)
+	r.closeAgentStreams()
 	if r.WebSSHBroker != nil {
 		r.WebSSHBroker.CloseAll()
 	}
@@ -794,6 +805,20 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 	}
 	tr := &xNetWSFrameConn{conn: websocketMessageConn{conn: conn}}
 	transport := NewWSFrameTransport(tr)
+	r.serveAgentConnection(ctx, transport, authentication, func() {
+		// Handover from the one-shot hello budget to the per-frame idle budget. Clearing
+		// the deadline here is what used to leave an established Agent connection
+		// unreadable-but-registered forever when the peer vanished without a FIN.
+		tr.idleReadTimeout = websocketIdleReadTimeout
+	})
+}
+
+// serveAgentConnection is the transport-neutral half of an agent connection. It reads
+// and validates the hello, authenticates the token, registers the session and serves
+// frames until the connection ends. The caller owns transport setup and deadlines;
+// afterHello runs once the hello is accepted, which is where a transport moves from its
+// one-shot hello budget to its steady-state idle budget.
+func (r *ServerRuntime) serveAgentConnection(ctx context.Context, transport agentFrameConn, authentication agentConnectionAuthentication, afterHello func()) {
 	helloStarted := time.Now()
 	initial, err := transport.Receive()
 	if err != nil || initial.Type != protocol.FrameAgentHello {
@@ -811,10 +836,9 @@ func (r *ServerRuntime) serveAgentWS(conn *websocket.Conn) {
 		_ = transport.Close()
 		return
 	}
-	// Handover from the one-shot hello budget to the per-frame idle budget. Clearing
-	// the deadline here is what used to leave an established Agent connection
-	// unreadable-but-registered forever when the peer vanished without a FIN.
-	tr.idleReadTimeout = websocketIdleReadTimeout
+	if afterHello != nil {
+		afterHello()
+	}
 	if r.metrics != nil {
 		r.metrics.ObserveStage("server", "agent_hello", "success", "", time.Since(helloStarted))
 	}
@@ -1039,6 +1063,9 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	entryCtx, cancelEntry := context.WithCancel(ctx)
 	defer cancelEntry()
 	proxyErrCh := make(chan error, 1)
+	for _, binding := range r.agentStreams {
+		go func(binding agentStreamBinding) { _ = binding.serve(entryCtx) }(binding)
+	}
 	// entryDone is closed once the entry goroutine has returned, which is what
 	// makes shutdown synchronous: Addr() doubles as the "is it listening"
 	// signal, so a supervisor (or a test) that sees ServeListener return must
@@ -1073,6 +1100,7 @@ func (r *ServerRuntime) ServeListener(ctx context.Context, ln net.Listener) erro
 	go func() { errCh <- srv.Serve(serveListener) }()
 	shutdown := func() {
 		cancelEntry()
+		r.closeAgentStreams()
 		// Bounded by the entry's own shutdown timeout: Serve always returns
 		// after its context is cancelled, so this cannot hang the runtime.
 		<-entryDone
