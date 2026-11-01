@@ -34,9 +34,10 @@
           <el-table-column :label="t('agents.enabledColumn')" width="120">
             <template #default="scope"><StatusTag :kind="scope.row.enabled ? 'success' : 'warning'" :label="scope.row.enabled ? t('agents.active') : t('agents.disabled')" /></template>
           </el-table-column>
-          <el-table-column :label="t('agents.actions')" width="150" align="right">
+          <el-table-column :label="t('agents.actions')" width="230" align="right">
             <template #default="scope">
               <span class="row-actions">
+                <el-button v-if="canRunScript(scope.row, auth.isAdmin)" link type="primary" data-test="script-run-open" @click="scriptTarget = scope.row">{{ t('scriptRun.button') }}</el-button>
                 <el-button link type="primary" @click="$router.push(`/agents/${scope.row.id}`)">{{ t('agents.details') }}</el-button>
                 <el-button v-if="auth.isAdmin" link type="primary" @click="openEdit(scope.row)">{{ t('agents.edit') }}</el-button>
               </span>
@@ -46,6 +47,7 @@
         <PagerBar hide-unavailable :page-index="pageIndex" :has-previous="pageIndex > 0" :has-next="!!nextCursor" :page-size="selectedPageSize" :loading="loading" @previous="previousPage" @next="nextPage" @size-change="changePageSize" />
       </DataState>
     </div>
+  <ScriptRunDialog v-if="scriptTarget" :agent="scriptTarget" @closed="scriptTarget = null" />
   </section>
 
   <el-dialog v-model="editOpen" :title="t('agents.editTitle')" width="min(440px,92vw)" @closed="resetEditForm">
@@ -87,6 +89,8 @@ import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
 import IdCell from '../components/IdCell.vue'
 import PagerBar from '../components/PagerBar.vue'
+import ScriptRunDialog from '../components/ScriptRunDialog.vue'
+import { canRunScript } from '../utils/scriptRun'
 import TmIcon from '../components/icons/TmIcon.vue'
 import { createAgent, getAgents, updateAgent, type Agent } from '../api/client'
 
@@ -97,6 +101,7 @@ const loading = ref(false)
 const error = ref(false)
 const saving = ref(false)
 const createOpen = ref(false)
+const scriptTarget = ref<Agent | null>(null)
 const createName = ref('')
 const createEnabled = ref(true)
 const editOpen = ref(false)

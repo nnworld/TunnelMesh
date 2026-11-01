@@ -58,6 +58,7 @@ declare module 'vue' {
     PatchPanel: typeof import('./components/PatchPanel.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    ScriptRunDialog: typeof import('./components/ScriptRunDialog.vue')['default']
     SecretBlock: typeof import('./components/SecretBlock.vue')['default']
     StatusLed: typeof import('./components/StatusLed.vue')['default']
     StatusTag: typeof import('./components/StatusTag.vue')['default']
