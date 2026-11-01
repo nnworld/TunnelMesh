@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"github.com/tunnelmesh/tunnelmesh/internal/reconnect"
@@ -35,6 +36,8 @@ type WebSocketRunOptions struct {
 	Rand              *rand.Rand
 	Metrics           *observability.Metrics
 	Dialer            *sharedtransport.Dialer
+	// TLSRootCAs is the trust store for tls:// agents. Nil means the system roots.
+	TLSRootCAs *x509.CertPool
 }
 
 const defaultHeartbeatInterval = 30 * time.Second
@@ -78,9 +81,11 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(nodeID) == "" || epoch <= 0 {
 		return ErrAgentIdentityRequired
 	}
-	if _, err := parseWebSocketURL(serverURL); err != nil {
+	if _, err := parseAgentServerURL(serverURL); err != nil {
 		return err
 	}
+	label := agentTransportLabel(serverURL)
+	upgradeStage := label + "_upgrade"
 	base := options.BaseBackoff
 	if base <= 0 {
 		base = time.Second
@@ -105,15 +110,16 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 		}
 		stageStarted := time.Now()
 		var delay time.Duration
-		transport, dialErr := dialWebSocketWithDialer(ctx, serverURL, token, options.Dialer)
+		transport, dialErr := dialAgentTransport(ctx, serverURL, token, options)
 		if dialErr == nil {
 			if options.Metrics != nil {
-				options.Metrics.ObserveConnection("agent", "websocket", "started", "")
-				options.Metrics.ObserveStage("agent", "websocket_upgrade", "success", "", time.Since(stageStarted))
+				options.Metrics.ObserveConnection("agent", label, "started", "")
+				options.Metrics.ObserveStage("agent", upgradeStage, "success", "", time.Since(stageStarted))
 			}
 			sessionStarted := time.Now()
 			session := NewSessionWithMetadata(transport, collector)
 			session.Metrics = options.Metrics
+			session.MetricsTransport = label
 			session.BaseBackoff, session.MaxBackoff, session.Rand = base, max, rng
 			session.HeartbeatInterval = heartbeat
 			if instanceID == "" && connectionID == "" {
@@ -135,8 +141,8 @@ func runWebSocketConnection(ctx context.Context, serverURL, token, agentID, node
 			delay = backoff.AfterSession(time.Since(sessionStarted))
 		} else {
 			if options.Metrics != nil {
-				options.Metrics.ObserveConnection("agent", "websocket", "failed", observability.NormalizeErrorClass(dialErr))
-				options.Metrics.ObserveStage("agent", "websocket_upgrade", "failure", observability.NormalizeErrorClass(dialErr), time.Since(stageStarted))
+				options.Metrics.ObserveConnection("agent", label, "failed", observability.NormalizeErrorClass(dialErr))
+				options.Metrics.ObserveStage("agent", upgradeStage, "failure", observability.NormalizeErrorClass(dialErr), time.Since(stageStarted))
 			}
 			delay = backoff.AfterDialFailure(dialErr)
 		}

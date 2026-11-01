@@ -938,10 +938,13 @@ type Session struct {
 	HeartbeatInterval       time.Duration
 	Rand                    *rand.Rand
 	Metrics                 *observability.Metrics
-	OnHeartbeatRTT          func(time.Duration)
-	heartbeatSentNanos      atomic.Int64
-	heartbeatRTTNanos       atomic.Int64
-	lastReceivedNanos       atomic.Int64
+	// MetricsTransport labels connection metrics with the transport this session runs
+	// over. Empty means websocket.
+	MetricsTransport   string
+	OnHeartbeatRTT     func(time.Duration)
+	heartbeatSentNanos atomic.Int64
+	heartbeatRTTNanos  atomic.Int64
+	lastReceivedNanos  atomic.Int64
 }
 
 func NewSession(tr FrameTransport) *Session {
@@ -1211,12 +1214,22 @@ func (s *Session) WriterQueueWaitP95() time.Duration {
 	}
 	return s.writer.WriterQueueWaitP95()
 }
+
+// metricsTransportLabel names the transport in connection metrics. Sessions built
+// outside the connection loop keep the WebSocket label they always reported.
+func (s *Session) metricsTransportLabel() string {
+	if s.MetricsTransport != "" {
+		return s.MetricsTransport
+	}
+	return "websocket"
+}
+
 func (s *Session) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
 	if s.Metrics != nil {
-		s.Metrics.ObserveConnection("agent", "websocket", "closed", "")
+		s.Metrics.ObserveConnection("agent", s.metricsTransportLabel(), "closed", "")
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
