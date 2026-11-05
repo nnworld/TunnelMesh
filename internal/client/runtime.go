@@ -31,6 +31,12 @@ type Forward interface {
 	Err() <-chan error
 }
 
+// ErrRunEndedUnexpectedly reports that a role stopped serving while nothing asked
+// the run to finish. Without it such a stop was reported as success, so the client
+// exited 0, its supervisor mirrored the clean exit, and systemd left every tunnel
+// unlistening.
+var ErrRunEndedUnexpectedly = errors.New("client: tunnel session ended while the client was still running")
+
 // Tunnel states reported by Runtime.Stats. They describe what an operator can act
 // on, not internal transitions: a tunnel is listening, it failed, or the run ended.
 const (
@@ -343,17 +349,31 @@ func (r *Runtime) runRoles(ctx context.Context) error {
 		return errors.New("client: no runtime roles configured")
 	}
 	var firstErr error
+	// A context error is evidence about *why* a role gave up, so it is kept for the
+	// message even though it does not decide the outcome.
+	var dropped error
 	for i := 0; i < roles; i++ {
 		err := <-results
 		if err != nil && !isContextErr(err) && firstErr == nil {
 			firstErr = err
 			cancel()
+		} else if err != nil {
+			dropped = err
 		}
 	}
 	if firstErr != nil {
 		return firstErr
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Every role has returned although nothing canceled the run. Reporting success
+	// here was indistinguishable from an operator's stop, so the process exited 0 and
+	// neither the supervisor nor systemd had anything to restart.
+	if dropped != nil {
+		return fmt.Errorf("%w: %v", ErrRunEndedUnexpectedly, dropped)
+	}
+	return ErrRunEndedUnexpectedly
 }
 
 func isContextErr(err error) bool {

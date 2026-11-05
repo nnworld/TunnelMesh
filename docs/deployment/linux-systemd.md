@@ -54,7 +54,7 @@ journalctl -u tunnelmesh-client.service -f
 
 ## 自动升级与重启策略
 
-`client` 与 `agent` 的单元带有 `RestartPreventExitStatus=78 77`：配置错误（78）和凭据被永久拒绝（77）重启修不好，不应被 systemd 无限拉起；其余退出（包括 supervisor 放弃时的 70）仍按 `Restart=on-failure` 重启。
+`client` 与 `agent` 的单元使用 `Restart=always`，并带有 `RestartPreventExitStatus=78 77`：退出码 0 不足以证明进程是自愿结束的（会话角色被意外拆掉时 worker 与 supervisor 都可能 0 退出），所以拉起交给 `Restart=always`，只把重启修不好的两类错误（78 配置错误、77 凭据被永久拒绝）挡在外面；其余退出，包括 supervisor 放弃时的 70，都会重新开始一个全新进程。`systemctl stop` 与 `systemctl restart` 是 systemd 自己的停止任务，不会被 `Restart=always` 顶回去。`server` 的单元保持 `Restart=on-failure`。
 
 自动升级把新版本写在状态目录（`/var/lib/tunnelmesh-<role>/updates/`），不修改 `/usr/local/bin`，因此 `ProtectSystem=strict` 与只读安装目录不受影响。注意 `ExecStartPre` 的 `check-config` 仍然由**已安装的**二进制执行，只校验基线版本；新版本对现有配置的校验由 supervisor 在切换前用新二进制自己完成。详见[配置参考](../operations/configuration.md#自动升级与进程守护)。
 

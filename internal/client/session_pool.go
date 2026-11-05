@@ -194,6 +194,11 @@ func (m *SessionPoolManager) pool(agentID string) *agentSessionPool {
 type sessionPoolSlot struct {
 	id     int
 	cancel context.CancelFunc
+	// scaledDown marks a capacity decision rather than a connection failure. The
+	// runner cannot tell the two apart from its own context, because every way a slot
+	// goes away cancels it, and reading a scale-down as terminal used to take the
+	// whole pool - and then the whole client process - down with it.
+	scaledDown atomic.Bool
 }
 
 // A session that has missed unhealthyAfterMissedPings consecutive heartbeats is
@@ -361,14 +366,16 @@ func (p *agentSessionPool) startSlot(ctx context.Context) {
 		err := runner(slotCtx, p.options.ServerURL, p.options.Token, func(session *Session) error {
 			return p.registerSession(slotCtx, slotID, session)
 		}, runOptions)
-		p.removeSlot(slotID)
+		slot := p.removeSlot(slotID)
 		// slotCtx is canceled on scale-down or manager shutdown; those are not
 		// terminal pool failures. Only an error while the pool is still active
 		// should stop the manager.
 		p.mu.RLock()
 		runCtx := p.runCtx
 		p.mu.RUnlock()
-		if err != nil && runCtx != nil && runCtx.Err() == nil {
+		// runCtx cannot make this distinction on its own: the pool outlives the slot
+		// it just dropped, so the slot has to say whether it asked to be dropped.
+		if err != nil && runCtx != nil && runCtx.Err() == nil && (slot == nil || !slot.scaledDown.Load()) {
 			select {
 			case p.errCh <- err:
 			default:
@@ -413,6 +420,9 @@ func (p *agentSessionPool) evaluate(ctx context.Context) {
 		return
 	}
 	if scaleDownSlot != nil {
+		// Mark before canceling, because the runner wakes on the cancellation and
+		// decides there whether the error it is holding is expected.
+		scaleDownSlot.scaledDown.Store(true)
 		scaleDownSlot.cancel()
 	}
 }
@@ -454,7 +464,9 @@ func (p *agentSessionPool) registerSession(ctx context.Context, slotID int, sess
 	return nil
 }
 
-func (p *agentSessionPool) removeSlot(slotID int) {
+// removeSlot forgets a slot and reports what was removed, so the runner that lost
+// it can read the reason the pool recorded rather than guess from its context.
+func (p *agentSessionPool) removeSlot(slotID int) *sessionPoolSlot {
 	p.mu.Lock()
 	slot := p.slots[slotID]
 	delete(p.slots, slotID)
@@ -463,6 +475,7 @@ func (p *agentSessionPool) removeSlot(slotID int) {
 	if slot != nil {
 		slot.cancel()
 	}
+	return slot
 }
 
 func (p *agentSessionPool) cancelAll() {
