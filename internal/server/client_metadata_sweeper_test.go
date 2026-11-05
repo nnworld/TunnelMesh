@@ -130,3 +130,45 @@ func TestClientMetadataSweeperPurgesUnreportedOrphans(t *testing.T) {
 		t.Fatalf("expired=%d purged=%d, want one of each", len(repo.expired), len(repo.purged))
 	}
 }
+
+func (r *fakeClientInstanceRepo) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+func (r *fakeClientInstanceRepo) rounds() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.expired)
+}
+
+// A database blip must cost one round, not the cleanup job. The loop used to
+// return the first error, which ended the goroutine silently and left lapsed
+// metadata marked live forever until the next Server restart.
+func TestClientMetadataSweeperSurvivesFailedRounds(t *testing.T) {
+	repo := &fakeClientInstanceRepo{}
+	repo.setErr(errors.New("database is not reachable"))
+	sweeper := NewClientMetadataSweeper(repo, 5*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sweeper.Run(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for repo.rounds() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	repo.setErr(nil)
+	for repo.rounds() < 5 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context canceled after %d rounds", err, repo.rounds())
+	}
+	if got := repo.rounds(); got < 5 {
+		t.Fatalf("rounds = %d, want the sweeper to keep ticking past a failed round", got)
+	}
+}

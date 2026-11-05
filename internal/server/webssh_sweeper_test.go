@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,5 +110,71 @@ func assertWebSSHSweeperStatus(t *testing.T, db *storage.DB, id string, want sto
 	session, err := db.WebSSHSessions().Get(context.Background(), id)
 	if err != nil || session.Status != want {
 		t.Fatalf("session %s = %+v err=%v, want status %s", id, session, err, want)
+	}
+}
+
+// failingWebSSHRepo is a two-method double: like recordingClientConnectionRepo
+// it embeds the interface so any new repository call the sweeper makes panics in
+// tests instead of quietly succeeding.
+type failingWebSSHRepo struct {
+	storage.WebSSHSessionRepository
+	mu        sync.Mutex
+	rounds    int
+	err       error
+	expiredAt []time.Time
+}
+
+func (r *failingWebSSHRepo) ExpirePending(_ context.Context, at time.Time) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rounds++
+	r.expiredAt = append(r.expiredAt, at)
+	return 0, r.err
+}
+
+func (r *failingWebSSHRepo) CloseExpiredActive(_ context.Context, _ time.Time) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return 0, r.err
+}
+
+func (r *failingWebSSHRepo) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+func (r *failingWebSSHRepo) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rounds
+}
+
+// Pending WebSSH tickets that nothing expires become reusable-looking tickets
+// and sessions that nothing closes keep an Agent stream alive. One unreachable
+// query must therefore cost a round, not the job.
+func TestWebSSHSweeperSurvivesFailedRounds(t *testing.T) {
+	repo := &failingWebSSHRepo{err: errors.New("database is not reachable")}
+	sweeper := NewWebSSHSweeper(repo, 5*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sweeper.Run(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for repo.count() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	repo.setErr(nil)
+	for repo.count() < 5 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context canceled after %d rounds", err, repo.count())
+	}
+	if got := repo.count(); got < 5 {
+		t.Fatalf("rounds = %d, want the sweeper to keep ticking past a failed round", got)
 	}
 }

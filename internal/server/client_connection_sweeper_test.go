@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 // in the sweeper panic in tests instead of quietly passing.
 type recordingClientConnectionRepo struct {
 	storage.ClientConnectionRepository
+	mu      sync.Mutex
 	cutoffs []time.Time
 	limits  []int
 	reaped  int64
@@ -21,9 +23,35 @@ type recordingClientConnectionRepo struct {
 }
 
 func (r *recordingClientConnectionRepo) DeleteExpired(_ context.Context, at time.Time, limit int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.cutoffs = append(r.cutoffs, at)
 	r.limits = append(r.limits, limit)
 	return r.reaped, r.err
+}
+
+// rounds, lastLimit and setErr are the accessors the Run tests need: the loop
+// calls the double from its own goroutine, so reading the fields directly would
+// be a data race rather than an assertion.
+func (r *recordingClientConnectionRepo) rounds() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.cutoffs)
+}
+
+func (r *recordingClientConnectionRepo) lastLimit() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.limits) == 0 {
+		return 0
+	}
+	return r.limits[len(r.limits)-1]
+}
+
+func (r *recordingClientConnectionRepo) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
 }
 
 type recordedSweep struct {
@@ -32,11 +60,28 @@ type recordedSweep struct {
 }
 
 type recordingReapGauges struct {
+	mu    sync.Mutex
 	calls []recordedSweep
 }
 
 func (r *recordingReapGauges) ObserveClientConnectionLeaseSweep(result, errorClass string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, recordedSweep{result: result, errorClass: errorClass})
+}
+
+// errorSamples counts the samples a stalled-or-failing reaper would expose to
+// Prometheus, which is what the alert rules read.
+func (r *recordingReapGauges) errorSamples() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, call := range r.calls {
+		if call.result == "error" {
+			count++
+		}
+	}
+	return count
 }
 
 func fixedClock(at time.Time) func() time.Time {
@@ -127,10 +172,10 @@ func TestClientConnectionSweeperRunSweepsBeforeTheFirstTick(t *testing.T) {
 	go func() { done <- sweeper.Run(ctx) }()
 
 	deadline := time.After(2 * time.Second)
-	for len(repo.cutoffs) < 2 {
+	for repo.rounds() < 2 {
 		select {
 		case <-deadline:
-			t.Fatalf("passes = %d, want at least two", len(repo.cutoffs))
+			t.Fatalf("passes = %d, want at least two", repo.rounds())
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
@@ -153,4 +198,41 @@ func TestClientConnectionSweeperWithoutGaugesOrRepository(t *testing.T) {
 	}
 	nilSweeper.SetClock(fixedClock(time.Now()))
 	nilSweeper.SetGauges(&recordingReapGauges{})
+}
+
+// The reaper is the only path out of the leases table for a Client that was
+// killed rather than stopped, so a single failed query must not be the last
+// round it ever runs: every failed round has to keep producing the
+// result="error" sample the alert rule counts, and the loop has to stay alive to
+// produce the next one.
+func TestClientConnectionSweeperSurvivesFailedRounds(t *testing.T) {
+	repo := &recordingClientConnectionRepo{}
+	repo.setErr(errors.New("database is not reachable"))
+	gauges := &recordingReapGauges{}
+	sweeper := NewClientConnectionSweeper(repo, 5*time.Millisecond, time.Hour)
+	sweeper.SetGauges(gauges)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sweeper.Run(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for repo.rounds() < 3 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	repo.setErr(nil)
+	for repo.rounds() < 5 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context canceled after %d rounds", err, repo.rounds())
+	}
+	if got := repo.rounds(); got < 5 {
+		t.Fatalf("rounds = %d, want the reaper to keep ticking past a failed round", got)
+	}
+	if got := gauges.errorSamples(); got < 3 {
+		t.Fatalf("error samples = %d, want one per failed round so increase(...{result=\"error\"}) can fire", got)
+	}
 }

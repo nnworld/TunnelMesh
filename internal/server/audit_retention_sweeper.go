@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"time"
 
@@ -112,39 +111,25 @@ func (s *AuditRetentionSweeper) Run(ctx context.Context) error {
 	if s == nil || s.audits == nil {
 		return ErrSessionClosed
 	}
-	s.sweepAndLog(ctx)
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.sweepAndLog(ctx)
-		}
-	}
+	return runSweepLoop(ctx, "audit_retention", s.interval, s.sweepAndLog)
 }
 
-func (s *AuditRetentionSweeper) sweepAndLog(ctx context.Context) {
+// sweepAndLog performs one retention drain and reports what it removed. Failure
+// reporting lives in runSweepLoop, which logs it as audit_retention_sweep_failed
+// and retries on the next tick; a shutdown landing mid-drain ends the loop as a
+// cancellation rather than as a fault.
+func (s *AuditRetentionSweeper) sweepAndLog(ctx context.Context) error {
 	started := time.Now()
 	deleted, err := s.SweepOnce(ctx)
-	switch {
-	case errors.Is(err, context.Canceled):
-		// A shutdown that lands mid-drain is not a fault: the next node's sweeper
-		// finishes the job, and a restart must not start with a false alarm.
-		return
-	case err != nil:
+	if err != nil {
 		// The error carries no row identifiers, so a failure log cannot leak the
 		// subject or resource of an audit record.
-		slog.ErrorContext(ctx, "audit_retention_sweep_failed", "error", err)
-		return
+		return err
 	}
 	if deleted > 0 {
 		slog.InfoContext(ctx, "audit_retention_swept",
 			"deleted_rows", deleted, "retention_days", int64(s.retention/(24*time.Hour)),
 			"duration_ms", time.Since(started).Milliseconds())
 	}
+	return nil
 }
