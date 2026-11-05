@@ -23,6 +23,30 @@ tunnelmesh-server --config tunnelmesh.yaml print-config
 
 服务日志位置和 systemd/Docker/macOS/Windows 查看命令见 [日志位置与查看方式](logging.md)。
 
+## Server 停止后没有执行优雅下线
+
+先取上一次停止的真实原因，不要只看服务状态是 `active` 还是 `inactive`：
+
+```bash
+systemctl show tunnelmesh-server.service -p ExecMainCode -p ExecMainStatus -p NRestarts
+```
+
+- `ExecMainCode=exited`、`ExecMainStatus=0`：收到 `SIGTERM` 后走完了 drain（HTTP 关停、Agent 流关闭、relay 停止、可选的 VPN 数据面排空），这是期望结果。
+- `ExecMainCode=killed`：进程是被信号直接带走的，drain 一行都没执行，在途请求被硬切断。修复版本之前的 `tunnelmesh-server` 就是这个表现：全仓只有 `cli.Main` 安装 `SIGINT`/`SIGTERM` 处理器，而 Server 入口走的是 `cli.Execute(context.Background(), …)` + `log.Fatal`，于是根本没有信号被接住，`systemctl stop` 一律算异常终止。升级到当前版本即修复，无需改配置。
+- 旧版本上「崩溃」「被停掉」「正常退出」三件事看起来一模一样（要么 1，要么 143），所以任何按退出码写的自动化都不可信；这也是三个角色的单元都不再以退出码表达「是否该拉起」的原因。
+
+再确认退出码是否还是「塌缩的 1」。用一份**故意写坏**的配置探一下（`check-config` 不开端口、不碰数据库，是安全的探针；不要用 `run`，它会把服务起起来）：
+
+```bash
+printf 'mode: [unclosed\n' > /tmp/broken.yaml
+/usr/local/bin/tunnelmesh-server --config /tmp/broken.yaml check-config; echo "exit=$?"
+rm -f /tmp/broken.yaml
+```
+
+应当是 `exit=78`（`run` 同样返回 78）。若仍是 `1`，说明跑的还是旧二进制，交付单元里的 `RestartPreventExitStatus=78 77` 对它无效，坏配置会以 `RestartSec` 的周期无限重启。三个角色的 `run` 与 `check-config` 现在遵循同一套退出码语义，见[配置参考](configuration.md) 的「退出码」小节。
+
+容器里的表现更极端：官方镜像以 exec 形式把 Server 作为 PID 1 运行（distroless，无 init），而内核不会把「默认行为是终止」的信号投递给 PID 1，所以没有安装处理器的旧二进制**根本收不到** `SIGTERM`——`docker stop` 一定等满 `stop_grace_period`（默认 10 秒）再 `SIGKILL`。判别方法就是这 10 秒：`docker stop -t 60 <id>` 计时，旧二进制必然耗满宽限期。当前版本会立即响应并在宽限期内干净退出；启用 VPN 数据面且把 `server.vpn.shutdown_timeout` 调到 10 秒以上时，记得同步调大 `stop_grace_period`。
+
 ## schema 错误
 
 - 自动初始化关闭时，确认数据库已经执行 `migrations/ddl.sql`。
@@ -113,6 +137,8 @@ SELECT COUNT(DISTINCT connection_epoch) AS distinct_epochs, COUNT(*) AS rows_tot
 - 详情默认只显示未过期租约，勾选「显示历史租约」才读取保留窗口内的历史，单次最多 200 条。
 
 确认清扫是否在跑：看 `tunnelmesh_client_connection_lease_sweep_total{result="error"}` 是否为 0，以及 Server 日志里的 `client connection lease sweep`（含 `cutoff`、`reaped`、`elapsed_ms`）。指标与窗口口径见[可观测性](observability.md)。
+
+清扫器遇到数据库错误时只记录并等下一轮，**进程存活不等于还在回收**，所以确认动作必须落到指标上。若 `result="error"` 持续非零，或 10 分钟窗口内一轮都没有（`sum(increase(tunnelmesh_client_connection_lease_sweep_total[10m])) == 0`），按 `client_connection_lease_sweep_failed` 检索 Server 日志定位是哪一轮、哪类错误，再检查数据库可达性与连接池；两条告警的口径见[可观测性](observability.md#客户端连接租约回收)。同一条日志事件名也适用于 `client_metadata_sweep_failed`、`webssh_session_sweep_failed`、`audit_retention_sweep_failed`、`auth_maintenance_sweep_failed`。
 
 不要手工删除的理由：与上文「集群连接查询或关闭失败」一致，租约是跨节点的事实，`DELETE` 绕过 epoch fencing 与审计链；正在使用的租约被删掉后，客户端要等到重连才会重新登记，期间该连接在后台消失、活跃流统计归零，排障证据也随之丢失。若只想停止删除动作，摘掉 Server 的清扫器启动即可（见计划 `docs/superpowers/plans/2026-11-05-client-connection-lease-cleanup.md` 的回滚说明），数据侧无需补偿。
 

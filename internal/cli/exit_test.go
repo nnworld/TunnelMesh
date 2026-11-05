@@ -96,3 +96,22 @@ func TestExitCodeFor(t *testing.T) {
 		}
 	}
 }
+
+// The Server binary is the third long-lived role, and a supervisor can only act
+// on an exit code the process actually produces. `cmd/tunnelmesh-server` used to
+// call log.Fatal, which collapsed every failure - including the two the systemd
+// units exclude from restarts - into exit 1, so this pins the mapping through
+// Main rather than through Execute.
+func TestServerMainReturnsConfigExitCode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.yaml")
+	if err := os.WriteFile(path, []byte("mode: [unclosed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewServerRoot()
+	root.SetArgs([]string{"--config", path, "run"})
+	root.SetOut(os.Stderr)
+	root.SetErr(os.Stderr)
+	if got := Main(root); got != workerproto.ExitConfig {
+		t.Fatalf("Main(server) exit code = %d, want %d (config error)", got, workerproto.ExitConfig)
+	}
+}

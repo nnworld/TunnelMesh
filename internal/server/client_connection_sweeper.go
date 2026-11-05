@@ -90,22 +90,22 @@ func (s *ClientConnectionSweeper) SetClock(now func() time.Time) {
 // Run reaps once before the first tick, then on the interval. Sweeping first is
 // what makes an upgrade converge immediately: on a table that was never pruned,
 // the backlog exists the moment the new binary starts.
+//
+// A failed round is logged and retried on the next tick rather than returned. This
+// reaper is the only path out of the leases table for a Client that was killed
+// instead of stopped, so a loop that ends on the first database error would
+// restore the unbounded growth the job exists to prevent - and it would do so
+// silently, because the error was only ever readable at Close.
 func (s *ClientConnectionSweeper) Run(ctx context.Context) error {
-	if _, err := s.SweepOnce(ctx); err != nil {
+	// A missing repository is a wiring error rather than a retryable round, so it
+	// reports immediately instead of entering a loop that can only fail.
+	if s == nil || s.leases == nil {
+		return errors.New("client connection lease sweeper is unavailable")
+	}
+	return runSweepLoop(ctx, "client_connection_lease", s.interval, func(ctx context.Context) error {
+		_, err := s.SweepOnce(ctx)
 		return err
-	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if _, err := s.SweepOnce(ctx); err != nil {
-				return err
-			}
-		}
-	}
+	})
 }
 
 // SweepOnce reaps one bounded batch of leases older than the retention window

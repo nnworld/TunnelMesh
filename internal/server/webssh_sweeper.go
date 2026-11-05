@@ -23,22 +23,22 @@ func NewWebSSHSweeper(sessions storage.WebSSHSessionRepository, interval time.Du
 	return &WebSSHSweeper{sessions: sessions, interval: interval}
 }
 
+// Run converges WebSSH rows once before the first tick, then on the interval.
+//
+// One unreachable query must not retire the job: a pending ticket nothing
+// expires stays redeemable-looking, and an active session nothing closes keeps an
+// Agent stream and its target connection open. Both are repaired by a later
+// round, so the loop logs the failure and keeps ticking.
 func (s *WebSSHSweeper) Run(ctx context.Context) error {
-	if _, err := s.Sweep(ctx, time.Now().UTC()); err != nil {
+	// A missing repository is a wiring error rather than a retryable round, so it
+	// reports immediately instead of entering a loop that can only fail.
+	if s == nil || s.sessions == nil {
+		return ErrWebSSHSessionUnavailable
+	}
+	return runSweepLoop(ctx, "webssh_session", s.interval, func(ctx context.Context) error {
+		_, err := s.Sweep(ctx, time.Now().UTC())
 		return err
-	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if _, err := s.Sweep(ctx, time.Now().UTC()); err != nil {
-				return err
-			}
-		}
-	}
+	})
 }
 
 func (s *WebSSHSweeper) Sweep(ctx context.Context, now time.Time) (int64, error) {

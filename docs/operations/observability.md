@@ -94,7 +94,36 @@ WebSSH 会话暴露以下指标。指标只包含状态、方向和稳定错误�
 
 日志只输出 `cutoff`、`reaped`、`elapsed_ms` 与错误，不含 connection ID、client instance ID 或 Token。清扫是后台聚合动作，因此不进审计日志：审计记录的是「谁做了什么」，而这里没有操作者。
 
-建议告警（起点值）：`sum(increase(tunnelmesh_client_connection_lease_sweep_total{result="error"}[15m])) > 3`——连续 15 分钟里多数轮次失败才算异常，单轮失败通常是数据库短暂不可达。
+已交付两条告警（`deploy/prometheus/alert-rules.yaml`）：
+
+- `TunnelMeshLeaseSweepErrors`：`sum(increase(...{result="error"}[15m])) > 3`，`for: 15m`。间隔是 1 分钟，所以 15 分钟里多于 3 轮失败才算异常，单轮失败通常是数据库短暂不可达。
+- `TunnelMeshLeaseSweepStalled`：`absent(...) or sum(increase(...[10m])) == 0`，`for: 5m`。正常同期应有约 10 轮，0 轮说明没有任何节点在回收。跨节点求和是刻意的：删除以时间戳为边界且幂等，任一节点跑成功一轮就够，所以这条规则表达的是「整个集群都没在回收」，单节点部署里等价于逐节点检测。
+
+两条规则只有在清扫循环「失败后继续跑」的前提下才有意义：循环若在首轮失败时退出，只会留下一个 error 样本，`increase` 永远达不到阈值，指标形同虚设。
+
+## 后台清扫任务
+
+Server 进程内有五个周期清理任务：客户端元数据（`client_metadata`）、WebSSH 会话（`webssh_session`）、
+客户端连接租约（`client_connection_lease`）、审计保留（`audit_retention`）、身份维护（`auth_maintenance`）。
+它们共用同一个循环 `internal/server/sweep_loop.go`，策略只有一份：
+
+- 启动时先立即跑一轮，之后按各自固定间隔补跑；
+- **一轮失败只意味着这一轮没做成**：错误按 `<前缀>_sweep_failed` 记入日志，下一个 tick 重试；
+- 只有上下文取消才会结束循环，且取消造成的失败不记错误日志（关停不该以误报开场）；
+- 仓储未接线属于配置错误，在进循环之前就返回，不会变成一个每 tick 刷一条日志的僵尸任务。
+
+日志事件共五个：`client_metadata_sweep_failed`、`webssh_session_sweep_failed`、
+`client_connection_lease_sweep_failed`、`audit_retention_sweep_failed`、`auth_maintenance_sweep_failed`。
+它们是「一轮清理失败」的唯一出口，**出现即说明任务还在重试**，而不是已经放弃；反复出现才需要人介入，
+判据是数据库可达性与连接池。这些日志只含错误文本与计数，不含行标识符、DSN 或 Token。
+
+这条策略是被一个静默故障换来的：三个清扫器原先把第一轮数据库错误当作致命错误直接返回，运行它的
+goroutine 随即结束，而错误只在 `ServerRuntime.Close()` 时才被读出来——一个长期运行的 Server 永远不会
+调用它。后果是清理能力永久消失且没有任何信号，租约表重新无界增长。进程存活因此不是后台任务的
+健康依据，必须看指标或日志事件。审计保留与身份维护原先就是「记录并继续」，现在五个任务实现同一份策略。
+
+五个任务都不需要分布式锁：每条语句都以时间戳为边界且幂等，集群里每节点各跑一份是安全的，重复的一轮
+只删 0 行。这与「用一把租约锁保护一个清理任务」相比，少了一个可能自身故障的新组件。
 
 ## Prometheus 抓取与规则
 
@@ -264,7 +293,7 @@ trace 就会被盖章。
 ## 告警责任
 
 平台值班负责 Server readiness、scrape 缺失、存储失败和 relay 失败；网络值班负责 heartbeat miss、探针成功率和 RTT；业务负责人负责 Agent 离线、路由拒绝，以及 tp-* 代理入口的
-`TunnelMeshProxyEntryAuthFailures` 与 `TunnelMeshProxyEntryDenials`（与路由拒绝同类）。值班需要能
+`TunnelMeshProxyEntryAuthFailures` 与 `TunnelMeshProxyEntryDenials`（与路由拒绝同类），以及后台清理的 `TunnelMeshLeaseSweepErrors` 与 `TunnelMeshLeaseSweepStalled`（清理停摆不会让进程出错，只能靠指标发现，见[后台清扫任务](#后台清扫任务)）。值班需要能
 区分“ACL 配错”和“密码爆破”，判据是 `tunnelmesh_proxy_entry_acl_denied_total` 与
 `tunnelmesh_proxy_entry_auth_failures_total` 的相对量级：前者独大通常是来源网段没加进 ACL，后者
 独大且集中在单条 `route` 上是爆破。告警中不得放置 Token 或原始目标地址。

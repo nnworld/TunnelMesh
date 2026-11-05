@@ -87,36 +87,23 @@ func (s *AuthMaintenanceSweeper) Run(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return ErrSessionClosed
 	}
-	s.sweepAndLog(ctx)
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			// A tick that lands in the same instant as the cancellation is
-			// dropped instead of starting work that can only fail, which keeps a
-			// shutdown log free of spurious database errors.
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.sweepAndLog(ctx)
-		}
-	}
+	return runSweepLoop(ctx, "auth_maintenance", s.interval, s.sweepAndLog)
 }
 
-func (s *AuthMaintenanceSweeper) sweepAndLog(ctx context.Context) {
+// sweepAndLog performs one maintenance pass and reports what it collected. The
+// shared loop owns the failure policy, so an expired credential table that is
+// briefly unreachable costs a round instead of the job.
+func (s *AuthMaintenanceSweeper) sweepAndLog(ctx context.Context) error {
 	challenges, devices, err := s.SweepOnce(ctx)
 	if err != nil {
 		// The error carries no identifier, so logging it cannot leak a subject,
 		// a challenge id, or a device token.
-		slog.ErrorContext(ctx, "auth_maintenance_sweep_failed", "error", err)
-		return
+		return err
 	}
 	if challenges > 0 || devices > 0 {
 		slog.InfoContext(ctx, "auth_maintenance_sweep", "challenges", challenges, "devices", devices)
 	}
+	return nil
 }
 
 // SweepOnce performs one collection pass and republishes the gauges. The counts

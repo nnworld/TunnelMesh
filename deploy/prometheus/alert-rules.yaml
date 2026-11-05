@@ -50,3 +50,20 @@ groups:
         for: 10m
         labels: {severity: warning}
         annotations: {summary: TunnelMesh tp proxy entry is denying proxy requests}
+      # 租约回收是「被杀掉的 Client」留下的死行离开该表的唯一路径：正常释放需要对端配合，
+      # 掉电、被 SIGKILL、断网都走不到。清扫循环遇到数据库错误只记录不退出，所以回收停摆
+      # 不会让 Server 崩掉，只能靠指标发现——两条规则各管一种停法：持续失败、彻底停摆。
+      # 删除语句以时间戳为边界且幂等，任一节点跑成功一轮就够，因此这里跨节点求和：它表达的
+      # 是「没有任何节点在回收」，正是需要叫醒人的那一件事；单节点部署里等价于逐节点检测。
+      # 阈值口径与 docs/operations/observability.md 一致：间隔 1 分钟，15 分钟内多于 3 轮失败
+      # 才算异常；10 分钟内一轮都没有即停摆（同期正常应有约 10 轮）。
+      - alert: TunnelMeshLeaseSweepErrors
+        expr: sum(increase(tunnelmesh_client_connection_lease_sweep_total{result="error"}[15m])) > 3
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh client connection lease reaping keeps failing}
+      - alert: TunnelMeshLeaseSweepStalled
+        expr: absent(tunnelmesh_client_connection_lease_sweep_total) or sum(increase(tunnelmesh_client_connection_lease_sweep_total[10m])) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: TunnelMesh client connection lease reaping is not running}

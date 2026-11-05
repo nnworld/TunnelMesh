@@ -24,22 +24,22 @@ func NewClientMetadataSweeper(instances storage.ClientInstanceRepository, interv
 	return &ClientMetadataSweeper{instances: instances, interval: interval}
 }
 
+// Run reconciles metadata once before the first tick, then on the interval.
+//
+// A failed round costs that round only: the shared loop logs it and the next tick
+// retries. These rows have no other path back to a correct state - a Client that
+// goes quiet never comes back to update them - so retiring the job on a database
+// blip would leave lapsed instances looking live until the next Server restart.
 func (s *ClientMetadataSweeper) Run(ctx context.Context) error {
-	if _, err := s.Sweep(ctx, time.Now().UTC()); err != nil {
+	// A missing repository is a wiring error rather than a retryable round: it can
+	// never succeed, so it must not enter a loop that logs every interval.
+	if s == nil || s.instances == nil {
+		return ErrSessionClosed
+	}
+	return runSweepLoop(ctx, "client_metadata", s.interval, func(ctx context.Context) error {
+		_, err := s.Sweep(ctx, time.Now().UTC())
 		return err
-	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if _, err := s.Sweep(ctx, time.Now().UTC()); err != nil {
-				return err
-			}
-		}
-	}
+	})
 }
 
 // Sweep reconciles Client instance rows and returns how many rows it changed.
