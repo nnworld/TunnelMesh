@@ -12,8 +12,15 @@ WorkingDirectory=__STATE_DIR__
 ExecStartPre=__BINARY__ --config __CONFIG__ --node-id-path __STATE_DIR__/node-id init-node-id
 ExecStartPre=__BINARY__ --config __CONFIG__ check-config
 ExecStart=__BINARY__ --config __CONFIG__ --node-id-path __STATE_DIR__/node-id run
-Restart=on-failure
+# 长驻服务不以退出码表达意图：入口返回 0 同样可能只是监听器被意外关掉，所以任何自行退出都要拉起。
+Restart=always
 RestartSec=5s
+# 78 是配置错误，77 是凭据被永久拒绝：重启修不好它们，不应被 systemd 无限拉起。
+# 同一份契约也覆盖 ExecStartPre 的 check-config——它现在同样以 78 退出。
+RestartPreventExitStatus=78 77
+# 优雅停机上界：HTTP drain 5s + server.vpn.shutdown_timeout（默认 15s），再留裕量。
+TimeoutStopSec=60s
+KillSignal=SIGTERM
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
