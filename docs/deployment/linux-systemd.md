@@ -54,7 +54,11 @@ journalctl -u tunnelmesh-client.service -f
 
 ## 自动升级与重启策略
 
-`client` 与 `agent` 的单元使用 `Restart=always`，并带有 `RestartPreventExitStatus=78 77`：退出码 0 不足以证明进程是自愿结束的（会话角色被意外拆掉时 worker 与 supervisor 都可能 0 退出），所以拉起交给 `Restart=always`，只把重启修不好的两类错误（78 配置错误、77 凭据被永久拒绝）挡在外面；其余退出，包括 supervisor 放弃时的 70，都会重新开始一个全新进程。`systemctl stop` 与 `systemctl restart` 是 systemd 自己的停止任务，不会被 `Restart=always` 顶回去。`server` 的单元保持 `Restart=on-failure`。
+三个角色的单元统一使用 `Restart=always` + `RestartPreventExitStatus=78 77`。退出码 0 不足以证明进程是自愿结束的：会话角色被意外拆掉时 worker 与 supervisor 都可能 0 退出，Server 的入口在监听器被意外关掉时同样返回 0——所以拉起交给 `Restart=always`，只把重启修不好的两类错误（78 配置错误、77 凭据被永久拒绝）挡在外面；其余退出，包括 supervisor 放弃时的 70，都会重新开始一个全新进程。`systemctl stop` 与 `systemctl restart` 是 systemd 自己的停止任务，不会被 `Restart=always` 顶回去。
+
+这条契约要求程序真的按这些码退出：`tunnelmesh-server` 早期是唯一没走 `cli.Main` 的入口，`log.Fatal` 把一切失败压成 1，于是坏配置在 `Restart=on-failure` 下每 `RestartSec` 重来一次、永不自愈，而崩溃与自愿停止无法区分。现在三个角色的 `run` 与 `check-config` 共用同一套退出码，`RestartPreventExitStatus` 对 `ExecStartPre` 同样生效。
+
+Server 还额外设置 `TimeoutStopSec=60s`：优雅停机的上界由 HTTP drain 的 5 秒与 `server.vpn.shutdown_timeout`（默认 15 秒）组成，显式写出来是为了让「停止是有界的」这件事出现在容量评审里，而不是依赖发行版默认的 90 秒。超过该预算 systemd 会发 `SIGKILL`，此时隧道与 VPN 端口随进程一起释放，代价是在途连接被硬切断。
 
 自动升级把新版本写在状态目录（`/var/lib/tunnelmesh-<role>/updates/`），不修改 `/usr/local/bin`，因此 `ProtectSystem=strict` 与只读安装目录不受影响。注意 `ExecStartPre` 的 `check-config` 仍然由**已安装的**二进制执行，只校验基线版本；新版本对现有配置的校验由 supervisor 在切换前用新二进制自己完成。详见[配置参考](../operations/configuration.md#自动升级与进程守护)。
 

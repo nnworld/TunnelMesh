@@ -8,12 +8,13 @@
 [AGENTS.md](../../../AGENTS.md)，文档组织约定见
 [文档规范](../../development/documentation.md)。
 
-共 79 份计划，按日期倒序排列。
+共 80 份计划，按日期倒序排列。
 
 ## 计划清单
 
 | 日期 | 实施计划 | 关联规格 | 关联 PR / ADR |
 | --- | --- | --- | --- |
+| 2026-11-05 | [后台清扫器容错统一与 Server 进程生命周期实施计划](2026-11-05-sweeper-resilience-and-server-lifecycle.md) | — | [PR：Client 缩容误终止会话池导致服务静默退出](../../pull-requests/2026-11-05-client-session-pool-silent-exit.md)<br>[PR：后台清扫器容错统一与 Server 进程生命周期](../../pull-requests/2026-11-05-sweeper-resilience-and-server-lifecycle.md) |
 | 2026-11-05 | [Client 缩容误终止会话池导致服务静默退出实施计划](2026-11-05-client-session-pool-silent-exit.md) | — | [PR：Client 缩容误终止会话池导致服务静默退出](../../pull-requests/2026-11-05-client-session-pool-silent-exit.md)<br>[ADR：Constrained self-update and process super…](../../architecture/adr/0003-constrained-self-update-and-supervision.md) |
 | 2026-11-05 | [客户端连接租约过期回收与历史读取上限实施计划](2026-11-05-client-connection-lease-cleanup.md) | — | [PR：客户端连接租约过期回收与历史读取上限](../../pull-requests/2026-11-05-client-connection-lease-cleanup.md) |
 | 2026-11-05 | [管理后台 Agent 引用统一显示名称并可跳转实施计划](2026-11-05-admin-agent-name-links.md) | — | [PR：管理后台 Agent 引用统一显示名称并可跳转](../../pull-requests/2026-11-05-admin-agent-name-links.md) |
