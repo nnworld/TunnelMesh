@@ -106,7 +106,7 @@ describe('admin routes', () => {
     expect(source).toContain("t('routes.create')")
     expect(source).toContain('v-if="auth.isAdmin"')
     expect(source).toContain('createRoute')
-    expect(source).toContain('getAgents')
+    expect(source).toContain('useAgentIndex')
     expect(source).toContain('filterable')
     expect(source).toContain('targetHost')
     expect(source).toContain('targetPort')
@@ -116,6 +116,15 @@ describe('admin routes', () => {
     expect(source).toContain("form.targetScheme === 'https'")
     expect(source).toContain('pathPrefix')
     expect(source).toContain('crypto.randomUUID()')
+  })
+
+  // The column shows an Agent, so it must read as an Agent: the name the
+  // operator recognizes, with the detail page one click away and the id kept in
+  // the hover title because names are not unique.
+  it('renders the managed route agent column as a link to the agent', () => {
+    const source = readFileSync('src/views/Routes.vue', 'utf8')
+    expect(source).toContain('<AgentRef :agent-id="row.agentId" />')
+    expect(source).not.toContain('prop="agentId"')
   })
 
   it('uses the shared client-style filter layout for managed routes', () => {
@@ -268,8 +277,8 @@ describe('in-app navigation', () => {
   const declared = router.getRoutes().map((route) => route.path)
 
   function navigationLiterals(source: string): string[] {
-    const needle = 'router.push('
     const found: string[] = []
+    const needle = 'router.push('
     for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + needle.length)) {
       let depth = 1
       let index = at + needle.length
@@ -279,6 +288,13 @@ describe('in-app navigation', () => {
       }
       const call = source.slice(at + needle.length, index - 1)
       for (const match of call.matchAll(/[`'"]\/[^`'"]*[`'"]/g)) found.push(match[0].slice(1, -1))
+    }
+    // Declarative navigation is the same hazard: a router-link with a path the
+    // router does not declare renders a link that goes nowhere, silently. Links
+    // whose target is a bare expression contribute nothing because the regex
+    // only accepts a quoted, slash-initial string.
+    for (const attribute of source.matchAll(/(?::)?to="([^"]*)"/g)) {
+      for (const match of attribute[1].matchAll(/[`'"]\/[^`'"]*[`'"]/g)) found.push(match[0].slice(1, -1))
     }
     return found
   }
@@ -302,7 +318,9 @@ describe('in-app navigation', () => {
   it('only pushes paths the router declares', () => {
     const checked: string[] = []
     const offenders: string[] = []
-    for (const dir of ['src/views', 'src/layouts']) {
+    // Components hold shared navigators such as AgentRef, so they are scanned
+    // exactly like the pages are.
+    for (const dir of ['src/views', 'src/layouts', 'src/components']) {
       for (const entry of readdirSync(dir).filter((name) => name.endsWith('.vue'))) {
         const file = `${dir}/${entry}`
         for (const literal of navigationLiterals(readFileSync(file, 'utf8'))) {
@@ -313,7 +331,10 @@ describe('in-app navigation', () => {
     }
     // A guard that silently matches nothing is worse than none: this is the assertion that
     // the scanner still sees the call sites, including the one that regressed.
-    expect(checked.length).toBeGreaterThanOrEqual(7)
+    expect(checked.length).toBeGreaterThanOrEqual(9)
+    // The count floor alone would not catch a scanner that stopped seeing
+    // component links, so the one this change added is asserted by name.
+    expect(checked).toEqual(expect.arrayContaining(['src/components/AgentRef.vue /agents/${agentId}']))
     expect(offenders).toEqual([])
   })
 })

@@ -12,6 +12,17 @@ describe('remote servers management view', () => {
     expect(source).toContain('status: filterStatus.value')
   })
 
+  // The projection already carries the agent name, so the cell passes it in
+  // explicitly; the shared index is only the fallback. The id remains both the
+  // link target and the hover title.
+  it('links the bound agent by name in the list and the detail', () => {
+    const source = readFileSync('src/views/RemoteServers.vue', 'utf8')
+    expect(source).toContain('<AgentRef')
+    expect(source).toContain(':name="row.agentName"')
+    expect(source).toContain(':agent-id="detailServer.agentId"')
+    expect(source).not.toContain('{{ agentName(row) }}')
+  })
+
   it('validates and binds every remote-server form field', () => {
     const source = readFileSync('src/views/RemoteServers.vue', 'utf8')
     for (const marker of [
@@ -20,6 +31,15 @@ describe('remote servers management view', () => {
     expect(source).toContain("type: 'number'")
     expect(source).toContain('min: 1')
     expect(source).toContain('max: 65535')
+  })
+
+  // The agent picker used to download its own page of agents while the same
+  // view already renders agent names for every row; both now read one index.
+  it('reads the agent picker from the shared agent index', () => {
+    const source = readFileSync('src/views/RemoteServers.vue', 'utf8')
+    expect(source).not.toContain('getAgents({ limit: 200 })')
+    expect(source).toContain('useAgentIndex')
+    expect(source).toContain('agentIndex.agents')
   })
 
   it('selects only active credentials and enabled agents', () => {

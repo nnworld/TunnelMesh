@@ -27,7 +27,11 @@
             </el-select>
           </el-form-item>
           <el-form-item :label="t('clients.agent')">
-            <el-input v-model="filters.agentId" :placeholder="t('clients.agent')" clearable />
+            <!-- The list filters on the exact agent id, so the control searches
+                 by name and still submits the id. -->
+            <el-select v-model="filters.agentId" filterable clearable :loading="agentIndex.status === 'loading'" :filter-method="setAgentFilter" :placeholder="t('clients.searchAgents')" @visible-change="openAgentFilter">
+              <el-option v-for="agent in visibleAgents" :key="agent.id" :label="`${agent.name} · ${agent.id}`" :value="agent.id" />
+            </el-select>
           </el-form-item>
           <el-form-item :label="t('clients.keyword')">
             <el-input v-model="filters.keyword" :placeholder="t('clients.keyword')" clearable />
@@ -103,7 +107,14 @@
             <el-descriptions-item :label="t('clients.processStartAt')">{{ formatDate(detailClient.processStartAt) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.lastSeen')">{{ formatDate(detailClient.lastSeenAt) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.tokens')">{{ formatList(detailClient.tokenIds) }}</el-descriptions-item>
-            <el-descriptions-item :label="t('clients.agents')">{{ formatList(detailClient.agentIds) }}</el-descriptions-item>
+            <el-descriptions-item :label="t('clients.agents')">
+              <span class="agent-refs">
+                <AgentRef v-for="agentId in detailClient.agentIds" :key="agentId" :agent-id="agentId" />
+                <!-- The component owns the empty rendering, so an instance with
+                     no agent shows the same dash as any other empty reference. -->
+                <AgentRef v-if="!detailClient.agentIds?.length" :agent-id="''" />
+              </span>
+            </el-descriptions-item>
             <el-descriptions-item :label="t('clients.serverNodes')">{{ formatList(detailClient.serverNodeIds) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.activeConnections')">{{ detailClient.activeConnections }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.activeStreams')">{{ detailClient.activeStreams }}</el-descriptions-item>
@@ -121,7 +132,7 @@
           <el-table :data="detailClient.listeners" class="section-table">
             <el-table-column prop="protocol" :label="t('clients.protocol')" width="100" />
             <el-table-column prop="listenAddress" :label="t('clients.listenAddress')" min-width="170" />
-            <el-table-column prop="agentId" :label="t('clients.agent')" min-width="180" />
+            <el-table-column :label="t('clients.agent')" min-width="180"><template #default="{ row }"><AgentRef :agent-id="row.agentId" /></template></el-table-column>
             <el-table-column :label="t('clients.enabled')" width="100"><template #default="{ row }">{{ row.enabled ? t('common.yes') : t('common.no') }}</template></el-table-column>
             <template #empty>{{ t('clients.listenersEmpty') }}</template>
           </el-table>
@@ -187,6 +198,9 @@ import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
+import AgentRef from '../components/AgentRef.vue'
+import { filterAgents } from './token-form'
+import { useAgentIndex } from '../stores/agentIndex'
 import { useFormatDateTime } from '../i18n/format'
 import { useAuthStore } from '../stores/auth'
 import { APIError, closeClientConnection, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance, type ClientMetadataState, type ClientListSummary, type ClientStatus } from '../api/client'
@@ -203,6 +217,15 @@ const pageIndex = ref(0)
 const pageCursors = ref<string[]>([''])
 const sort = ref('lastSeenAt')
 const order = ref<'asc' | 'desc'>('desc')
+// The shared index answers both the filter options and every AgentRef in the
+// drawer, so one page of agents serves the whole view.
+const agentIndex = useAgentIndex()
+const agentFilter = ref('')
+const visibleAgents = computed(() => filterAgents(agentIndex.agents, agentFilter.value))
+function setAgentFilter(query: string) { agentFilter.value = query }
+// Opening the picker is the only moment the filter needs the inventory: a
+// console that never touches it does not pay for the list request.
+function openAgentFilter(visible: boolean) { if (visible) void agentIndex.ensureLoaded() }
 const filters = reactive({ ownerUserId: '', tokenId: '', serverNodeId: '', status: '' as '' | ClientStatus, metadataState: '' as '' | ClientMetadataState, agentId: '', keyword: '' })
 // Counters are the server's whole-population aggregate for the active filter.
 // Deriving them from the loaded rows is what made the cards disagree with the
@@ -366,6 +389,7 @@ onMounted(load)
 
 <style scoped>
 .filter-form { margin-bottom: 18px; }
+.agent-refs { display: inline-flex; flex-wrap: wrap; gap: var(--tm-s-2) var(--tm-s-3); }
 .filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
 .filter-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
 .summary-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:18px; }

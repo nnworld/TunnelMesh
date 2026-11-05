@@ -2,15 +2,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import { createPinia } from 'pinia'
 import { readFileSync } from 'node:fs'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import Clients from '../views/Clients.vue'
 import { i18n } from '../i18n'
-import { getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance } from '../api/client'
+import { getAgents, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
-vi.mock('vue-router', () => ({ useRoute: () => ({ path: '/clients', params: {} }) }))
+// Agent references render through AgentRef, which needs a real router for its
+// links and Pinia for the shared index; a bare useRoute stub cannot satisfy
+// either, so the module keeps its actual exports here.
+vi.mock('vue-router', async () => {
+  const actual = await vi.importActual<typeof import('vue-router')>('vue-router')
+  return { ...actual, useRoute: () => ({ path: '/clients', params: {} }) }
+})
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
-  return { ...actual, listClients: vi.fn(), getClientDetail: vi.fn(), listClientConnections: vi.fn() }
+  return { ...actual, listClients: vi.fn(), getClientDetail: vi.fn(), listClientConnections: vi.fn(), getAgents: vi.fn() }
 })
 
 async function flush() {
@@ -38,6 +45,7 @@ async function mountClients() {
   app.use(pinia)
   const auth = useAuthStore(pinia)
   auth.user = { id: 'user-1', username: 'tester', role: 'admin' }
+  app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/agents/:id', component: { render: () => null } }] }))
   app.use(i18n)
   app.mount(container)
   await flush()
@@ -58,12 +66,162 @@ function summaryCards(container: HTMLElement) {
 // online nor offline. The numbers now come from the server's aggregate over the
 // whole filtered population, and presence and metadata freshness are separate
 // columns.
+// The Agent filter took a raw id because the list filters on the exact id.
+// Operators do not keep ids in their head, so the control is now a searchable
+// select over the shared index while the request parameter stays the id.
+describe('client agent filter', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    vi.mocked(listClients).mockReset()
+    vi.mocked(getAgents).mockReset()
+  })
+
+  function agentFilterParams() {
+    const calls = vi.mocked(listClients).mock.calls
+    return calls[calls.length - 1]?.[0]?.agentId
+  }
+
+  // The filter grid holds several selects, so the agent control is found by the
+  // label the operator reads rather than by position.
+  function agentFilterSelect(container: HTMLElement) {
+    const item = Array.from(container.querySelectorAll('.el-form-item'))
+      .find(entry => (entry.querySelector('.el-form-item__label')?.textContent || '').trim() === i18n.global.t('clients.agent'))!
+    return item.querySelector('.el-select')!
+  }
+
+  it('searches agents by name and queries by their id', async () => {
+    vi.mocked(getAgents).mockResolvedValue({ items: [{ id: 'agent-edge', name: 'edge-01', enabled: true, status: 'online' }], nextCursor: '' })
+    vi.mocked(listClients).mockResolvedValue({ items: [], nextCursor: '' })
+    const { container, unmount } = await mountClients()
+    try {
+      const select = agentFilterSelect(container)
+      expect(select).toBeTruthy()
+      expect(select.classList.contains('el-select')).toBe(true)
+      select.querySelector('input')!.click()
+      await flush()
+      const option = Array.from(document.querySelectorAll('.el-select-dropdown__item'))
+        .find(item => (item.textContent || '').includes('edge-01'))
+      expect(option).toBeTruthy()
+      option!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      await flush()
+      // Selecting narrows the pending filter; the query button is what submits
+      // it, exactly as the free-text control it replaced did.
+      Array.from(container.querySelectorAll('button'))
+        .find(button => (button.textContent || '').trim() === i18n.global.t('clients.query'))!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      await flush()
+      await flush()
+      expect(agentFilterParams()).toBe('agent-edge')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('asks for agents with the shared placeholder in both locales', async () => {
+    const source = readFileSync('src/views/Clients.vue', 'utf8')
+    expect(source).toContain('v-model="filters.agentId"')
+    expect(source).toContain("t('clients.searchAgents')")
+    const { default: zhCN } = await import('../i18n/messages/zh-CN')
+    const { default: enUS } = await import('../i18n/messages/en-US')
+    expect(zhCN.clients.searchAgents).toBeTruthy()
+    expect(enUS.clients.searchAgents).toBeTruthy()
+  })
+})
+
+// The drawer used to print agent ids in both the related-agent line and the
+// listener table, which is the one place an operator learns which agent owns a
+// port. Names now, with the id still reachable by hover and by clicking through.
+describe('agent references in the client detail', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    vi.mocked(listClients).mockReset()
+    vi.mocked(getClientDetail).mockReset()
+    vi.mocked(listClientConnections).mockReset()
+    vi.mocked(getAgents).mockReset()
+  })
+
+  it('names the agent of a listener and links to its page', async () => {
+    const withAgent = instance({
+      agentIds: ['agent-edge'],
+      listeners: [{ protocol: 'tcp', listenAddress: '127.0.0.1:6021', agentId: 'agent-edge', enabled: true }],
+    })
+    vi.mocked(listClients).mockResolvedValue({ items: [withAgent], nextCursor: '' })
+    vi.mocked(getClientDetail).mockResolvedValue(withAgent)
+    vi.mocked(listClientConnections).mockResolvedValue([])
+    vi.mocked(getAgents).mockResolvedValue({ items: [{ id: 'agent-edge', name: 'edge-01', enabled: true, status: 'online' }], nextCursor: '' })
+
+    const { container, unmount } = await mountClients()
+    try {
+      const row = Array.from(container.querySelectorAll('.el-table__body tr'))
+        .find(entry => entry.textContent?.includes('client-local-1'))
+      row?.querySelector('button')?.click()
+      await flush()
+      await flush()
+      const refs = Array.from(document.body.querySelectorAll('.agent-ref'))
+      expect(refs.length).toBeGreaterThanOrEqual(2)
+      for (const ref of refs) {
+        expect(ref.textContent).toBe('edge-01')
+        expect(ref.getAttribute('href')).toBe('/agents/agent-edge')
+        expect(ref.getAttribute('title')).toBe('agent-edge')
+      }
+    } finally {
+      unmount()
+    }
+  })
+
+  it('still links an agent the index cannot name', async () => {
+    const withAgent = instance({ agentIds: ['agent-gone'], listeners: [] })
+    vi.mocked(listClients).mockResolvedValue({ items: [withAgent], nextCursor: '' })
+    vi.mocked(getClientDetail).mockResolvedValue(withAgent)
+    vi.mocked(listClientConnections).mockResolvedValue([])
+    vi.mocked(getAgents).mockResolvedValue({ items: [], nextCursor: '' })
+
+    const { container, unmount } = await mountClients()
+    try {
+      const row = Array.from(container.querySelectorAll('.el-table__body tr'))
+        .find(entry => entry.textContent?.includes('client-local-1'))
+      row?.querySelector('button')?.click()
+      await flush()
+      await flush()
+      const ref = document.body.querySelector('.agent-ref')
+      expect(ref?.textContent).toBe('agent-gone')
+      expect(ref?.getAttribute('href')).toBe('/agents/agent-gone')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('renders an em dash when the client has no agents', async () => {
+    vi.mocked(listClients).mockResolvedValue({ items: [instance()], nextCursor: '' })
+    vi.mocked(getClientDetail).mockResolvedValue(instance())
+    vi.mocked(listClientConnections).mockResolvedValue([])
+
+    const { container, unmount } = await mountClients()
+    try {
+      const row = Array.from(container.querySelectorAll('.el-table__body tr'))
+        .find(entry => entry.textContent?.includes('client-local-1'))
+      row?.querySelector('button')?.click()
+      await flush()
+      await flush()
+      expect(document.querySelector('.agent-ref--empty')).not.toBeNull()
+      // The shared index has nothing to resolve, so it must not be fetched.
+      expect(getAgents).not.toHaveBeenCalled()
+    } finally {
+      unmount()
+    }
+  })
+})
+
 describe('client observability summary', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
     vi.mocked(listClients).mockReset()
     vi.mocked(getClientDetail).mockReset()
     vi.mocked(listClientConnections).mockReset()
+    vi.mocked(getAgents).mockReset()
+    // Views that resolve agent names share one index; a test that cares about
+    // the names it overwrites this with the page it wants.
+    vi.mocked(getAgents).mockResolvedValue({ items: [], nextCursor: '' })
   })
 
   it('renders the server summary for the whole population, not the loaded page', async () => {

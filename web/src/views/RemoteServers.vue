@@ -30,7 +30,7 @@
           <el-table-column :label="t('remoteServers.agent')" min-width="170">
             <template #default="{ row }">
               <div class="agent-cell">
-                <span>{{ agentName(row) }}</span>
+                <AgentRef :agent-id="row.agentId" :name="row.agentName" />
                 <StatusTag :kind="row.agentOnline ? 'success' : row.agentOnline === false ? 'warning' : 'info'" :label="agentStatusLabel(row)" />
               </div>
             </template>
@@ -154,7 +154,7 @@
           <dt>{{ t('remoteServers.username') }}</dt><dd>{{ detailServer.defaultUsername }}</dd>
         <dt>{{ t('remoteServers.credential') }}</dt><dd>{{ credentialName(detailServer) }}</dd>
         <dt>{{ t('remoteServers.authMode') }}</dt><dd>{{ detailServer.credentialHasSecret ? t('remoteServers.autoAuth') : t('remoteServers.manualAuth') }}</dd>
-          <dt>{{ t('remoteServers.agent') }}</dt><dd>{{ agentName(detailServer) }}</dd>
+          <dt>{{ t('remoteServers.agent') }}</dt><dd><AgentRef :agent-id="detailServer.agentId" :name="detailServer.agentName" /></dd>
           <dt>{{ t('remoteServers.status') }}</dt><dd>{{ statusLabel(detailServer.status) }}</dd>
           <dt>{{ t('remoteServers.lastConnected') }}</dt><dd>{{ formatDate(detailServer.lastConnectedAt) }}</dd>
           <dt>{{ t('remoteServers.lastResult') }}</dt><dd>{{ detailServer.lastResult || '—' }}</dd>
@@ -177,8 +177,10 @@ import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
+import { useAgentIndex } from '../stores/agentIndex'
+import AgentRef from '../components/AgentRef.vue'
 import { useFormatDateTime } from '../i18n/format'
-import { getAgents, type Agent } from '../api/client'
+import { type Agent } from '../api/client'
 import { listCredentials, type Credential } from '../api/credentials'
 import {
   createRemoteServer, deleteRemoteServer, getRemoteServer, listRemoteServers,
@@ -208,7 +210,7 @@ const loadError = ref(false)
 const filterKeyword = ref('')
 const filterAgentId = ref('')
 const filterStatus = ref<StatusFilter>('all')
-const agents = ref<Agent[]>([])
+const agentIndex = useAgentIndex()
 const credentials = ref<Credential[]>([])
 const resourcesError = ref(false)
 const statusOptions = computed(() => [
@@ -217,7 +219,7 @@ const statusOptions = computed(() => [
   { label: t('remoteServers.deleted'), value: 'deleted' },
   { label: t('remoteServers.all'), value: 'all' },
 ])
-const enabledAgents = computed(() => agents.value.filter(agent => agent.enabled))
+const enabledAgents = computed(() => agentIndex.agents.filter(agent => agent.enabled))
 const activeCredentials = computed(() => credentials.value.filter(credential => credential.enabled && credential.status === 'active'))
 
 // The session API only returns IDs, so names are resolved from the loaded server
@@ -264,12 +266,14 @@ const sshDialogTitle = computed(() => (
 async function loadResources() {
   resourcesError.value = false
   try {
-    const [agentPage, credentialPage] = await Promise.all([
-      getAgents({ limit: 200 }),
+    const [, credentialPage] = await Promise.all([
+      agentIndex.ensureLoaded(),
       listCredentials({ status: 'active', limit: 200 }),
     ])
-    agents.value = agentPage.items
     credentials.value = credentialPage.items
+    // The shared index reports failure through its status instead of throwing,
+    // so an empty agent picker has to fold into this same error path.
+    if (agentIndex.status === 'error') throw new Error('agent index unavailable')
   } catch {
     resourcesError.value = true
     ElMessage.error(t('remoteServers.loadFailed'))
@@ -556,7 +560,6 @@ function statusLabel(status: RemoteServer['status']) {
   if (status === 'disabled') return t('remoteServers.disabled')
   return t('remoteServers.deleted')
 }
-function agentName(row: RemoteServer) { return row.agentName || row.agentId }
 function credentialName(row: RemoteServer) { return row.credentialName || row.credentialId || t('remoteServers.noneCredential') }
 function agentStatusLabel(row: RemoteServer) {
   if (row.agentOnline) return t('remoteServers.agentOnline')

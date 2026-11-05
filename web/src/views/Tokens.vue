@@ -16,7 +16,16 @@
           <el-table-column prop="prefix" :label="t('tokens.prefix')" width="130"><template #default="{ row }"><span class="tm-mono">{{ row.prefix }}</span></template></el-table-column>
           <el-table-column prop="type" :label="t('tokens.type')" width="130" />
           <el-table-column prop="ownerUserId" :label="t('tokens.owner')" min-width="150"><template #default="{ row }"><IdCell :value="row.ownerUserId" /></template></el-table-column>
-          <el-table-column :label="t('tokens.binding')" min-width="180"><template #default="{ row }"><span class="tm-mono binding" :title="tokenBinding(row)">{{ tokenBinding(row) }}</span></template></el-table-column>
+          <el-table-column :label="t('tokens.binding')" min-width="180">
+            <template #default="{ row }">
+              <span class="binding" :title="tokenBinding(row)">
+                <span v-if="bindingAgentIds(row).length" class="agent-refs">
+                  <AgentRef v-for="agentId in bindingAgentIds(row)" :key="agentId" :agent-id="agentId" />
+                </span>
+                <span v-else>{{ tokenBinding(row) }}</span>
+              </span>
+            </template>
+          </el-table-column>
           <el-table-column :label="t('tokens.state')" width="120"><template #default="{ row }"><StatusTag :kind="row.status === 'revoked' ? 'info' : row.status === 'active' ? 'success' : 'warning'" :label="row.status" /></template></el-table-column>
           <el-table-column prop="expiresAt" :label="t('tokens.expires')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
           <el-table-column prop="lastUsedAt" :label="t('tokens.lastUsed')" width="180" sortable="custom"><template #default="{ row }">{{ formatDate(row.lastUsedAt) }}</template></el-table-column>
@@ -74,7 +83,7 @@
           <el-descriptions-item :label="t('tokens.state')"><StatusTag :kind="detailToken.status === 'revoked' ? 'info' : detailToken.status === 'active' ? 'success' : 'warning'" :label="detailToken.status" /></el-descriptions-item>
           <el-descriptions-item :label="t('tokens.owner')">{{ detailToken.ownerUserId }}</el-descriptions-item>
           <el-descriptions-item :label="t('tokens.prefix')">{{ detailToken.prefix }}</el-descriptions-item>
-          <el-descriptions-item :label="t('tokens.agentId')">{{ detailToken.agentId || '—' }}</el-descriptions-item>
+          <el-descriptions-item :label="t('tokens.agentId')"><AgentRef :agent-id="detailToken.agentId" /></el-descriptions-item>
           <el-descriptions-item :label="t('tokens.nodeId')">{{ detailToken.nodeId || '—' }}</el-descriptions-item>
           <el-descriptions-item :label="t('tokens.expires')">{{ formatDate(detailToken.expiresAt) }}</el-descriptions-item>
           <el-descriptions-item :label="t('tokens.revokedAt')">{{ formatDate(detailToken.revokedAt) }}</el-descriptions-item>
@@ -84,7 +93,13 @@
           <el-descriptions-item :label="t('tokens.replayed')">{{ formatBoolean(detailToken.replayed) }}</el-descriptions-item>
           <el-descriptions-item :label="t('tokens.scope')" :span="2">
             <div class="scope-list">
-              <div><span>{{ t('tokens.agentIds') }}:</span>{{ formatList(detailToken.scope.agentIds) }}</div>
+              <div>
+                <span>{{ t('tokens.agentIds') }}:</span>
+                <span class="agent-refs">
+                  <AgentRef v-for="agentId in detailToken.scope.agentIds" :key="agentId" :agent-id="agentId" />
+                  <AgentRef v-if="!detailToken.scope.agentIds?.length" :agent-id="''" />
+                </span>
+              </div>
               <div><span>{{ t('tokens.serverNodes') }}:</span>{{ formatServerNodeScope(detailToken) }}</div>
               <div><span>{{ t('tokens.protocols') }}:</span>{{ formatList(detailToken.scope.protocols) }}</div>
               <div><span>{{ t('tokens.cidrs') }}:</span>{{ formatList(detailToken.scope.targetCIDRs) }}</div>
@@ -154,15 +169,17 @@ import IdCell from '../components/IdCell.vue'
 import PagerBar from '../components/PagerBar.vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { createToken, getAgents, getServerNodes, getTokenDetail, listTokens, revokeToken, rotateToken, revealToken, updateTokenExpiration, updateTokenScope, type Agent, type ServerNode, type ServiceToken, type TokenType } from '../api/client'
+import { createToken, getServerNodes, getTokenDetail, listTokens, revokeToken, rotateToken, revealToken, updateTokenExpiration, updateTokenScope, type Agent, type ServerNode, type ServiceToken, type TokenType } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { useI18n } from 'vue-i18n'
 import TokenSecretDialog from '../components/TokenSecretDialog.vue'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
+import AgentRef from '../components/AgentRef.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useFormatDateTime } from '../i18n/format'
-import { defaultTokenExpiration, filterAgents, loadAgentsForSelection, tokenPayloadFromForm, tokenScopePatchFromForm } from './token-form'
+import { defaultTokenExpiration, filterAgents, tokenPayloadFromForm, tokenScopePatchFromForm } from './token-form'
+import { useAgentIndex } from '../stores/agentIndex'
 
 const auth = useAuthStore(); const {t}=useI18n(); const items = ref<ServiceToken[]>([]); const nextCursor = ref(''); const pageIndex = ref(0); const pageSize = ref(20); const cursors = ref<string[]>(['']); const sort = ref('createdAt'); const order = ref<'asc' | 'desc'>('desc'); const loading = ref(false); const loadError = ref(false); const saving = ref(false); const filterTypes = ref<TokenType[]>([]); const createVisible = ref(false); const secret = ref('')
 const detailVisible = ref(false); const detailLoading = ref(false); const detailError = ref(false); const detailToken = ref<ServiceToken | null>(null)
@@ -170,7 +187,8 @@ const expirationVisible = ref(false); const expirationSaving = ref(false); const
 const scopeVisible = ref(false); const scopeSaving = ref(false); const scopeToken = ref<ServiceToken | null>(null)
 const scopeForm = reactive<{ agentIds: string[]; serverNodeIds: string[]; protocols: string[]; cidrsText: string; portsText: string }>({ agentIds: [], serverNodeIds: [], protocols: [], cidrsText: '', portsText: '' })
 const selectedScopeAgents = computed(() => scopeForm.agentIds.map(id => agents.value.find(agent => agent.id === id)).filter((agent): agent is Agent => Boolean(agent)))
-const agents = ref<Agent[]>([]); const agentsLoading = ref(false); const agentFilter = ref(''); const visibleAgents = computed(() => filterAgents(agents.value, agentFilter.value)); const selectedAgent = computed(() => agents.value.find(agent => agent.id === form.agentId)); const selectedClientAgents = computed(() => form.agentIds.map(id => agents.value.find(agent => agent.id === id)).filter((agent): agent is Agent => Boolean(agent)))
+const agentIndex = useAgentIndex()
+const agents = computed(() => agentIndex.agents); const agentsLoading = computed(() => agentIndex.status === 'loading'); const agentFilter = ref(''); const visibleAgents = computed(() => filterAgents(agents.value, agentFilter.value)); const selectedAgent = computed(() => agents.value.find(agent => agent.id === form.agentId)); const selectedClientAgents = computed(() => form.agentIds.map(id => agents.value.find(agent => agent.id === id)).filter((agent): agent is Agent => Boolean(agent)))
 const serverNodes = ref<ServerNode[]>([]); const serverNodesLoading = ref(false)
 const form = reactive<{ type: TokenType; agentId: string; agentIds: string[]; nodeId: string; serverNodeIds: string[]; expiresAt: string; scope: { agentIds: string[]; protocols: string[]; targetCIDRs: string[]; targetPorts: number[] } }>({ type: 'client', agentId: '', agentIds: [], nodeId: '', serverNodeIds: [], expiresAt: defaultTokenExpiration(), scope: { agentIds: [], protocols: ['tcp'], targetCIDRs: [], targetPorts: [] } })
 const cidrsText = ref(''); const portsText = ref('')
@@ -181,14 +199,19 @@ function resetForm() { form.type = 'client'; form.agentId = ''; form.agentIds = 
 function setAgentFilter(query: string) { agentFilter.value = query }
 function formatList(values?: Array<string | number>) { return values?.length ? values.join(', ') : '—' }
 function formatBoolean(value?: boolean) { return value ? t('common.yes') : t('common.no') }
+// One place decides which Agents a token is bound to: an agent-type token names
+// exactly one, a client-type token names the agents in its scope. Everything
+// that is not an Agent reference (a server-node scope, the node fallback, the
+// "all agents" label) is still text from tokenBinding().
+function bindingAgentIds(row: ServiceToken) {
+  if (row.type === 'agent') return row.agentId ? [row.agentId] : []
+  if (row.type === 'client') return row.scope.agentIds ?? []
+  return []
+}
 function tokenBinding(row: ServiceToken) {
   if (row.type === 'server_node') return formatServerNodeScope(row)
-  if (row.type === 'client') return formatAgentScope(row)
-  return row.agentId || row.nodeId || t('tokens.scoped')
-}
-function formatAgentScope(row: ServiceToken) {
-  if (row.type !== 'client') return '—'
-  return row.scope.agentIds?.length ? row.scope.agentIds.join(', ') : t('tokens.allAgents')
+  if (row.type === 'client') return t('tokens.allAgents')
+  return row.nodeId || t('tokens.scoped')
 }
 function formatServerNodeScope(row: ServiceToken) {
   if (row.type !== 'server_node') return '—'
@@ -245,7 +268,7 @@ async function updateScope() {
   } catch { ElMessage.error(t('tokens.updateFailed')) }
   finally { scopeSaving.value = false }
 }
-async function loadAgents() { agentsLoading.value = true; try { agents.value = await loadAgentsForSelection(getAgents) } finally { agentsLoading.value = false } }
+async function loadAgents() { await agentIndex.ensureLoaded() }
 async function loadServerNodes() { serverNodesLoading.value = true; try { const page = await getServerNodes({ limit: 500 }); serverNodes.value = page.items } finally { serverNodesLoading.value = false } }
 async function reload() { pageIndex.value = 0; cursors.value = ['']; await loadPage() }
 function changePageSize(size: number) { pageSize.value = size; void reload() }
@@ -276,6 +299,7 @@ onMounted(() => { void reload(); void loadAgents(); if (auth.isAdmin) void loadS
 .binding { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--tm-fs-xs); color: var(--tm-ink-2); }
 .row-actions { display: inline-flex; flex-wrap: nowrap; gap: var(--tm-s-1); }
 .field-help { margin-top: var(--tm-s-1); color: var(--tm-ink-2); font-size: var(--tm-fs-xs); }
+.agent-refs { display: inline-flex; flex-wrap: wrap; gap: var(--tm-s-1) var(--tm-s-2); vertical-align: middle; }
 .scope-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--tm-s-2); }
 .scope-list span { display: inline-block; min-width: 120px; color: var(--tm-ink-2); }
 </style>

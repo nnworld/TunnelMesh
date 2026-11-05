@@ -80,9 +80,16 @@ Agent 详情中的连接列表来自数据库连接租约，并用当前 Server 
 
 远端 Server 节点不可达时，关闭请求返回 `503`，页面提示租约已保留。此时不要手工删除数据库租约；应先恢复远端 relay，再刷新列表重试。`409` 表示 connection epoch 已过期，通常发生在连接被替换后；刷新列表并使用新 epoch 即可。
 
+其他页面引用 Agent 时统一显示它的名称，并点击进入本页详情；鼠标悬停显示 Agent
+ID。名称没有唯一约束，因此 ID 始终是引用与排查的权威标识，名称只是可读标签。
+当前账号读不到的 Agent（例如属于其他用户且未授权）继续显示原始 ID，不会因此
+报错或隐藏这一行。
+
 ## Client 运行观测与连接管理
 
-Clients 页面用于查看当前用户权限范围内的客户端实例、metadata 和物理 WebSocket 连接。管理员可以按 Owner、Token、Server 节点、状态、元数据时效、Agent 和关键词筛选；普通用户的 Owner 过滤固定为自己的用户 ID，并在数据库查询内完成，不能通过分页绕过。`status` 查询参数只接受 `online` 和 `offline`；历史值 `stale` 与 `metadata_unavailable` 仍作为 `metadataState=expired|unavailable` 的别名保留一个次版本后移除。
+Clients 页面用于查看当前用户权限范围内的客户端实例、metadata 和物理 WebSocket 连接。管理员可以按 Owner、Token、Server 节点、状态、元数据时效、Agent 和关键词筛选，其中 Agent 筛选是按名称或 ID 搜索的下拉框，选中后提交给服务端的仍是精确的 Agent ID；普通用户的 Owner 过滤固定为自己的用户 ID，并在数据库查询内完成，不能通过分页绕过。`status` 查询参数只接受 `online` 和 `offline`；历史值 `stale` 与 `metadata_unavailable` 仍作为 `metadataState=expired|unavailable` 的别名保留一个次版本后移除。
+
+详情抽屉里的“Agent”与“本地监听入口”列显示 Agent 名称并可跳转到该节点，监听地址本身仍是精确匹配的路由目标。
 
 客户端会通过 metadata 子协议上报稳定实例 ID、版本、commit、平台、主机名、进程启动时间、本地监听入口、允许的 Agent 和非敏感自定义字段。自定义字段必须写入 Client 配置的 `client.metadata` allowlist，来源只能是绝对路径文件或指定环境变量。最多 32 项，单项 4 KiB，总 payload 32 KiB；包含 password、passphrase、token、secret、private key、api key、credential、authorization、cookie 或 DSN 语义的名称会被拒绝。metadata 只用于观测，不参与任何授权判断。
 
@@ -111,7 +118,7 @@ Policy 页面限制 Agent 可访问的协议、目标 CIDR 和端口。建议按
 
 ## Explicit Route 与 Wildcard Route
 
-Routes 页面支持将某个域名/路径绑定到 Agent 的目标主机和端口。域名与路径组合必须唯一，写请求建议携带稳定的 `Idempotency-Key`。
+Routes 页面支持将某个域名/路径绑定到 Agent 的目标主机和端口，列表的 Agent 列显示名称并可跳转到该节点详情。域名与路径组合必须唯一，写请求建议携带稳定的 `Idempotency-Key`。
 
 动态泛域名格式为：
 
@@ -143,7 +150,7 @@ Agent 详情页的“逻辑 Agent 状态”按连接池健康状态推导：至�
 
 左侧菜单包含“远程服务器”和“密钥管理”。远程服务器用于保存通过 Agent 通道访问的 SSH 目标；密钥管理用于维护 SSH 认证方式（公钥或密码）。两个页面都支持新建、编辑、详情、逻辑删除和恢复，列表使用 cursor 分页。
 
-远程服务器字段包括名称、主机、端口、默认用户名、认证凭据、Agent 和启用状态。主机必须是 IPv4 地址，并且目标地址与端口必须命中所选 Agent 的访问策略；Server 会在保存时校验，Agent 建立连接时再次校验。列表会联查显示 Agent 名称、凭据名称和 Agent 在线状态；当绑定的凭据带有已保存的认证秘密时，凭据列会额外标记“自动认证”，表示点击“SSH 连接”或“SFTP 文件”可以直接进入而无需再输入密码。解绑凭据请使用“编辑”并把凭据清空后保存。
+远程服务器字段包括名称、主机、端口、默认用户名、认证凭据、Agent 和启用状态。主机必须是 IPv4 地址，并且目标地址与端口必须命中所选 Agent 的访问策略；Server 会在保存时校验，Agent 建立连接时再次校验。列表会联查显示 Agent 名称、凭据名称和 Agent 在线状态，其中 Agent 名称可点击跳转到该节点详情（悬停显示 Agent ID）；当绑定的凭据带有已保存的认证秘密时，凭据列会额外标记“自动认证”，表示点击“SSH 连接”或“SFTP 文件”可以直接进入而无需再输入密码。解绑凭据请使用“编辑”并把凭据清空后保存。
 
 密钥管理支持两种类型：
 
@@ -223,7 +230,7 @@ Server 进程启动时会把本节点遗留的 `active` 会话统一关闭（原
 
 ## VPN 网关 peer 管理
 
-左侧菜单的“VPN 网关”（`/vpn`）用于给原生 WireGuard 客户端签发 peer：分配一个 VPN 地址、限定可达网段与端口，出口仍由 Agent 承担。页面不按管理员门禁，普通用户只看自己签发的 peer，管理员看全部；可见范围由服务端在分页查询内过滤，前端不再维护第二套角色判断。列表使用 cursor 分页，支持按名称或备注搜索，并按“启用中 / 已停用 / 已吊销”筛选。
+左侧菜单的“VPN 网关”（`/vpn`）用于给原生 WireGuard 客户端签发 peer：分配一个 VPN 地址、限定可达网段与端口，出口仍由 Agent 承担。页面不按管理员门禁，普通用户只看自己签发的 peer，管理员看全部；可见范围由服务端在分页查询内过滤，前端不再维护第二套角色判断。列表使用 cursor 分页，支持按名称或备注搜索，并按“启用中 / 已停用 / 已吊销”筛选。“出口 Agent”列显示 Agent 名称，点击进入该节点详情，悬停显示 Agent ID。
 
 **管理面在本版本可用，数据面取决于构建变体。** peer 可以签发、编辑、轮换、吊销并被审计；隧道能否真正建立，取决于 Server 是否为 `-tags vpn` 构建且 `server.vpn.enabled: true`。官方发行包与镜像的构建矩阵**尚不含**该 tag，用发行版部署时导入配置后仍连不通，而后台页面不会提示这一点——它只负责签发，不探测构建变体。部署前先按 [VPN 网关部署](../deployment/vpn-gateway.md) 确认变体。签发表单与服务端校验逐字对齐：名称 1–255 个字符且不含控制字符；授权网段是逗号分隔的 IPv4 CIDR，裸 IP 会被归一为 `/32`（服务端用 `net.ParseCIDR` 解析，不接受无前缀写法），留空表示没有可达目标；授权端口是逗号分隔的 1–65535 整数，留空表示不限；到期时间留空表示永不到期，填写时必须晚于当前时间；并发流与包速率上限填 0 表示不限。前端校验只省一次往返，不是信任边界，服务端会再校验一次。
 
@@ -245,7 +252,7 @@ IP 池概览来自 `GET /api/v1/vpn-nodes`，读的是本节点：`allocated` �
 
 ## 审计日志
 
-Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel/远程服务器/WebSSH 会话操作、metadata 读取和 SSH/TCP proxy 上下文。列表按事件时间倒序显示，同一时间使用审计 ID 倒序作为稳定排序；分页继续沿用 cursor。表格上方可按时间范围、操作者、动作、资源类型和资源 ID 做服务端筛选，点击“查询”后从第一页加载，点击“重置”清空条件并恢复默认列表。列表显示时间、操作者、动作、资源类型、资源 ID 和**变更摘要**；点击“详情”可查看完整结构化 JSON、该事件所属请求的链路 ID（`traceId`，用于把审计行与 Server 日志对齐；早于该机制或不由请求产生的事件显示为“未采集链路 ID”）。
+Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel/远程服务器/WebSSH 会话操作、metadata 读取和 SSH/TCP proxy 上下文。列表按事件时间倒序显示，同一时间使用审计 ID 倒序作为稳定排序；分页继续沿用 cursor。表格上方可按时间范围、操作者、动作、资源类型和资源 ID 做服务端筛选，点击“查询”后从第一页加载，点击“重置”清空条件并恢复默认列表。列表显示时间、操作者、动作、资源类型、资源 ID 和**变更摘要**，其中资源类型为 `agent` 时资源 ID 显示为 Agent 名称链接，其余资源类型继续显示原始 ID 并提供复制按钮；点击“详情”可查看完整结构化 JSON、该事件所属请求的链路 ID（`traceId`，用于把审计行与 Server 日志对齐；早于该机制或不由请求产生的事件显示为“未采集链路 ID”）。
 
 - **操作者**：数据库只保存操作者 ID，用户名由服务端在**调用者本来就能读到的那些行**上解析（审计页仅管理员可见）。账号已删除或系统事件（无操作者）时，界面分别退化为“原始 ID”和“系统事件”，不会因此报错。
 - **变更摘要与 `*Before` 约定**：更新类事件记录当前值，并且只为**真正改动过**的字段附带改动前的值，键名加 `Before` 后缀，例如改名得到 `name=edge · nameBefore=old-edge`，只切换启用状态则只有 `enabled=false · enabledBefore=true`。未改动的字段不出现，避免“看起来像被改过”。
@@ -265,7 +272,12 @@ Audit Logs 记录登录、凭据恢复、Agent/Policy/Route/Tunnel/远程服务�
 
 ## Service Tokens
 
-Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`server_node` 三类服务凭据。普通用户只能为自己拥有且启用的 Agent 创建 Agent/Client token；`server_node` 仅管理员可创建。
+Tokens 页面用于创建、查看、轮换和撤销 `agent`、`client`、`server_node` 三类服务凭据。
+“绑定”列与详情的 Agent 字段显示 Agent 名称并可跳转到该节点详情：`agent` 型 token
+绑定单个 Agent，`client` 型 token 列出 `scope.agentIds` 里的每个 Agent，scope 留空
+时显示“全部 Agent”而不是 ID；`server_node` 型继续显示 Server 节点 ID。
+
+普通用户只能为自己拥有且启用的 Agent 创建 Agent/Client token；`server_node` 仅管理员可创建。
 
 创建 `client` token 时，Agent ID 为多选框，可按名称或 ID 模糊搜索。留空表示允许该 Token owner 有权访问的所有 Agent；选择多个 Agent 会写入 `scope.agentIds` 显式允许列表。一个 Client Token 只能选择同一 owner 的 Agent；管理员选择其他用户的 Agent 时会自动携带对应 `ownerUserId`，混选不同 owner 会被拒绝。
 

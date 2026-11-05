@@ -58,7 +58,10 @@
           </el-table-column>
           <el-table-column prop="action" :label="t('audits.action')" min-width="240"><template #default="{ row }"><span class="action tone-chip" :class="`tone-${actionHue(row.action)}`">{{ row.action }}</span></template></el-table-column>
           <el-table-column prop="resourceType" :label="t('audits.resourceType')" min-width="150" />
-          <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200"><template #default="{ row }"><IdCell v-if="row.resourceId" :value="row.resourceId" /></template></el-table-column>
+          <!-- An agent row names the agent and links to it; the id stays in the
+               hover title. Every other resource type has no name to resolve, so
+               its id keeps the copy affordance an operator uses to grep logs. -->
+          <el-table-column prop="resourceId" :label="t('audits.resourceId')" min-width="200"><template #default="{ row }"><AgentRef v-if="isAgentResource(row)" :agent-id="row.resourceId" /><IdCell v-else-if="row.resourceId" :value="row.resourceId" /></template></el-table-column>
           <!-- What changed, without opening a dialog for every row: the facts an
                action recorded, summarized, with the whole payload on hover. -->
           <el-table-column :label="t('audits.summary')" min-width="260">
@@ -87,7 +90,7 @@
         </el-descriptions-item>
         <el-descriptions-item :label="t('audits.action')">{{ detailAudit.action }}</el-descriptions-item>
         <el-descriptions-item :label="t('audits.resourceType')">{{ detailAudit.resourceType }}</el-descriptions-item>
-        <el-descriptions-item :label="t('audits.resourceId')">{{ detailAudit.resourceId || '—' }}</el-descriptions-item>
+        <el-descriptions-item :label="t('audits.resourceId')"><AgentRef v-if="isAgentResource(detailAudit)" :agent-id="detailAudit.resourceId" /><template v-else>{{ detailAudit.resourceId || '—' }}</template></el-descriptions-item>
         <!-- The id that joins this row to the structured logs of the same request. -->
         <el-descriptions-item :label="t('audits.traceId')">{{ auditTraceId(detailAudit.details) || t('audits.noTrace') }}</el-descriptions-item>
       </el-descriptions>
@@ -104,11 +107,16 @@ import DataState from '../components/DataState.vue'
 import DetailDrawer from '../components/DetailDrawer.vue'
 import CodeBlock from '../components/CodeBlock.vue'
 import IdCell from '../components/IdCell.vue'
+import AgentRef from '../components/AgentRef.vue'
 import PagerBar from '../components/PagerBar.vue'
 import { listAuditLogs, type AuditLog } from '../api/client'
 import { useFormatDateTime } from '../i18n/format'
 import { auditActorLabel, auditDetailsSummary, auditDetailsTitle, auditTraceId } from '../utils/audit'
 import { actionHue } from '../utils/actionHue'
+
+// Only agents have a human name to show, and the decision lives in one place so
+// the row and the drawer can never disagree about which ids are linked.
+function isAgentResource(row: { resourceType?: string } | null) { return row?.resourceType === 'agent' }
 
 // How many facts fit on a table row before the line is marked as truncated.
 const summaryPairLimit = 3

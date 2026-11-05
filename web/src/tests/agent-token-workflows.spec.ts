@@ -152,6 +152,18 @@ describe('agent creation and token workflow', () => {
     expect(tokens).not.toContain('agentIdsText')
   })
 
+  // The binding column and the detail drawer are where an operator decides
+  // which agent a token can talk to, so both have to read as agent names with
+  // the detail page one click away. Server-node scopes are untouched: their
+  // ids have no name to show.
+  it('renders token agent bindings as name links', () => {
+    const source = readFileSync('src/views/Tokens.vue', 'utf8')
+    expect(source).toContain('<AgentRef')
+    expect(source).toContain('formatServerNodeScope')
+    expect(source).not.toContain("row.scope.agentIds.join(', ')")
+    expect(source).toContain('<AgentRef :agent-id="detailToken.agentId" />')
+  })
+
   it('reads token details and updates expiration through the resource API', async () => {
     await getTokenDetail('token-1')
     await updateTokenExpiration('token-1', undefined)
@@ -233,7 +245,7 @@ describe('agent creation and token workflow', () => {
     expect(source).toContain('label="ws"')
     expect(source).toContain('scopeForm.agentIds')
     expect(source).toContain('scopeForm.serverNodeIds')
-    expect(source).toContain('formatAgentScope')
+    expect(source).toContain('bindingAgentIds')
     expect(source).toContain('scopeToken.value?.ownerUserId')
   })
 })
