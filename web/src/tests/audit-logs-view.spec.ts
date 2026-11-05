@@ -1,16 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import AuditLogs from '../views/AuditLogs.vue'
 import { i18n } from '../i18n'
-import { listAuditLogs } from '../api/client'
+import { getAgents, listAuditLogs } from '../api/client'
 
-vi.mock('vue-router', () => ({
-  useRoute: () => ({ path: '/audits', params: {} }),
-  useRouter: () => ({ push: vi.fn() }),
-}))
+// Agent rows render through AgentRef, which needs a real router for its links
+// and Pinia for the shared index, so the module keeps its actual exports and the
+// view is installed with both plugins.
+vi.mock('vue-router', async () => {
+  const actual = await vi.importActual<typeof import('vue-router')>('vue-router')
+  return {
+    ...actual,
+    useRoute: () => ({ path: '/audits', params: {} }),
+    useRouter: () => ({ push: vi.fn() }),
+  }
+})
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
-  return { ...actual, listAuditLogs: vi.fn() }
+  return { ...actual, listAuditLogs: vi.fn(), getAgents: vi.fn() }
 })
 
 // The list used to show an opaque actor id and hide every fact behind a dialog that
@@ -20,12 +29,22 @@ describe('audit logs view', () => {
   beforeEach(() => {
     document.body.innerHTML = ''
     vi.mocked(listAuditLogs).mockReset()
+    vi.mocked(getAgents).mockReset()
+    vi.mocked(getAgents).mockResolvedValue({ items: [{ id: 'agent-abc', name: 'edge-01', enabled: true, status: 'online' }], nextCursor: '' })
   })
+
+  function rows(scope: HTMLElement) {
+    return Array.from(scope.querySelectorAll('.el-table__body tr'))
+  }
 
   async function mountAuditLogs() {
     const container = document.createElement('div')
     document.body.appendChild(container)
     const app = createApp(AuditLogs)
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    app.use(pinia)
+    app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/agents/:id', component: { render: () => null } }] }))
     app.use(i18n)
     app.mount(container)
     await nextTick()
@@ -67,10 +86,23 @@ describe('audit logs view', () => {
     // detail view so it never pushes the real facts off the row.
     expect(container.querySelector('.audit-summary')!.textContent).not.toContain('traceId')
 
+    // Only agent rows become name links. Every other resource type has no name
+    // to show, so its id stays exactly where an operator expects to copy it.
+    const agentRow = rows(container).find(row => row.textContent?.includes('edge-01'))!
+    expect(agentRow).toBeTruthy()
+    expect(agentRow.querySelector('a.agent-ref')?.getAttribute('href')).toBe('/agents/agent-abc')
+    expect(agentRow.textContent).not.toContain('agent-abc')
+    const routeRow = rows(container).find(row => row.textContent?.includes('route-1'))!
+    expect(routeRow.textContent).toContain('route-1')
+    expect(routeRow.querySelector('a.agent-ref')).toBeNull()
+
     buttonByText(container, i18n.global.t('audits.detail'))!.click()
     await nextTick()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(document.body.textContent).toContain('4bf92f3577b34da6a3ce929d0e0e4736')
+    const drawerLink = document.querySelector<HTMLAnchorElement>('.detail-drawer a.agent-ref')
+    expect(drawerLink?.textContent).toBe('edge-01')
+    expect(drawerLink?.getAttribute('href')).toBe('/agents/agent-abc')
   })
 
   it('says so when an event carries no details', async () => {

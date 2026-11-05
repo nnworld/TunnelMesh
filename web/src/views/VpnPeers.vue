@@ -36,7 +36,7 @@
           </el-table-column>
           <el-table-column prop="vpnIp" :label="t('vpn.vpnIp')" width="140" />
           <el-table-column :label="t('vpn.agent')" min-width="150">
-            <template #default="{ row }">{{ agentName(row.agentId) }}</template>
+            <template #default="{ row }"><AgentRef :agent-id="row.agentId" /></template>
           </el-table-column>
           <!-- A count rather than the list: the canonical encoding is long and a
                wide column is what forces a horizontal scrollbar. -->
@@ -119,7 +119,7 @@
         <el-descriptions-item :label="t('vpn.name')">{{ detailPeer.name }}</el-descriptions-item>
         <el-descriptions-item :label="t('vpn.status')"><StatusTag :kind="statusKind(detailPeer.status)" :label="statusLabel(detailPeer.status)" /></el-descriptions-item>
         <el-descriptions-item :label="t('vpn.vpnIp')">{{ detailPeer.vpnIp }}</el-descriptions-item>
-        <el-descriptions-item :label="t('vpn.agent')">{{ agentName(detailPeer.agentId) }}</el-descriptions-item>
+        <el-descriptions-item :label="t('vpn.agent')"><AgentRef :agent-id="detailPeer.agentId" /></el-descriptions-item>
         <el-descriptions-item :label="t('vpn.usage.peerPublicKey')"><code class="key-text">{{ detailPeer.publicKey }}</code></el-descriptions-item>
         <el-descriptions-item :label="t('vpn.allowedIps')">{{ joinList(detailPeer.allowedIps) }}</el-descriptions-item>
         <el-descriptions-item :label="t('vpn.allowedPorts')">{{ detailPeer.allowedPorts?.length ? detailPeer.allowedPorts.join(', ') : t('vpn.all') }}</el-descriptions-item>
@@ -242,14 +242,16 @@ import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
+import AgentRef from '../components/AgentRef.vue'
 import { useFormatDateTime } from '../i18n/format'
-import { getAgents, type Agent } from '../api/client'
+import { type Agent } from '../api/client'
 import {
   createVpnPeer, listVpnNodes, listVpnPeerFlows, listVpnPeers, patchVpnPeer,
   revealVpnPeerConfig, revokeVpnPeer, rotateVpnPeer,
   type VpnFlow, type VpnNodeStatus, type VpnPeer, type VpnPeerStatus,
 } from '../api/vpn'
-import { filterAgents, loadAgentsForSelection } from './token-form'
+import { filterAgents } from './token-form'
+import { useAgentIndex } from '../stores/agentIndex'
 import {
   isRevealConfirmation, maxPeerDescriptionLength, maxPeerNameLength, normalizeVpnExpiry,
   parseVpnCidrList, parseVpnPortList, vpnPatchFromForm, vpnPeerInputFromForm, type VpnPeerForm,
@@ -284,14 +286,12 @@ const statusOptions = computed(() => [
 // the page says the level is unknown instead of inventing one.
 const pool = ref<VpnNodeStatus | null>(null)
 
-const agents = ref<Agent[]>([])
-const agentsLoading = ref(false)
+const agentIndex = useAgentIndex()
+const agents = computed(() => agentIndex.agents)
+const agentsLoading = computed(() => agentIndex.status === 'loading')
 const agentFilter = ref('')
 const visibleAgents = computed(() => filterAgents(agents.value, agentFilter.value))
 function setAgentFilter(value: string) { agentFilter.value = value }
-function agentName(agentId: string) {
-  return agents.value.find(agent => agent.id === agentId)?.name || agentId || '—'
-}
 
 function statusKind(status: VpnPeerStatus) {
   if (status === 'active') return 'success'
@@ -427,15 +427,9 @@ async function load() {
 }
 
 async function loadAgents() {
-  if (agents.value.length) return
-  agentsLoading.value = true
-  try {
-    agents.value = await loadAgentsForSelection(getAgents)
-  } catch {
-    agents.value = []
-  } finally {
-    agentsLoading.value = false
-  }
+  // The store owns the "load once" rule and reports failure as `error`, which
+  // leaves the picker empty rather than half-filled.
+  await agentIndex.ensureLoaded()
 }
 
 function reload() { pageIndex.value = 0; cursors.value = ['']; void load(); void loadPool() }

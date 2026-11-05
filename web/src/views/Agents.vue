@@ -93,8 +93,12 @@ import ScriptRunDialog from '../components/ScriptRunDialog.vue'
 import { canRunScript } from '../utils/scriptRun'
 import TmIcon from '../components/icons/TmIcon.vue'
 import { createAgent, getAgents, updateAgent, type Agent } from '../api/client'
+import { useAgentIndex } from '../stores/agentIndex'
 
 const { t } = useI18n()
+// Every other console page labels agents from the shared index, so a rename
+// here has to re-pull it or those pages keep showing the old name.
+const agentIndex = useAgentIndex()
 const auth = useAuthStore()
 const items = ref<Agent[]>([])
 const loading = ref(false)
@@ -205,7 +209,7 @@ async function create() {
   try {
     await createAgent({ name: createName.value.trim(), enabled: createEnabled.value })
     createOpen.value = false
-    await load()
+    await Promise.all([load(), agentIndex.refresh()])
     ElMessage.success(t('agents.created'))
   } catch {
     ElMessage.error(t('agents.createFailed'))
@@ -253,7 +257,7 @@ async function saveEdit() {
     // shows, so a rename can never be interpreted as an implicit re-enable.
     await updateAgent(agent.id, { name, enabled })
     editOpen.value = false
-    await load()
+    await Promise.all([load(), agentIndex.refresh()])
     ElMessage.success(t('agents.updated'))
   } catch {
     ElMessage.error(t('agents.updateFailed'))

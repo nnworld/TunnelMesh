@@ -156,7 +156,12 @@ describe('agent list time and rename', () => {
       await flush()
 
       expect(updateAgent).toHaveBeenCalledWith('agent-newest', { name: 'renamed', enabled: true })
-      expect(getAgents).toHaveBeenCalledTimes(2)
+      // Other console pages label agents from the shared index, so a rename has
+      // to re-pull it or every one of them keeps showing the old name.
+      expect(getAgents).toHaveBeenCalledWith({ cursor: undefined, limit: 500 })
+      // Three pages: the list at mount, the list after the rename, and the
+      // index. Any further call would mean a reload nobody asked for.
+      expect(getAgents).toHaveBeenCalledTimes(3)
       expect(rows(container)[0].textContent).toContain('renamed')
     } finally {
       unmount()

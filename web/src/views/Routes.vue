@@ -28,7 +28,7 @@
         <el-table :data="items" row-key="id" @sort-change="onSortChange">
           <el-table-column prop="domain" :label="t('routes.domain')" min-width="220" sortable="custom" />
           <el-table-column prop="pathPrefix" :label="t('routes.path')" width="120" />
-          <el-table-column prop="agentId" :label="t('routes.agent')" min-width="180" />
+          <el-table-column :label="t('routes.agent')" min-width="180"><template #default="{ row }"><AgentRef :agent-id="row.agentId" /></template></el-table-column>
           <el-table-column prop="protocol" :label="t('routes.protocol')" width="110" />
           <!-- The proxy columns render only once a tp-* route exists, so a
                console that never uses the proxy entry keeps its narrow table
@@ -233,12 +233,14 @@ import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
+import AgentRef from '../components/AgentRef.vue'
 import {
-  createRoute, getAgents, listRoutes, updateRoute,
+  createRoute, listRoutes, updateRoute,
   type Agent, type ManagedRoute, type ManagedRouteCreateInput, type ManagedRouteUpdateInput,
 } from '../api/client'
 import { listCredentials, type Credential } from '../api/credentials'
-import { filterAgents, loadAgentsForSelection } from './token-form'
+import { filterAgents } from './token-form'
+import { useAgentIndex } from '../stores/agentIndex'
 
 const { t } = useI18n()
 const auth = useAuthStore()
@@ -257,8 +259,11 @@ const createOpen = ref(false)
 const editOpen = ref(false)
 const saving = ref(false)
 const editingRoute = ref<ManagedRoute | null>(null)
-const agents = ref<Agent[]>([])
-const agentsLoading = ref(false)
+// The form picker and the list columns read the one agent inventory the console
+// already keeps, instead of each view downloading its own copy.
+const agentIndex = useAgentIndex()
+const agents = computed(() => agentIndex.agents)
+const agentsLoading = computed(() => agentIndex.status === 'loading')
 const agentFilter = ref('')
 const idempotencyKey = ref('')
 const proxyCredentials = ref<Credential[]>([])
@@ -375,15 +380,11 @@ function next() { if (!nextCursor.value) return; cursors.value[pageIndex.value +
 function previous() { if (!pageIndex.value) return; pageIndex.value -= 1; void load() }
 function onSortChange(payload: { prop?: string; order?: 'ascending' | 'descending' | null }) { sort.value = payload.prop === 'domain' ? 'domain' : 'createdAt'; order.value = payload.order === 'ascending' ? 'asc' : 'desc'; reload() }
 
+// The index reports failure through its status rather than throwing, so the
+// form keeps its own message for a picker that came back empty.
 async function loadAgents() {
-  agentsLoading.value = true
-  try {
-    agents.value = await loadAgentsForSelection(getAgents)
-  } catch {
-    ElMessage.error(t('routes.agentLoadFailed'))
-  } finally {
-    agentsLoading.value = false
-  }
+  await agentIndex.ensureLoaded()
+  if (agentIndex.status === 'error') ElMessage.error(t('routes.agentLoadFailed'))
 }
 
 async function loadProxyCredentials() {

@@ -82,6 +82,20 @@ WebSSH 会话暴露以下指标。指标只包含状态、方向和稳定错误�
 （`auth.login.*`、`auth.mfa.*`、`auth.device.*`、`auth.oidc.provider.*`、`auth.policy.update`），
 而不是给指标加标签。
 
+## 客户端连接租约回收
+
+`client_connection_leases` 只有两条删除路径：客户端正常关闭 WebSocket 时按 `connection_id + connection_epoch` 释放，以及后台清扫。进程被杀、宿主掉电、网络硬中断都走不到前者，因此在引入清扫器之前，每一个意外退出的客户端都留下一行永不过期也永不删除的租约，而抽屉把它们全部当成「当前连接」显示。
+
+回收器（`internal/server/client_connection_sweeper.go`）每 **1 分钟**跑一次，启动时先立即跑一次，删除 `expires_at` 早于「当前时间减 24 小时」的行，每轮最多 1000 行。间隔、24 小时保留期和 1000 行批量都是编译期常量，不可配置。选择 select-ids-then-delete-by-PK 而不是 `DELETE ... LIMIT`，因为后者是 MySQL 专有语法，而两步式在 SQLite/MySQL 上都一样可中断、可续跑。每条语句都以时间戳为边界且幂等，所以集群里每个节点各跑一份是安全的，重复的一轮只会删 0 行并花费一次 `idx_client_connection_leases_expires` 索引扫描；这比引入分布式锁更可靠，代价只是每节点一次轻量扫描。
+
+- `tunnelmesh_client_connection_lease_sweep_total{result,error_class}`：每轮清扫一次计数，`result` 取 `ok`/`error`，`error_class` 复用全局归一化的错误类别。`result="error"` 持续非零意味着回收没在跑，死行会重新堆积。
+
+保留 24 小时而不是立刻删除，是为了让「昨天那个客户端为什么反复掉线」这类问题还能在详情抽屉里查到历史行；读取侧因此也默认只看未过期租约，`state=all` 是显式可选且有上限的视图（见[客户端运行观测](../user-guide/server-admin.md)）。
+
+日志只输出 `cutoff`、`reaped`、`elapsed_ms` 与错误，不含 connection ID、client instance ID 或 Token。清扫是后台聚合动作，因此不进审计日志：审计记录的是「谁做了什么」，而这里没有操作者。
+
+建议告警（起点值）：`sum(increase(tunnelmesh_client_connection_lease_sweep_total{result="error"}[15m])) > 3`——连续 15 分钟里多数轮次失败才算异常，单轮失败通常是数据库短暂不可达。
+
 ## Prometheus 抓取与规则
 
 只有 Server 暴露 `/metrics`；Agent 与 Client 没有本地 metrics 端点，它们的运行观测通过协议上报

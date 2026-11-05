@@ -93,12 +93,77 @@ func TestClientAPIDetailAndConnectionsExposeObservability(t *testing.T) {
 	}
 }
 
+// A Client that dies without a clean WS close leaves its lease row behind, so
+// the drawer used to fill up with rows that were already expired. The list read
+// is therefore live-only by default, and history is an explicit, capped view.
+func TestClientAPIConnectionsDefaultToLiveLeases(t *testing.T) {
+	test := newClientAPITest(t)
+	test.createClient(t, "client-instance-1", "owner-1", "client-local-1")
+	now := time.Now().UTC()
+	test.createConnectionAt("client-instance-1", "owner-1", "client_connection_1", 7, now, now.Add(time.Minute))
+	test.createConnectionAt("client-instance-1", "owner-1", "client_connection_2", 8, now.Add(-10*time.Minute), now.Add(-9*time.Minute))
+	test.createConnectionAt("client-instance-1", "owner-1", "client_connection_3", 9, now.Add(-20*time.Minute), now.Add(-19*time.Minute))
+
+	live := test.decodeConnections(t, test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections", "owner-1"))
+	if got := connectionIDs(live); len(got) != 1 || got[0] != "client_connection_1" {
+		t.Fatalf("default connections = %#v, want only the live lease", got)
+	}
+	if live.Data.Truncated {
+		t.Fatalf("default connections truncated = true, want false")
+	}
+
+	detail := test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1", "owner-1")
+	if detail.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, body = %s", detail.Code, detail.Body.String())
+	}
+	for _, want := range []string{`"activeConnections":1`, `"status":"online"`} {
+		if !strings.Contains(detail.Body.String(), want) {
+			t.Fatalf("detail view = %s, want %s", detail.Body.String(), want)
+		}
+	}
+
+	all := test.decodeConnections(t, test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections?state=all", "owner-1"))
+	if got := connectionIDs(all); len(got) != 3 || got[0] != "client_connection_1" {
+		t.Fatalf("state=all connections = %#v, want three newest-first", got)
+	}
+	if all.Data.Truncated {
+		t.Fatalf("state=all truncated = true, want false")
+	}
+
+	capped := test.decodeConnections(t, test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections?state=all&limit=1", "owner-1"))
+	if got := connectionIDs(capped); len(got) != 1 || got[0] != "client_connection_1" {
+		t.Fatalf("limit=1 connections = %#v, want the newest lease", got)
+	}
+	if !capped.Data.Truncated {
+		t.Fatalf("limit=1 truncated = false, want true")
+	}
+
+	invalidState := test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections?state=bogus", "owner-1")
+	if invalidState.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid state status = %d, want 422", invalidState.Code)
+	}
+	for _, allowed := range []string{`"live"`, `"all"`} {
+		if !strings.Contains(invalidState.Body.String(), allowed) {
+			t.Fatalf("invalid state body = %s, want allowlist containing %s", invalidState.Body.String(), allowed)
+		}
+	}
+
+	invalidLimit := test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections?limit=abc", "owner-1")
+	if invalidLimit.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid limit status = %d, want 422", invalidLimit.Code)
+	}
+}
+
 func TestClientAPIRejectsOtherOwner(t *testing.T) {
 	test := newClientAPITest(t)
 	test.createClient(t, "client-instance-1", "owner-1", "client-local-1")
 	detail := test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1", "owner-2")
 	if detail.Code != http.StatusForbidden {
 		t.Fatalf("detail status = %d, want 403", detail.Code)
+	}
+	connections := test.requestAsUser(http.MethodGet, "/api/v1/clients/client-instance-1/connections?state=all", "owner-2")
+	if connections.Code != http.StatusForbidden {
+		t.Fatalf("connections status = %d, want 403", connections.Code)
 	}
 	closeResponse := test.requestAsUser(http.MethodDelete, "/api/v1/clients/client-instance-1/connections/client_connection_1?connectionEpoch=7", "owner-2")
 	if closeResponse.Code != http.StatusForbidden {
@@ -149,14 +214,47 @@ func newClientAPITest(t *testing.T) *clientAPITest {
 
 func (test *clientAPITest) createConnection(clientInstanceID, ownerKey, connectionID string, epoch int64) {
 	now := time.Now().UTC()
+	test.createConnectionAt(clientInstanceID, ownerKey, connectionID, epoch, now, now.Add(time.Minute))
+}
+
+// createConnectionAt writes a lease with explicit heartbeat and expiry
+// timestamps, so a test can model history instead of only a live connection.
+func (test *clientAPITest) createConnectionAt(clientInstanceID, ownerKey, connectionID string, epoch int64, updatedAt, expiresAt time.Time) {
 	lease := storage.ClientConnectionLease{
 		ConnectionID: connectionID, ClientInstanceID: clientInstanceID, TokenID: "token-1",
 		OwnerUserID: test.users[ownerKey].ID, ServerNodeID: "server-1", ConnectionEpoch: epoch,
-		ActiveStreams: 3, HealthScore: 100, AcquiredAt: now, ExpiresAt: now.Add(time.Minute), UpdatedAt: now,
+		ActiveStreams: 3, HealthScore: 100, AcquiredAt: updatedAt.Add(-time.Minute),
+		ExpiresAt: expiresAt, UpdatedAt: updatedAt,
 	}
 	if _, err := test.db.ClientConnections().Register(context.Background(), lease); err != nil {
 		panic(err)
 	}
+}
+
+type clientConnectionsPayload struct {
+	Data struct {
+		Connections []struct {
+			ConnectionID string `json:"connectionId"`
+		} `json:"connections"`
+		Truncated bool `json:"truncated"`
+	} `json:"data"`
+}
+
+func (test *clientAPITest) decodeConnections(t *testing.T, response *httptest.ResponseRecorder) clientConnectionsPayload {
+	t.Helper()
+	var payload clientConnectionsPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode connections: %v (%s)", err, response.Body.String())
+	}
+	return payload
+}
+
+func connectionIDs(payload clientConnectionsPayload) []string {
+	ids := make([]string, 0, len(payload.Data.Connections))
+	for _, connection := range payload.Data.Connections {
+		ids = append(ids, connection.ConnectionID)
+	}
+	return ids
 }
 
 func (t *clientAPITest) requestAsUser(method, path, userKey string) *httptest.ResponseRecorder {

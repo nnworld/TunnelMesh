@@ -11,6 +11,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AgentRef: typeof import('./components/AgentRef.vue')['default']
     BrandMark: typeof import('./components/BrandMark.vue')['default']
     CodeBlock: typeof import('./components/CodeBlock.vue')['default']
     CommandPalette: typeof import('./components/CommandPalette.vue')['default']

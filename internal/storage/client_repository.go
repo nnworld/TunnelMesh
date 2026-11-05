@@ -368,37 +368,125 @@ func (r *clientConnectionRepo) List(ctx context.Context, filter ClientConnection
 	return page, nil
 }
 
-func (r *clientConnectionRepo) ListByInstance(ctx context.Context, clientInstanceID string) ([]ClientConnectionLease, error) {
-	return r.ListByInstances(ctx, []string{clientInstanceID})
+// clientConnectionLiveCondition is the single definition of "this lease still
+// counts": every reader that shows current connections has to use it, because a
+// second copy drifts the moment the TTL rule changes.
+func clientConnectionLiveCondition(now time.Time) (string, any) {
+	return `expires_at>?`, tm(now)
 }
 
-func (r *clientConnectionRepo) ListByInstances(ctx context.Context, clientInstanceIDs []string) ([]ClientConnectionLease, error) {
+// DefaultClientConnectionDeleteBatch bounds one reaping pass so the helper can
+// never turn into the unbounded delete it exists to prevent: the first sweep
+// after a long upgrade can face tens of thousands of rows, and a single big
+// DELETE would lock a table the management API is still writing to.
+const DefaultClientConnectionDeleteBatch = 1000
+
+// DeleteExpired reaps leases whose expires_at is at or before the cutoff, at
+// most limit rows per call, and reports how many rows it removed.
+//
+// Release by id+epoch is the only other delete, and it needs a Client that shut
+// down cooperatively; every crash, power loss and dropped network leaves a row
+// whose only remaining fact is a timestamp. Rows exactly at the cutoff count as
+// expired, matching MarkExpired and PurgeUnreported.
+//
+// Ids are selected first and deleted by primary key instead of `DELETE ...
+// LIMIT`, which is MySQL-only. The two-step form is also what makes a first pass
+// over a never-pruned table resumable: each batch is short, so an interruption
+// leaves a smaller table rather than a rolled-back one. It is idempotent, so
+// every Server node may run its own pass without a distributed lock.
+func (r *clientConnectionRepo) DeleteExpired(ctx context.Context, at time.Time, limit int) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("client connection repository is unavailable")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if limit <= 0 {
+		limit = DefaultClientConnectionDeleteBatch
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT connection_id FROM client_connection_leases WHERE expires_at<=? ORDER BY expires_at,connection_id LIMIT ?`, tm(at), limit)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	res, err := r.db.ExecContext(ctx, `DELETE FROM client_connection_leases WHERE connection_id IN (`+placeholders(len(ids))+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (r *clientConnectionRepo) ListByInstance(ctx context.Context, clientInstanceID string, liveOnly bool, limit int) ([]ClientConnectionLease, error) {
+	return r.ListByInstances(ctx, []string{clientInstanceID}, liveOnly, limit)
+}
+
+// ListByInstances reads leases for several instances in one query. liveOnly
+// restricts the read to leases that still count; limit caps rows per instance
+// (zero means no cap) because one instance's history must not starve the
+// others on a shared page. The cap is applied per instance in Go rather than in
+// SQL: no portable "LIMIT per group" form exists, and the row order the query
+// already guarantees makes the truncation a counter.
+func (r *clientConnectionRepo) ListByInstances(ctx context.Context, clientInstanceIDs []string, liveOnly bool, limit int) ([]ClientConnectionLease, error) {
 	if len(clientInstanceIDs) == 0 {
 		return nil, nil
 	}
 	if len(clientInstanceIDs) > 500 {
 		clientInstanceIDs = clientInstanceIDs[:500]
 	}
-	placeholders := make([]string, len(clientInstanceIDs))
-	args := make([]any, len(clientInstanceIDs))
-	for i, id := range clientInstanceIDs {
-		placeholders[i] = "?"
-		args[i] = id
+	args := make([]any, 0, len(clientInstanceIDs)+1)
+	for _, id := range clientInstanceIDs {
+		args = append(args, id)
+	}
+	query := `SELECT ` + clientConnectionColumns + ` FROM client_connection_leases WHERE client_instance_id IN (` + placeholders(len(clientInstanceIDs)) + `)`
+	if liveOnly {
+		condition, arg := clientConnectionLiveCondition(time.Now().UTC())
+		query += ` AND ` + condition
+		args = append(args, arg)
 	}
 	// Grouped by instance so one batch serves every row of the list page, and
 	// newest heartbeat first inside an instance because the drawer renders these
 	// rows as the Client's live connections: an idle lease from hours ago must
 	// not sit above the one carrying traffic now.
-	rows, err := r.db.QueryContext(ctx, `SELECT `+clientConnectionColumns+` FROM client_connection_leases WHERE client_instance_id IN (`+strings.Join(placeholders, `,`)+`) ORDER BY client_instance_id,updated_at DESC,connection_id`, args...)
+	query += ` ORDER BY client_instance_id,updated_at DESC,connection_id`
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ClientConnectionLease
+	perInstance := make(map[string]int, len(clientInstanceIDs))
 	for rows.Next() {
 		lease, err := scanClientConnectionRows(rows)
 		if err != nil {
 			return nil, err
+		}
+		if limit > 0 {
+			if perInstance[lease.ClientInstanceID] >= limit {
+				continue
+			}
+			perInstance[lease.ClientInstanceID]++
 		}
 		out = append(out, lease)
 	}
@@ -497,8 +585,9 @@ func clientConnectionConditions(filter ClientConnectionFilter, now time.Time) ([
 		args = append(args, filter.ServerNodeID)
 	}
 	if !filter.IncludeExpired {
-		conditions = append(conditions, `expires_at>?`)
-		args = append(args, tm(now))
+		condition, arg := clientConnectionLiveCondition(now)
+		conditions = append(conditions, condition)
+		args = append(args, arg)
 	}
 	return conditions, args
 }

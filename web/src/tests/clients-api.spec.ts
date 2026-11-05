@@ -12,14 +12,35 @@ describe('clients API', () => {
   })
 
   it('reads client detail and connections', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { connections: [] } }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { connections: [], truncated: false } }) })
     vi.stubGlobal('fetch', fetchMock)
 
     await getClientDetail('client/one')
-    await listClientConnections('client/one')
+    const view = await listClientConnections('client/one')
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/v1/clients/client%2Fone', expect.anything())
+    // The default request carries no view parameters: the server default is the
+    // live-lease view, and duplicating it in the console would let the two drift.
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/v1/clients/client%2Fone/connections', expect.anything())
+    expect(view).toEqual({ connections: [], truncated: false })
+  })
+
+  it('asks for lease history with state and limit', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { connections: [], truncated: true } }) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listClientConnections('client/one', { state: 'all', limit: 20 })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/clients/client%2Fone/connections?state=all&limit=20', expect.anything())
+  })
+
+  it('leaves out a limit that was not chosen', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { connections: [], truncated: false } }) })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listClientConnections('client/one', { state: 'live' })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/clients/client%2Fone/connections?state=live', expect.anything())
   })
 
   it('closes one exact client connection', async () => {

@@ -436,3 +436,120 @@ func assertClientInstanceIDs(t *testing.T, items []ClientInstance, want ...strin
 		}
 	}
 }
+
+// putClientLeaseAt registers one lease with explicit timestamps, so a test can
+// describe an ordering the helpers with a fixed UpdatedAt cannot: the per
+// instance history limit is defined by "newest heartbeat first".
+// sameLeaseIDs compares two id lists in order: the order is the assertion here,
+// because the per instance limit keeps the newest heartbeats.
+func sameLeaseIDs(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func putClientLeaseAt(t *testing.T, db *DB, connectionID, clientInstanceID string, expiresAt, heartbeat time.Time) {
+	t.Helper()
+	lease := ClientConnectionLease{
+		ConnectionID: connectionID, ClientInstanceID: clientInstanceID, TokenID: "token-" + connectionID,
+		OwnerUserID: "owner-1", ServerNodeID: "server-1", ConnectionEpoch: 1,
+		AcquiredAt: heartbeat.Add(-time.Hour), ExpiresAt: expiresAt, UpdatedAt: heartbeat,
+	}
+	if _, err := db.ClientConnections().Register(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func clientLeaseIDs(t *testing.T, db *DB, ids []string, liveOnly bool, limit int) []string {
+	t.Helper()
+	leases, err := db.ClientConnections().ListByInstances(context.Background(), ids, liveOnly, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(leases))
+	for _, lease := range leases {
+		out = append(out, lease.ConnectionID)
+	}
+	return out
+}
+
+// Release by id+epoch is the only delete a well behaved Client triggers. A
+// process that is killed, a host that loses power and a network that drops all
+// leave the row behind forever, so reaping has to be bounded in time rather
+// than in caller cooperation. The boundary is inclusive: a lease whose
+// expires_at equals the cutoff is already expired, which is the same reading
+// MarkExpired and PurgeUnreported use.
+func TestClientConnectionDeleteExpiredRemovesOnlyLapsedBounded(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	cutoff := now.Add(-24 * time.Hour)
+	putClientLeaseAt(t, db, "lapsed-old", "ci-1", cutoff.Add(-3*time.Hour), now)
+	putClientLeaseAt(t, db, "lapsed-mid", "ci-1", cutoff.Add(-2*time.Hour), now)
+	putClientLeaseAt(t, db, "lapsed-new", "ci-1", cutoff.Add(-1*time.Hour), now)
+	putClientLeaseAt(t, db, "at-cutoff", "ci-1", cutoff, now)
+	putClientLeaseAt(t, db, "still-live", "ci-1", cutoff.Add(time.Hour), now)
+
+	reaped, err := db.ClientConnections().DeleteExpired(ctx, cutoff, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 2 {
+		t.Fatalf("first batch reaped = %d, want 2", reaped)
+	}
+	reaped, err = db.ClientConnections().DeleteExpired(ctx, cutoff, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 2 {
+		t.Fatalf("second batch reaped = %d, want 2", reaped)
+	}
+	// Nothing left matches the cutoff, and the live lease survived both passes.
+	reaped, err = db.ClientConnections().DeleteExpired(ctx, cutoff, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 0 {
+		t.Fatalf("third pass reaped = %d, want 0", reaped)
+	}
+	if got := clientLeaseIDs(t, db, []string{"ci-1"}, false, 0); len(got) != 1 || got[0] != "still-live" {
+		t.Fatalf("remaining leases = %#v, want [still-live]", got)
+	}
+}
+
+func TestClientConnectionListByInstanceLiveOnlyAndPerInstanceLimit(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	putClientLeaseAt(t, db, "ci1-live", "ci-1", now.Add(time.Minute), now)
+	putClientLeaseAt(t, db, "ci1-old", "ci-1", now.Add(-30*time.Minute), now.Add(-30*time.Minute))
+	putClientLeaseAt(t, db, "ci1-older", "ci-1", now.Add(-60*time.Minute), now.Add(-60*time.Minute))
+	putClientLeaseAt(t, db, "ci2-live", "ci-2", now.Add(time.Minute), now.Add(-time.Second))
+	putClientLeaseAt(t, db, "ci2-expired", "ci-2", now.Add(-5*time.Minute), now.Add(-5*time.Minute))
+
+	live, err := db.ClientConnections().ListByInstance(ctx, "ci-1", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].ConnectionID != "ci1-live" {
+		t.Fatalf("live leases = %#v, want only ci1-live", live)
+	}
+
+	// The limit is per instance, not per query: one batch serves a whole list
+	// page and a global cap would starve every instance after the first.
+	if got := clientLeaseIDs(t, db, []string{"ci-1", "ci-2"}, false, 1); !sameLeaseIDs(got, []string{"ci1-live", "ci2-live"}) {
+		t.Fatalf("capped batch = %#v, want [ci1-live ci2-live]", got)
+	}
+	if got := clientLeaseIDs(t, db, []string{"ci-1", "ci-2"}, false, 0); len(got) != 5 {
+		t.Fatalf("uncapped batch = %#v, want all five rows", got)
+	}
+	if got := clientLeaseIDs(t, db, []string{"ci-1", "ci-2"}, true, 0); !sameLeaseIDs(got, []string{"ci1-live", "ci2-live"}) {
+		t.Fatalf("live batch = %#v, want the two unexpired rows", got)
+	}
+}

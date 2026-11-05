@@ -339,9 +339,16 @@ type ClientConnectionRepository interface {
 	Get(context.Context, string) (ClientConnectionLease, error)
 	Renew(context.Context, string, int64, time.Duration) error
 	Release(context.Context, string, int64) error
+	// DeleteExpired reaps at most limit leases whose expires_at is at or before
+	// at (zero means now) and returns how many rows it removed. The cutoff, not
+	// the caller's cooperation, decides what goes: a Client that died without a
+	// Release leaves a row that only time can retire.
+	DeleteExpired(context.Context, time.Time, int) (int64, error)
 	List(context.Context, ClientConnectionFilter, string, int) (Page[ClientConnectionLease], error)
-	ListByInstance(context.Context, string) ([]ClientConnectionLease, error)
-	ListByInstances(context.Context, []string) ([]ClientConnectionLease, error)
+	// ListByInstance(s) read current leases when liveOnly is set; limit caps rows
+	// per instance and zero means no cap.
+	ListByInstance(context.Context, string, bool, int) ([]ClientConnectionLease, error)
+	ListByInstances(context.Context, []string, bool, int) ([]ClientConnectionLease, error)
 	UpdateStats(context.Context, ClientConnectionLease) error
 }
 

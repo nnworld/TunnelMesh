@@ -27,7 +27,11 @@
             </el-select>
           </el-form-item>
           <el-form-item :label="t('clients.agent')">
-            <el-input v-model="filters.agentId" :placeholder="t('clients.agent')" clearable />
+            <!-- The list filters on the exact agent id, so the control searches
+                 by name and still submits the id. -->
+            <el-select v-model="filters.agentId" filterable clearable :loading="agentIndex.status === 'loading'" :filter-method="setAgentFilter" :placeholder="t('clients.searchAgents')" @visible-change="openAgentFilter">
+              <el-option v-for="agent in visibleAgents" :key="agent.id" :label="`${agent.name} · ${agent.id}`" :value="agent.id" />
+            </el-select>
           </el-form-item>
           <el-form-item :label="t('clients.keyword')">
             <el-input v-model="filters.keyword" :placeholder="t('clients.keyword')" clearable />
@@ -103,7 +107,14 @@
             <el-descriptions-item :label="t('clients.processStartAt')">{{ formatDate(detailClient.processStartAt) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.lastSeen')">{{ formatDate(detailClient.lastSeenAt) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.tokens')">{{ formatList(detailClient.tokenIds) }}</el-descriptions-item>
-            <el-descriptions-item :label="t('clients.agents')">{{ formatList(detailClient.agentIds) }}</el-descriptions-item>
+            <el-descriptions-item :label="t('clients.agents')">
+              <span class="agent-refs">
+                <AgentRef v-for="agentId in detailClient.agentIds" :key="agentId" :agent-id="agentId" />
+                <!-- The component owns the empty rendering, so an instance with
+                     no agent shows the same dash as any other empty reference. -->
+                <AgentRef v-if="!detailClient.agentIds?.length" :agent-id="''" />
+              </span>
+            </el-descriptions-item>
             <el-descriptions-item :label="t('clients.serverNodes')">{{ formatList(detailClient.serverNodeIds) }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.activeConnections')">{{ detailClient.activeConnections }}</el-descriptions-item>
             <el-descriptions-item :label="t('clients.activeStreams')">{{ detailClient.activeStreams }}</el-descriptions-item>
@@ -121,14 +132,24 @@
           <el-table :data="detailClient.listeners" class="section-table">
             <el-table-column prop="protocol" :label="t('clients.protocol')" width="100" />
             <el-table-column prop="listenAddress" :label="t('clients.listenAddress')" min-width="170" />
-            <el-table-column prop="agentId" :label="t('clients.agent')" min-width="180" />
+            <el-table-column :label="t('clients.agent')" min-width="180"><template #default="{ row }"><AgentRef :agent-id="row.agentId" /></template></el-table-column>
             <el-table-column :label="t('clients.enabled')" width="100"><template #default="{ row }">{{ row.enabled ? t('common.yes') : t('common.no') }}</template></el-table-column>
             <template #empty>{{ t('clients.listenersEmpty') }}</template>
           </el-table>
 
           <div class="connection-header">
             <div class="section-title">{{ t('clients.connections') }}</div>
-            <el-button :loading="connectionsLoading" @click="loadConnections">{{ t('clients.refresh') }}</el-button>
+            <div class="connection-controls">
+              <div class="connection-history">
+                <el-switch v-model="showExpiredLeases" @change="toggleLeaseHistory" />
+                <span>{{ t('clients.showExpiredLeases') }}</span>
+              </div>
+              <el-button :loading="connectionsLoading" @click="loadConnections">{{ t('clients.refresh') }}</el-button>
+            </div>
+          </div>
+          <div v-if="connectionsTruncated" class="connection-truncated">
+            <span>{{ t('clients.connectionsTruncated', { count: connectionsLimit }) }}</span>
+            <el-button v-if="connectionsLimit < maxConnectionsWindow" link type="primary" @click="loadMoreConnections">{{ t('clients.loadMore') }}</el-button>
           </div>
           <el-alert v-if="connectionsError" type="error" :title="t('clients.connectionsLoadFailed')" show-icon :closable="false" class="connection-error" />
           <el-table v-else :data="connections" class="section-table" v-loading="connectionsLoading">
@@ -187,9 +208,12 @@ import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/PageHeader.vue'
 import DataState from '../components/DataState.vue'
 import StatusTag from '../components/StatusTag.vue'
+import AgentRef from '../components/AgentRef.vue'
+import { filterAgents } from './token-form'
+import { useAgentIndex } from '../stores/agentIndex'
 import { useFormatDateTime } from '../i18n/format'
 import { useAuthStore } from '../stores/auth'
-import { APIError, closeClientConnection, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientInstance, type ClientMetadataState, type ClientListSummary, type ClientStatus } from '../api/client'
+import { APIError, closeClientConnection, getClientDetail, listClientConnections, listClients, type ClientConnection, type ClientConnectionsView, type ClientInstance, type ClientMetadataState, type ClientListSummary, type ClientStatus } from '../api/client'
 
 const { t } = useI18n()
 const auth = useAuthStore()
@@ -203,6 +227,15 @@ const pageIndex = ref(0)
 const pageCursors = ref<string[]>([''])
 const sort = ref('lastSeenAt')
 const order = ref<'asc' | 'desc'>('desc')
+// The shared index answers both the filter options and every AgentRef in the
+// drawer, so one page of agents serves the whole view.
+const agentIndex = useAgentIndex()
+const agentFilter = ref('')
+const visibleAgents = computed(() => filterAgents(agentIndex.agents, agentFilter.value))
+function setAgentFilter(query: string) { agentFilter.value = query }
+// Opening the picker is the only moment the filter needs the inventory: a
+// console that never touches it does not pay for the list request.
+function openAgentFilter(visible: boolean) { if (visible) void agentIndex.ensureLoaded() }
 const filters = reactive({ ownerUserId: '', tokenId: '', serverNodeId: '', status: '' as '' | ClientStatus, metadataState: '' as '' | ClientMetadataState, agentId: '', keyword: '' })
 // Counters are the server's whole-population aggregate for the active filter.
 // Deriving them from the loaded rows is what made the cards disagree with the
@@ -215,6 +248,15 @@ const detailClient = ref<ClientInstance | null>(null)
 const connections = ref<ClientConnection[]>([])
 const connectionsLoading = ref(false)
 const connectionsError = ref(false)
+// The server returns live leases unless history is asked for, and caps one
+// response so a Client that never released its leases cannot stream its whole
+// past into the drawer. These mirror clientConnectionsDefaultLimit/MaxLimit in
+// internal/server/client_api.go, which is where the window is enforced.
+const defaultConnectionsWindow = 50
+const maxConnectionsWindow = 200
+const showExpiredLeases = ref(false)
+const connectionsLimit = ref(defaultConnectionsWindow)
+const connectionsTruncated = ref(false)
 // Lease liveness is judged against one fixed baseline per drawer load rather
 // than Date.now() at render time, so a row cannot flip state mid-render and the
 // predicate stays identical for the tag and for the Close action guard.
@@ -304,10 +346,10 @@ async function showDetail(row: ClientInstance) {
   detailVisible.value = true; detailLoading.value = true; detailError.value = false
   detailClient.value = row; connections.value = []; connectionsError.value = false; connectionsLoading.value = true
   connectionsNow.value = Date.now()
+  showExpiredLeases.value = false; connectionsLimit.value = defaultConnectionsWindow; connectionsTruncated.value = false
   try {
-    const [client, clientConnections] = await Promise.all([getClientDetail(row.id), listClientConnections(row.id)])
+    const [client] = await Promise.all([getClientDetail(row.id), loadConnections()])
     detailClient.value = client
-    connections.value = clientConnections
   } catch {
     detailError.value = true
   } finally {
@@ -319,13 +361,28 @@ async function retryDetail() {
   if (detailClient.value) await showDetail(detailClient.value)
 }
 
-async function loadConnections() {
-  if (!detailClient.value) return
+// loadConnections answers for both the drawer's first paint and its refresh, so
+// it returns the view instead of only writing it into refs.
+async function loadConnections(): Promise<ClientConnectionsView> {
+  if (!detailClient.value) return { connections: [], truncated: false }
   connectionsLoading.value = true; connectionsError.value = false
   connectionsNow.value = Date.now()
-  try { connections.value = await listClientConnections(detailClient.value.id) }
-  catch { connectionsError.value = true }
+  try {
+    const view = await listClientConnections(detailClient.value.id, { state: showExpiredLeases.value ? 'all' : 'live', limit: connectionsLimit.value })
+    connections.value = view.connections
+    connectionsTruncated.value = view.truncated
+    return view
+  }
+  catch { connectionsError.value = true; return { connections: [], truncated: false } }
   finally { connectionsLoading.value = false }
+}
+
+// History is a different question from presence, so switching views starts a
+// fresh window rather than keeping the one chosen for the other view.
+function toggleLeaseHistory() { connectionsLimit.value = defaultConnectionsWindow; void loadConnections() }
+function loadMoreConnections() {
+  connectionsLimit.value = Math.min(connectionsLimit.value * 2, maxConnectionsWindow)
+  void loadConnections()
 }
 
 function openCloseConnection(connection: ClientConnection) {
@@ -366,6 +423,7 @@ onMounted(load)
 
 <style scoped>
 .filter-form { margin-bottom: 18px; }
+.agent-refs { display: inline-flex; flex-wrap: wrap; gap: var(--tm-s-2) var(--tm-s-3); }
 .filter-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
 .filter-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
 .summary-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
@@ -376,6 +434,9 @@ onMounted(load)
 .section-title { margin-top:4px; font-size:15px; font-weight:650; }
 .section-table { width:100%; }
 .connection-header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.connection-controls { display:flex; align-items:center; gap:16px; }
+.connection-history { display:flex; align-items:center; gap:8px; color:var(--tm-muted); font-size:13px; }
+.connection-truncated { display:flex; align-items:center; gap:12px; margin-bottom:8px; color:var(--tm-muted); font-size:13px; }
 .connection-error { margin-bottom:12px; }
 .close-warning { margin:14px 0 0; color:var(--tm-muted); }
 .pager { display:flex; justify-content:center; padding:18px 0 4px; }

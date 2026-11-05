@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { readFileSync } from 'node:fs'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import VpnPeers from '../views/VpnPeers.vue'
 import { i18n } from '../i18n'
 import zhCN from '../i18n/messages/zh-CN'
@@ -52,6 +53,7 @@ async function mountVpn() {
   setActivePinia(pinia)
   const app = createApp(VpnPeers)
   app.use(pinia)
+  app.use(createRouter({ history: createMemoryHistory(), routes: [{ path: '/agents/:id', component: { render: () => null } }] }))
   app.use(i18n)
   app.mount(container)
   await flush()
@@ -85,6 +87,30 @@ beforeEach(() => {
 })
 
 describe('vpn peers console', () => {
+  // The egress agent is the row an operator scans for, and the peer page used to
+  // print either a bare id or a name with no way back to the agent. Both the
+  // list and the drawer now name it and link it; the id stays in the title
+  // because agent names are not unique.
+  it('names and links the egress agent in the list and the drawer', async () => {
+    stubVpn()
+    const { container, unmount } = await mountVpn()
+    try {
+      const link = container.querySelector('.el-table a.agent-ref') as HTMLAnchorElement | null
+      expect(link?.textContent).toBe('edge-1')
+      expect(link?.getAttribute('href')).toBe('/agents/a-1')
+      expect(link?.getAttribute('title')).toBe('a-1')
+      await clickButton(t('vpn.detail'), container)
+      const drawerLink = document.querySelector('.el-drawer a.agent-ref') as HTMLAnchorElement | null
+      expect(drawerLink?.textContent).toBe('edge-1')
+      expect(drawerLink?.getAttribute('href')).toBe('/agents/a-1')
+      // The per-view name lookup is gone: the shared index owns that job.
+      const source = readFileSync('src/views/VpnPeers.vue', 'utf8')
+      expect(source).toContain('<AgentRef')
+      expect(source).not.toContain('agentName(row.agentId)')
+    } finally { unmount() }
+  })
+
+
   it('lists peers without a standing disclaimer about a missing data plane', async () => {
     stubVpn()
     const { container, unmount } = await mountVpn()
