@@ -13,7 +13,8 @@ WorkingDirectory=/var/lib/tunnelmesh-agent
 EnvironmentFile=-/etc/tunnelmesh/agent.env
 ExecStartPre=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml check-config
 ExecStart=/usr/local/bin/tunnelmesh-agent --config /etc/tunnelmesh/agent.yaml run
-Restart=on-failure
+# 长驻服务不以退出码表达意图：会话意外结束同样可能带 0 退出，所以任何自行退出都要拉起。
+Restart=always
 RestartSec=5s
 # 78 是配置错误，77 是凭据被永久拒绝：重启修不好它们，不应被 systemd 无限拉起。
 RestartPreventExitStatus=78 77
