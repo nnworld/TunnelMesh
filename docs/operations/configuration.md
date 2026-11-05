@@ -516,11 +516,15 @@ client:                    # agent.update.* 的结构完全相同
 
 | 退出码 | 含义 | systemd 是否重启 |
 |---|---|---|
-| 0 | 正常停止 | 否 |
+| 0 | 正常停止 | 是（client/agent 用 `Restart=always`）；`systemctl stop` 是停止任务，不会重启 |
 | 70 | supervisor 放弃（worker 反复崩溃且从未就绪） | 是 |
 | 75 | `client.lock` 被占用（重启时的正常现象，supervisor 会自行重试） | - |
 | 77 | 凭据被永久拒绝 | 否（`RestartPreventExitStatus`） |
 | 78 | 配置错误 | 否（`RestartPreventExitStatus`） |
+
+退出码 0 不再被当作“进程自愿结束”的证据：会话角色被意外拆掉时，worker 与 supervisor 都可能是 0 退出，
+因此 client/agent 的单元使用 `Restart=always`，把“拉起”交给服务管理器而不是退出码，只靠
+`RestartPreventExitStatus=78 77` 挡住重启修不好的两类错误。`server` 仍用 `Restart=on-failure`。
 
 **状态目录**
 

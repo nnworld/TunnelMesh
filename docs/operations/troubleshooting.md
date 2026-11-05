@@ -120,6 +120,14 @@ SELECT COUNT(DISTINCT connection_epoch) AS distinct_epochs, COUNT(*) AS rows_tot
 
 全链路探针可通过 `POST /api/v1/agents/{agentId}/diagnose` 发起 TCP/HTTP/UDP 诊断，并通过 `GET /api/v1/agents/{agentId}/probes` 查看受限结果摘要；目标响应体不会被保存或返回。详见 [全链路网络探针](network-probes.md)。
 
+## Client 隧道突然全部不可用，但服务显示“正常停止”
+
+- 症状：本地监听端口全部消失，`systemctl status tunnelmesh-client` 显示 `inactive (dead)`，退出记录是 `Deactivated successfully`，`NRestarts=0`；日志尾部是一批 `client: tcp forward bridge failed: ... client session closed`，而 supervisor 没有 `worker exited; restarting`。
+- 判别：`systemctl show tunnelmesh-client -p Result -p ExecMainStatus -p NRestarts`。`Result=success` 且 `ExecMainStatus=0` 说明进程以 0 退出，`Restart=on-failure` 不会拉起——`enabled` 只决定开机自启，与进程退出后的拉起无关。
+- 已修复的形态：连接池缩容曾把被取消 slot 的 `context.Canceled` 当成链路终止故障，连带拆除整个连接池并让进程 0 退出。现在缩容不再终止连接池，任何“没人要求停止而角色已退出”都会以 `client: tunnel session ended while the client was still running` 非 0 退出，supervisor 退避重启 worker。
+- 适用范围：只有显式配置 `client.connections.max > min` 的 Client 会命中该窗口（默认 `max=1` 永不缩容）。
+- 应急：`systemctl restart tunnelmesh-client` 恢复；若单元仍是 `Restart=on-failure`，加 drop-in 写 `Restart=always` 并保留 `RestartPreventExitStatus=78 77`。长期暴露的 SSH 端口会持续被公网扫描，这类 burst→idle 抖动是主要触发源，收紧 `allow_remote` 与来源 ACL 能降低频率。
+
 ## 集群连接查询或关闭失败
 
 - 看不到远端连接：确认所有 Server 都已升级到支持连接租约的版本，`node.id` 唯一且稳定，`server.relay.enabled=true`，集群时间同步。
