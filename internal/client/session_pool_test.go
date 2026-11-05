@@ -365,6 +365,80 @@ func TestSessionPoolScalesUpAndDown(t *testing.T) {
 	}
 }
 
+// TestSessionPoolScaleDownDoesNotStopPool pins that shrinking the pool is a
+// capacity decision rather than a dead connection.
+//
+// The canceled slot's runner sees the same context error in both cases, so a
+// scale-down used to be reported as a terminal pool failure: every session went
+// with it, the run ended without an error, and `client run` exited successfully
+// with all of its tunnels silently unlistening.
+func TestSessionPoolScaleDownDoesNotStopPool(t *testing.T) {
+	calls := make(chan *poolTestTransport, 4)
+	manager := NewSessionPoolManager(SessionPoolManagerOptions{
+		ServerURL: "ws://server.example/ws/client",
+		Token:     "client-secret",
+		Config: SessionPoolConfig{
+			Min: 1, Max: 2, HighWatermark: 1, LowWatermark: 0,
+			EvaluationInterval: 10 * time.Millisecond, Cooldown: 10 * time.Millisecond,
+		},
+		Runner: newPoolTestRunner(calls),
+	})
+	opener := manager.Opener("agent-a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+
+	first := waitPoolTransport(t, calls)
+	stream, err := opener.OpenStream(ctx, StreamRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 3000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-first.sent
+	waitForCondition(t, time.Second, func() bool { return manager.OpenCount("agent-a") == 2 })
+	second := waitPoolTransport(t, calls)
+	if second == first {
+		t.Fatal("scale-up reused the first transport")
+	}
+
+	// Closing the only active stream leaves every session at or below the low
+	// watermark, so the next evaluation drops the newest slot. The slot count alone
+	// would also be satisfied by the pool tearing itself down, so the check that the
+	// run is still alive is what carries the guarantee.
+	_ = stream.Close()
+	waitForCondition(t, 2*time.Second, func() bool { return manager.OpenCount("agent-a") <= 1 })
+
+	select {
+	case err := <-done:
+		t.Fatalf("Run() returned after a scale-down: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if got := manager.OpenCount("agent-a"); got != 1 {
+		t.Fatalf("OpenCount after scale-down = %d, want the pool to keep one slot", got)
+	}
+	if got := manager.ReadyCount("agent-a"); got != 1 {
+		t.Fatalf("ReadyCount after scale-down = %d, want the surviving session ready", got)
+	}
+
+	reopened, err := opener.OpenStream(ctx, StreamRequest{AgentID: "agent-a", Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 3001})
+	if err != nil {
+		t.Fatalf("OpenStream after scale-down: %v", err)
+	}
+	_ = reopened.Close()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop after context cancellation")
+	}
+}
+
 func TestSessionPoolReconnectsWithoutReplacingOpener(t *testing.T) {
 	ready := make(chan *poolTestTransport, 2)
 	runner := func(ctx context.Context, _, _ string, onReady func(*Session) error, _ WebSocketRunOptions) error {

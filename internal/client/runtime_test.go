@@ -459,6 +459,46 @@ func TestRuntimeStopEndsWait(t *testing.T) {
 	}
 }
 
+// TestRuntimeWaitFailsWhenSessionRoleEndsUnexpectedly keeps a session role that
+// stops on its own from being reported as a clean stop.
+//
+// The role can come back with a context error while nobody asked the run to finish,
+// and reporting success there is what let `client run` exit 0 with every tunnel
+// unlistening: nothing downstream had a failure to react to.
+func TestRuntimeWaitFailsWhenSessionRoleEndsUnexpectedly(t *testing.T) {
+	var stdout bytes.Buffer
+	rt, err := NewRuntimeFromConfig(context.Background(), runtimeTestConfig(
+		config.TunnelConfig{Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22},
+	), RuntimeOptions{
+		Stdout:   &stdout,
+		SkipLock: true,
+		Runner: func(context.Context, string, string, func(*Session) error, WebSocketRunOptions) error {
+			return context.Canceled
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = rt.Stop() }()
+
+	waited := make(chan error, 1)
+	go func() { waited <- rt.Wait(ctx) }()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, ErrRunEndedUnexpectedly) {
+			t.Fatalf("Wait() = %v, want ErrRunEndedUnexpectedly", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait() did not report the session role ending")
+	}
+}
+
 // ackingRunner connects a session over a transport the test controls, so it can
 // deliver the Server's metadata ack at the moment it chooses.
 func ackingRunner(transports chan *pingAwareTransport) SessionPoolRunner {

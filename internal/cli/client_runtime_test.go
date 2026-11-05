@@ -18,7 +18,57 @@ import (
 	"github.com/tunnelmesh/tunnelmesh/internal/build"
 	"github.com/tunnelmesh/tunnelmesh/internal/client"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
+	"github.com/tunnelmesh/tunnelmesh/internal/workerproto"
 )
+
+// TestClientRunExitsNonZeroWhenSessionRoleEndsUnexpectedly is the operator-facing
+// half of the guarantee: a session role that stops unasked must leave an exit code
+// that both the built-in supervisor and systemd act on.
+//
+// Exiting 0 here is exactly how a production client ended up serving nothing at
+// all while every watcher reported a clean, successful stop.
+func TestClientRunExitsNonZeroWhenSessionRoleEndsUnexpectedly(t *testing.T) {
+	previous := runClientSessionPool
+	defer func() { runClientSessionPool = previous }()
+
+	listen := reserveLoopbackListenAddress(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	yaml := `mode: local
+client:
+  server_url: wss://server.example/ws/client
+  token: client-secret
+  instance_id_path: ` + filepath.Join(dir, "client-instance-id") + `
+  tunnels:
+    - name: socks-a
+      protocol: socks5
+      listen: ` + listen + `
+      agent_id: agent-a
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runClientSessionPool = func(context.Context, string, string, func(*client.Session) error, client.WebSocketRunOptions) error {
+		return context.Canceled
+	}
+
+	root := NewClientRoot()
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"--config", path, "run"})
+
+	finished := make(chan error, 1)
+	go func() { finished <- Execute(context.Background(), root) }()
+	select {
+	case err := <-finished:
+		if got := workerproto.ExitCodeOf(err); got != workerproto.ExitGeneric {
+			t.Fatalf("client run exit code = %d (err = %v), want %d so a supervisor restarts it", got, err, workerproto.ExitGeneric)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("client run did not return after the session role ended")
+	}
+}
 
 func TestClientProxyUsesAuthenticatedSessionAndStdio(t *testing.T) {
 	previous := runClientWebSocket
