@@ -147,7 +147,7 @@ describe('agent references in the client detail', () => {
     })
     vi.mocked(listClients).mockResolvedValue({ items: [withAgent], nextCursor: '' })
     vi.mocked(getClientDetail).mockResolvedValue(withAgent)
-    vi.mocked(listClientConnections).mockResolvedValue([])
+    vi.mocked(listClientConnections).mockResolvedValue({ connections: [], truncated: false })
     vi.mocked(getAgents).mockResolvedValue({ items: [{ id: 'agent-edge', name: 'edge-01', enabled: true, status: 'online' }], nextCursor: '' })
 
     const { container, unmount } = await mountClients()
@@ -173,7 +173,7 @@ describe('agent references in the client detail', () => {
     const withAgent = instance({ agentIds: ['agent-gone'], listeners: [] })
     vi.mocked(listClients).mockResolvedValue({ items: [withAgent], nextCursor: '' })
     vi.mocked(getClientDetail).mockResolvedValue(withAgent)
-    vi.mocked(listClientConnections).mockResolvedValue([])
+    vi.mocked(listClientConnections).mockResolvedValue({ connections: [], truncated: false })
     vi.mocked(getAgents).mockResolvedValue({ items: [], nextCursor: '' })
 
     const { container, unmount } = await mountClients()
@@ -194,7 +194,7 @@ describe('agent references in the client detail', () => {
   it('renders an em dash when the client has no agents', async () => {
     vi.mocked(listClients).mockResolvedValue({ items: [instance()], nextCursor: '' })
     vi.mocked(getClientDetail).mockResolvedValue(instance())
-    vi.mocked(listClientConnections).mockResolvedValue([])
+    vi.mocked(listClientConnections).mockResolvedValue({ connections: [], truncated: false })
 
     const { container, unmount } = await mountClients()
     try {
@@ -338,7 +338,7 @@ describe('client connection lease state', () => {
     ]
     vi.mocked(listClients).mockResolvedValue({ items: [instance()], nextCursor: '' })
     vi.mocked(getClientDetail).mockResolvedValue(instance())
-    vi.mocked(listClientConnections).mockResolvedValue(connections)
+    vi.mocked(listClientConnections).mockResolvedValue({ connections, truncated: false })
 
     const { container, unmount } = await mountClients()
     try {
@@ -361,6 +361,103 @@ describe('client connection lease state', () => {
       const expiredRow = leaseRows.find(row => row.textContent?.includes('conn-expired'))
       expect(liveRow?.textContent).toContain('2')
       expect(expiredRow?.textContent).not.toContain('84')
+    } finally {
+      unmount()
+    }
+  })
+})
+
+// Expired leases used to arrive in the same unbounded list as live ones, so a
+// Client that was killed instead of closed left "已过期" rows in every drawer
+// forever. The default view is live-only now, and history is an explicit,
+// capped request that the operator opts into.
+describe('client lease history', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    vi.mocked(listClients).mockReset()
+    vi.mocked(getClientDetail).mockReset()
+    vi.mocked(listClientConnections).mockReset()
+    vi.mocked(getAgents).mockReset()
+    vi.mocked(getAgents).mockResolvedValue({ items: [], nextCursor: '' })
+  })
+
+  function lease(connectionId: string, heartbeatAgoMs: number): ClientConnection {
+    const now = Date.now()
+    return {
+      connectionId, clientInstanceId: 'client-instance-1', tokenId: 'token-1',
+      ownerUserId: 'owner-1', serverNodeId: 'server-1', connectionEpoch: 7,
+      activeStreams: 1, healthScore: 100,
+      acquiredAt: new Date(now - heartbeatAgoMs - 60_000).toISOString(),
+      lastHeartbeatAt: new Date(now - heartbeatAgoMs).toISOString(),
+      expiresAt: new Date(now - heartbeatAgoMs + 60_000).toISOString(),
+      local: true,
+    }
+  }
+
+  async function openDrawer(container: HTMLElement) {
+    const row = Array.from(container.querySelectorAll('.el-table__body tr'))
+      .find(entry => entry.textContent?.includes('client-local-1'))
+    row?.querySelector('button')?.click()
+    await flush()
+    await flush()
+  }
+
+  function historySwitch() {
+    return document.querySelector('.connection-history .el-switch') as HTMLElement
+  }
+
+  it('lists live leases by default and history only when asked', async () => {
+    const live = lease('conn-live', 5_000)
+    const history = [live, lease('conn-dead-1', 90_000), lease('conn-dead-2', 120_000)]
+    vi.mocked(listClients).mockResolvedValue({ items: [instance()], nextCursor: '' })
+    vi.mocked(getClientDetail).mockResolvedValue(instance())
+    vi.mocked(listClientConnections).mockImplementation(async (_id, params = {}) => (
+      params.state === 'all'
+        ? { connections: history, truncated: false }
+        : { connections: [live], truncated: false }
+    ))
+
+    const { container, unmount } = await mountClients()
+    try {
+      await openDrawer(container)
+      let text = document.body.textContent || ''
+      expect(text).toContain('conn-live')
+      expect(text).not.toContain('conn-dead-1')
+      expect(listClientConnections).toHaveBeenLastCalledWith('client-instance-1', { state: 'live', limit: 50 })
+
+      historySwitch().dispatchEvent(new MouseEvent('click'))
+      await flush()
+      await flush()
+      text = document.body.textContent || ''
+      expect(text).toContain('conn-dead-1')
+      expect(text).toContain('conn-dead-2')
+      expect(listClientConnections).toHaveBeenLastCalledWith('client-instance-1', { state: 'all', limit: 50 })
+      // The lease-state column keeps its meaning in the history view: two of
+      // these rows are expired facts, not connections.
+      const expiredTags = Array.from(document.body.querySelectorAll('.status-tag'))
+        .filter(tag => (tag.textContent || '').trim() === i18n.global.t('clients.leaseStateLabel.expired'))
+      expect(expiredTags).toHaveLength(2)
+    } finally {
+      unmount()
+    }
+  })
+
+  it('widens the window when the history is capped', async () => {
+    vi.mocked(listClients).mockResolvedValue({ items: [instance()], nextCursor: '' })
+    vi.mocked(getClientDetail).mockResolvedValue(instance())
+    vi.mocked(listClientConnections).mockResolvedValue({ connections: [lease('conn-dead-1', 90_000)], truncated: true })
+
+    const { container, unmount } = await mountClients()
+    try {
+      await openDrawer(container)
+      expect(document.body.textContent || '').toContain(i18n.global.t('clients.connectionsTruncated', { count: 50 }))
+
+      const loadMore = Array.from(document.body.querySelectorAll('button'))
+        .find(button => (button.textContent || '').trim() === i18n.global.t('clients.loadMore'))!
+      loadMore.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      await flush()
+      await flush()
+      expect(listClientConnections).toHaveBeenLastCalledWith('client-instance-1', { state: 'live', limit: 100 })
     } finally {
       unmount()
     }

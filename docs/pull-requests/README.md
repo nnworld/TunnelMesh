@@ -6,13 +6,14 @@
 内容包含标题、目标分支、摘要、用户影响、API/Schema/配置影响、安全影响、测试证据、
 发布与回滚步骤、Reviewer 关注点和集成状态。
 
-共 59 份记录，按日期倒序排列。
+共 60 份记录，按日期倒序排列。
 
 ## 记录清单
 
 | 日期 | PR 记录 | 关联计划 | 关联规格 / ADR |
 | --- | --- | --- | --- |
 | 2026-11-05 | [Client 缩容误终止会话池导致服务静默退出](2026-11-05-client-session-pool-silent-exit.md) | [计划：Client 缩容误终止会话池导致服务静默退出](../superpowers/plans/2026-11-05-client-session-pool-silent-exit.md) | — |
+| 2026-11-05 | [客户端连接租约过期回收与历史读取上限](2026-11-05-client-connection-lease-cleanup.md) | [计划：客户端连接租约过期回收与历史读取上限](../superpowers/plans/2026-11-05-client-connection-lease-cleanup.md) | — |
 | 2026-11-05 | [管理后台 Agent 引用统一显示名称并可跳转](2026-11-05-admin-agent-name-links.md) | [计划：管理后台 Agent 引用统一显示名称并可跳转](../superpowers/plans/2026-11-05-admin-agent-name-links.md) | — |
 | 2026-10-26 | [管理后台界面重设计「机架 Rack」](2026-10-26-admin-console-rack-redesign.md) | [计划：管理后台界面重设计「机架 Rack」](../superpowers/plans/2026-10-26-admin-console-rack-redesign.md) | — |
 | 2026-10-25 | [Client Agent 角色融合与自动注册](2026-10-25-client-agent-role.md) | — | — |

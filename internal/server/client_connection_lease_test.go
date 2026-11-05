@@ -45,12 +45,16 @@ func (r *fakeClientConnectionRepo) Release(_ context.Context, connectionID strin
 func (r *fakeClientConnectionRepo) List(context.Context, storage.ClientConnectionFilter, string, int) (storage.Page[storage.ClientConnectionLease], error) {
 	return storage.Page[storage.ClientConnectionLease]{}, nil
 }
-func (r *fakeClientConnectionRepo) ListByInstance(context.Context, string) ([]storage.ClientConnectionLease, error) {
+func (r *fakeClientConnectionRepo) ListByInstance(_ context.Context, _ string, _ bool, _ int) ([]storage.ClientConnectionLease, error) {
 	return nil, nil
 }
-func (r *fakeClientConnectionRepo) ListByInstances(context.Context, []string) ([]storage.ClientConnectionLease, error) {
+func (r *fakeClientConnectionRepo) ListByInstances(_ context.Context, _ []string, _ bool, _ int) ([]storage.ClientConnectionLease, error) {
 	return nil, nil
 }
+func (r *fakeClientConnectionRepo) DeleteExpired(context.Context, time.Time, int) (int64, error) {
+	return 0, nil
+}
+
 func (r *fakeClientConnectionRepo) UpdateStats(_ context.Context, lease storage.ClientConnectionLease) error {
 	r.stats = append(r.stats, lease)
 	return r.err

@@ -145,7 +145,7 @@ func runClientRepositoryContract(t *testing.T, db *DB) {
 	if err := db.ClientConnections().Release(ctx, onlineLease.ConnectionID, epoch); err != nil {
 		t.Fatalf("release with the authoritative epoch: %v", err)
 	}
-	if leases, err := db.ClientConnections().ListByInstance(ctx, onlineID); err != nil {
+	if leases, err := db.ClientConnections().ListByInstance(ctx, onlineID, false, 0); err != nil {
 		t.Fatalf("list leases for released client: %v", err)
 	} else if len(leases) != 0 {
 		t.Fatalf("leases after release = %+v, want none", leases)
@@ -223,7 +223,7 @@ func runClientRepositoryContract(t *testing.T, db *DB) {
 	for index, fixture := range leaseFixtures {
 		putContractClientLease(t, db, fixture.connectionID, staleID, int64(index+1), epoch+int64(index), live, fixture.heartbeat)
 	}
-	if leases, err := db.ClientConnections().ListByInstance(ctx, staleID); err != nil {
+	if leases, err := db.ClientConnections().ListByInstance(ctx, staleID, false, 0); err != nil {
 		t.Fatalf("list leases by heartbeat order: %v", err)
 	} else if got := strings.Join(leaseConnectionIDs(leases), ","); got != "contract-lease-new,contract-lease-mid,contract-lease-old" {
 		t.Fatalf("lease order = %q, want newest heartbeat first", got)
@@ -232,6 +232,71 @@ func runClientRepositoryContract(t *testing.T, db *DB) {
 		if err := db.ClientConnections().Release(ctx, fixture.connectionID, epoch+int64(index)); err != nil {
 			t.Fatalf("release contract lease %s: %v", fixture.connectionID, err)
 		}
+	}
+
+	// Reaping and live-only reads are the two halves of the same rule, and the
+	// bounded delete is the part where SQLite and MySQL diverge in syntax. The
+	// fixtures sit years in the past so the cutoff can only ever match rows this
+	// block wrote: the contract database is shared across the package, and an
+	// unrelated old lease must never be collateral damage.
+	reapInstance := "contract-reap-instance"
+	reapCutoff := time.Date(2020, 6, 1, 0, 0, 0, 0, time.UTC)
+	reapOld := reapCutoff.Add(-24 * time.Hour)
+	for _, fixture := range []struct {
+		id        string
+		expires   time.Time
+		heartbeat time.Time
+	}{
+		{"contract-reap-a", reapCutoff.Add(-3 * time.Hour), reapOld.Add(-3 * time.Hour)},
+		{"contract-reap-b", reapCutoff.Add(-2 * time.Hour), reapOld.Add(-2 * time.Hour)},
+		{"contract-reap-c", reapCutoff.Add(-1 * time.Hour), reapOld.Add(-time.Hour)},
+		// A lease expiring exactly at the cutoff is expired: same reading as
+		// MarkExpired and PurgeUnreported, and a driver-visible difference if one
+		// dialect used < and the other <=.
+		{"contract-reap-boundary", reapCutoff, reapOld},
+		{"contract-reap-live", now.Add(10 * time.Minute), now},
+	} {
+		putContractClientLease(t, db, fixture.id, reapInstance, 0, 1, fixture.expires, fixture.heartbeat)
+	}
+	// A live read must not be able to return any of the lapsed rows, whichever
+	// way the driver evaluates the timestamp text.
+	if leases, err := db.ClientConnections().ListByInstance(ctx, reapInstance, true, 0); err != nil {
+		t.Fatalf("list live leases: %v", err)
+	} else if got := strings.Join(leaseConnectionIDs(leases), ","); got != "contract-reap-live" {
+		t.Fatalf("live leases = %q, want only contract-reap-live", got)
+	}
+	// The per instance cap keeps the newest heartbeats, so a Client that
+	// reconnected a hundred times still shows the rows that mean something.
+	if leases, err := db.ClientConnections().ListByInstance(ctx, reapInstance, false, 2); err != nil {
+		t.Fatalf("list capped lease history: %v", err)
+	} else if got := strings.Join(leaseConnectionIDs(leases), ","); got != "contract-reap-live,contract-reap-boundary" {
+		t.Fatalf("capped history = %q, want contract-reap-live then contract-reap-boundary", got)
+	}
+	reaped, err := db.ClientConnections().DeleteExpired(ctx, reapCutoff, 2)
+	if err != nil {
+		t.Fatalf("reap expired leases in a bounded batch: %v", err)
+	}
+	if reaped != 2 {
+		t.Fatalf("reaped = %d, want 2", reaped)
+	}
+	// limit <= 0 falls back to the documented default batch, which is still
+	// bounded: the helper may never turn into the delete it exists to prevent.
+	reaped, err = db.ClientConnections().DeleteExpired(ctx, reapCutoff, 0)
+	if err != nil {
+		t.Fatalf("reap the remaining expired leases: %v", err)
+	}
+	if reaped != 2 {
+		t.Fatalf("reaped = %d, want the two remaining expired rows", reaped)
+	}
+	if reaped, err = db.ClientConnections().DeleteExpired(ctx, reapCutoff, 10); err != nil {
+		t.Fatalf("reap an already clean table: %v", err)
+	} else if reaped != 0 {
+		t.Fatalf("reaped again = %d, want 0 (a second pass deletes nothing)", reaped)
+	}
+	if leases, err := db.ClientConnections().ListByInstance(ctx, reapInstance, false, 0); err != nil {
+		t.Fatalf("list leases after reaping: %v", err)
+	} else if got := strings.Join(leaseConnectionIDs(leases), ","); got != "contract-reap-live" {
+		t.Fatalf("leases after reaping = %q, want the live row untouched", got)
 	}
 }
 

@@ -126,26 +126,29 @@ type ServerRuntime struct {
 	// vpnGateway is the embedded WireGuard data plane, nil when server.vpn is
 	// disabled. It is typed as the untagged seam rather than as the gateway so this
 	// file compiles, and keeps compiling, in a build that contains no data plane.
-	vpnGateway                   VPNDataPlane
-	clientMetadataSweeper        *ClientMetadataSweeper
-	clientMetadataSweeperCancel  context.CancelFunc
-	clientMetadataSweeperDone    chan error
-	websshSweeper                *WebSSHSweeper
-	websshSweeperCancel          context.CancelFunc
-	websshSweeperDone            chan error
-	authMaintenanceSweeper       *AuthMaintenanceSweeper
-	authMaintenanceSweeperCancel context.CancelFunc
-	authMaintenanceSweeperDone   chan error
-	auditRetentionSweeper        *AuditRetentionSweeper
-	auditRetentionCancel         context.CancelFunc
-	auditRetentionDone           chan error
-	config                       RuntimeConfig
-	WebSSHEnabled                bool
-	ProxyEntryEnabled            bool
-	metricsRegistry              *prometheus.Registry
-	metrics                      *observability.Metrics
-	authorizationCacheCleanup    func() error
-	closed                       atomic.Bool
+	vpnGateway                    VPNDataPlane
+	clientMetadataSweeper         *ClientMetadataSweeper
+	clientMetadataSweeperCancel   context.CancelFunc
+	clientMetadataSweeperDone     chan error
+	clientConnectionSweeper       *ClientConnectionSweeper
+	clientConnectionSweeperCancel context.CancelFunc
+	clientConnectionSweeperDone   chan error
+	websshSweeper                 *WebSSHSweeper
+	websshSweeperCancel           context.CancelFunc
+	websshSweeperDone             chan error
+	authMaintenanceSweeper        *AuthMaintenanceSweeper
+	authMaintenanceSweeperCancel  context.CancelFunc
+	authMaintenanceSweeperDone    chan error
+	auditRetentionSweeper         *AuditRetentionSweeper
+	auditRetentionCancel          context.CancelFunc
+	auditRetentionDone            chan error
+	config                        RuntimeConfig
+	WebSSHEnabled                 bool
+	ProxyEntryEnabled             bool
+	metricsRegistry               *prometheus.Registry
+	metrics                       *observability.Metrics
+	authorizationCacheCleanup     func() error
+	closed                        atomic.Bool
 }
 
 // NewServerRuntime creates the server runtime with durable Agent metadata
@@ -449,6 +452,19 @@ func NewServerRuntime(db *storage.DB, cfg AgentSessionConfig, options ...Runtime
 	go func() {
 		runtime.clientMetadataSweeperDone <- runtime.clientMetadataSweeper.Run(sweeperCtx)
 	}()
+	// Lapsed client connection leases are reaped here rather than by the Client:
+	// Release needs a cooperative shutdown, and a killed process leaves a row
+	// whose only remaining fact is a timestamp. The retention window keeps the
+	// last day readable for the drawer, so this never races the operator who is
+	// looking at the failure.
+	runtime.clientConnectionSweeper = NewClientConnectionSweeper(db.ClientConnections(), DefaultClientConnectionSweepInterval, DefaultClientConnectionLeaseRetention)
+	runtime.clientConnectionSweeper.SetGauges(runtime.metrics)
+	clientConnectionSweeperCtx, stopClientConnectionSweeper := context.WithCancel(context.Background())
+	runtime.clientConnectionSweeperCancel = stopClientConnectionSweeper
+	runtime.clientConnectionSweeperDone = make(chan error, 1)
+	go func() {
+		runtime.clientConnectionSweeperDone <- runtime.clientConnectionSweeper.Run(clientConnectionSweeperCtx)
+	}()
 	runtime.websshSweeper = NewWebSSHSweeper(db.WebSSHSessions(), DefaultWebSSHSweepInterval)
 	webSSHSweeperCtx, stopWebSSHSweeper := context.WithCancel(context.Background())
 	runtime.websshSweeperCancel = stopWebSSHSweeper
@@ -490,7 +506,7 @@ func (r *ServerRuntime) Close() error {
 	if r.WebSSHBroker != nil {
 		r.WebSSHBroker.CloseAll()
 	}
-	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr error
+	var relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, clientConnectionSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr error
 	// The data plane goes first among the owned resources: it is a public traffic
 	// path with its own drain budget, and stopping it before the sweepers means no
 	// flow can be created while the rest of the runtime is being unwound.
@@ -519,6 +535,17 @@ func (r *ServerRuntime) Close() error {
 			clientMetadataSweeperErr = err
 		}
 		r.clientMetadataSweeperCancel = nil
+	}
+	// Stopping this loop only freezes the backlog at whatever the last pass
+	// reached: no lease is retired by the worker itself, so a stopped sweeper can
+	// never report a live connection as gone.
+	if r.clientConnectionSweeperCancel != nil {
+		r.clientConnectionSweeperCancel()
+		if err := <-r.clientConnectionSweeperDone; err != nil && !errors.Is(err, context.Canceled) {
+			clientConnectionSweeperErr = err
+		}
+		r.clientConnectionSweeperCancel = nil
+		r.clientConnectionSweeperDone = nil
 	}
 	if r.websshSweeperCancel != nil {
 		r.websshSweeperCancel()
@@ -549,7 +576,7 @@ func (r *ServerRuntime) Close() error {
 	if r.ClientStreamService != nil {
 		_ = r.ClientStreamService.Close()
 	}
-	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr)
+	return errors.Join(relayErr, credentialErr, serverNodeErr, authorizationCacheErr, clientMetadataSweeperErr, clientConnectionSweeperErr, webSSHSweeperErr, authSweeperErr, vpnErr)
 }
 
 // closeVPNGateway drains and releases the embedded data plane.

@@ -1611,3 +1611,54 @@ func TestAutoRegisterAgentEnforcesOwnerQuota(t *testing.T) {
 		t.Fatalf("idempotent registration = %+v, err = %v", again, err)
 	}
 }
+
+// The reaper is the only thing that retires a lease whose Client never reached
+// Release, so wiring it into the runtime is the difference between a bounded
+// table and an ever-growing one. The loop sweeps before its first tick, which is
+// what makes this observable in one second instead of one interval.
+func TestNewServerRuntimeReapsExpiredClientConnectionLeases(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + t.TempDir() + "/runtime-lease-reap.sqlite"
+	db, err := storage.OpenSQLite(ctx, dsn, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	instanceID := "runtime-reap-instance"
+	if _, err := db.ClientConnections().Register(ctx, storage.ClientConnectionLease{
+		ConnectionID: "runtime-reap-lease", ClientInstanceID: instanceID, TokenID: "token-1",
+		OwnerUserID: "owner-1", ServerNodeID: "server-1", ConnectionEpoch: 1,
+		AcquiredAt: now.Add(-10 * 24 * time.Hour), ExpiresAt: now.Add(-9 * 24 * time.Hour), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime, err := NewServerRuntime(db, AgentSessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.clientConnectionSweeper == nil || runtime.clientConnectionSweeperCancel == nil || runtime.clientConnectionSweeperDone == nil {
+		t.Fatal("ClientConnectionSweeper was not started")
+	}
+	defer func() {
+		if err := runtime.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		leases, err := db.ClientConnections().ListByInstance(ctx, instanceID, false, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leases) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the runtime never reaped the lapsed lease: %#v", leases)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

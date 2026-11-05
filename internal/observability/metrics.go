@@ -11,61 +11,62 @@ import (
 // Metrics owns the bounded Prometheus collectors used by runtime observers.
 // A registry is injected so tests and embedded users never mutate the global registry.
 type Metrics struct {
-	connectionsTotal          *prometheus.CounterVec
-	connectionsActive         *prometheus.GaugeVec
-	connectionStageDuration   *prometheus.HistogramVec
-	heartbeatTotal            *prometheus.CounterVec
-	heartbeatRTT              *prometheus.HistogramVec
-	bytesTotal                *prometheus.CounterVec
-	streamsActive             *prometheus.GaugeVec
-	streamsTotal              *prometheus.CounterVec
-	streamErrorsTotal         *prometheus.CounterVec
-	probeTotal                *prometheus.CounterVec
-	probeDuration             *prometheus.HistogramVec
-	registryLeaseTotal        *prometheus.CounterVec
-	relayTotal                *prometheus.CounterVec
-	agentConnections          *prometheus.GaugeVec
-	agentConnectionCapacity   *prometheus.GaugeVec
-	agentActiveStreams        *prometheus.GaugeVec
-	agentConnectionRTT        *prometheus.HistogramVec
-	agentConnectionErrors     *prometheus.CounterVec
-	agentScaleDecisions       *prometheus.CounterVec
-	agentSelection            *prometheus.CounterVec
-	storageOperationDuration  *prometheus.HistogramVec
-	storageErrorsTotal        *prometheus.CounterVec
-	configReloadTotal         *prometheus.CounterVec
-	ready                     *prometheus.GaugeVec
-	streamStageDuration       *prometheus.HistogramVec
-	streamOpenTotal           *prometheus.CounterVec
-	streamQueueWait           *prometheus.HistogramVec
-	streamWindowStall         *prometheus.HistogramVec
-	streamBackpressure        *prometheus.CounterVec
-	authorizationCache        *prometheus.CounterVec
-	authorizationRevision     *prometheus.GaugeVec
-	authorizationRevisionPoll *prometheus.CounterVec
-	remoteValidationCache     *prometheus.CounterVec
-	websshSessionsActive      *prometheus.GaugeVec
-	websshTicketsCreatedTotal *prometheus.CounterVec
-	websshTicketReuseTotal    *prometheus.CounterVec
-	websshStreamErrorsTotal   *prometheus.CounterVec
-	websshStreamDuration      *prometheus.HistogramVec
-	websshBytesTotal          *prometheus.CounterVec
-	proxyEntryRequests        *prometheus.CounterVec
-	proxyEntryTunnels         *prometheus.GaugeVec
-	proxyEntryTunnelDuration  *prometheus.HistogramVec
-	proxyEntryAuthFailures    *prometheus.CounterVec
-	proxyEntryACLDenied       *prometheus.CounterVec
-	authLoginTotal            *prometheus.CounterVec
-	authMFAVerifyTotal        *prometheus.CounterVec
-	authOIDCStepTotal         *prometheus.CounterVec
-	authTrustedDevices        *prometheus.GaugeVec
-	authPendingChallenges     *prometheus.GaugeVec
-	authLoginBlockedBuckets   *prometheus.GaugeVec
-	activeMu                  sync.Mutex
-	activeConnections         map[string]int
-	activeStreams             map[string]int
-	agentConnectionStates     map[string]bool
-	agentConnectionStreams    map[string]int
+	connectionsTotal                *prometheus.CounterVec
+	connectionsActive               *prometheus.GaugeVec
+	connectionStageDuration         *prometheus.HistogramVec
+	heartbeatTotal                  *prometheus.CounterVec
+	heartbeatRTT                    *prometheus.HistogramVec
+	bytesTotal                      *prometheus.CounterVec
+	streamsActive                   *prometheus.GaugeVec
+	streamsTotal                    *prometheus.CounterVec
+	streamErrorsTotal               *prometheus.CounterVec
+	probeTotal                      *prometheus.CounterVec
+	probeDuration                   *prometheus.HistogramVec
+	registryLeaseTotal              *prometheus.CounterVec
+	clientConnectionLeaseSweepTotal *prometheus.CounterVec
+	relayTotal                      *prometheus.CounterVec
+	agentConnections                *prometheus.GaugeVec
+	agentConnectionCapacity         *prometheus.GaugeVec
+	agentActiveStreams              *prometheus.GaugeVec
+	agentConnectionRTT              *prometheus.HistogramVec
+	agentConnectionErrors           *prometheus.CounterVec
+	agentScaleDecisions             *prometheus.CounterVec
+	agentSelection                  *prometheus.CounterVec
+	storageOperationDuration        *prometheus.HistogramVec
+	storageErrorsTotal              *prometheus.CounterVec
+	configReloadTotal               *prometheus.CounterVec
+	ready                           *prometheus.GaugeVec
+	streamStageDuration             *prometheus.HistogramVec
+	streamOpenTotal                 *prometheus.CounterVec
+	streamQueueWait                 *prometheus.HistogramVec
+	streamWindowStall               *prometheus.HistogramVec
+	streamBackpressure              *prometheus.CounterVec
+	authorizationCache              *prometheus.CounterVec
+	authorizationRevision           *prometheus.GaugeVec
+	authorizationRevisionPoll       *prometheus.CounterVec
+	remoteValidationCache           *prometheus.CounterVec
+	websshSessionsActive            *prometheus.GaugeVec
+	websshTicketsCreatedTotal       *prometheus.CounterVec
+	websshTicketReuseTotal          *prometheus.CounterVec
+	websshStreamErrorsTotal         *prometheus.CounterVec
+	websshStreamDuration            *prometheus.HistogramVec
+	websshBytesTotal                *prometheus.CounterVec
+	proxyEntryRequests              *prometheus.CounterVec
+	proxyEntryTunnels               *prometheus.GaugeVec
+	proxyEntryTunnelDuration        *prometheus.HistogramVec
+	proxyEntryAuthFailures          *prometheus.CounterVec
+	proxyEntryACLDenied             *prometheus.CounterVec
+	authLoginTotal                  *prometheus.CounterVec
+	authMFAVerifyTotal              *prometheus.CounterVec
+	authOIDCStepTotal               *prometheus.CounterVec
+	authTrustedDevices              *prometheus.GaugeVec
+	authPendingChallenges           *prometheus.GaugeVec
+	authLoginBlockedBuckets         *prometheus.GaugeVec
+	activeMu                        sync.Mutex
+	activeConnections               map[string]int
+	activeStreams                   map[string]int
+	agentConnectionStates           map[string]bool
+	agentConnectionStreams          map[string]int
 }
 
 // NewMetrics creates and registers a complete metrics set. Nil creates an isolated registry.
@@ -74,36 +75,37 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		reg = prometheus.NewRegistry()
 	}
 	m := &Metrics{
-		connectionsTotal:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_connections_total", Help: "Total connection attempts by result."}, []string{"component", "mode", "result", "error_class"}),
-		connectionsActive:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_connections_active", Help: "Current active connections."}, []string{"component", "mode"}),
-		connectionStageDuration:  prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_connection_stage_duration_seconds", Help: "Connection stage duration in seconds."}, []string{"component", "stage", "result", "error_class"}),
-		heartbeatTotal:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_heartbeat_total", Help: "Total heartbeat outcomes."}, []string{"component", "result"}),
-		heartbeatRTT:             prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_heartbeat_rtt_seconds", Help: "Heartbeat round-trip time in seconds."}, []string{"component"}),
-		bytesTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_bytes_total", Help: "Total bytes transferred."}, []string{"component", "direction", "protocol"}),
-		streamsActive:            prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_streams_active", Help: "Current active logical streams."}, []string{"protocol"}),
-		streamsTotal:             prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_streams_total", Help: "Total logical stream outcomes."}, []string{"protocol", "result", "error_class"}),
-		streamErrorsTotal:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_errors_total", Help: "Total logical stream errors."}, []string{"protocol", "error_class"}),
-		probeTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_probe_total", Help: "Total probe outcomes."}, []string{"probe_kind", "result", "error_class"}),
-		probeDuration:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_probe_duration_seconds", Help: "Probe duration in seconds."}, []string{"probe_kind", "result", "error_class"}),
-		registryLeaseTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_registry_lease_total", Help: "Registry lease outcomes."}, []string{"operation", "result", "error_class"}),
-		relayTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_relay_total", Help: "Relay outcomes."}, []string{"result", "error_class"}),
-		agentConnections:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connections", Help: "Current Agent connections, by identity."}, []string{"agent_id", "instance_id"}),
-		agentConnectionCapacity:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connection_capacity", Help: "Maximum Agent connections allowed by policy."}, []string{"agent_id", "instance_id"}),
-		agentActiveStreams:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_active_streams", Help: "Active streams per Agent identity."}, []string{"agent_id", "instance_id"}),
-		agentConnectionRTT:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_agent_connection_rtt_seconds", Help: "Agent connection heartbeat RTT in seconds."}, []string{"agent_id", "instance_id"}),
-		agentConnectionErrors:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_errors_total", Help: "Agent connection errors."}, []string{"agent_id", "instance_id", "error_class"}),
-		agentScaleDecisions:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_scale_decisions_total", Help: "Agent connection pool scale decisions."}, []string{"agent_id", "instance_id", "decision", "reason"}),
-		agentSelection:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_selection_total", Help: "Agent connection selection decisions."}, []string{"agent_id", "server_node_id", "scope"}),
-		storageOperationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_storage_operation_duration_seconds", Help: "Storage operation duration in seconds."}, []string{"operation", "result"}),
-		storageErrorsTotal:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_storage_errors_total", Help: "Storage errors."}, []string{"operation", "error_class"}),
-		configReloadTotal:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_config_reload_total", Help: "Configuration reload outcomes."}, []string{"result", "error_class"}),
-		ready:                    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_ready", Help: "Readiness state, one when ready."}, []string{"component"}),
-		streamStageDuration:      prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_stage_duration_seconds", Help: "Stream lifecycle stage duration in seconds."}, []string{"component", "stage", "result", "error_class", "protocol"}),
-		streamOpenTotal:          prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_open_total", Help: "Stream open outcomes by negotiated mode."}, []string{"component", "result", "error_class", "open_mode"}),
-		streamQueueWait:          prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_queue_wait_seconds", Help: "Stream queue wait in seconds."}, []string{"component", "result"}),
-		streamWindowStall:        prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_window_stall_seconds", Help: "Stream flow-control window stall duration in seconds."}, []string{"component", "result"}),
-		streamBackpressure:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_backpressure_total", Help: "Stream backpressure outcomes."}, []string{"component", "result"}),
-		authorizationCache:       prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_authorization_cache_requests_total", Help: "Stream authorization cache requests."}, []string{"cache", "result"}),
+		connectionsTotal:                prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_connections_total", Help: "Total connection attempts by result."}, []string{"component", "mode", "result", "error_class"}),
+		connectionsActive:               prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_connections_active", Help: "Current active connections."}, []string{"component", "mode"}),
+		connectionStageDuration:         prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_connection_stage_duration_seconds", Help: "Connection stage duration in seconds."}, []string{"component", "stage", "result", "error_class"}),
+		heartbeatTotal:                  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_heartbeat_total", Help: "Total heartbeat outcomes."}, []string{"component", "result"}),
+		heartbeatRTT:                    prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_heartbeat_rtt_seconds", Help: "Heartbeat round-trip time in seconds."}, []string{"component"}),
+		bytesTotal:                      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_bytes_total", Help: "Total bytes transferred."}, []string{"component", "direction", "protocol"}),
+		streamsActive:                   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_streams_active", Help: "Current active logical streams."}, []string{"protocol"}),
+		streamsTotal:                    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_streams_total", Help: "Total logical stream outcomes."}, []string{"protocol", "result", "error_class"}),
+		streamErrorsTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_errors_total", Help: "Total logical stream errors."}, []string{"protocol", "error_class"}),
+		probeTotal:                      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_probe_total", Help: "Total probe outcomes."}, []string{"probe_kind", "result", "error_class"}),
+		probeDuration:                   prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_probe_duration_seconds", Help: "Probe duration in seconds."}, []string{"probe_kind", "result", "error_class"}),
+		registryLeaseTotal:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_registry_lease_total", Help: "Registry lease outcomes."}, []string{"operation", "result", "error_class"}),
+		clientConnectionLeaseSweepTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_connection_lease_sweep_total", Help: "Client connection lease reaping passes by result."}, []string{"result", "error_class"}),
+		relayTotal:                      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_relay_total", Help: "Relay outcomes."}, []string{"result", "error_class"}),
+		agentConnections:                prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connections", Help: "Current Agent connections, by identity."}, []string{"agent_id", "instance_id"}),
+		agentConnectionCapacity:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_connection_capacity", Help: "Maximum Agent connections allowed by policy."}, []string{"agent_id", "instance_id"}),
+		agentActiveStreams:              prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_agent_active_streams", Help: "Active streams per Agent identity."}, []string{"agent_id", "instance_id"}),
+		agentConnectionRTT:              prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_agent_connection_rtt_seconds", Help: "Agent connection heartbeat RTT in seconds."}, []string{"agent_id", "instance_id"}),
+		agentConnectionErrors:           prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_errors_total", Help: "Agent connection errors."}, []string{"agent_id", "instance_id", "error_class"}),
+		agentScaleDecisions:             prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_connection_scale_decisions_total", Help: "Agent connection pool scale decisions."}, []string{"agent_id", "instance_id", "decision", "reason"}),
+		agentSelection:                  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_agent_selection_total", Help: "Agent connection selection decisions."}, []string{"agent_id", "server_node_id", "scope"}),
+		storageOperationDuration:        prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_storage_operation_duration_seconds", Help: "Storage operation duration in seconds."}, []string{"operation", "result"}),
+		storageErrorsTotal:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_storage_errors_total", Help: "Storage errors."}, []string{"operation", "error_class"}),
+		configReloadTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_config_reload_total", Help: "Configuration reload outcomes."}, []string{"result", "error_class"}),
+		ready:                           prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_ready", Help: "Readiness state, one when ready."}, []string{"component"}),
+		streamStageDuration:             prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_stage_duration_seconds", Help: "Stream lifecycle stage duration in seconds."}, []string{"component", "stage", "result", "error_class", "protocol"}),
+		streamOpenTotal:                 prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_open_total", Help: "Stream open outcomes by negotiated mode."}, []string{"component", "result", "error_class", "open_mode"}),
+		streamQueueWait:                 prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_queue_wait_seconds", Help: "Stream queue wait in seconds."}, []string{"component", "result"}),
+		streamWindowStall:               prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_stream_window_stall_seconds", Help: "Stream flow-control window stall duration in seconds."}, []string{"component", "result"}),
+		streamBackpressure:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_backpressure_total", Help: "Stream backpressure outcomes."}, []string{"component", "result"}),
+		authorizationCache:              prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_authorization_cache_requests_total", Help: "Stream authorization cache requests."}, []string{"cache", "result"}),
 		authorizationRevision: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "tunnelmesh_authorization_revision",
@@ -173,7 +175,7 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		agentConnectionStates:  make(map[string]bool),
 		agentConnectionStreams: make(map[string]int),
 	}
-	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
+	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.clientConnectionLeaseSweepTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
 	// Registered separately from the collector list above: that call is already
 	// one line per feature area and appending here keeps the proxy entry
 	// collectors reviewable as a unit.
@@ -287,6 +289,16 @@ func (m *Metrics) ObserveProbe(kind, result, errorClass string, duration time.Du
 
 func (m *Metrics) ObserveRegistryLease(operation, result, errorClass string) {
 	m.registryLeaseTotal.WithLabelValues(label(operation), label(result), label(errorClass)).Inc()
+}
+
+// ObserveClientConnectionLeaseSweep records one reaping pass. "ok" with zero
+// rows and "error" are different facts, and only the caller can tell them
+// apart, so the pass itself is what gets counted.
+func (m *Metrics) ObserveClientConnectionLeaseSweep(result, errorClass string) {
+	if m == nil || m.clientConnectionLeaseSweepTotal == nil {
+		return
+	}
+	m.clientConnectionLeaseSweepTotal.WithLabelValues(label(result), label(errorClass)).Inc()
 }
 
 func (m *Metrics) ObserveRelay(result, errorClass string) {

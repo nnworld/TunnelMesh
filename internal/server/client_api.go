@@ -114,7 +114,7 @@ func (a *API) handleClients(w http.ResponseWriter, r *http.Request, p auth.Princ
 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		connections, err := a.clientConnections.ListByInstance(r.Context(), clientInstanceID)
+		connections, err := a.clientConnections.ListByInstance(r.Context(), clientInstanceID, true, 0)
 		if err != nil {
 			writeStorageError(w, err)
 			return
@@ -127,16 +127,28 @@ func (a *API) handleClients(w http.ResponseWriter, r *http.Request, p auth.Princ
 			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		connections, err := a.clientConnections.ListByInstance(r.Context(), clientInstanceID)
+		liveOnly, limit, queryErr := parseClientConnectionsQuery(r)
+		if queryErr != nil {
+			queryErr.write(w)
+			return
+		}
+		// One row past the cap decides "truncated" without a second query: a
+		// never-pruned table can hold tens of thousands of dead leases for one
+		// Client, and the drawer must know it is showing a window of them.
+		connections, err := a.clientConnections.ListByInstance(r.Context(), clientInstanceID, liveOnly, limit+1)
 		if err != nil {
 			writeStorageError(w, err)
 			return
+		}
+		truncated := len(connections) > limit
+		if truncated {
+			connections = connections[:limit]
 		}
 		views := make([]ClientConnectionView, 0, len(connections))
 		for _, connection := range connections {
 			views = append(views, newClientConnectionView(connection, a.localNodeID))
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"connections": views})
+		writeJSON(w, http.StatusOK, map[string]any{"connections": views, "truncated": truncated})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "connections" {
@@ -215,7 +227,9 @@ func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Princip
 	for _, instance := range page.Items {
 		ids = append(ids, instance.ID)
 	}
-	connections, err := a.clientConnections.ListByInstances(r.Context(), ids)
+	// The summary counts only live leases, so this read asks the database for
+	// exactly those rows instead of the whole lease history of the page.
+	connections, err := a.clientConnections.ListByInstances(r.Context(), ids, true, 0)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -240,6 +254,46 @@ func (a *API) listClients(w http.ResponseWriter, r *http.Request, p auth.Princip
 func clientMetadataReported(instance storage.ClientInstance) bool {
 	metadata := strings.TrimSpace(instance.Metadata)
 	return metadata != "" && metadata != "{}"
+}
+
+// Client lease views: "live" is the fact that a connection still counts, "all"
+// is recent history. The defaults keep the drawer honest about online
+// connections while leaving the history path available for postmortems.
+const (
+	clientConnectionsDefaultLimit = 50
+	clientConnectionsMaxLimit     = 200
+)
+
+var clientConnectionStates = map[string]string{"all": "all", "live": "live"}
+
+// parseClientConnectionsQuery maps the drawer's view parameters onto storage
+// arguments. Out-of-range numbers are clamped the way every other list read in
+// this API clamps them; only values that cannot be interpreted at all are
+// rejected, with the allowlist the console can render.
+func parseClientConnectionsQuery(r *http.Request) (liveOnly bool, limit int, queryErr *listQueryError) {
+	liveOnly = true
+	if state := strings.TrimSpace(r.URL.Query().Get("state")); state != "" {
+		normalised, ok := containsFold(clientConnectionStates, state)
+		if !ok {
+			return false, 0, newListQueryError("unsupported connection state", allowlistKeys(clientConnectionStates))
+		}
+		liveOnly = normalised != "all"
+	}
+	limit = clientConnectionsDefaultLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return false, 0, newListQueryError("limit must be a positive integer", []string{})
+		}
+		if parsed <= 0 {
+			parsed = clientConnectionsDefaultLimit
+		}
+		if parsed > clientConnectionsMaxLimit {
+			parsed = clientConnectionsMaxLimit
+		}
+		limit = parsed
+	}
+	return liveOnly, limit, nil
 }
 
 func (a *API) closeClientConnection(w http.ResponseWriter, r *http.Request, p auth.Principal, instance storage.ClientInstance, connectionID string) {

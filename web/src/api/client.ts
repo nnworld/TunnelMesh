@@ -207,6 +207,9 @@ export type ClientConnection = {
   expiresAt: string
   local: boolean
 }
+export type ClientConnectionState = 'live' | 'all'
+export type ClientConnectionsView = { connections: ClientConnection[]; truncated: boolean }
+
 export type ClientInstance = {
   id: string
   instanceId: string
@@ -455,9 +458,18 @@ export function listClients(params: ClientListParams = {}) {
 export function getClientDetail(clientInstanceId: string) {
   return api<ClientInstance>(`/clients/${encodeURIComponent(clientInstanceId)}`)
 }
-export function listClientConnections(clientInstanceId: string) {
-  return api<{ connections: ClientConnection[] }>(`/clients/${encodeURIComponent(clientInstanceId)}/connections`)
-    .then(data => data.connections)
+// state=live asks for leases that still count, which is the server default and
+// what the drawer shows; state=all adds the retained history, capped by limit so
+// a Client that never reaped its leases cannot return an unbounded list.
+export function listClientConnections(
+  clientInstanceId: string,
+  params: { state?: ClientConnectionState; limit?: number } = {},
+) {
+  const query = new URLSearchParams()
+  if (params.state) query.set('state', params.state)
+  if (params.limit) query.set('limit', String(params.limit))
+  const suffix = query.toString() ? `?${query}` : ''
+  return api<ClientConnectionsView>(`/clients/${encodeURIComponent(clientInstanceId)}/connections${suffix}`)
 }
 export function closeClientConnection(clientInstanceId: string, connectionId: string, connectionEpoch: number) {
   const query = new URLSearchParams({ connectionEpoch: String(connectionEpoch) })
