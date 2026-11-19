@@ -30,6 +30,9 @@ type StreamRequest struct {
 	Protocol, TargetHost string
 	TargetPort           int
 	Metadata             []byte
+	// Tunnel is the local configuration name this stream serves. It is never
+	// sent on the wire; it only attributes bytes to a person-readable tunnel.
+	Tunnel string
 }
 type StreamOpenPayload = protocol.StreamOpenPayload
 type SessionOpenMode uint8
@@ -66,6 +69,11 @@ const (
 	// has not noticed yet.
 	defaultLivenessInterval = 30 * time.Second
 	livenessIntervals       = 3
+	// clientMetadataKeepalive is how long an unchanged metadata revision stays
+	// off the wire. The Server keeps the last snapshot, so a periodic resend is
+	// only a safety net for its own retention or for debugging; 30-second
+	// refreshes cost real bandwidth on long-lived idle tunnels.
+	clientMetadataKeepalive = 5 * time.Minute
 )
 
 // ErrPeerUnresponsive ends a session whose Server stopped answering heartbeats.
@@ -77,6 +85,7 @@ type Session struct {
 	closed                bool
 	nextID                atomic.Uint32
 	recvOnce              sync.Once
+	startOnce             sync.Once
 	done                  chan struct{}
 	doneOnce              sync.Once
 	runErr                error
@@ -91,8 +100,13 @@ type Session struct {
 	windowUpdateThreshold uint32
 	metadataCollector     *ClientMetadataCollector
 	metadataRevision      uint64
-	inboundBytes          int
-	lastReceivedNanos     atomic.Int64
+	// metadataSentRevision/At describe the last metadata successfully written to
+	// this session, guarded by mu. They let the update loop skip revisions the
+	// peer already has while still refreshing after clientMetadataKeepalive.
+	metadataSentRevision uint64
+	metadataSentAt       time.Time
+	inboundBytes         int
+	lastReceivedNanos    atomic.Int64
 	// serverVersion is the Server's version from its last accepted metadata ack, or
 	// empty when the Server has not announced one (an older Server, or no ack yet).
 	serverVersion atomic.Pointer[string]
@@ -183,16 +197,20 @@ func (s *Session) sendFrame(frame protocol.Frame) error {
 	} else {
 		err = s.writer.EnqueueControl(frame)
 	}
+	if err == nil && s.Metrics != nil {
+		s.Metrics.ObserveFrame("client", frameTypeName(frame.Type), "outbound", int64(len(frame.Payload)))
+	}
 	if err == nil && frame.Type == protocol.FrameData && len(frame.Payload) > 0 && s.Metrics != nil {
 		s.mu.RLock()
-		protocolName := ""
+		protocolName, tunnel := "", ""
 		if stream := s.streams[frame.StreamID]; stream != nil {
-			protocolName = stream.protocol
+			protocolName, tunnel = stream.protocol, stream.tunnel
 		} else if datagram := s.datagrams[frame.StreamID]; datagram != nil {
-			protocolName = datagram.protocol
+			protocolName, tunnel = datagram.protocol, datagram.tunnel
 		}
 		s.mu.RUnlock()
 		s.Metrics.ObserveBytes("client", "outbound", protocolName, int64(len(frame.Payload)))
+		s.Metrics.ObserveTunnelBytes("client", tunnel, "outbound", protocolName, int64(len(frame.Payload)))
 	}
 	return err
 }
@@ -244,22 +262,24 @@ func (s *Session) Start() {
 	if s == nil {
 		return
 	}
-	tr, ok := s.transport.(ReceiveTransport)
-	if !ok || tr == nil {
-		s.finishReceive(errors.New("client session transport does not receive frames"))
-		return
-	}
-	if s.OpenMode().supportsClientMetadata() && s.metadataCollector != nil {
-		if err := s.sendClientMetadata(protocol.FrameClientHello); err != nil {
-			s.finishReceive(err)
+	s.startOnce.Do(func() {
+		tr, ok := s.transport.(ReceiveTransport)
+		if !ok || tr == nil {
+			s.finishReceive(errors.New("client session transport does not receive frames"))
 			return
 		}
-		go s.reportClientMetadata()
-	}
-	s.lastReceivedNanos.Store(time.Now().UnixNano())
-	s.recvOnce.Do(func() {
-		go s.receiveLoop(tr)
-		go s.watchLiveness()
+		if s.OpenMode().supportsClientMetadata() && s.metadataCollector != nil {
+			if err := s.sendClientMetadata(protocol.FrameClientHello); err != nil {
+				s.finishReceive(err)
+				return
+			}
+			go s.reportClientMetadata()
+		}
+		s.lastReceivedNanos.Store(time.Now().UnixNano())
+		s.recvOnce.Do(func() {
+			go s.receiveLoop(tr)
+			go s.watchLiveness()
+		})
 	})
 }
 
@@ -300,6 +320,14 @@ func (s *Session) sendClientMetadata(frameType protocol.FrameType) error {
 	if err != nil {
 		return err
 	}
+	s.mu.RLock()
+	unchanged := frameType == protocol.FrameClientMetadataUpdate &&
+		payload.Revision == s.metadataSentRevision &&
+		time.Since(s.metadataSentAt) < clientMetadataKeepalive
+	s.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
 	frame := protocol.Frame{Version: protocol.CurrentVersion, Type: frameType, Payload: encoded}
 	if s.writer != nil {
 		// Metadata is connection identity and must be on the wire before the
@@ -310,10 +338,17 @@ func (s *Session) sendClientMetadata(frameType protocol.FrameType) error {
 	} else if err := s.transport.Send(frame); err != nil {
 		return err
 	}
+	if s.Metrics != nil {
+		s.Metrics.ObserveFrame("client", frameTypeName(frame.Type), "outbound", int64(len(encoded)))
+	}
 	s.mu.Lock()
 	if payload.Revision > s.metadataRevision {
 		s.metadataRevision = payload.Revision
 	}
+	// Record only after the write succeeded: a failed enqueue must not suppress
+	// the next attempt as if the peer had already received this revision.
+	s.metadataSentRevision = payload.Revision
+	s.metadataSentAt = time.Now()
 	s.mu.Unlock()
 	return nil
 }
@@ -415,6 +450,7 @@ func (s *Session) OpenDatagram(ctx context.Context, req StreamRequest) (Datagram
 		return nil, errors.New("client session transport does not receive frames")
 	}
 	stream := newFrameDatagramStream(s, req.StreamID, req.Protocol)
+	stream.tunnel = req.Tunnel
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
 		s.mu.Unlock()
@@ -453,6 +489,7 @@ func (s *Session) OpenStreamConn(ctx context.Context, req StreamRequest) (io.Rea
 		return nil, errors.New("client session transport does not receive frames")
 	}
 	stream := newFrameStream(s, req.StreamID, req.Protocol)
+	stream.tunnel = req.Tunnel
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
 		s.mu.Unlock()
@@ -492,6 +529,7 @@ func (s *Session) OpenStreamResult(ctx context.Context, req StreamRequest) (io.R
 		return nil, failureOpenResult(protocol.OpenResultCodeInternalError), errors.New("client session transport does not receive frames")
 	}
 	stream := newFrameStream(s, req.StreamID, req.Protocol)
+	stream.tunnel = req.Tunnel
 	stream.openResult = make(chan protocol.OpenResultPayload, 1)
 	s.mu.Lock()
 	if s.closed || s.transport == nil {
@@ -618,6 +656,9 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			s.finishReceive(err)
 			return
 		}
+		if s.Metrics != nil {
+			s.Metrics.ObserveFrame("client", frameTypeName(f.Type), "inbound", int64(len(f.Payload)))
+		}
 		if f.Type == protocol.FramePing {
 			if err := s.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePong, Payload: append([]byte(nil), f.Payload...)}); err != nil {
 				s.finishReceive(err)
@@ -643,6 +684,12 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 		datagram := s.datagrams[f.StreamID]
 		s.mu.RUnlock()
 		if stream == nil && datagram == nil {
+			// A peer that keeps writing to a stream this client no longer knows
+			// inflates the connection without delivering anything. Counting the
+			// bytes is the only way to see that loss from the client side.
+			if f.Type == protocol.FrameData && s.Metrics != nil {
+				s.Metrics.ObserveDroppedBytes("client", "unknown_stream", int64(len(f.Payload)))
+			}
 			continue
 		}
 		switch f.Type {
@@ -661,18 +708,21 @@ func (s *Session) receiveLoop(tr ReceiveTransport) {
 			}
 		case protocol.FrameData:
 			if s.Metrics != nil && len(f.Payload) > 0 {
-				protocolName := ""
+				protocolName, tunnel := "", ""
 				if stream != nil {
-					protocolName = stream.protocol
+					protocolName, tunnel = stream.protocol, stream.tunnel
 				} else if datagram != nil {
-					protocolName = datagram.protocol
+					protocolName, tunnel = datagram.protocol, datagram.tunnel
 				}
 				s.Metrics.ObserveBytes("client", "inbound", protocolName, int64(len(f.Payload)))
+				s.Metrics.ObserveTunnelBytes("client", tunnel, "inbound", protocolName, int64(len(f.Payload)))
 			}
 			if stream != nil {
-				stream.push(f.Payload)
-			} else {
-				datagram.push(f.Payload)
+				if reason := stream.push(f.Payload); reason != "" && s.Metrics != nil {
+					s.Metrics.ObserveDroppedBytes("client", reason, int64(len(f.Payload)))
+				}
+			} else if reason := datagram.push(f.Payload); reason != "" && s.Metrics != nil {
+				s.Metrics.ObserveDroppedBytes("client", reason, int64(len(f.Payload)))
 			}
 		case protocol.FrameHalfClose:
 			if stream != nil {
@@ -761,10 +811,56 @@ func failureOpenResult(code protocol.OpenResultCode) protocol.OpenResultPayload 
 	}
 }
 
+// frameTypeName keeps the metrics label set finite and readable. Unknown types
+// stay observable as "unknown" so a newer peer cannot inflate cardinality.
+func frameTypeName(t protocol.FrameType) string {
+	switch t {
+	case protocol.FrameOpenStream:
+		return "open_stream"
+	case protocol.FrameData:
+		return "data"
+	case protocol.FrameHalfClose:
+		return "half_close"
+	case protocol.FrameReset:
+		return "reset"
+	case protocol.FrameWindowUpdate:
+		return "window_update"
+	case protocol.FrameGoAway:
+		return "goaway"
+	case protocol.FramePing:
+		return "ping"
+	case protocol.FramePong:
+		return "pong"
+	case protocol.FrameAgentHello:
+		return "agent_hello"
+	case protocol.FrameAgentMetadataUpdate:
+		return "agent_metadata_update"
+	case protocol.FrameAgentMetadataAck:
+		return "agent_metadata_ack"
+	case protocol.FrameTraceStart:
+		return "trace_start"
+	case protocol.FrameTraceHop:
+		return "trace_hop"
+	case protocol.FrameTraceEnd:
+		return "trace_end"
+	case protocol.FrameOpenResult:
+		return "open_result"
+	case protocol.FrameClientHello:
+		return "client_hello"
+	case protocol.FrameClientMetadataUpdate:
+		return "client_metadata_update"
+	case protocol.FrameClientMetadataAck:
+		return "client_metadata_ack"
+	default:
+		return "unknown"
+	}
+}
+
 type frameStream struct {
 	session        *Session
 	id             uint32
 	protocol       string
+	tunnel         string
 	readQueue      *streamsession.BoundedFrameQueue
 	readSignal     chan struct{}
 	openResult     chan protocol.OpenResultPayload
@@ -973,10 +1069,13 @@ func (s *frameStream) CloseWrite() error {
 	})
 	return err
 }
-func (s *frameStream) push(p []byte) {
+
+// push reports why a DATA payload could not be delivered. The caller turns a
+// non-empty reason into a metric; an empty string means the bytes were queued.
+func (s *frameStream) push(p []byte) string {
 	select {
 	case <-s.done:
-		return
+		return "closed_stream"
 	default:
 	}
 	if s.flow != nil {
@@ -984,7 +1083,7 @@ func (s *frameStream) push(p []byte) {
 			s.finish(err)
 			_ = s.session.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: s.id})
 			s.session.removeStream(s.id)
-			return
+			return "window_or_queue"
 		}
 	}
 	if s.readQueue.TryPush(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.id, Payload: append([]byte(nil), p...)}) {
@@ -992,11 +1091,12 @@ func (s *frameStream) push(p []byte) {
 		case s.readSignal <- struct{}{}:
 		default:
 		}
-		return
+		return ""
 	}
 	s.finish(protocol.ErrWindowExhausted)
 	_ = s.session.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: s.id})
 	s.session.removeStream(s.id)
+	return "window_or_queue"
 }
 func (s *frameStream) releaseReceiveWindow(n int) {
 	if s.flow == nil || n <= 0 {
@@ -1035,6 +1135,7 @@ type frameDatagramStream struct {
 	session    *Session
 	id         uint32
 	protocol   string
+	tunnel     string
 	readQueue  *streamsession.BoundedFrameQueue
 	readSignal chan struct{}
 	done       chan struct{}
@@ -1117,10 +1218,10 @@ func (s *frameDatagramStream) WriteDatagram(p []byte) error {
 	}
 	return s.session.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: s.id, Payload: append([]byte(nil), p...)})
 }
-func (s *frameDatagramStream) push(p []byte) {
+func (s *frameDatagramStream) push(p []byte) string {
 	select {
 	case <-s.done:
-		return
+		return "closed_stream"
 	default:
 	}
 	// The receive loop must never block on an unread UDP stream. Reaching the
@@ -1130,11 +1231,12 @@ func (s *frameDatagramStream) push(p []byte) {
 		case s.readSignal <- struct{}{}:
 		default:
 		}
-		return
+		return ""
 	}
 	s.finish(protocol.ErrWindowExhausted)
 	_ = s.session.sendFrame(protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameReset, StreamID: s.id})
 	s.session.removeDatagram(s.id)
+	return "window_or_queue"
 }
 func (s *frameDatagramStream) finish(err error) {
 	s.finishOnce.Do(func() { s.mu.Lock(); s.err = err; s.mu.Unlock(); close(s.done) })

@@ -24,6 +24,7 @@ const (
 type HTTPProxyForwardConfig struct {
 	ListenAddr       string
 	AgentID          string
+	TunnelName       string
 	OpenTimeout      time.Duration
 	AllowRemote      bool
 	AuthMode         HTTPProxyAuthMode
@@ -171,7 +172,7 @@ func (f *HTTPProxyForward) handleConnect(w http.ResponseWriter, r *http.Request)
 	}
 	defer cancel()
 	stream, err := f.opener.OpenStream(ctx, StreamRequest{
-		AgentID: f.cfg.AgentID, Protocol: "tcp", TargetHost: host, TargetPort: port,
+		AgentID: f.cfg.AgentID, Tunnel: f.cfg.TunnelName, Protocol: "tcp", TargetHost: host, TargetPort: port,
 	})
 	if err != nil {
 		http.Error(w, "tunnel unavailable", http.StatusBadGateway)
@@ -235,7 +236,7 @@ func (f *HTTPProxyForward) handleAbsoluteForm(w http.ResponseWriter, r *http.Req
 	}
 	defer cancel()
 	stream, err := f.opener.OpenStream(ctx, StreamRequest{
-		AgentID: f.cfg.AgentID, Protocol: "http", TargetHost: host, TargetPort: port,
+		AgentID: f.cfg.AgentID, Tunnel: f.cfg.TunnelName, Protocol: "http", TargetHost: host, TargetPort: port,
 	})
 	if err != nil {
 		http.Error(w, "tunnel unavailable", http.StatusBadGateway)

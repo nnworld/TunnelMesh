@@ -127,8 +127,9 @@ goroutine 随即结束，而错误只在 `ServerRuntime.Close()` 时才被读出
 
 ## Prometheus 抓取与规则
 
-只有 Server 暴露 `/metrics`；Agent 与 Client 没有本地 metrics 端点，它们的运行观测通过协议上报
-给 Server 后由 Server 输出。因此不要为 Agent/Client 配置单独的 scrape job。
+Server 始终暴露 `/metrics`；Agent 没有本地 metrics 端点，Client 仅在显式配置
+`client.metrics.listen` 时于回环地址暴露 `/metrics`（默认关闭）。未开启时不要在 Prometheus 侧为
+Agent/Client 配置 scrape job；开启 Client 端点后应由同机抓取或经 SSH/内网代理读取，不要直接暴露公网。
 
 起点配置见 [deploy/prometheus/prometheus.yml.example](../../deploy/prometheus/prometheus.yml.example)，
 其中包含单节点与集群两种形态。集群模式下必须为每个节点单独列出 target，并逐节点标注
@@ -142,7 +143,7 @@ goroutine 随即结束，而错误只在 `ServerRuntime.Close()` 时才被读出
 ```text
 component, mode, result, error_class, stage, direction, protocol,
 probe_kind, operation, cache, scope, decision, reason, route,
-method, step, agent_id, instance_id, server_node_id
+method, step, agent_id, instance_id, server_node_id, tunnel, transport
 ```
 
 ### `/metrics` 的访问控制
@@ -161,6 +162,24 @@ method, step, agent_id, instance_id, server_node_id
 侧用 `authorization.credentials_file` 读取 token，不要把 token 写进 `prometheus.yml` 正文——该文件
 常常被提交进配置仓库。
 
+
+### Client 字节归因
+
+`client.metrics.listen` 开启后，Client 额外输出三类计数器，用来把线路字节与业务载荷对账：
+
+| 指标 | 标签 | 含义 |
+|---|---|---|
+| `tunnelmesh_client_stream_bytes_total` | `component,tunnel,direction,protocol` | 已交付或已入队的数据帧载荷字节，按本地配置的隧道名归因；空名记为 `unattributed` |
+| `tunnelmesh_client_wire_bytes_total` | `component,transport,direction` | WebSocket 消息字节（帧头 + 载荷），即线路层的实际收发量 |
+| `tunnelmesh_client_dropped_bytes_total` | `component,reason` | 收到但未交付的数据字节；`reason` 为 `unknown_stream`（流已被移除）、`closed_stream`（流已关闭）或 `window_or_queue`（窗口/队列耗尽） |
+| `tunnelmesh_client_frames_total` | `component,type,direction` | 按帧类型计数的帧数，用于发现“小控制帧风暴” |
+| `tunnelmesh_client_frame_bytes_total` | `component,type,direction` | 按帧类型统计的负载字节，与 `frames_total` 一起判断是帧多还是帧大 |
+
+判读顺序：
+
+1. `wire_out - stream_out` 持续很大且丢弃为 0：差额是协议/TLS 开销或控制面（心跳、重连），检查 `tunnelmesh_heartbeat_total` 与连接重建次数。
+2. `wire_in - stream_in` 很大，同时 `dropped_bytes{reason="unknown_stream"}` 同步增长：服务端仍在向客户端已不存在的流发送数据，应先修对端关闭时序，而不是加带宽。
+3. `stream_out` 按 `tunnel` 分布即可直接回答“哪条隧道在占带宽”。标签只来自本地配置，数量受隧道数限制。
 
 ### 管理入口的拒绝与 shedding
 
