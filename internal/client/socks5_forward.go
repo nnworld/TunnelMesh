@@ -24,6 +24,7 @@ const (
 type SOCKS5ForwardConfig struct {
 	ListenAddr       string
 	AgentID          string
+	TunnelName       string
 	ConnectTimeout   time.Duration
 	OpenTimeout      time.Duration
 	HandshakeTimeout time.Duration
@@ -262,6 +263,7 @@ func (f *SOCKS5Forward) openStreamResult(request proxy.SOCKS5Request) (io.ReadWr
 		defer cancel()
 	}
 	req := StreamRequest{
+		Tunnel:     f.cfg.TunnelName,
 		AgentID:    f.cfg.AgentID,
 		Protocol:   "tcp",
 		TargetHost: request.Host,

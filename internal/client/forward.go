@@ -33,6 +33,7 @@ type ResultStreamOpener interface {
 type TCPForwardConfig struct {
 	ListenAddr     string
 	AgentID        string
+	TunnelName     string
 	TargetHost     string
 	TargetPort     int
 	ConnectTimeout time.Duration
@@ -143,7 +144,7 @@ func (f *TCPForward) handleConn(local net.Conn) {
 		ctx, cancel = context.WithTimeout(ctx, f.cfg.ConnectTimeout)
 		defer cancel()
 	}
-	remote, err := f.opener.OpenStream(ctx, StreamRequest{AgentID: f.cfg.AgentID, Protocol: "tcp", TargetHost: f.cfg.TargetHost, TargetPort: f.cfg.TargetPort})
+	remote, err := f.opener.OpenStream(ctx, StreamRequest{AgentID: f.cfg.AgentID, Protocol: "tcp", TargetHost: f.cfg.TargetHost, TargetPort: f.cfg.TargetPort, Tunnel: f.cfg.TunnelName})
 	if err != nil {
 		return
 	}
@@ -156,6 +157,7 @@ func (f *TCPForward) handleConn(local net.Conn) {
 type HTTPForwardConfig struct {
 	ListenAddr  string
 	AgentID     string
+	TunnelName  string
 	TargetHost  string
 	TargetPort  int
 	OpenTimeout time.Duration
@@ -165,6 +167,7 @@ type HTTPForwardConfig struct {
 type UDPForwardConfig struct {
 	ListenAddr      string
 	AgentID         string
+	TunnelName      string
 	TargetHost      string
 	TargetPort      int
 	OpenTimeout     time.Duration
@@ -190,7 +193,7 @@ func NewUDPForward(opener StreamOpener, cfg UDPForwardConfig) (*UDPForward, erro
 	if err := requireLoopbackListen("UDP", cfg.ListenAddr, cfg.AllowRemote); err != nil {
 		return nil, err
 	}
-	m, err := NewUDPAssociationManager(opener, UDPAssociationConfig{AgentID: cfg.AgentID, TargetHost: cfg.TargetHost, TargetPort: cfg.TargetPort, OpenTimeout: cfg.OpenTimeout, IdleTimeout: cfg.IdleTimeout, MaxDatagram: cfg.MaxDatagram, MaxAssociations: cfg.MaxAssociations})
+	m, err := NewUDPAssociationManager(opener, UDPAssociationConfig{AgentID: cfg.AgentID, TunnelName: cfg.TunnelName, TargetHost: cfg.TargetHost, TargetPort: cfg.TargetPort, OpenTimeout: cfg.OpenTimeout, IdleTimeout: cfg.IdleTimeout, MaxDatagram: cfg.MaxDatagram, MaxAssociations: cfg.MaxAssociations})
 	if err != nil {
 		return nil, err
 	}
@@ -374,7 +377,7 @@ func (f *HTTPForward) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel = context.WithTimeout(ctx, f.cfg.OpenTimeout)
 		defer cancel()
 	}
-	stream, err := f.opener.OpenStream(ctx, StreamRequest{AgentID: f.cfg.AgentID, Protocol: "http", TargetHost: f.cfg.TargetHost, TargetPort: f.cfg.TargetPort})
+	stream, err := f.opener.OpenStream(ctx, StreamRequest{AgentID: f.cfg.AgentID, Protocol: "http", TargetHost: f.cfg.TargetHost, TargetPort: f.cfg.TargetPort, Tunnel: f.cfg.TunnelName})
 	if err != nil {
 		http.Error(w, "tunnel unavailable", http.StatusBadGateway)
 		return

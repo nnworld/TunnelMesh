@@ -483,9 +483,16 @@ type ClientConfig struct {
 	Tunnels          []TunnelConfig         `mapstructure:"tunnels" json:"tunnels" yaml:"tunnels"`
 	Connections      ClientConnectionConfig `mapstructure:"connections" json:"connections" yaml:"connections"`
 	Stream           ClientStreamConfig     `mapstructure:"stream" json:"stream" yaml:"stream"`
+	Metrics          ClientMetricsConfig    `mapstructure:"metrics" json:"metrics" yaml:"metrics"`
 	RemoteValidation RemoteValidationConfig `mapstructure:"remote_validation" json:"remote_validation" yaml:"remote_validation"`
 	Metadata         []MetadataSource       `mapstructure:"metadata" json:"metadata" yaml:"metadata"`
 	Update           UpdateConfig           `mapstructure:"update" json:"update" yaml:"update"`
+}
+
+// ClientMetricsConfig exposes in-process Prometheus metrics. Listen is empty by
+// default so `client run` opens no endpoint; when set it must be loopback.
+type ClientMetricsConfig struct {
+	Listen string `mapstructure:"listen" json:"listen" yaml:"listen"`
 }
 
 // ServerUpdatesConfig lets the Server distribute client and agent releases.
@@ -869,6 +876,7 @@ func setDefaults(v *viper.Viper) {
 		"client.connections.cooldown":                        30 * time.Second,
 		"client.stream.open_timeout":                         8 * time.Second,
 		"client.stream.inbound_buffer_bytes":                 262144,
+		"client.metrics.listen":                              "",
 		"client.remote_validation.positive_ttl":              15 * time.Second,
 		"client.remote_validation.negative_ttl":              2 * time.Second,
 		"client.remote_validation.timeout":                   3 * time.Second,
@@ -919,6 +927,7 @@ func bindEnvironment(v *viper.Viper) {
 		"registry.type", "registry.endpoints", "node.id", "server.http_addr", "server.https_addr",
 		"server.agent_ws_addr", "server.client_ws_addr", "server.dynamic_suffix", "server.tcp_bridge.enabled", "server.tcp_bridge_enabled",
 		"agent.transport.proxy_mode", "agent.transport.proxy_url", "agent.transport.proxy_username", "agent.transport.proxy_password_env", "agent.transport.proxy_password_file", "agent.transport.allow_insecure_transport",
+		"client.metrics.listen",
 		"client.transport.proxy_mode", "client.transport.proxy_url", "client.transport.proxy_username", "client.transport.proxy_password_env", "client.transport.proxy_password_file", "client.transport.allow_insecure_transport",
 		"security.allowed_hosts", "security.allowed_origins", "security.allow_legacy_connection_tokens",
 		"tls.enabled", "tls.cert_file", "tls.key_file", "tls.min_version",
@@ -964,6 +973,7 @@ func Validate(cfg Config) error {
 	problems = append(problems, validateAgentStreams(cfg.Agent.Streams)...)
 	problems = append(problems, validateAgentExec(cfg.Agent.Exec)...)
 	problems = append(problems, validateClientStreams(cfg.Client.Stream)...)
+	problems = append(problems, validateClientMetrics(cfg.Client.Metrics)...)
 	problems = append(problems, validateRemoteValidation(cfg.Client.RemoteValidation)...)
 	if dir := strings.TrimSpace(cfg.Server.Updates.Dir); dir != "" && !filepath.IsAbs(dir) {
 		problems = append(problems, "server.updates.dir must be an absolute path")
@@ -1377,6 +1387,27 @@ func validateAgentStreams(cfg AgentStreamConfig) []string {
 		}
 	}
 	return problems
+}
+
+// validateClientMetrics keeps the diagnostics endpoint off the network: an
+// operator who wants remote scraping must tunnel or proxy it explicitly.
+func validateClientMetrics(cfg ClientMetricsConfig) []string {
+	listen := strings.TrimSpace(cfg.Listen)
+	if listen == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return []string{"client.metrics.listen must be a host:port address"}
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return []string{"client.metrics.listen must bind to a loopback address"}
+	}
+	return nil
 }
 
 func validateClientStreams(cfg ClientStreamConfig) []string {

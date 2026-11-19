@@ -646,6 +646,27 @@ client:
 
 `remote_validation` 只缓存外部校验的 allow/deny 决策，不缓存凭据或目标响应体；同键并发请求会合并。生产环境优先调小 `cluster_positive_ttl` 和 `remote_validation.positive_ttl`，在权限收敛速度和数据库/外部校验压力之间取得平衡。
 
+## Client 本地指标端点
+
+Client 默认不监听任何观测端口。需要按隧道核对流量时，可显式开启只读的 Prometheus 端点：
+
+```yaml
+client:
+  metrics:
+    # 只能是回环地址（127.0.0.1、::1 或 localhost）；留空表示关闭。
+    listen: 127.0.0.1:9101
+```
+
+等价环境变量为 `TUNNELMESH_CLIENT_METRICS_LISTEN`。非回环地址会在配置校验阶段被拒绝，避免把
+未经认证的指标暴露到公网；需要远程抓取时请用 SSH 隧道或同机 Prometheus。开启后：
+
+```bash
+curl -s http://127.0.0.1:9101/metrics | grep -E 'client_(stream|wire|dropped)_bytes'
+```
+
+端口绑定失败会让 `client run` 直接启动失败，而不是以“无指标”状态继续运行。关闭时移除该配置并重启
+Client 即可，不涉及数据迁移或 Schema 变更。
+
 ## 安全白名单与兼容开关
 
 ```yaml

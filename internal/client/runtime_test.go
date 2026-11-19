@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/tunnelmesh/tunnelmesh/internal/config"
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -570,5 +574,145 @@ func TestRuntimeAgentOnlyReadinessComesFromTheAgentAck(t *testing.T) {
 	rt.agentPool.OnReady("v1.5.0")
 	if got := rt.Readiness(); !got.Ready || got.ServerVersion != "v1.5.0" {
 		t.Fatalf("Readiness() = %+v, want ready with the Agent's Server version", got)
+	}
+}
+
+// TestConfiguredForwardPropagatesTunnelName pins the attribution label at the
+// point where it is cheap to check: every forwarder must receive the tunnel's
+// operator-facing name, and a live TCP dial must put it on the open request.
+func TestConfiguredForwardPropagatesTunnelName(t *testing.T) {
+	cfg := runtimeTestConfig()
+	opener := openerFunc(func(context.Context, StreamRequest) (io.ReadWriteCloser, error) {
+		return newTestStream(nil), nil
+	})
+	checks := []struct {
+		protocol string
+		name     func(Forward) string
+	}{
+		{"tcp", func(f Forward) string { return f.(*TCPForward).cfg.TunnelName }},
+		{"udp", func(f Forward) string { return f.(*UDPForward).cfg.TunnelName }},
+		{"http", func(f Forward) string { return f.(*HTTPForward).cfg.TunnelName }},
+		{"socks5", func(f Forward) string { return f.(*SOCKS5Forward).cfg.TunnelName }},
+		{"http-proxy", func(f Forward) string { return f.(*HTTPProxyForward).cfg.TunnelName }},
+	}
+	for _, check := range checks {
+		tunnel := config.TunnelConfig{
+			Name: " edge-https ", Protocol: check.protocol, ListenAddr: "127.0.0.1:0",
+			AgentID: "agent", TargetHost: "host", TargetPort: 443,
+		}
+		forward, _, err := NewConfiguredForward(opener, cfg.Client, tunnel)
+		if err != nil {
+			t.Fatalf("%s: %v", check.protocol, err)
+		}
+		if got := check.name(forward); got != "edge-https" {
+			t.Fatalf("%s tunnel name = %q, want edge-https", check.protocol, got)
+		}
+		_ = forward.Close()
+	}
+
+	opened := make(chan StreamRequest, 1)
+	fwd, err := NewTCPForward(openerFunc(func(_ context.Context, req StreamRequest) (io.ReadWriteCloser, error) {
+		opened <- req
+		return newTestStream(nil), nil
+	}), TCPForwardConfig{ListenAddr: "127.0.0.1:0", AgentID: "agent", TargetHost: "host", TargetPort: 443, TunnelName: "edge-https"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := fwd.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer fwd.Close()
+	conn, err := net.Dial("tcp", fwd.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	select {
+	case req := <-opened:
+		if req.Tunnel != "edge-https" {
+			t.Fatalf("open request tunnel = %q, want edge-https", req.Tunnel)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forward never opened a stream")
+	}
+}
+
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func TestRuntimeServesClientMetricsOnLoopbackOnly(t *testing.T) {
+	addr := freeLoopbackAddr(t)
+	cfg := runtimeTestConfig(config.TunnelConfig{
+		Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	cfg.Client.Metrics.Listen = addr
+	registry := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(registry)
+	rt, err := NewRuntimeFromConfig(context.Background(), cfg, RuntimeOptions{
+		SkipLock: true, Runner: newPoolTestRunner(make(chan *poolTestTransport, 4)), Metrics: metrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	metrics.ObserveTunnelBytes("client", "web", "outbound", "tcp", 7)
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d", resp.StatusCode)
+	}
+	if !bytes.Contains(body, []byte(`tunnelmesh_client_stream_bytes_total{component="client",direction="outbound",protocol="tcp",tunnel="web"} 7`)) {
+		t.Fatalf("metrics body missing attributed counter:\n%s", body)
+	}
+
+	if err := rt.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("metrics listener still bound after Stop: %v", err)
+	}
+	_ = ln.Close()
+}
+
+func TestRuntimeRejectsOccupiedMetricsPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	cfg := runtimeTestConfig(config.TunnelConfig{
+		Name: "web", Protocol: "tcp", ListenAddr: "127.0.0.1:0", AgentID: "agent-a", TargetHost: "10.0.0.8", TargetPort: 22,
+	})
+	cfg.Client.Metrics.Listen = ln.Addr().String()
+	rt, err := NewRuntimeFromConfig(context.Background(), cfg, RuntimeOptions{
+		SkipLock: true, Runner: newPoolTestRunner(make(chan *poolTestTransport, 1)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rt.Stop() }()
+	err = rt.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "client metrics listen") {
+		t.Fatalf("Start error = %v, want occupied metrics port error", err)
 	}
 }

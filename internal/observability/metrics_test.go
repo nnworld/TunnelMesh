@@ -306,3 +306,69 @@ func TestMetricsStreamLatencyAndCacheFamilies(t *testing.T) {
 		t.Fatalf("authorization revision = %v, want 42", got)
 	}
 }
+
+func TestMetricsAttributesBytesByTunnelWireAndDropReason(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg)
+	m.ObserveTunnelBytes("client", "edge-https", "inbound", "tcp", 4096)
+	m.ObserveTunnelBytes("client", "  ", "outbound", "tcp", 10)
+	m.ObserveTunnelBytes("client", "edge-https", "inbound", "tcp", -1)
+	m.ObserveWireBytes("client", "websocket", "outbound", 8192)
+	m.ObserveDroppedBytes("client", "unknown_stream", 2048)
+
+	if got := testutil.ToFloat64(m.streamBytesTotal.WithLabelValues("client", "edge-https", "inbound", "tcp")); got != 4096 {
+		t.Fatalf("stream bytes by tunnel = %v, want 4096", got)
+	}
+	if got := testutil.ToFloat64(m.streamBytesTotal.WithLabelValues("client", "unattributed", "outbound", "tcp")); got != 10 {
+		t.Fatalf("unattributed stream bytes = %v, want 10", got)
+	}
+	if got := testutil.ToFloat64(m.wireBytesTotal.WithLabelValues("client", "websocket", "outbound")); got != 8192 {
+		t.Fatalf("wire bytes = %v, want 8192", got)
+	}
+	if got := testutil.ToFloat64(m.droppedBytesTotal.WithLabelValues("client", "unknown_stream")); got != 2048 {
+		t.Fatalf("dropped bytes = %v, want 2048", got)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	names := make(map[string]bool, len(families))
+	for _, family := range families {
+		names[family.GetName()] = true
+	}
+	for _, want := range []string{
+		"tunnelmesh_client_stream_bytes_total",
+		"tunnelmesh_client_wire_bytes_total",
+		"tunnelmesh_client_dropped_bytes_total",
+	} {
+		if !names[want] {
+			t.Fatalf("missing metric family %q in %v", want, names)
+		}
+	}
+}
+
+func TestMetricsByteObserversAreNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveTunnelBytes("client", "edge", "inbound", "tcp", 1)
+	m.ObserveWireBytes("client", "websocket", "inbound", 1)
+	m.ObserveDroppedBytes("client", "unknown_stream", 1)
+}
+
+func TestMetricsObservesFramesByType(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewMetrics(reg)
+	m.ObserveFrame("client", "data", "outbound", 900)
+	m.ObserveFrame("client", "data", "outbound", 100)
+	m.ObserveFrame("client", "ping", "outbound", 8)
+
+	if got := testutil.ToFloat64(m.frameBytesTotal.WithLabelValues("client", "data", "outbound")); got != 1000 {
+		t.Fatalf("frame bytes = %v, want 1000", got)
+	}
+	if got := testutil.ToFloat64(m.framesTotal.WithLabelValues("client", "data", "outbound")); got != 2 {
+		t.Fatalf("frame count = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.framesTotal.WithLabelValues("client", "ping", "outbound")); got != 1 {
+		t.Fatalf("ping count = %v, want 1", got)
+	}
+}

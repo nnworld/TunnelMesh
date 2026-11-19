@@ -15,8 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/net/websocket"
 
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -237,4 +239,55 @@ func clientFrameBytes(t *testing.T, frame protocol.Frame) []byte {
 		t.Fatal(err)
 	}
 	return payload.Bytes()
+}
+
+// TestClientWebSocketCountsWireBytes asserts both directions are accounted at
+// the transport boundary, where the bytes are the actual WebSocket message.
+func TestClientWebSocketCountsWireBytes(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ping := clientFrameBytes(t, protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FramePing, Payload: []byte("heartbeat")})
+	server := httptest.NewServer(websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(conn *websocket.Conn) {
+			defer conn.Close()
+			_ = websocket.Message.Send(conn, ping)
+			var raw []byte
+			_ = websocket.Message.Receive(conn, &raw)
+			<-ctx.Done()
+		},
+	})
+	defer server.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWebSocketWithOptions(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client", "client-secret", func(*Session) error {
+			deadline := time.Now().Add(2 * time.Second)
+			inbound := map[string]string{"component": "client", "transport": "websocket", "direction": "inbound"}
+			outbound := map[string]string{"component": "client", "transport": "websocket", "direction": "outbound"}
+			for time.Now().Before(deadline) {
+				if gatheredCounter(t, reg, "tunnelmesh_client_wire_bytes_total", inbound) >= float64(len(ping)) &&
+					gatheredCounter(t, reg, "tunnelmesh_client_wire_bytes_total", outbound) > 0 {
+					cancel()
+					return nil
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Error("wire byte counters did not advance")
+			cancel()
+			return nil
+		}, WebSocketRunOptions{Metrics: metrics, BaseBackoff: 5 * time.Millisecond, MaxBackoff: 10 * time.Millisecond})
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWebSocketWithOptions error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunWebSocketWithOptions did not stop")
+	}
 }
