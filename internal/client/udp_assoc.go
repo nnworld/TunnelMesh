@@ -37,6 +37,7 @@ var ErrTooManyUDPAssociations = errors.New("client: too many UDP associations")
 
 type UDPAssociationConfig struct {
 	AgentID         string
+	TunnelName      string
 	TargetHost      string
 	TargetPort      int
 	OpenTimeout     time.Duration
@@ -111,7 +112,7 @@ func (m *UDPAssociationManager) HandleDatagram(ctx context.Context, source *net.
 		if refused {
 			return ErrTooManyUDPAssociations
 		}
-		req := StreamRequest{AgentID: m.cfg.AgentID, Protocol: "udp", TargetHost: m.cfg.TargetHost, TargetPort: m.cfg.TargetPort}
+		req := StreamRequest{AgentID: m.cfg.AgentID, Protocol: "udp", TargetHost: m.cfg.TargetHost, TargetPort: m.cfg.TargetPort, Tunnel: m.cfg.TunnelName}
 		var ds DatagramStream
 		var err error
 		openCtx := ctx

@@ -2019,3 +2019,64 @@ func TestServerUpdatesDirComesFromTheEnvironment(t *testing.T) {
 		t.Fatalf("server.updates.dir = %q, want %q from the environment", cfg.Server.Updates.Dir, dir)
 	}
 }
+
+func TestClientMetricsListenMustBeLoopback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	yaml := `mode: local
+client:
+  server_url: wss://tunnel.example.com/ws/client
+  token: client-secret
+  tunnels:
+    - name: web
+      protocol: tcp
+      listen: 127.0.0.1:18080
+      agent_id: agent-a
+      target_host: 10.0.0.8
+      target_port: 22
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.Client.Metrics.Listen != "" {
+		t.Fatalf("default client.metrics.listen = %q, want disabled", loaded.Client.Metrics.Listen)
+	}
+
+	t.Setenv("TUNNELMESH_CLIENT_METRICS_LISTEN", "127.0.0.1:19101")
+	fromEnv, err := config.Load(context.Background(), config.ConfigOptions{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("Load() with env error = %v", err)
+	}
+	if fromEnv.Client.Metrics.Listen != "127.0.0.1:19101" {
+		t.Fatalf("env client.metrics.listen = %q", fromEnv.Client.Metrics.Listen)
+	}
+
+	for _, tc := range []struct {
+		listen string
+		want   string
+	}{
+		{listen: "", want: ""},
+		{listen: "127.0.0.1:19101", want: ""},
+		{listen: "localhost:19101", want: ""},
+		{listen: "0.0.0.0:19101", want: "client.metrics.listen must bind to a loopback address"},
+		{listen: "10.0.0.5:19101", want: "client.metrics.listen must bind to a loopback address"},
+		{listen: "not-an-address", want: "client.metrics.listen must be a host:port address"},
+	} {
+		cfg := loaded
+		cfg.Client.Metrics.Listen = tc.listen
+		err := config.Validate(cfg)
+		if tc.want == "" {
+			if err != nil && strings.Contains(err.Error(), "client.metrics.listen") {
+				t.Fatalf("Validate(%q) error = %v, want accepted", tc.listen, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("Validate(%q) error = %v, want %q", tc.listen, err, tc.want)
+		}
+	}
+}

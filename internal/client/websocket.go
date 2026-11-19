@@ -73,6 +73,11 @@ func RunWebSocketWithOptions(ctx context.Context, serverURL, token string, onRea
 		var delay time.Duration
 		transport, dialErr := dialWebSocketWithLegacyFallback(ctx, serverURL, token, options.Dialer)
 		if dialErr == nil {
+			if ws, ok := transport.(*clientWebSocketTransport); ok {
+				// Byte accounting belongs to the transport that actually writes
+				// frames, so the session cannot double count retries.
+				ws.metrics = options.Metrics
+			}
 			if options.Metrics != nil {
 				options.Metrics.ObserveConnection("client", "websocket", "started", "")
 			}
@@ -253,6 +258,7 @@ func clientOriginFor(u *url.URL) string {
 type clientWebSocketTransport struct {
 	conn        *websocket.Conn
 	subprotocol string
+	metrics     *observability.Metrics
 	mu          sync.Mutex
 }
 
@@ -274,12 +280,14 @@ func (t *clientWebSocketTransport) Send(frame protocol.Frame) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	_ = t.conn.SetWriteDeadline(time.Now().Add(sharedtransport.WriteTimeout))
+	wireBytes := payload.Len()
 	if err := websocket.Message.Send(t.conn, payload.Bytes()); err != nil {
 		// See the Agent transport: a failed write corrupts the frame stream, and
 		// closing wakes the read loop so the session reconnects.
 		_ = t.conn.Close()
 		return err
 	}
+	t.metrics.ObserveWireBytes("client", "websocket", "outbound", int64(wireBytes))
 	return nil
 }
 
@@ -291,6 +299,7 @@ func (t *clientWebSocketTransport) Receive() (protocol.Frame, error) {
 	if err := websocket.Message.Receive(t.conn, &payload); err != nil {
 		return protocol.Frame{}, err
 	}
+	t.metrics.ObserveWireBytes("client", "websocket", "inbound", int64(len(payload)))
 	return protocol.NewDecoder(bytes.NewReader(payload)).ReadFrame()
 }
 

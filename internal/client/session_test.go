@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/tunnelmesh/tunnelmesh/internal/observability"
 	"github.com/tunnelmesh/tunnelmesh/internal/protocol"
 )
 
@@ -585,4 +588,247 @@ func TestSessionIgnoresTheVersionInARejectedOrVersionlessAck(t *testing.T) {
 	// frames were processed rather than never read.
 	tr.recv <- clientAckFrame(t, protocol.ClientMetadataAckPayload{Accepted: true, ServerVersion: "v1.2.0"})
 	waitForCondition(t, time.Second, func() bool { return session.ServerVersion() == "v1.2.0" })
+}
+
+// gatheredCounter reads one counter without depending on unexported collector
+// fields, which is what lets client tests assert observability behaviour.
+func gatheredCounter(t *testing.T, reg *prometheus.Registry, familyName string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != familyName {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matched := true
+			for name, want := range labels {
+				found := false
+				for _, pair := range metric.GetLabel() {
+					if pair.GetName() == name && pair.GetValue() == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// waitForFloat polls one counter until it reaches want, because the receive
+// loop publishes the observation asynchronously from the test goroutine.
+func waitForFloat(t *testing.T, read func() float64, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := read(); got == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("metric never reached %v (last %v)", want, read())
+}
+
+func TestSessionAttributesDataBytesToTunnel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(reg)
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 16), recv: make(chan protocol.Frame, 16), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	session.Metrics = metrics
+	defer session.Close()
+
+	stream, err := session.OpenStreamConn(context.Background(), StreamRequest{
+		AgentID: "agent", Protocol: "tcp", TargetHost: "host", TargetPort: 443, Tunnel: "edge-https",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	var streamID uint32
+	for streamID == 0 {
+		select {
+		case frame := <-tr.sent:
+			if frame.Type == protocol.FrameOpenStream {
+				streamID = frame.StreamID
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("OPEN_STREAM was not sent")
+		}
+	}
+
+	if _, err := stream.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-tr.sent:
+		if frame.Type != protocol.FrameData || frame.StreamID != streamID || len(frame.Payload) != 5 {
+			t.Fatalf("outbound frame = %+v", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DATA was not sent")
+	}
+	outbound := map[string]string{"component": "client", "tunnel": "edge-https", "direction": "outbound", "protocol": "tcp"}
+	if got := gatheredCounter(t, reg, "tunnelmesh_client_stream_bytes_total", outbound); got != 5 {
+		t.Fatalf("outbound tunnel bytes = %v, want 5", got)
+	}
+	if got := gatheredCounter(t, reg, "tunnelmesh_client_frames_total", map[string]string{
+		"component": "client", "type": "data", "direction": "outbound",
+	}); got != 1 {
+		t.Fatalf("outbound data frames = %v, want 1", got)
+	}
+
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: streamID, Payload: []byte("world!")}
+	inbound := map[string]string{"component": "client", "tunnel": "edge-https", "direction": "inbound", "protocol": "tcp"}
+	waitForFloat(t, func() float64 {
+		return gatheredCounter(t, reg, "tunnelmesh_client_stream_bytes_total", inbound)
+	}, 6)
+}
+
+func TestSessionCountsDroppedDataBytes(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(reg)
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 32), recv: make(chan protocol.Frame, 32), done: make(chan struct{})}
+	session := NewSessionWithOpenMode(tr, SessionOpenFlowControl)
+	session.Metrics = metrics
+	defer session.Close()
+	session.Start()
+
+	dropped := func(reason string) float64 {
+		return gatheredCounter(t, reg, "tunnelmesh_client_dropped_bytes_total", map[string]string{
+			"component": "client", "reason": reason,
+		})
+	}
+
+	// An unknown stream models the production case: the peer keeps sending on a
+	// stream this client already forgot, so every byte is acknowledged and lost.
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: 4242, Payload: make([]byte, 100)}
+	waitForFloat(t, func() float64 { return dropped("unknown_stream") }, 100)
+
+	openStream := func(port int) (io.ReadWriteCloser, uint32) {
+		stream, err := session.OpenStreamConn(context.Background(), StreamRequest{
+			AgentID: "agent", Protocol: "tcp", TargetHost: "host", TargetPort: port,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			select {
+			case frame := <-tr.sent:
+				if frame.Type == protocol.FrameOpenStream {
+					return stream, frame.StreamID
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("OPEN_STREAM was not sent")
+			}
+		}
+	}
+
+	closedStream, closedID := openStream(443)
+	defer closedStream.Close()
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameHalfClose, StreamID: closedID}
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: closedID, Payload: make([]byte, 64)}
+	waitForFloat(t, func() float64 { return dropped("closed_stream") }, 64)
+
+	exhausted, exhaustedID := openStream(8443)
+	defer exhausted.Close()
+	tr.recv <- protocol.Frame{Version: protocol.CurrentVersion, Type: protocol.FrameData, StreamID: exhaustedID, Payload: make([]byte, 300<<10)}
+	waitForFloat(t, func() float64 { return dropped("window_or_queue") }, 300<<10)
+}
+
+// TestSessionStartIsIdempotent pins the fix for a bandwidth leak: Start is
+// called from every OpenStreamConn, so unguarded metadata work sent a full
+// CLIENT_HELLO per proxied connection and leaked one 30s ticker per call.
+func TestSessionStartIsIdempotent(t *testing.T) {
+	collector, err := NewClientMetadataCollector(ClientMetadataOptions{InstanceID: "client-0123456789abcdef0123456789abcdef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 8), recv: make(chan protocol.Frame, 8), done: make(chan struct{})}
+	session := NewSessionWithOpenModeAndMetadata(tr, SessionOpenMetadata, collector)
+	defer session.Close()
+
+	session.Start()
+	session.Start()
+	stream, err := session.OpenStreamConn(context.Background(), StreamRequest{AgentID: "agent", Protocol: "tcp", TargetHost: "host", TargetPort: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	if first := <-tr.sent; first.Type != protocol.FrameClientHello {
+		t.Fatalf("first frame = %v, want CLIENT_HELLO", first.Type)
+	}
+	if second := <-tr.sent; second.Type != protocol.FrameOpenStream {
+		t.Fatalf("second frame = %v, want OPEN_STREAM", second.Type)
+	}
+	select {
+	case extra := <-tr.sent:
+		t.Fatalf("unexpected extra frame after one session start: %v", extra.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func newMetadataTestSession(t *testing.T) (*Session, *receiveTransport) {
+	t.Helper()
+	collector, err := NewClientMetadataCollector(ClientMetadataOptions{InstanceID: "client-0123456789abcdef0123456789abcdef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &receiveTransport{sent: make(chan protocol.Frame, 8), recv: make(chan protocol.Frame, 8), done: make(chan struct{})}
+	session := NewSessionWithOpenModeAndMetadata(tr, SessionOpenMetadata, collector)
+	t.Cleanup(func() { _ = session.Close() })
+	session.Start()
+	select {
+	case frame := <-tr.sent:
+		if frame.Type != protocol.FrameClientHello {
+			t.Fatalf("first frame = %v, want CLIENT_HELLO", frame.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CLIENT_HELLO was not sent")
+	}
+	return session, tr
+}
+
+func TestSessionMetadataUpdateSkipsUnchangedWithinKeepalive(t *testing.T) {
+	session, tr := newMetadataTestSession(t)
+	if err := session.sendClientMetadata(protocol.FrameClientMetadataUpdate); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.sendClientMetadata(protocol.FrameClientMetadataUpdate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-tr.sent:
+		t.Fatalf("unchanged metadata was resent: %v", frame.Type)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestSessionMetadataUpdateResendsAfterKeepalive(t *testing.T) {
+	session, tr := newMetadataTestSession(t)
+	session.mu.Lock()
+	session.metadataSentAt = time.Now().Add(-clientMetadataKeepalive - time.Second)
+	session.mu.Unlock()
+	if err := session.sendClientMetadata(protocol.FrameClientMetadataUpdate); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-tr.sent:
+		if frame.Type != protocol.FrameClientMetadataUpdate {
+			t.Fatalf("frame = %v, want CLIENT_METADATA_UPDATE", frame.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("metadata keepalive was not sent")
+	}
 }
