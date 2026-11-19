@@ -1,22 +1,30 @@
 package observability
 
 import (
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Metrics owns the bounded Prometheus collectors used by runtime observers.
 // A registry is injected so tests and embedded users never mutate the global registry.
 type Metrics struct {
+	registry                        *prometheus.Registry
 	connectionsTotal                *prometheus.CounterVec
 	connectionsActive               *prometheus.GaugeVec
 	connectionStageDuration         *prometheus.HistogramVec
 	heartbeatTotal                  *prometheus.CounterVec
 	heartbeatRTT                    *prometheus.HistogramVec
 	bytesTotal                      *prometheus.CounterVec
+	streamBytesTotal                *prometheus.CounterVec
+	wireBytesTotal                  *prometheus.CounterVec
+	droppedBytesTotal               *prometheus.CounterVec
+	frameBytesTotal                 *prometheus.CounterVec
+	framesTotal                     *prometheus.CounterVec
 	streamsActive                   *prometheus.GaugeVec
 	streamsTotal                    *prometheus.CounterVec
 	streamErrorsTotal               *prometheus.CounterVec
@@ -75,12 +83,18 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		reg = prometheus.NewRegistry()
 	}
 	m := &Metrics{
+		registry:                        reg,
 		connectionsTotal:                prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_connections_total", Help: "Total connection attempts by result."}, []string{"component", "mode", "result", "error_class"}),
 		connectionsActive:               prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_connections_active", Help: "Current active connections."}, []string{"component", "mode"}),
 		connectionStageDuration:         prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_connection_stage_duration_seconds", Help: "Connection stage duration in seconds."}, []string{"component", "stage", "result", "error_class"}),
 		heartbeatTotal:                  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_heartbeat_total", Help: "Total heartbeat outcomes."}, []string{"component", "result"}),
 		heartbeatRTT:                    prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "tunnelmesh_heartbeat_rtt_seconds", Help: "Heartbeat round-trip time in seconds."}, []string{"component"}),
 		bytesTotal:                      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_bytes_total", Help: "Total bytes transferred."}, []string{"component", "direction", "protocol"}),
+		streamBytesTotal:                prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_stream_bytes_total", Help: "Client stream payload bytes by configured tunnel."}, []string{"component", "tunnel", "direction", "protocol"}),
+		wireBytesTotal:                  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_wire_bytes_total", Help: "Client transport bytes on the wire."}, []string{"component", "transport", "direction"}),
+		droppedBytesTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_dropped_bytes_total", Help: "Client DATA bytes that could not be delivered, by reason."}, []string{"component", "reason"}),
+		frameBytesTotal:                 prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_frame_bytes_total", Help: "Client frame payload bytes by frame type."}, []string{"component", "type", "direction"}),
+		framesTotal:                     prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_client_frames_total", Help: "Client frames by frame type."}, []string{"component", "type", "direction"}),
 		streamsActive:                   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "tunnelmesh_streams_active", Help: "Current active logical streams."}, []string{"protocol"}),
 		streamsTotal:                    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_streams_total", Help: "Total logical stream outcomes."}, []string{"protocol", "result", "error_class"}),
 		streamErrorsTotal:               prometheus.NewCounterVec(prometheus.CounterOpts{Name: "tunnelmesh_stream_errors_total", Help: "Total logical stream errors."}, []string{"protocol", "error_class"}),
@@ -175,7 +189,7 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 		agentConnectionStates:  make(map[string]bool),
 		agentConnectionStreams: make(map[string]int),
 	}
-	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.clientConnectionLeaseSweepTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
+	reg.MustRegister(m.connectionsTotal, m.connectionsActive, m.connectionStageDuration, m.heartbeatTotal, m.heartbeatRTT, m.bytesTotal, m.streamBytesTotal, m.wireBytesTotal, m.droppedBytesTotal, m.frameBytesTotal, m.framesTotal, m.streamsActive, m.streamsTotal, m.streamErrorsTotal, m.probeTotal, m.probeDuration, m.registryLeaseTotal, m.clientConnectionLeaseSweepTotal, m.relayTotal, m.agentConnections, m.agentConnectionCapacity, m.agentActiveStreams, m.agentConnectionRTT, m.agentConnectionErrors, m.agentScaleDecisions, m.agentSelection, m.storageOperationDuration, m.storageErrorsTotal, m.configReloadTotal, m.ready, m.streamStageDuration, m.streamOpenTotal, m.streamQueueWait, m.streamWindowStall, m.streamBackpressure, m.authorizationCache, m.authorizationRevision, m.authorizationRevisionPoll, m.remoteValidationCache, m.websshSessionsActive, m.websshTicketsCreatedTotal, m.websshTicketReuseTotal, m.websshStreamErrorsTotal, m.websshStreamDuration, m.websshBytesTotal)
 	// Registered separately from the collector list above: that call is already
 	// one line per feature area and appending here keeps the proxy entry
 	// collectors reviewable as a unit.
@@ -184,6 +198,16 @@ func NewMetrics(reg *prometheus.Registry) *Metrics {
 	// unit next to the bounded-label comment above.
 	reg.MustRegister(m.authLoginTotal, m.authMFAVerifyTotal, m.authOIDCStepTotal, m.authTrustedDevices, m.authPendingChallenges, m.authLoginBlockedBuckets)
 	return m
+}
+
+// Handler returns the Prometheus scrape handler for this Metrics set. The
+// registry is kept private so callers can serve it without rebuilding the
+// collector set or accidentally mixing in the global registry.
+func (m *Metrics) Handler() http.Handler {
+	if m == nil || m.registry == nil {
+		return http.NotFoundHandler()
+	}
+	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
 func label(value string) string {
@@ -256,6 +280,56 @@ func (m *Metrics) ObserveBytes(component, direction, protocol string, n int64) {
 	if n > 0 {
 		m.bytesTotal.WithLabelValues(label(component), label(direction), NormalizeProtocol(protocol)).Add(float64(n))
 	}
+}
+
+// ObserveTunnelBytes attributes stream payload bytes to one configured tunnel.
+// The tunnel label is local configuration rather than peer input, so the label
+// set stays bounded by the number of tunnels this client serves.
+func (m *Metrics) ObserveTunnelBytes(component, tunnel, direction, protocol string, n int64) {
+	if m == nil || m.streamBytesTotal == nil || n <= 0 {
+		return
+	}
+	tunnel = label(tunnel)
+	if tunnel == "" {
+		tunnel = "unattributed"
+	}
+	m.streamBytesTotal.WithLabelValues(label(component), tunnel, label(direction), NormalizeProtocol(protocol)).Add(float64(n))
+}
+
+// ObserveWireBytes records transport-level bytes before the stream layer sees
+// them, which is what lets an operator separate protocol/TLS overhead from
+// payload and from silently dropped frames.
+func (m *Metrics) ObserveWireBytes(component, transport, direction string, n int64) {
+	if m == nil || m.wireBytesTotal == nil || n <= 0 {
+		return
+	}
+	m.wireBytesTotal.WithLabelValues(label(component), label(transport), label(direction)).Add(float64(n))
+}
+
+// ObserveFrame counts every frame, including control frames. This is the layer
+// that explains a wire/payload gap: a flood of tiny control frames shows up as
+// a high count with almost no payload bytes.
+func (m *Metrics) ObserveFrame(component, frameType, direction string, payloadBytes int64) {
+	if m == nil || m.framesTotal == nil {
+		return
+	}
+	component, frameType, direction = label(component), label(frameType), label(direction)
+	if frameType == "" {
+		frameType = "unknown"
+	}
+	m.framesTotal.WithLabelValues(component, frameType, direction).Inc()
+	if payloadBytes > 0 {
+		m.frameBytesTotal.WithLabelValues(component, frameType, direction).Add(float64(payloadBytes))
+	}
+}
+
+// ObserveDroppedBytes records DATA that arrived but was not delivered. The
+// reason set is deliberately small and fixed by callers.
+func (m *Metrics) ObserveDroppedBytes(component, reason string, n int64) {
+	if m == nil || m.droppedBytesTotal == nil || n <= 0 {
+		return
+	}
+	m.droppedBytesTotal.WithLabelValues(label(component), label(reason)).Add(float64(n))
 }
 
 func (m *Metrics) ObserveStream(protocol, result, errorClass string) {

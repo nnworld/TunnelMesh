@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/tunnelmesh/tunnelmesh/internal/agent"
 	"github.com/tunnelmesh/tunnelmesh/internal/build"
@@ -95,7 +99,9 @@ type Runtime struct {
 	runErr    error
 	attempts  map[int]int
 	watcher   *ForwardServeWatcher
-	agentRole bool
+	// metricsServer is non-nil only while client.metrics.listen is bound.
+	metricsServer *http.Server
+	agentRole     bool
 	// agentPool is built in NewRuntimeFromConfig so a bad Agent endpoint or transport
 	// fails before any listener binds, not after the tunnel role is already running.
 	agentPool *agent.WebSocketPoolOptions
@@ -169,6 +175,11 @@ func NewRuntimeFromConfig(ctx context.Context, cfg config.Config, opts RuntimeOp
 	}
 	if len(cfg.Client.Tunnels) == 0 && strings.TrimSpace(cfg.Client.AgentID) == "" {
 		return nil, errors.New("client run requires at least one client.tunnels or client.agent_id entry")
+	}
+	if opts.Metrics == nil && strings.TrimSpace(cfg.Client.Metrics.Listen) != "" {
+		// Sessions capture their recorder at construction time, so the metrics
+		// set must exist before the pool is built, not when Start binds the port.
+		opts.Metrics = observability.NewMetrics(prometheus.NewRegistry())
 	}
 	meta, err := RuntimeMetadata(ctx, cfg, opts.InstanceID, opts.ConfigPath)
 	if err != nil {
@@ -277,6 +288,16 @@ func (r *Runtime) Start(ctx context.Context) error {
 		r.mu.Lock()
 		r.lock = lock
 		r.mu.Unlock()
+	}
+
+	if listen := strings.TrimSpace(r.cfg.Client.Metrics.Listen); listen != "" {
+		if err := r.startMetricsServer(listen); err != nil {
+			r.mu.Lock()
+			r.started = false
+			r.mu.Unlock()
+			_ = r.releaseLock()
+			return err
+		}
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -451,6 +472,7 @@ func (r *Runtime) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
+	r.closeMetricsServer()
 	r.closeForwards()
 	if done != nil {
 		<-done
@@ -523,6 +545,7 @@ func (r *Runtime) Stats() RuntimeStats {
 // newest ingress is withdrawn before the one an operator is most likely using.
 func (r *Runtime) fail(cancel context.CancelFunc, runErr error) {
 	cancel()
+	r.closeMetricsServer()
 	r.closeForwards()
 	r.mu.Lock()
 	r.started = false
@@ -534,6 +557,44 @@ func (r *Runtime) fail(cancel context.CancelFunc, runErr error) {
 	_ = r.releaseLock()
 	if done != nil {
 		close(done)
+	}
+}
+
+// startMetricsServer binds the diagnostics endpoint before any tunnel listener,
+// so a port conflict is reported as a startup failure instead of a half-running
+// client that silently lacks metrics.
+func (r *Runtime) startMetricsServer(listen string) error {
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return fmt.Errorf("client metrics listen %s: %w", listen, err)
+	}
+	// Configuration validation already enforces this; repeating it here keeps
+	// programmatic callers that skip Validate from exposing an open endpoint.
+	if addr, ok := ln.Addr().(*net.TCPAddr); ok && !addr.IP.IsLoopback() {
+		_ = ln.Close()
+		return fmt.Errorf("client metrics listen %s: must bind to a loopback address", listen)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", r.opts.Metrics.Handler())
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	r.mu.Lock()
+	r.metricsServer = server
+	r.mu.Unlock()
+	go func() {
+		if serveErr := server.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Warn("client_metrics_server_stopped", "listen", listen, "error", serveErr)
+		}
+	}()
+	return nil
+}
+
+func (r *Runtime) closeMetricsServer() {
+	r.mu.Lock()
+	server := r.metricsServer
+	r.metricsServer = nil
+	r.mu.Unlock()
+	if server != nil {
+		_ = server.Close()
 	}
 }
 
@@ -789,7 +850,7 @@ func NewConfiguredForward(opener StreamOpener, cfg config.ClientConfig, tunnel c
 	switch strings.ToLower(strings.TrimSpace(tunnel.Protocol)) {
 	case "tcp":
 		forward, err := NewTCPForward(opener, TCPForwardConfig{
-			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
+			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID, TunnelName: TunnelDisplayName(tunnel),
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
 			ConnectTimeout: cfg.Stream.OpenTimeout,
 			AllowRemote:    tunnel.AllowRemote,
@@ -797,7 +858,7 @@ func NewConfiguredForward(opener StreamOpener, cfg config.ClientConfig, tunnel c
 		return forward, fmt.Sprintf("tcp tunnel %s listening on %s", TunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "udp":
 		forward, err := NewUDPForward(opener, UDPForwardConfig{
-			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
+			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID, TunnelName: TunnelDisplayName(tunnel),
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
 			OpenTimeout: cfg.Stream.OpenTimeout,
 			AllowRemote: tunnel.AllowRemote,
@@ -805,7 +866,7 @@ func NewConfiguredForward(opener StreamOpener, cfg config.ClientConfig, tunnel c
 		return forward, fmt.Sprintf("udp tunnel %s listening on %s", TunnelDisplayName(tunnel), tunnel.ListenAddr), err
 	case "http":
 		forward, err := NewHTTPForward(opener, HTTPForwardConfig{
-			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID,
+			ListenAddr: tunnel.ListenAddr, AgentID: tunnel.AgentID, TunnelName: TunnelDisplayName(tunnel),
 			TargetHost: tunnel.TargetHost, TargetPort: tunnel.TargetPort,
 			OpenTimeout: cfg.Stream.OpenTimeout,
 			AllowRemote: tunnel.AllowRemote,
@@ -839,6 +900,7 @@ func newConfiguredSOCKS5Forward(opener StreamOpener, cfg config.ClientConfig, tu
 	return NewSOCKS5Forward(opener, SOCKS5ForwardConfig{
 		ListenAddr:  tunnel.ListenAddr,
 		AgentID:     tunnel.AgentID,
+		TunnelName:  TunnelDisplayName(tunnel),
 		OpenTimeout: cfg.Stream.OpenTimeout,
 		AllowRemote: tunnel.AllowRemote,
 		AuthMode:    SOCKS5AuthMode(authMode),
@@ -871,6 +933,7 @@ func newConfiguredHTTPProxyForward(opener StreamOpener, cfg config.ClientConfig,
 	return NewHTTPProxyForward(opener, HTTPProxyForwardConfig{
 		ListenAddr:  tunnel.ListenAddr,
 		AgentID:     tunnel.AgentID,
+		TunnelName:  TunnelDisplayName(tunnel),
 		OpenTimeout: cfg.Stream.OpenTimeout,
 		AllowRemote: tunnel.AllowRemote,
 		AuthMode:    HTTPProxyAuthMode(authMode),
