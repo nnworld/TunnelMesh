@@ -21,7 +21,7 @@ jobs:
       - run: cd web && npm ci
       - run: cd web && npm test -- --run
       - run: cd web && npm run build
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -82,7 +82,7 @@ jobs:
       # a runner with a different fetch chain and turned red there instead of here.
       - run: cd web-tray && npm test -- --run
       - run: cd web-tray && npm run build
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -152,7 +152,7 @@ jobs:
       TUNNELMESH_TEST_MYSQL_DSN: tunnelmesh:tunnelmesh@tcp(127.0.0.1:3306)/tunnelmesh_test?parseTime=true&tls=false
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
           cache: true
