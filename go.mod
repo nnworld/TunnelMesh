@@ -3,7 +3,7 @@ module github.com/tunnelmesh/tunnelmesh
 go 1.26.0
 
 require (
-	github.com/go-sql-driver/mysql v1.10.1
+	github.com/go-sql-driver/mysql v1.10.2
 	github.com/prometheus/client_golang v1.25.0
 	github.com/quic-go/quic-go v0.65.0
 	github.com/spf13/cobra v1.10.2
